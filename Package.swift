@@ -181,6 +181,11 @@ let package = Package(
             path: "Tests/RepoPromptWorkspaceCoreTests"
         ),
         .testTarget(
+            name: "RepoPromptSharedTests",
+            dependencies: ["RepoPromptShared"],
+            path: "Tests/RepoPromptSharedTests"
+        ),
+        .testTarget(
             name: "RepoPromptRegexCoreTests",
             dependencies: ["RepoPromptRegexCore"],
             path: "Tests/RepoPromptRegexCoreTests",
