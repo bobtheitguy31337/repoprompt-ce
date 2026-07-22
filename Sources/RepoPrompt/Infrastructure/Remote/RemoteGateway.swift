@@ -20,6 +20,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
     @Published private(set) var isRunning = false
     @Published private(set) var pairingAdvertisement: RemotePairingAdvertisement?
+    @Published private(set) var pairingCode: String?
     @Published private(set) var lastError: String?
     @Published private(set) var lastRequestAt: Date?
     @Published private(set) var lastSuccessfulRequestAt: Date?
@@ -70,10 +71,8 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         }
     }
 
-    var pairingCode: String? {
-        guard let pairingAdvertisement,
-              let data = try? JSONEncoder().encode(pairingAdvertisement)
-        else { return nil }
+    private static func makePairingCode(for advertisement: RemotePairingAdvertisement) -> String? {
+        guard let data = try? JSONEncoder().encode(advertisement) else { return nil }
         let payload = data.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
@@ -87,11 +86,11 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
     func refreshPairingAdvertisement() {
         guard let activePort else { return }
-        pairingAdvertisement = pairingManager.issueAdvertisement(
+        setPairingAdvertisement(pairingManager.issueAdvertisement(
             port: activePort,
             serviceName: bonjourName,
             host: RemoteLocalAddress.preferredIPv4Address()
-        )
+        ))
     }
 
     var defaultAuthority: RemoteAuthorityLevel {
@@ -178,11 +177,11 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                                 return
                             }
                             controller.activePort = port
-                            controller.pairingAdvertisement = controller.pairingManager.issueAdvertisement(
+                            controller.setPairingAdvertisement(controller.pairingManager.issueAdvertisement(
                                 port: port,
                                 serviceName: controller.bonjourName,
                                 host: RemoteLocalAddress.preferredIPv4Address()
-                            )
+                            ))
                             controller.publishBonjour(port: port)
                             controller.isRunning = true
                             controller.lastError = nil
@@ -225,7 +224,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         bonjourService?.stop()
         bonjourService = nil
         connectionBuffers.removeAll()
-        pairingAdvertisement = nil
+        setPairingAdvertisement(nil)
         activePort = nil
         isRunning = false
         availabilityController.releaseSleepAssertion()
@@ -253,6 +252,11 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         } else {
             stop()
         }
+    }
+
+    private func setPairingAdvertisement(_ advertisement: RemotePairingAdvertisement?) {
+        pairingAdvertisement = advertisement
+        pairingCode = advertisement.flatMap(Self.makePairingCode(for:))
     }
 
     func revokePairedDevice() {

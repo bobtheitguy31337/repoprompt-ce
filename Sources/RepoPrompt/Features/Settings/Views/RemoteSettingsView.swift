@@ -103,6 +103,10 @@ struct RemoteSettingsView: View {
                 if let pairingCode = gateway.pairingCode {
                     HStack(alignment: .top, spacing: 20) {
                         PairingQRCodeView(payload: pairingCode)
+                            .frame(width: 220, height: 220)
+                            .padding(10)
+                            .background(.white)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
 
                         VStack(alignment: .leading, spacing: 10) {
                             Text("Scan this code with RepoPrompt Remote")
@@ -269,37 +273,52 @@ struct RemoteSettingsView: View {
     }
 }
 
-private struct PairingQRCodeView: View {
+private struct PairingQRCodeView: NSViewRepresentable {
     let payload: String
 
-    @State private var image: Image?
+    private static let imageCache = NSCache<NSString, NSImage>()
+    private static let imageContext = CIContext()
 
-    var body: some View {
-        Group {
-            if let image {
-                image
-                    .interpolation(.none)
-                    .resizable()
-            } else {
-                ProgressView()
-            }
-        }
-        .frame(width: 220, height: 220)
-        .padding(10)
-        .background(.white)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .task(id: payload) {
-            image = Self.makeImage(for: payload)
+    func makeCoordinator() -> Coordinator {
+        Coordinator(payload: payload)
+    }
+
+    func makeNSView(context: Context) -> NSImageView {
+        let imageView = NSImageView()
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.imageAlignment = .alignCenter
+        imageView.image = Self.image(for: payload)
+        return imageView
+    }
+
+    func updateNSView(_ imageView: NSImageView, context: Context) {
+        guard context.coordinator.payload != payload else { return }
+        context.coordinator.payload = payload
+        imageView.image = Self.image(for: payload)
+    }
+
+    final class Coordinator {
+        var payload: String
+
+        init(payload: String) {
+            self.payload = payload
         }
     }
 
-    private static func makeImage(for payload: String) -> Image? {
+    private static func image(for payload: String) -> NSImage? {
+        let cacheKey = payload as NSString
+        if let cached = imageCache.object(forKey: cacheKey) {
+            return cached
+        }
+
         let filter = CIFilter(name: "CIQRCodeGenerator")
         filter?.setValue(Data(payload.utf8), forKey: "inputMessage")
         filter?.setValue("Q", forKey: "inputCorrectionLevel")
         guard let output = filter?.outputImage else { return nil }
         let scaled = output.transformed(by: CGAffineTransform(scaleX: 8, y: 8))
-        guard let cgImage = CIContext().createCGImage(scaled, from: scaled.extent) else { return nil }
-        return Image(decorative: cgImage, scale: 1, orientation: .up)
+        guard let cgImage = imageContext.createCGImage(scaled, from: scaled.extent) else { return nil }
+        let image = NSImage(cgImage: cgImage, size: NSSize(width: 220, height: 220))
+        imageCache.setObject(image, forKey: cacheKey)
+        return image
     }
 }
