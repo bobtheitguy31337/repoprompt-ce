@@ -136,6 +136,93 @@ final class RemoteSnapshotProjectionTests: XCTestCase {
         }
     }
 
+    func testProjectionRebuildsAfterRestartAndPreservesLifecycleState() async {
+        let workspaceID = UUID()
+        let waitingID = UUID()
+        let cancelledID = UUID()
+        let now = Date(timeIntervalSince1970: 250)
+        let workspace = RemoteWorkspaceRecord(
+            workspaceID: workspaceID,
+            name: "Restart fixture",
+            repositoryRootSummary: "repo",
+            isOpen: false,
+            activeSessionIDs: [],
+            lastActivityAt: now
+        )
+        let records = [
+            RemoteSessionRecord(
+                sessionID: waitingID,
+                workspaceID: workspaceID,
+                composeTabID: UUID(),
+                parentSessionID: nil,
+                sessionName: "Waiting",
+                workflow: nil,
+                agent: nil,
+                model: nil,
+                reasoningEffort: nil,
+                runState: .waitingForInput,
+                lifecycleStage: "waiting",
+                latestMeaningfulActivity: "Waiting for input",
+                pendingInteraction: RemoteInteractionSummary(
+                    id: "waiting",
+                    kind: .question,
+                    prompt: "Continue?"
+                ),
+                worktreeSummary: nil,
+                mergeAttention: nil,
+                failureSummary: nil,
+                lastUpdatedAt: now,
+                isLive: true
+            ),
+            RemoteSessionRecord(
+                sessionID: cancelledID,
+                workspaceID: workspaceID,
+                composeTabID: UUID(),
+                parentSessionID: nil,
+                sessionName: "Cancelled",
+                workflow: nil,
+                agent: nil,
+                model: nil,
+                reasoningEffort: nil,
+                runState: .cancelled,
+                lifecycleStage: "cancelled",
+                latestMeaningfulActivity: "Cancelled",
+                pendingInteraction: nil,
+                worktreeSummary: nil,
+                mergeAttention: nil,
+                failureSummary: nil,
+                lastUpdatedAt: now.addingTimeInterval(-1),
+                isLive: false
+            )
+        ]
+
+        func build() async -> RemoteSnapshot {
+            await RemoteSnapshotBuilder(
+                workspaceCatalog: FixtureWorkspaceCatalog(records: [workspace]),
+                sessionQuery: FixtureSessionQuery(records: records),
+                workflowCatalog: StaticRemoteCatalogService()
+            ).build(
+                desktop: RemoteDesktopSummary(
+                    instanceID: "restart-desktop",
+                    displayName: "Fixture Mac",
+                    appVersion: "test",
+                    isAvailable: true
+                ),
+                connection: RemoteConnectionSummary(state: .connected),
+                authorization: RemoteAuthorizationState()
+            )
+        }
+
+        let beforeRestart = await build()
+        let afterRestart = await build()
+
+        XCTAssertEqual(afterRestart.workspaces, beforeRestart.workspaces)
+        XCTAssertEqual(afterRestart.sessions, beforeRestart.sessions)
+        XCTAssertTrue(afterRestart.sessions.contains { $0.runState == .waitingForInput })
+        XCTAssertTrue(afterRestart.sessions.contains { $0.runState == .cancelled })
+        XCTAssertTrue(afterRestart.workspaces.contains { !$0.isOpen })
+    }
+
     func testProjectionHandlesLargeFleetWithParentChildRelationships() async {
         let workspaceID = UUID()
         let now = Date(timeIntervalSince1970: 300)
