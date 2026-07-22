@@ -140,6 +140,11 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         do {
             let identity = try tlsIdentityStore.loadOrCreate()
             tlsIdentity = identity
+            if identity.wasCreated {
+                // A new TLS identity invalidates the certificate pin held by
+                // existing phones, so do not leave an unusable device paired.
+                pairingManager.revokeDevice()
+            }
             pairingManager.setCertificateSHA256(identity.certificateSHA256)
 
             let tlsOptions = NWProtocolTLS.Options()
@@ -531,6 +536,14 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             } catch {
                 sendError(.init(code: "pairing_failed", message: "Pairing could not be completed."), status: 500, on: connection)
             }
+
+        case ("POST", RemoteProtocol.unpairPath):
+            guard pairingManager.isAuthorized(request.headers["authorization"]) else {
+                sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
+                return
+            }
+            pairingManager.revokeDevice()
+            sendJSON(RemoteUnpairResponse(), status: 200, on: connection)
 
         case ("GET", RemoteProtocol.snapshotPath):
             guard pairingManager.isAuthorized(request.headers["authorization"]) else {
