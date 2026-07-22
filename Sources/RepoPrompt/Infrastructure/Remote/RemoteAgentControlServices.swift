@@ -203,7 +203,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         let target = try await context.agentMode.mcpResolveOrCreateSessionTarget(
             tabID: nil,
             sessionID: sessionID,
-            createIfNeeded: false,
+            createIfNeeded: true,
             sessionName: nil
         )
         let session = await context.agentMode.ensureSessionReady(tabID: target.tabID)
@@ -452,9 +452,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
     ) async throws -> WindowContext {
         if let requestedWorkspaceID, let workspaceID = UUID(uuidString: requestedWorkspaceID) {
             let context = try await activateWorkspace(workspaceID)
-            if context.agentMode.sessionIndex[sessionID] != nil
-                || context.agentMode.sessions.values.contains(where: { $0.activeAgentSessionID == sessionID })
-            {
+            if await canResolveSession(sessionID, in: context) {
                 return context
             }
         }
@@ -462,13 +460,34 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             throw RemoteAgentControlServiceError.sessionNotFound
         }
         for window in manager.allWindows where !window.isClosing {
-            if window.agentModeViewModel.sessionIndex[sessionID] != nil
-                || window.agentModeViewModel.sessions.values.contains(where: { $0.activeAgentSessionID == sessionID })
-            {
-                return WindowContext(window: window)
+            let context = WindowContext(window: window)
+            if await canResolveSession(sessionID, in: context) {
+                return context
             }
         }
         throw RemoteAgentControlServiceError.sessionNotFound
+    }
+
+    private func canResolveSession(
+        _ sessionID: UUID,
+        in context: WindowContext
+    ) async -> Bool {
+        if context.agentMode.sessionIndex[sessionID] != nil
+            || context.agentMode.sessions.values.contains(where: { $0.activeAgentSessionID == sessionID })
+        {
+            return true
+        }
+        guard let workspace = context.workspaceManager.activeWorkspace else {
+            return false
+        }
+        do {
+            return try await context.agentMode.mcpResolveSessionID(
+                reference: sessionID.uuidString,
+                workspace: workspace
+            ) == sessionID
+        } catch {
+            return false
+        }
     }
 
     private func response(
