@@ -107,6 +107,64 @@ fingerprint. The QR code contains a short-lived, one-time pairing secret, never
 a long-lived bearer credential. The desktop stores the generated PKCS#12 TLS
 identity and the single paired-device credential in separate Keychain records.
 
+## Local development integration
+
+Keep `repoprompt-ce` and `repoprompt-remote` as adjacent checkouts; CE resolves
+the shared protocol from
+`../repoprompt-remote/Packages/RepoPromptRemoteProtocol`. In the mobile checkout,
+run `xcodegen generate`. A fast Simulator Debug build may disable signing:
+
+```sh
+xcodebuild -project RepoPromptRemote.xcodeproj \
+  -scheme RepoPromptRemote \
+  -configuration Debug \
+  -sdk iphonesimulator \
+  -destination 'generic/platform=iOS Simulator' \
+  CODE_SIGNING_ALLOWED=NO build
+```
+
+For a device Debug build, select the developer's own Apple Developer team in
+Xcode locally—never hard-code or commit it. Register the iPhone and use a
+development profile for a Push Notifications-enabled App ID; the installed
+Debug app must carry `aps-environment=development`.
+
+Use the CE checkout's canonical coordinated workflow:
+
+```sh
+make doctor
+export SIGN_IDENTITY='Apple Development: <local identity>'
+export DEBUG_SECURE_STORAGE_BACKEND=keychain
+make dev-build
+make dev-run
+make debug-cli-status            # make install-debug-cli if not installed
+rpce-cli-debug -e 'windows'
+```
+
+The local signing identity and secure-storage override are required when
+validating CE certificate and paired-credential persistence; never commit the
+identity or team. Prefer the
+applicable `make dev-*` targets (`make dev-test`, `make dev-smoke`, and so on)
+to uncoordinated commands. Use `rpce-cli-debug` against the running CE debug app
+to select a known workspace, create recognizable non-destructive session state,
+and record the CLI start/wait result that the phone observes.
+
+Run acceptance in sequence: pair Simulator through the Debug manual field with
+the copied short-lived `rpremote://pair?...` value, then test a registered
+physical iPhone by camera on the same non-isolated LAN. On the device, verify
+Bonjour discovery and recovery after Wi-Fi interruption and a CE restart with
+an ephemeral-port change. Only one device credential is active: forget the
+pairing in iOS and revoke it in CE before re-pairing, and confirm the old
+credential is rejected.
+
+Optional local push comes last. Run the relay with APNs sandbox credentials
+(`APNS_PRODUCTION` unset) and configure the Mac-side relay URL as
+`http://127.0.0.1:8787/v1/notify`. The Mac, not the phone, resolves loopback;
+push remains only an attention signal followed by authoritative LAN resync.
+This path does not cover production APNs, FCM, or deployed relay operations.
+Simulator, physical-device, Bonjour/LAN, Keychain-persistence, and APNs
+acceptance remain environment-dependent and are not established by these
+documentation steps.
+
 ## Delivery order
 
 1. Extract typed control services and implement a snapshot projection from
