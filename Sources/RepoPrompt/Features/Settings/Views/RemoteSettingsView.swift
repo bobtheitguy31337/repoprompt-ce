@@ -16,7 +16,9 @@ struct RemoteSettingsView: View {
         case fifteenMinutes
         case persistent
 
-        var id: String { rawValue }
+        var id: String {
+            rawValue
+        }
 
         var title: String {
             switch self {
@@ -98,20 +100,14 @@ struct RemoteSettingsView: View {
     private var pairingSection: some View {
         GroupBox("Pair your phone") {
             VStack(alignment: .leading, spacing: 14) {
-                if let image = qrImage {
+                if let pairingCode = gateway.pairingCode {
                     HStack(alignment: .top, spacing: 20) {
-                        image
-                            .interpolation(.none)
-                            .resizable()
-                            .frame(width: 220, height: 220)
-                            .padding(10)
-                            .background(.white)
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                        PairingQRCodeView(payload: pairingCode)
 
                         VStack(alignment: .leading, spacing: 10) {
                             Text("Scan this code with RepoPrompt Remote")
                                 .font(.headline)
-                            Text("The code expires after two minutes and is single-use. Generating a new code invalidates the previous one.")
+                            Text("The code stays valid until it is used or you generate a new code. Generating a new code invalidates the previous one.")
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -133,12 +129,6 @@ struct RemoteSettingsView: View {
                         gateway.refreshPairingAdvertisement()
                     }
                     .disabled(!gateway.isRunning)
-                }
-
-                if let advertisement = gateway.pairingAdvertisement {
-                    Text("Code expires \(advertisement.expiresAt, style: .relative)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
 
                 LabeledContent("Paired phone") {
@@ -233,7 +223,7 @@ struct RemoteSettingsView: View {
                         .foregroundStyle(availability.preventsIdleSleepForActiveRun ? .green : .secondary)
                 }
 
-                    Text("The Mac stays awake only while an agent is opening, working, blocked, or waiting for input.")
+                Text("The Mac stays awake only while an agent is opening, working, blocked, or waiting for input.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -247,17 +237,6 @@ struct RemoteSettingsView: View {
             }
             .padding(8)
         }
-    }
-
-    private var qrImage: Image? {
-        guard gateway.isRunning, let pairingCode = gateway.pairingCode else { return nil }
-        let filter = CIFilter(name: "CIQRCodeGenerator")
-        filter?.setValue(Data(pairingCode.utf8), forKey: "inputMessage")
-        filter?.setValue("Q", forKey: "inputCorrectionLevel")
-        guard let output = filter?.outputImage else { return nil }
-        let scaled = output.transformed(by: CGAffineTransform(scaleX: 8, y: 8))
-        guard let cgImage = CIContext().createCGImage(scaled, from: scaled.extent) else { return nil }
-        return Image(decorative: cgImage, scale: 1, orientation: .up)
     }
 
     private func copyPairingLink() {
@@ -287,5 +266,40 @@ struct RemoteSettingsView: View {
         case .persistent:
             return "\(level) remains granted until revoked."
         }
+    }
+}
+
+private struct PairingQRCodeView: View {
+    let payload: String
+
+    @State private var image: Image?
+
+    var body: some View {
+        Group {
+            if let image {
+                image
+                    .interpolation(.none)
+                    .resizable()
+            } else {
+                ProgressView()
+            }
+        }
+        .frame(width: 220, height: 220)
+        .padding(10)
+        .background(.white)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .task(id: payload) {
+            image = Self.makeImage(for: payload)
+        }
+    }
+
+    private static func makeImage(for payload: String) -> Image? {
+        let filter = CIFilter(name: "CIQRCodeGenerator")
+        filter?.setValue(Data(payload.utf8), forKey: "inputMessage")
+        filter?.setValue("Q", forKey: "inputCorrectionLevel")
+        guard let output = filter?.outputImage else { return nil }
+        let scaled = output.transformed(by: CGAffineTransform(scaleX: 8, y: 8))
+        guard let cgImage = CIContext().createCGImage(scaled, from: scaled.extent) else { return nil }
+        return Image(decorative: cgImage, scale: 1, orientation: .up)
     }
 }

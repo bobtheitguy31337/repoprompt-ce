@@ -10,7 +10,6 @@ enum RemoteGatewaySecurityError: LocalizedError {
     case identityGenerationFailed(String)
     case identityImportFailed(OSStatus)
     case pairingSecretInvalid
-    case pairingSecretExpired
     case unsupportedProtocol(Int)
     case deviceCredentialUnavailable
 
@@ -26,8 +25,6 @@ enum RemoteGatewaySecurityError: LocalizedError {
             "The Remote TLS identity could not be imported (status \(status))."
         case .pairingSecretInvalid:
             "The pairing code is invalid."
-        case .pairingSecretExpired:
-            "The pairing code has expired."
         case let .unsupportedProtocol(version):
             "The pairing request uses unsupported protocol version \(version)."
         case .deviceCredentialUnavailable:
@@ -249,8 +246,9 @@ private struct RemoteStoredNotificationRegistration: Codable, Equatable, Sendabl
     let updatedAt: Date
 }
 
-/// Enforces the first-release one-device pairing rule. Pairing material is
-/// short-lived and in memory; the issued bearer credential is Keychain-backed.
+/// Enforces the first-release one-device pairing rule. Pairing material stays
+/// in memory until used or manually replaced; the issued bearer credential is
+/// Keychain-backed.
 @MainActor
 final class RemotePairingManager {
     static let shared = RemotePairingManager()
@@ -258,7 +256,6 @@ final class RemotePairingManager {
     let desktopInstanceID: String
     private(set) var certificateSHA256: String = ""
     private var pendingSecret: String?
-    private var pendingSecretExpiresAt: Date?
     private var storedDevice: RemoteStoredDeviceCredential?
     private var notificationRegistration: RemoteNotificationRegistration?
 
@@ -280,13 +277,21 @@ final class RemotePairingManager {
             .flatMap { try decoder.decode(RemoteStoredNotificationRegistration.self, from: $0).registration }
     }
 
-    var isPaired: Bool { storedDevice != nil }
+    var isPaired: Bool {
+        storedDevice != nil
+    }
 
-    var pairedDeviceID: String? { storedDevice?.deviceID }
+    var pairedDeviceID: String? {
+        storedDevice?.deviceID
+    }
 
-    var pairedCredential: String? { storedDevice?.credential }
+    var pairedCredential: String? {
+        storedDevice?.credential
+    }
 
-    var registeredNotification: RemoteNotificationRegistration? { notificationRegistration }
+    var registeredNotification: RemoteNotificationRegistration? {
+        notificationRegistration
+    }
 
     func setCertificateSHA256(_ fingerprint: String) {
         certificateSHA256 = fingerprint
@@ -295,7 +300,6 @@ final class RemotePairingManager {
     func issueAdvertisement(port: UInt16, serviceName: String, host: String?) -> RemotePairingAdvertisement {
         let secret = remoteRandomToken()
         pendingSecret = secret
-        pendingSecretExpiresAt = Date().addingTimeInterval(120)
         return RemotePairingAdvertisement(
             desktopInstanceID: desktopInstanceID,
             serviceName: serviceName,
@@ -303,7 +307,9 @@ final class RemotePairingManager {
             port: Int(port),
             certificateSHA256: certificateSHA256,
             oneTimeSecret: secret,
-            expiresAt: pendingSecretExpiresAt!
+            // Keep the field for wire compatibility with older clients, but
+            // pairing codes remain valid until used or manually regenerated.
+            expiresAt: .distantFuture
         )
     }
 
@@ -319,11 +325,6 @@ final class RemotePairingManager {
               expectedSecret == request.oneTimeSecret
         else {
             throw RemoteGatewaySecurityError.pairingSecretInvalid
-        }
-        guard let expiry = pendingSecretExpiresAt, Date() < expiry else {
-            self.pendingSecret = nil
-            self.pendingSecretExpiresAt = nil
-            throw RemoteGatewaySecurityError.pairingSecretExpired
         }
         guard !certificateSHA256.isEmpty else {
             throw RemoteGatewaySecurityError.certificateUnavailable
@@ -342,7 +343,6 @@ final class RemotePairingManager {
             service: RemoteGatewayKeychain.deviceService
         )
         pendingSecret = nil
-        pendingSecretExpiresAt = nil
         return RemotePairingResponse(
             desktop: desktop,
             deviceID: credential.deviceID,
