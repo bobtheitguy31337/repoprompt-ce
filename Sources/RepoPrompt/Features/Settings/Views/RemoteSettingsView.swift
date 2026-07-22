@@ -50,31 +50,31 @@ struct RemoteSettingsView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Remote Control")
+            Text("Connect your phone")
                 .font(.largeTitle.weight(.semibold))
-            Text("Optionally connect the RepoPrompt Remote app over your local network. The Mac remains the runtime, authority boundary, and source of truth.")
+            Text("Connect RepoPrompt Remote to this Mac. Your Mac remains in control of its projects and agents.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
 
     private var gatewaySection: some View {
-        GroupBox("Local gateway") {
+        GroupBox("Remote access") {
             VStack(alignment: .leading, spacing: 14) {
-                Toggle("Enable local HTTPS gateway", isOn: Binding(
+                Toggle("Enable pairing", isOn: Binding(
                     get: { gateway.isEnabled },
                     set: { enabled in
                         Task { await gateway.setEnabled(enabled) }
                     }
                 ))
 
-                Text("Only devices on the same LAN can reach the listener. Pairing is required before a snapshot or event stream is served.")
+                Text("Allow RepoPrompt Remote to connect to this Mac. Pairing is required before anything can be viewed or controlled.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
 
-                if gateway.isRunning, let port = gateway.activePort {
+                if gateway.isRunning {
                     LabeledContent("Status") {
-                        Label("Running on HTTPS port \(port)", systemImage: "checkmark.circle.fill")
+                        Label("Ready for pairing", systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.green)
                     }
                 } else {
@@ -96,7 +96,7 @@ struct RemoteSettingsView: View {
     }
 
     private var pairingSection: some View {
-        GroupBox("Pair a phone") {
+        GroupBox("Pair your phone") {
             VStack(alignment: .leading, spacing: 14) {
                 if let image = qrImage {
                     HStack(alignment: .top, spacing: 20) {
@@ -109,7 +109,7 @@ struct RemoteSettingsView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 8))
 
                         VStack(alignment: .leading, spacing: 10) {
-                            Text("Scan this code in RepoPrompt Remote")
+                            Text("Scan this code with RepoPrompt Remote")
                                 .font(.headline)
                             Text("The code expires after two minutes and is single-use. Generating a new code invalidates the previous one.")
                                 .font(.callout)
@@ -127,7 +127,7 @@ struct RemoteSettingsView: View {
                         }
                     }
                 } else {
-                    Text(gateway.isEnabled ? "Start the gateway to generate a pairing code." : "Enable the gateway to generate a pairing code.")
+                    Text(gateway.isEnabled ? "Start pairing to generate a code." : "Enable pairing to generate a code.")
                         .foregroundStyle(.secondary)
                     Button("Generate pairing code") {
                         gateway.refreshPairingAdvertisement()
@@ -141,15 +141,16 @@ struct RemoteSettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                LabeledContent("Paired device") {
+                LabeledContent("Paired phone") {
                     Text(gateway.isPaired ? "One device paired" : "None")
                         .foregroundStyle(gateway.isPaired ? .primary : .secondary)
                 }
 
-                Button("Revoke paired device", role: .destructive) {
-                    gateway.revokePairedDevice()
+                if gateway.isPaired {
+                    Button("Unpair phone", role: .destructive) {
+                        gateway.revokePairedDevice()
+                    }
                 }
-                .disabled(!gateway.isPaired)
             }
             .padding(8)
         }
@@ -232,7 +233,7 @@ struct RemoteSettingsView: View {
                         .foregroundStyle(availability.preventsIdleSleepForActiveRun ? .green : .secondary)
                 }
 
-                Text("The sleep assertion is held only while an agent is opening, working, blocked, or waiting for input. The Remote gateway itself does not keep the Mac awake.")
+                    Text("The Mac stays awake only while an agent is opening, working, blocked, or waiting for input.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
