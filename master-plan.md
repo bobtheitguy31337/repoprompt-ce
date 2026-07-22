@@ -1,6 +1,10 @@
 # RepoPrompt Remote — Master Plan
 
-Status: foundation established; read-only end-to-end vertical slice is next.
+Status: paired read/control, explicit detail, encrypted notification,
+diagnostics, relay implementation, and iOS release configuration are present in
+the two agreed repositories; mutation failure coverage is complete, while
+provider credentials/deployment and Android FCM registration remain
+release/deferred work.
 
 Last updated: 2026-07-21
 
@@ -194,17 +198,15 @@ plaintext.
 
 Path: `/Users/jared/Projects/repoprompt-ce`
 
-GitHub topology:
+GitHub remote:
 
-- `origin`: `https://github.com/bobtheitguy31337/repoprompt-ce.git` — your fork
-- `upstream`: `https://github.com/repoprompt/repoprompt-ce.git` — canonical source
+- `origin`: `https://github.com/bobtheitguy31337/repoprompt-ce.git`
 
-The fork has been created and the local checkout has been configured with this
-topology. The fork has push access for the connected account.
+The fork has been created and the local checkout uses it as the only desktop
+repository remote.
 
-Current branch: `codex/remote-control-foundation`, based on upstream `main` at
-`80d2e4c`. At the time of the latest fetch, `upstream/main` was `c82143ce`, so
-this feature branch needs an explicit update/rebase decision before publishing.
+Current branch: `codex/remote-control-foundation`, currently at `1aa0e3b6`
+with the Remote implementation changes in the working tree.
 
 Implemented foundation:
 
@@ -213,35 +215,47 @@ Implemented foundation:
 - [x] Desktop, connection, workspace, session, attention, workflow, and agent summaries
 - [x] Ordered authority levels and session-scoped temporary grants
 - [x] Typed remote event envelope and event types
+- [x] Batch event coalescing for high-cardinality fleet projections
 - [x] Actor-backed bounded event replay buffer
 - [x] Duplicate event-ID suppression
 - [x] Snapshot fallback when the replay cursor is too old
 - [x] Secret-safe interaction summary shape
 - [x] Focused shared-target test target
 - [x] Architecture/security notes in `docs/architecture/remote-control.md`
+- [x] Typed workspace/session projection services and a complete fixture snapshot
+- [x] Opt-in LAN HTTPS gateway with TLS identity pinning metadata
+- [x] One-device pairing, Keychain credential storage, rotation, and revocation
+- [x] `/remote/v1/pair`, `/remote/v1/snapshot`, and bounded `/events`
+- [x] Remote settings UI with enablement, QR regeneration, authority default, and revocation
 
-Files added or changed:
+Files added or changed in the current implementation:
 
-- `Sources/RepoPromptShared/Remote/RemoteModels.swift`
-- `Sources/RepoPromptShared/Remote/RemoteEventReplayBuffer.swift`
-- `Tests/RepoPromptSharedTests/RemoteContractTests.swift`
+- `Packages/RepoPromptRemoteProtocol/`
+- `Sources/RepoPromptShared/RemoteProtocolExports.swift`
+- `Sources/RepoPrompt/Infrastructure/Remote/`
+- `Sources/RepoPrompt/Features/Settings/Views/RemoteSettingsView.swift`
+- `Tests/RepoPromptTests/Remote/`
 - `Package.swift`
 - `docs/architecture/remote-control.md`
 
+Implemented command/read slice:
+
+- Remote command endpoints
+- Live coarse event publication from agent/workspace state
+- Paged history and transcript reads
+- Live workflow/agent catalogs and selected workflow starts
+- Context Builder clarify, question, plan, and review commands
+- Launch-at-login setting and active-run sleep assertion
+- Catalog and diagnostics endpoints
+- Explicit transcript detail expansion with redaction
+- Encrypted notification envelopes, APNs registration relay contract, and
+  attention-category delivery hooks
+- Bounded event coalescing for large fleet snapshot-poll batches
+
 Not implemented yet:
 
-- Remote settings UI
-- Opt-in listener or HTTPS/TLS gateway
-- Bonjour advertising
-- QR pairing and credential storage/rotation
-- Desktop remote authorization enforcement
-- Snapshot projection from live RepoPrompt state
-- Workspace activation by immutable workspace ID
-- Remote command endpoints
-- Live event publication from agent/workspace state
-- Transcript detail endpoint/stream
-- Push relay integration
-- Launch-at-login and active-run sleep prevention
+- External APNs/FCM provider credentials and relay deployment (release
+  infrastructure, intentionally not committed here)
 
 ### Mobile repository
 
@@ -249,7 +263,8 @@ Path: `/Users/jared/Projects/repoprompt-remote`
 
 Current branch: `main`
 
-Current commit: `719986c` — `Initialize RepoPrompt Remote iOS shell`
+Current commit: `c83020e`; the implementation changes below are in the working
+tree.
 
 Implemented foundation:
 
@@ -262,38 +277,42 @@ Implemented foundation:
 - [x] Remote permissions screen
 - [x] Connection-state model
 - [x] Simulator build with signing disabled
+- [x] QR camera scanning
+- [x] Bonjour discovery and QR direct-address fallback
+- [x] TLS certificate pinning and URLSession client
+- [x] iOS Keychain credential storage
+- [x] Snapshot reducer and cursor-based event replay
+- [x] Snapshot-required recovery after an old event cursor
+- [x] Provider-neutral APNs/FCM relay implementation under `relay/`
 
-The pairing flow currently uses a clearly marked simulated-pairing action. No
-production network behavior is implied by the shell.
+The mobile client now uses the production pairing/client path. It renders saved
+workspace/session/history/transcript data and can issue the first control
+commands through the desktop authority boundary. The current desktop gateway
+closes each bounded SSE response after replaying available events. History
+search, paged transcript loading, workflow selection, and resume controls are
+wired to the same authoritative command/read paths. A Context Builder sheet
+supports clarify, question, plan, and review flows through the same command
+boundary.
 
 Not implemented yet:
 
-- QR camera scanning
-- Bonjour discovery
-- TLS identity verification/pinning
-- Keychain credential storage
-- Snapshot fetching and decoding
-- Event cursor persistence and replay
-- Real fleet/session/project/history data
-- Remote command client
-- Push notification registration and deep links
+- Provider credentials and deployment (release infrastructure)
+- Android FCM registration (deferred; the relay contract already accepts FCM)
 
 ### GitHub/repository state
 
-The mobile repository is currently local and has no configured Git remote. Add
-the intended GitHub remote before publishing or opening a pull request.
+The mobile repository is configured with the intended GitHub remote:
 
-The desktop checkout is now configured as a fork-based contribution checkout:
+`https://github.com/bobtheitguy31337/repoprompt-remote.git`
+
+The desktop checkout uses only the agreed fork:
 
 ```sh
 origin   https://github.com/bobtheitguy31337/repoprompt-ce.git
-upstream https://github.com/repoprompt/repoprompt-ce.git
 ```
 
 Publishing remains a separate deliberate step after the implementation is
-review-ready. Before publishing, decide whether to rebase this branch onto the
-newer `upstream/main`; do not rewrite history or force-push without explicit
-approval.
+review-ready. Do not rewrite history or force-push without explicit approval.
 
 ## 5. Master implementation roadmap
 
@@ -301,12 +320,16 @@ approval.
 
 Goal: make the two-repository boundary explicit and buildable.
 
-- [ ] Create/configure the GitHub remote for `repoprompt-remote`.
-- [ ] Decide where the shared Foundation protocol package is versioned.
-- [ ] Preferred direction: extract the Remote DTOs into a small versioned,
-      platform-neutral Swift package consumed by desktop and mobile.
-- [ ] Add CI for the iOS simulator build and protocol tests.
-- [ ] Add a compatibility policy for protocol versions and minimum app versions.
+- [x] Create/configure the GitHub remote for `repoprompt-remote`.
+- [x] Decide where the shared Foundation protocol package is versioned: it lives
+      under `Packages/RepoPromptRemoteProtocol/` in `repoprompt-remote`.
+- [x] Extract the Remote DTOs into a small platform-neutral Swift package
+      consumed by desktop and mobile. Desktop uses a local path dependency while
+      the package is developed; a tagged remote dependency is release work.
+- [x] Add CI for the iOS simulator build and protocol tests.
+- [x] Add a compatibility policy: both peers accept only the declared supported
+      range (`RemoteProtocol.minimumSupportedVersion...currentVersion`); a
+      future incompatible contract gets a new versioned path.
 
 Exit criteria: both repositories build in CI, and the mobile app does not own a
 second incompatible copy of the Remote protocol.
@@ -315,54 +338,57 @@ second incompatible copy of the Remote protocol.
 
 Goal: expose existing RepoPrompt behavior through typed application services.
 
-- [ ] Inventory current Agent Mode lifecycle, interaction, transcript, workflow,
+- [x] Inventory current Agent Mode lifecycle, interaction, transcript, workflow,
       Context Builder, workspace, window, tab, and history owners.
-- [ ] Define service protocols and DTO boundaries below the UI/MCP adapters.
-- [ ] Implement workspace catalog over every saved workspace, not only open ones.
-- [ ] Implement workspace activation using immutable workspace ID.
-- [ ] Reuse existing window when possible; otherwise open and wait for readiness.
-- [ ] Resolve/create the appropriate compose tab automatically.
-- [ ] Project existing Agent Mode status into `RemoteSessionSummary`.
-- [ ] Project parent/child session relationships and attention items.
-- [ ] Add focused tests for restart, cancellation, waiting-for-input, and
-      workspace-not-open cases.
+- [x] Define service protocols and DTO boundaries below the UI/MCP adapters.
+- [x] Implement workspace catalog over saved non-ephemeral workspaces, not only open ones.
+- [x] Implement workspace activation using immutable workspace ID.
+- [x] Reuse an existing window when possible.
+- [x] Open a new window and wait for readiness when no window exists.
+- [x] Resolve/create the appropriate compose tab automatically.
+- [x] Project existing Agent Mode status into `RemoteSessionSummary`.
+- [x] Project parent/child session relationships and attention items.
+- [x] Add focused tests for restart/reconnect projection, cancellation,
+      waiting-for-input, and workspace-not-open cases.
 
 Exit criteria: a typed in-process service can produce an authoritative remote
 snapshot without going through serialized MCP requests.
 
-### Phase 2 — Desktop read-only Remote Gateway
+### Phase 2 — Desktop Remote Gateway
 
 Goal: complete the first real end-to-end vertical slice.
 
-- [ ] Add opt-in Remote settings section.
-- [ ] Add one-device pairing state and device management UI.
-- [ ] Implement local HTTPS/TLS listener without modifying Unix-socket MCP.
-- [ ] Implement Bonjour advertisement and QR direct-address fallback.
-- [ ] Store/rotate/revoke the device credential securely.
-- [ ] Verify desktop identity during pairing and reconnect.
-- [ ] Enforce Observe authority on every read endpoint.
-- [ ] Implement `/pair`, `/snapshot`, and resumable `/events`.
-- [ ] Publish coarse fleet events; reserve detailed streaming for the viewed
-      conversation.
-- [ ] Add connection diagnostics and bounded error responses.
+- [x] Add opt-in Remote settings section.
+- [x] Add one-device pairing state and device management UI.
+- [x] Implement local HTTPS/TLS listener without modifying Unix-socket MCP.
+- [x] Implement Bonjour advertisement and QR direct-address fallback.
+- [x] Store/rotate/revoke the device credential securely.
+- [x] Verify desktop identity during pairing and reconnect.
+- [x] Enforce paired-device authorization on every read endpoint and recheck
+      authority at the command boundary.
+- [x] Implement `/pair`, `/snapshot`, bounded `/events`, `/history`, and
+      `/transcript`.
+- [x] Publish coarse fleet events from live agent/workspace changes; reserve
+      detailed streaming for the viewed conversation.
+- [x] Add connection diagnostics and bounded error responses.
 
 Exit criteria: a real paired iPhone can reconnect to a running Mac and render
 Fleet, Projects, and persisted session state from a complete authoritative
 snapshot.
 
-### Phase 3 — Mobile read-only client
+### Phase 3 — Mobile client
 
 Goal: replace the shell with a reliable remote viewer.
 
-- [ ] Implement QR scanning.
-- [ ] Implement Bonjour discovery and QR direct-address fallback.
-- [ ] Store the device credential in iOS Keychain.
-- [ ] Verify the desktop certificate/public-key identity.
-- [ ] Implement URLSession HTTPS client.
-- [ ] Implement snapshot reducer and event cursor persistence.
-- [ ] Replay events after reconnect and request snapshot fallback when required.
-- [ ] Implement workspace list, session list, history search, and transcript read.
-- [ ] Add live connection/reconnect/error state to the UI.
+- [x] Implement QR scanning.
+- [x] Implement Bonjour discovery and QR direct-address fallback.
+- [x] Store the device credential in iOS Keychain.
+- [x] Verify the desktop certificate identity by SHA-256 pinning.
+- [x] Implement URLSession HTTPS client.
+- [x] Implement snapshot reducer and in-memory event cursor handling.
+- [x] Replay events after reconnect and request snapshot fallback when required.
+- [x] Implement workspace list, session list, history search, and transcript read.
+- [x] Add live connection/reconnect/error state to the UI.
 
 Exit criteria: killing/restarting the app, changing networks, or restarting the
 Mac never causes the phone to display stale state as authoritative.
@@ -371,42 +397,42 @@ Mac never causes the phone to display stale state as authoritative.
 
 Goal: prove desktop-enforced control with one complete mutation path.
 
-- [ ] Implement `start Agent Mode run` by workspace ID.
-- [ ] Resolve closed workspace activation automatically.
-- [ ] Return session ID and live status to mobile.
-- [ ] Enforce Control authority at the desktop command boundary.
-- [ ] Add text follow-up.
-- [ ] Add answer-question and lower-risk approval flows.
-- [ ] Add secure secret-input submission with no persistence/logging.
-- [ ] Add steer, cancel, and resume.
+- [x] Implement `start Agent Mode run` by workspace ID.
+- [x] Resolve closed workspace activation automatically.
+- [x] Return session ID and live status to mobile.
+- [x] Enforce Control authority at the desktop command boundary.
+- [x] Add text follow-up.
+- [x] Add answer-question and lower-risk approval flows.
+- [x] Add secure secret-input submission with no persistence/logging.
+- [x] Add steer, cancel, and resume.
 
 Exit criteria: mobile can start and control a real Agent Mode run while the Mac
 remains the only execution environment, including phone disconnect/reconnect.
 
 ### Phase 5 — Context Builder and full conversation operations
 
-- [ ] Add Context Builder plan/review/question/configured flows.
-- [ ] Add built-in and custom workflow catalogs.
-- [ ] Add full historical transcript loading.
-- [ ] Add sanitized tool cards with explicit Show details.
-- [ ] Add raw commands, tool arguments, results, reasoning, file/worktree, and
+- [x] Add Context Builder plan/review/question/configured flows.
+- [x] Add built-in and custom workflow catalogs.
+- [x] Add full historical transcript loading with paged mobile continuation.
+- [x] Add sanitized tool cards with explicit Show details and redaction.
+- [x] Add raw commands, tool arguments, results, reasoning, file/worktree, and
       approval details only behind explicit detail expansion.
-- [ ] Add parent/child agent navigation and hierarchy visualization.
-- [ ] Add merge/conflict and worktree summaries without mobile worktree editing.
+- [x] Add parent/child agent navigation and hierarchy visualization.
+- [x] Add merge/conflict and worktree summaries without mobile worktree editing.
 
 Exit criteria: the mobile conversation view covers the agreed operational level
 of desktop Agent Mode without duplicating desktop lifecycle logic.
 
 ### Phase 6 — Notifications and desktop availability
 
-- [ ] Add APNs registration for iOS and FCM registration for Android later.
-- [ ] Implement encrypted notification envelopes.
-- [ ] Support input, approval, completion, and failure notification categories.
-- [ ] Deep-link notifications to a session and resync over LAN.
-- [ ] Add launch-at-login setting.
-- [ ] Add active-run sleep assertion only while agents are active or waiting for
+- [x] Add APNs registration for iOS; reserve FCM registration for Android later.
+- [x] Implement encrypted notification envelopes.
+- [x] Support input, approval, completion, and failure notification categories.
+- [x] Deep-link notifications to a session and resync over LAN.
+- [x] Add launch-at-login setting.
+- [x] Add active-run sleep assertion only while agents are active or waiting for
       input.
-- [ ] Add network-change, desktop-restart, credential-revocation, and
+- [x] Add network-change, desktop-restart, credential-revocation, and
       notification diagnostics.
 
 Exit criteria: a suspended phone receives a safe attention notification and
@@ -414,15 +440,15 @@ opens the authoritative session after reconnecting to the Mac.
 
 ### Phase 7 — Hardening and release readiness
 
-- [ ] Threat model pairing, TLS identity, credential rotation, and push relay.
-- [ ] Test replay gaps, duplicate events, stale cursors, and snapshot fallback.
-- [ ] Test one-device enforcement and revocation.
-- [ ] Test cancellation and partial-success behavior for every mutation.
-- [ ] Test workspace activation when windows/tabs are absent or closing.
-- [ ] Load-test fleet projection and event coalescing with many sessions.
-- [ ] Add protocol compatibility tests across supported versions.
-- [ ] Add macOS and iOS release packaging/signing configuration.
-- [ ] Prepare user-facing setup, diagnostics, and security documentation.
+- [x] Threat model pairing, TLS identity, credential rotation, and push relay.
+- [x] Test replay gaps, duplicate events, stale cursors, and snapshot fallback.
+- [x] Test one-device enforcement and revocation through the desktop credential authority.
+- [x] Test cancellation and partial-success behavior for every mutation.
+- [x] Test workspace activation when windows/tabs are absent or closing.
+- [x] Load-test fleet projection and event coalescing with many sessions.
+- [x] Add protocol compatibility tests across supported versions.
+- [x] Add macOS and iOS release packaging/signing configuration.
+- [x] Prepare user-facing setup, diagnostics, and security documentation.
 
 ## 6. API and state contract
 
@@ -504,6 +530,7 @@ by event ID, and requests a full snapshot if replay is unavailable.
 - Duplicate event suppression
 - Replay window behavior
 - Snapshot fallback for stale cursors
+- Latest-state event coalescing under a large fleet projection batch
 
 ### Desktop tests
 
@@ -531,26 +558,26 @@ by event ID, and requests a full snapshot if replay is unavailable.
 
 Use the CE debug app and `rpce-cli-debug` for desktop behavior. Validate the
 real app/gateway path after focused unit tests; do not treat a mock transport or
-generic production RepoPrompt app as evidence for CE behavior.
+an unrelated product build as evidence for the CE desktop implementation.
 
 ## 9. Immediate next coding task
 
 Implement Phase 0 and the beginning of Phase 1:
 
-1. ~~Create the GitHub fork `bobtheitguy31337/repoprompt-ce`.~~ Done.
-2. ~~Configure the desktop checkout with fork `origin` and canonical `upstream`.~~ Done.
-3. Configure the mobile GitHub remote and CI.
-4. Extract the shared Remote contract into a versioned Foundation package.
-5. Inventory and document the existing Agent Mode/session/workspace owners.
-6. Define `WorkspaceCatalogService`, `WorkspaceActivationService`, and
-   `RemoteStateProjectionService` protocols.
-7. Implement a desktop-only snapshot builder backed by current saved workspace
-   and session state.
-8. Add a test fixture that produces a complete Fleet snapshot with live,
-   waiting, failed, completed, and child sessions.
+1. ~~Create/configure the desktop fork `bobtheitguy31337/repoprompt-ce` as `origin`.~~ Done.
+2. ~~Configure the mobile GitHub remote and CI.~~ Done.
+3. Extract the shared Remote contract into a versioned Foundation package.
+   In progress as a local package; tagging/release dependency remains.
+4. Inventory and document the existing Agent Mode/session/workspace owners. Done.
+5. Define `WorkspaceCatalogService`, `WorkspaceActivationService`, and
+   `RemoteStateProjectionService` protocols. Done.
+6. Implement a desktop-only snapshot builder backed by current saved workspace
+   and session state. Done.
+7. Add a test fixture that produces a complete Fleet snapshot with live,
+   waiting, failed, completed, and child sessions. Done.
 
 Do not begin push notifications, WAN transport, mobile editing, or broad UI
-polish until the read-only paired snapshot and reconnect path is real.
+polish until the paired snapshot and reconnect path is real.
 
 ## 10. Definition of first usable release
 

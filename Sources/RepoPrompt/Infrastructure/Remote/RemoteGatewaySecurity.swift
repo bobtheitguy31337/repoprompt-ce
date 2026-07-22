@@ -1,0 +1,410 @@
+import CryptoKit
+import Darwin
+import Foundation
+import RepoPromptRemoteProtocol
+import Security
+
+enum RemoteGatewaySecurityError: LocalizedError {
+    case keychainFailure(OSStatus)
+    case certificateUnavailable
+    case identityGenerationFailed(String)
+    case identityImportFailed(OSStatus)
+    case pairingSecretInvalid
+    case pairingSecretExpired
+    case unsupportedProtocol(Int)
+    case deviceCredentialUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case let .keychainFailure(status):
+            "Remote credential storage failed (Keychain status \(status))."
+        case .certificateUnavailable:
+            "The Remote TLS certificate is unavailable."
+        case let .identityGenerationFailed(message):
+            "The Remote TLS identity could not be generated: \(message)"
+        case let .identityImportFailed(status):
+            "The Remote TLS identity could not be imported (status \(status))."
+        case .pairingSecretInvalid:
+            "The pairing code is invalid."
+        case .pairingSecretExpired:
+            "The pairing code has expired."
+        case let .unsupportedProtocol(version):
+            "The pairing request uses unsupported protocol version \(version)."
+        case .deviceCredentialUnavailable:
+            "No paired device credential is available."
+        }
+    }
+}
+
+private enum RemoteGatewayKeychain {
+    private static let baseService = "com.repoprompt.ce.remote"
+    private static let account = "remote"
+    static let tlsService = "\(baseService).tls"
+    static let deviceService = "\(baseService).device"
+    static let notificationService = "\(baseService).notifications"
+
+    static func read(service: String) throws -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw RemoteGatewaySecurityError.keychainFailure(status)
+        }
+        return result as? Data
+    }
+
+    static func write(_ data: Data, service: String) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if updateStatus == errSecSuccess { return }
+        guard updateStatus == errSecItemNotFound else {
+            throw RemoteGatewaySecurityError.keychainFailure(updateStatus)
+        }
+        var addQuery = query
+        attributes.forEach { addQuery[$0.key] = $0.value }
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        guard addStatus == errSecSuccess else {
+            throw RemoteGatewaySecurityError.keychainFailure(addStatus)
+        }
+    }
+
+    static func remove(service: String) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw RemoteGatewaySecurityError.keychainFailure(status)
+        }
+    }
+}
+
+private func remoteRandomToken(byteCount: Int = 32) -> String {
+    var bytes = Data(count: byteCount)
+    let status = bytes.withUnsafeMutableBytes { buffer in
+        SecRandomCopyBytes(kSecRandomDefault, byteCount, buffer.baseAddress!)
+    }
+    guard status == errSecSuccess else { return UUID().uuidString }
+    return bytes.base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .trimmingCharacters(in: CharacterSet(charactersIn: "="))
+}
+
+struct RemoteTLSIdentity {
+    let identity: SecIdentity
+    let certificateSHA256: String
+}
+
+/// Owns the self-signed identity used by the opt-in LAN gateway. The PKCS#12
+/// blob is kept in Keychain; the private key is never checked into the source
+/// tree or left in the temporary generation directory.
+final class RemoteTLSIdentityStore {
+    private let importPassphrase = "RepoPromptRemoteIdentity"
+
+    func loadOrCreate() throws -> RemoteTLSIdentity {
+        if let stored = try RemoteGatewayKeychain.read(service: RemoteGatewayKeychain.tlsService) {
+            return try importIdentity(from: stored)
+        }
+
+        let bundle = try generatePKCS12Bundle()
+        try RemoteGatewayKeychain.write(bundle, service: RemoteGatewayKeychain.tlsService)
+        return try importIdentity(from: bundle)
+    }
+
+    private func importIdentity(from data: Data) throws -> RemoteTLSIdentity {
+        var imported: CFArray?
+        let options: [String: Any] = [
+            kSecImportExportPassphrase as String: importPassphrase
+        ]
+        let status = SecPKCS12Import(data as CFData, options as CFDictionary, &imported)
+        guard status == errSecSuccess,
+              let entries = imported as? [[String: Any]],
+              let first = entries.first,
+              let identityValue = first[kSecImportItemIdentity as String]
+        else {
+            throw RemoteGatewaySecurityError.identityImportFailed(status)
+        }
+        let identity = identityValue as! SecIdentity
+
+        var certificate: SecCertificate?
+        guard SecIdentityCopyCertificate(identity, &certificate) == errSecSuccess,
+              let certificate,
+              let certificateData = SecCertificateCopyData(certificate) as Data?
+        else {
+            throw RemoteGatewaySecurityError.certificateUnavailable
+        }
+
+        let digest = SHA256.hash(data: certificateData)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return RemoteTLSIdentity(identity: identity, certificateSHA256: digest)
+    }
+
+    private func generatePKCS12Bundle() throws -> Data {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("repoprompt-remote-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let keyURL = directory.appendingPathComponent("key.pem")
+        let certificateURL = directory.appendingPathComponent("certificate.pem")
+        let bundleURL = directory.appendingPathComponent("identity.p12")
+
+        try runOpenSSL(arguments: [
+            "req", "-x509", "-newkey", "ec",
+            "-pkeyopt", "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-keyout", keyURL.path,
+            "-out", certificateURL.path,
+            "-days", "3650",
+            "-subj", "/CN=RepoPrompt Remote"
+        ])
+        try runOpenSSL(arguments: [
+            "pkcs12", "-export",
+            "-out", bundleURL.path,
+            "-inkey", keyURL.path,
+            "-in", certificateURL.path,
+            "-passout", "pass:\(importPassphrase)"
+        ])
+        do {
+            return try Data(contentsOf: bundleURL)
+        } catch {
+            throw RemoteGatewaySecurityError.identityGenerationFailed(error.localizedDescription)
+        }
+    }
+
+    private func runOpenSSL(arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/openssl")
+        process.arguments = arguments
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            throw RemoteGatewaySecurityError.identityGenerationFailed(error.localizedDescription)
+        }
+        guard process.terminationStatus == 0 else {
+            let diagnostic = String(
+                data: errorPipe.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8
+            )?.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw RemoteGatewaySecurityError.identityGenerationFailed(
+                diagnostic?.isEmpty == false ? diagnostic! : "openssl exited with status \(process.terminationStatus)"
+            )
+        }
+    }
+}
+
+struct RemoteStoredDeviceCredential: Codable, Equatable, Sendable {
+    let deviceID: String
+    let credential: String
+    let expiresAt: Date
+}
+
+enum RemoteCredentialAuthority {
+    static func accepts(
+        authorizationHeader: String?,
+        credential: RemoteStoredDeviceCredential?,
+        at date: Date = Date()
+    ) -> Bool {
+        guard let credential,
+              date < credential.expiresAt,
+              let authorizationHeader,
+              authorizationHeader.hasPrefix("Bearer ")
+        else { return false }
+        return String(authorizationHeader.dropFirst("Bearer ".count)) == credential.credential
+    }
+}
+
+private struct RemoteStoredNotificationRegistration: Codable, Equatable, Sendable {
+    let registration: RemoteNotificationRegistration
+    let updatedAt: Date
+}
+
+/// Enforces the first-release one-device pairing rule. Pairing material is
+/// short-lived and in memory; the issued bearer credential is Keychain-backed.
+@MainActor
+final class RemotePairingManager {
+    static let shared = RemotePairingManager()
+
+    let desktopInstanceID: String
+    private(set) var certificateSHA256: String = ""
+    private var pendingSecret: String?
+    private var pendingSecretExpiresAt: Date?
+    private var storedDevice: RemoteStoredDeviceCredential?
+    private var notificationRegistration: RemoteNotificationRegistration?
+
+    private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
+
+    private init() {
+        let key = "RepoPrompt.remote.desktopInstanceID"
+        if let existing = UserDefaults.standard.string(forKey: key), !existing.isEmpty {
+            desktopInstanceID = existing
+        } else {
+            let created = UUID().uuidString
+            UserDefaults.standard.set(created, forKey: key)
+            desktopInstanceID = created
+        }
+        storedDevice = try? RemoteGatewayKeychain.read(service: RemoteGatewayKeychain.deviceService)
+            .flatMap { try decoder.decode(RemoteStoredDeviceCredential.self, from: $0) }
+        notificationRegistration = try? RemoteGatewayKeychain.read(service: RemoteGatewayKeychain.notificationService)
+            .flatMap { try decoder.decode(RemoteStoredNotificationRegistration.self, from: $0).registration }
+    }
+
+    var isPaired: Bool { storedDevice != nil }
+
+    var pairedDeviceID: String? { storedDevice?.deviceID }
+
+    var pairedCredential: String? { storedDevice?.credential }
+
+    var registeredNotification: RemoteNotificationRegistration? { notificationRegistration }
+
+    func setCertificateSHA256(_ fingerprint: String) {
+        certificateSHA256 = fingerprint
+    }
+
+    func issueAdvertisement(port: UInt16, serviceName: String, host: String?) -> RemotePairingAdvertisement {
+        let secret = remoteRandomToken()
+        pendingSecret = secret
+        pendingSecretExpiresAt = Date().addingTimeInterval(120)
+        return RemotePairingAdvertisement(
+            desktopInstanceID: desktopInstanceID,
+            serviceName: serviceName,
+            host: host,
+            port: Int(port),
+            certificateSHA256: certificateSHA256,
+            oneTimeSecret: secret,
+            expiresAt: pendingSecretExpiresAt!
+        )
+    }
+
+    func pair(
+        request: RemotePairingRequest,
+        desktop: RemoteDesktopSummary
+    ) throws -> RemotePairingResponse {
+        guard RemoteProtocol.supports(request.protocolVersion) else {
+            throw RemoteGatewaySecurityError.unsupportedProtocol(request.protocolVersion)
+        }
+        guard request.desktopInstanceID == desktopInstanceID,
+              let expectedSecret = pendingSecret,
+              expectedSecret == request.oneTimeSecret
+        else {
+            throw RemoteGatewaySecurityError.pairingSecretInvalid
+        }
+        guard let expiry = pendingSecretExpiresAt, Date() < expiry else {
+            self.pendingSecret = nil
+            self.pendingSecretExpiresAt = nil
+            throw RemoteGatewaySecurityError.pairingSecretExpired
+        }
+        guard !certificateSHA256.isEmpty else {
+            throw RemoteGatewaySecurityError.certificateUnavailable
+        }
+
+        let credential = RemoteStoredDeviceCredential(
+            deviceID: UUID().uuidString,
+            credential: remoteRandomToken(byteCount: 48),
+            expiresAt: Date().addingTimeInterval(60 * 60 * 24 * 30)
+        )
+        storedDevice = credential
+        notificationRegistration = nil
+        try? RemoteGatewayKeychain.remove(service: RemoteGatewayKeychain.notificationService)
+        try RemoteGatewayKeychain.write(
+            encoder.encode(credential),
+            service: RemoteGatewayKeychain.deviceService
+        )
+        pendingSecret = nil
+        pendingSecretExpiresAt = nil
+        return RemotePairingResponse(
+            desktop: desktop,
+            deviceID: credential.deviceID,
+            credential: credential.credential,
+            credentialExpiresAt: credential.expiresAt
+        )
+    }
+
+    func isAuthorized(_ authorizationHeader: String?) -> Bool {
+        RemoteCredentialAuthority.accepts(
+            authorizationHeader: authorizationHeader,
+            credential: storedDevice
+        )
+    }
+
+    func revokeDevice() {
+        storedDevice = nil
+        notificationRegistration = nil
+        try? RemoteGatewayKeychain.remove(service: RemoteGatewayKeychain.deviceService)
+        try? RemoteGatewayKeychain.remove(service: RemoteGatewayKeychain.notificationService)
+    }
+
+    func registerNotifications(_ registration: RemoteNotificationRegistration) throws {
+        guard !registration.deviceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw RemoteGatewaySecurityError.deviceCredentialUnavailable
+        }
+        guard let storedDevice else {
+            throw RemoteGatewaySecurityError.deviceCredentialUnavailable
+        }
+        guard Date() < storedDevice.expiresAt else {
+            throw RemoteGatewaySecurityError.deviceCredentialUnavailable
+        }
+        let stored = RemoteStoredNotificationRegistration(registration: registration, updatedAt: Date())
+        try RemoteGatewayKeychain.write(
+            encoder.encode(stored),
+            service: RemoteGatewayKeychain.notificationService
+        )
+        notificationRegistration = registration
+    }
+}
+
+enum RemoteLocalAddress {
+    static func preferredIPv4Address() -> String? {
+        var address: String?
+        var interfacePointer: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&interfacePointer) == 0 else { return nil }
+        defer { freeifaddrs(interfacePointer) }
+        var current = interfacePointer
+        while let interface = current?.pointee {
+            defer { current = interface.ifa_next }
+            guard let addressPointer = interface.ifa_addr,
+                  addressPointer.pointee.sa_family == UInt8(AF_INET),
+                  let name = interface.ifa_name,
+                  String(cString: name) != "lo0"
+            else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            var sockaddr = addressPointer.pointee
+            let status = getnameinfo(
+                &sockaddr,
+                socklen_t(addressPointer.pointee.sa_len),
+                &host,
+                socklen_t(host.count),
+                nil,
+                0,
+                NI_NUMERICHOST
+            )
+            if status == 0 {
+                address = String(cString: host)
+                break
+            }
+        }
+        return address
+    }
+}

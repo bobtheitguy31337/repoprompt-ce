@@ -254,7 +254,7 @@ struct SettingsView: View {
         case .workspaces:
             [.manageWorkspaces, .managePresets]
         case .general:
-            [.appearance, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry]
+            [.appearance, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry, .remote]
         case .copyChat:
             // `.copyPresets` and `.chatPresets` are intentionally omitted from the
             // sidebar – they now resolve to the unified Workflow Presets surface.
@@ -303,6 +303,9 @@ struct SettingsView: View {
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .telemetry:
             TelemetrySettingsView()
+                .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+        case .remote:
+            RemoteSettingsView()
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .chatSettings:
             ChatSettingsView(promptViewModel: promptViewModel, windowID: windowState.windowID, closeAction: closeAction)
@@ -521,6 +524,7 @@ enum SettingsTab: String, CaseIterable {
     case keyboardShortcuts
     case advanced
     case telemetry
+    case remote
     case chatSettings
     case benchmark
     case apiGeneral
@@ -551,6 +555,7 @@ enum SettingsTab: String, CaseIterable {
         case .keyboardShortcuts: "Keyboard Shortcuts"
         case .advanced: "Advanced"
         case .telemetry: "Telemetry"
+        case .remote: "Remote"
         case .chatSettings: "Chat Settings"
         case .benchmark: "Benchmark"
         case .apiGeneral: "API Providers"
@@ -583,6 +588,7 @@ enum SettingsTab: String, CaseIterable {
         case .keyboardShortcuts: "keyboard"
         case .advanced: "gearshape.2"
         case .telemetry: "lock.shield"
+        case .remote: "antenna.radiowaves.left.and.right"
         case .chatSettings: "message"
         case .benchmark: "gauge"
         case .apiGeneral: "key"
@@ -630,7 +636,7 @@ enum SettingsTab: String, CaseIterable {
             .workspaces
 
         // General
-        case .appearance, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry:
+        case .appearance, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry, .remote:
             .general
 
         // Copy & Chat workflows
@@ -735,6 +741,22 @@ enum SettingsTab: String, CaseIterable {
             ]
         case .telemetry:
             ["telemetry", "privacy", "crash", "diagnostics", "sentry"]
+        case .remote:
+            [
+                "remote",
+                "remote control",
+                "phone",
+                "mobile",
+                "pairing",
+                "qr code",
+                "bonjour",
+                "local network",
+                "https",
+                "tls",
+                "gateway",
+                "read only",
+                "observe"
+            ]
         case .chatSettings:
             [
                 "chat",

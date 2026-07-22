@@ -6512,10 +6512,11 @@ final class AgentModeViewModel: ObservableObject {
     /// Discard a session target created by `mcpResolveOrCreateSessionTarget` when a later step
     /// in start/create/resume/steer fails before the target becomes a real session. Only targets
     /// with origin `.createdNewTab` or `.createdForSessionResume` are eligible for discard.
-    func mcpDiscardSessionTarget(_ target: MCPSessionTarget) async {
+    @discardableResult
+    func mcpDiscardSessionTarget(_ target: MCPSessionTarget) async -> Bool {
         switch target.origin {
         case .existingSession, .existingTab:
-            return
+            return true
         case .createdNewTab, .createdForSessionResume:
             break
         }
@@ -6537,6 +6538,8 @@ final class AgentModeViewModel: ObservableObject {
         tabsWithActiveAgentRun.remove(target.tabID)
         mcpControlledTabIDs.remove(target.tabID)
         await promptManager?.closeComposeTab(target.tabID)
+        let sessionRemoved = target.sessionID.map { ownerValidatedSessionIndex[$0] == nil } ?? true
+        return sessionRemoved && sessions[target.tabID] == nil
     }
 
     func mcpDeactivateControlContext(
