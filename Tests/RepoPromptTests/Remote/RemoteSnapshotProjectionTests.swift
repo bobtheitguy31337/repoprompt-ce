@@ -61,7 +61,8 @@ final class RemoteSnapshotProjectionTests: XCTestCase {
         let credential = RemoteStoredDeviceCredential(
             deviceID: "device-1",
             credential: "credential-1",
-            expiresAt: now.addingTimeInterval(60)
+            expiresAt: now.addingTimeInterval(60),
+            deviceName: "Test phone"
         )
         XCTAssertTrue(RemoteCredentialAuthority.accepts(
             authorizationHeader: "Bearer credential-1",

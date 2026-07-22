@@ -25,14 +25,13 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     @Published private(set) var lastRequestAt: Date?
     @Published private(set) var lastSuccessfulRequestAt: Date?
     @Published private(set) var lastSnapshotAt: Date?
-    @Published private(set) var activeAuthorityGrant: RemoteAuthorityGrant?
+    @Published private(set) var isPaired = false
     @Published var isEnabled: Bool {
         didSet { UserDefaults.standard.set(isEnabled, forKey: Self.enabledKey) }
     }
 
     private static let enabledKey = "RepoPrompt.remote.gatewayEnabled"
     private static let defaultAuthorityKey = "RepoPrompt.remote.defaultAuthority"
-    private static let authorityGrantKey = "RepoPrompt.remote.authorityGrant"
     private static let maximumBufferedRequestBytes = 1_048_576
 
     private weak var windowStatesManager: WindowStatesManager?
@@ -56,8 +55,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
     private override init() {
         isEnabled = UserDefaults.standard.bool(forKey: Self.enabledKey)
-        activeAuthorityGrant = UserDefaults.standard.data(forKey: Self.authorityGrantKey)
-            .flatMap { try? JSONDecoder().decode(RemoteAuthorityGrant.self, from: $0) }
+        isPaired = pairingManager.isPaired
         super.init()
     }
 
@@ -80,8 +78,8 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         return "rpremote://pair?payload=\(payload)"
     }
 
-    var isPaired: Bool {
-        pairingManager.isPaired
+    var pairedDeviceName: String? {
+        pairingManager.pairedDeviceName
     }
 
     func refreshPairingAdvertisement() {
@@ -103,31 +101,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     }
 
     var authorizationState: RemoteAuthorizationState {
-        let grant = activeAuthorityGrant?.isActive(at: Date()) == true ? activeAuthorityGrant : nil
-        return RemoteAuthorizationState(
-            defaultLevel: defaultAuthority,
-            activeGrant: grant,
-            dangerModeEnabled: defaultAuthority == .danger || grant?.level == .danger
-        )
-    }
-
-    func grantAuthority(
-        level: RemoteAuthorityLevel,
-        duration: RemoteElevationDuration,
-        sessionID: UUID? = nil
-    ) {
-        let scope: RemoteAuthorizationScope = sessionID.map(RemoteAuthorizationScope.session) ?? .device
-        let grant = RemoteAuthorityGrant(level: level, scope: scope, duration: duration)
-        activeAuthorityGrant = grant
-        UserDefaults.standard.set(
-            try? JSONEncoder().encode(grant),
-            forKey: Self.authorityGrantKey
-        )
-    }
-
-    func clearAuthorityGrant() {
-        activeAuthorityGrant = nil
-        UserDefaults.standard.removeObject(forKey: Self.authorityGrantKey)
+        RemoteAuthorizationState(defaultLevel: defaultAuthority)
     }
 
     func start() async throws {
@@ -143,6 +117,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 // A new TLS identity invalidates the certificate pin held by
                 // existing phones, so do not leave an unusable device paired.
                 pairingManager.revokeDevice()
+                isPaired = false
             }
             pairingManager.setCertificateSHA256(identity.certificateSHA256)
 
@@ -261,6 +236,8 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
     func revokePairedDevice() {
         pairingManager.revokeDevice()
+        isPaired = false
+        refreshPairingAdvertisement()
     }
 
     func publish(_ event: RemoteEvent) async -> RemoteEvent {
@@ -534,6 +511,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             }
             do {
                 let response = try pairingManager.pair(request: pairingRequest, desktop: desktopSummary)
+                isPaired = true
                 sendJSON(response, status: 200, on: connection)
             } catch let error as RemoteGatewaySecurityError {
                 sendError(.init(code: "pairing_failed", message: error.localizedDescription), status: 403, on: connection)
@@ -547,6 +525,8 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 return
             }
             pairingManager.revokeDevice()
+            isPaired = false
+            refreshPairingAdvertisement()
             sendJSON(RemoteUnpairResponse(), status: 200, on: connection)
 
         case ("GET", RemoteProtocol.snapshotPath):
@@ -708,7 +688,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 return
             }
             let requiredAuthority = Self.requiredAuthority(for: command.operation)
-            guard authorizationState.allows(requiredAuthority, for: command.sessionID) else {
+            guard authorizationState.allows(requiredAuthority) else {
                 sendError(
                     .init(code: "forbidden", message: "The paired device does not have sufficient authority for this command."),
                     status: 403,
@@ -734,7 +714,6 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                     contextBuilderResult: response.contextBuilderResult
                 )
                 sendJSON(responseWithCursor, status: 200, on: connection)
-                consumeOneShotGrantIfNeeded(for: requiredAuthority)
             } catch let error as RemoteAgentControlServiceError {
                 sendError(.init(code: "command_rejected", message: error.localizedDescription), status: 409, on: connection)
             } catch {
@@ -755,15 +734,6 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         case .registerNotifications:
             .observe
         }
-    }
-
-    private func consumeOneShotGrantIfNeeded(for requiredAuthority: RemoteAuthorityLevel) {
-        guard let grant = activeAuthorityGrant,
-              grant.duration == .once,
-              requiredAuthority > defaultAuthority,
-              grant.level >= requiredAuthority
-        else { return }
-        clearAuthorityGrant()
     }
 
     private func makeReadService() -> WindowRemoteReadService? {

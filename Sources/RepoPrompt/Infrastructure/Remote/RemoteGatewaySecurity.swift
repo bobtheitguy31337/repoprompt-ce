@@ -224,6 +224,7 @@ struct RemoteStoredDeviceCredential: Codable, Equatable, Sendable {
     let deviceID: String
     let credential: String
     let expiresAt: Date
+    let deviceName: String
 }
 
 enum RemoteCredentialAuthority {
@@ -289,6 +290,10 @@ final class RemotePairingManager {
         storedDevice?.credential
     }
 
+    var pairedDeviceName: String? {
+        storedDevice?.deviceName
+    }
+
     var registeredNotification: RemoteNotificationRegistration? {
         notificationRegistration
     }
@@ -306,10 +311,7 @@ final class RemotePairingManager {
             host: host,
             port: Int(port),
             certificateSHA256: certificateSHA256,
-            oneTimeSecret: secret,
-            // Keep the field for wire compatibility with older clients, but
-            // pairing codes remain valid until used or manually regenerated.
-            expiresAt: .distantFuture
+            oneTimeSecret: secret
         )
     }
 
@@ -330,10 +332,12 @@ final class RemotePairingManager {
             throw RemoteGatewaySecurityError.certificateUnavailable
         }
 
+        let deviceName = request.deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
         let credential = RemoteStoredDeviceCredential(
             deviceID: UUID().uuidString,
             credential: remoteRandomToken(byteCount: 48),
-            expiresAt: Date().addingTimeInterval(60 * 60 * 24 * 30)
+            expiresAt: Date().addingTimeInterval(60 * 60 * 24 * 30),
+            deviceName: deviceName.isEmpty ? "Remote device" : deviceName
         )
         storedDevice = credential
         notificationRegistration = nil
