@@ -23,6 +23,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     // New global routing/settings services (kept alive by the AppDelegate)
     private var windowRoutingService: WindowRoutingService?
     private var appSettingsMCPService: AppSettingsMCPService?
+    private var remoteGatewayController: RemoteGatewayController?
 
     // MARK: - Global references
 
@@ -90,6 +91,9 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             windowStates: WindowStatesManager.shared,
             networkMgr: ServerNetworkManager.shared
         )
+        let remoteGateway = RemoteGatewayController.shared
+        remoteGateway.configure(windowStatesManager: WindowStatesManager.shared)
+        remoteGatewayController = remoteGateway
         if !launchConfiguration.suppressesNonessentialLaunchSideEffects {
             // Request notification authorization
             Task {
@@ -153,6 +157,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         WindowStatesManager.shared.signalTermination()
         ProcessTermination.beginAppTerminationFastPath()
         MCPBackgroundModeCoordinator.shared.resetForTermination()
+        remoteGatewayController?.stop()
 
         // 2) Persist the final restorable window session before async shutdown begins.
         // Using .terminateLater lets us do async work without deadlocking.
@@ -180,6 +185,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         MCPBackgroundModeCoordinator.shared.resetForTermination()
         WindowStatesManager.shared.signalTermination()
         ProcessTermination.beginAppTerminationFastPath()
+        remoteGatewayController?.stop()
         if !AppLaunchConfiguration.current.suppressesWindowPersistence {
             WindowStatesManager.shared.persistWindowSession(reason: "appWillTerminate")
         }
