@@ -1,10 +1,35 @@
 import Foundation
+import MCP
 import RepoPromptRemoteProtocol
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
 @MainActor
 final class RemoteMutationBehaviorTests: XCTestCase {
+    func testMCPInvalidParamsBecomeActionableRemoteRejection() {
+        let message = WindowRemoteAgentControlService.remoteRejectionMessage(
+            for: MCPError.invalidParams("The requested agent session is not currently available.")
+        )
+
+        XCTAssertEqual(message, "The requested agent session is not currently available.")
+    }
+
+    func testMCPTransportFailureDoesNotExposeInternalDetails() {
+        let message = WindowRemoteAgentControlService.remoteRejectionMessage(
+            for: MCPError.transportError(NSError(
+                domain: "fixture",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "/private/sensitive/socket failed"]
+            ))
+        )
+
+        XCTAssertEqual(
+            message,
+            "The Mac lost its connection to the agent while delivering this command. Try again."
+        )
+        XCTAssertFalse(message.contains("/private/sensitive"))
+    }
+
     func testRemoteMutationBoundaryRejectsIncompleteRequestsForEveryMutation() async {
         let service = WindowRemoteAgentControlService(windowStatesManager: WindowStatesManager.shared)
 

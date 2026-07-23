@@ -108,25 +108,50 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
     }
 
     func execute(_ request: RemoteCommandRequest) async throws -> RemoteCommandResponse {
-        guard RemoteProtocol.supports(request.protocolVersion) else {
-            throw RemoteAgentControlServiceError.unsupportedProtocol(request.protocolVersion)
-        }
+        do {
+            guard RemoteProtocol.supports(request.protocolVersion) else {
+                throw RemoteAgentControlServiceError.unsupportedProtocol(request.protocolVersion)
+            }
 
-        switch request.operation {
-        case .startRun:
-            return try await start(request)
-        case .followUp, .steer, .resume:
-            return try await continueRun(request)
-        case .respond:
-            return try await respond(request)
-        case .cancel:
-            return try await cancel(request)
-        case .contextBuilder:
-            return try await contextBuilder(request)
-        case .registerNotifications:
+            switch request.operation {
+            case .startRun:
+                return try await start(request)
+            case .followUp, .steer, .resume:
+                return try await continueRun(request)
+            case .respond:
+                return try await respond(request)
+            case .cancel:
+                return try await cancel(request)
+            case .contextBuilder:
+                return try await contextBuilder(request)
+            case .registerNotifications:
+                throw RemoteAgentControlServiceError.commandRejected(
+                    "Notification registration must be handled by the Remote gateway."
+                )
+            }
+        } catch let error as RemoteAgentControlServiceError {
+            throw error
+        } catch let error as MCPError {
             throw RemoteAgentControlServiceError.commandRejected(
-                "Notification registration must be handled by the Remote gateway."
+                Self.remoteRejectionMessage(for: error)
             )
+        }
+    }
+
+    static func remoteRejectionMessage(for error: MCPError) -> String {
+        switch error {
+        case let .invalidParams(detail),
+             let .invalidRequest(detail),
+             let .internalError(detail),
+             let .parseError(detail),
+             let .methodNotFound(detail):
+            return detail ?? "The Mac could not deliver this command to the agent session."
+        case let .serverError(_, message):
+            return message
+        case let .urlElicitationRequired(message, _):
+            return message
+        case .connectionClosed, .transportError:
+            return "The Mac lost its connection to the agent while delivering this command. Try again."
         }
     }
 
@@ -231,7 +256,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             if activatedForRequest {
                 await context.agentMode.mcpDeactivateControlContext(
                     sessionID: sessionID,
-                    cleanupSessionStore: false
+                    cleanupSessionStore: true
                 )
             }
             throw error
@@ -299,7 +324,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             if activatedForRequest {
                 await context.agentMode.mcpDeactivateControlContext(
                     sessionID: sessionID,
-                    cleanupSessionStore: false
+                    cleanupSessionStore: true
                 )
             }
             throw error
