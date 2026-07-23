@@ -3961,6 +3961,9 @@ final class AgentModeViewModel: ObservableObject {
         session.hasSentFirstMessage = payload.transcript.turns.contains { $0.request != nil }
         session.parentSessionID = agentSession.parentSessionID
         session.isMCPOriginated = agentSession.isMCPOriginated
+        session.originWorkflowID = agentSession.originWorkflowID
+        session.originWorkflowDisplayName = agentSession.originWorkflowDisplayName
+        session.lastRunStartedAt = agentSession.lastRunStartedAt
         session.worktreeBindings = agentSession.worktreeBindings
         session.worktreeMergeOperations = agentSession.worktreeMergeOperations
         session.nextSequenceIndex = payload.transcript.nextSequenceIndex
@@ -4228,6 +4231,9 @@ final class AgentModeViewModel: ObservableObject {
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
         session.setRunningStatus(nil, source: nil)
         session.activeAgentRunStartedAt = nil
+        session.originWorkflowID = nil
+        session.originWorkflowDisplayName = nil
+        session.lastRunStartedAt = nil
         session.waitingPrompt = nil
         session.pendingAskUser = nil
         session.pendingUserInputRequest = nil
@@ -5964,7 +5970,10 @@ final class AgentModeViewModel: ObservableObject {
                 hasUnknownConversationContent: existingEntry.hasUnknownConversationContent,
                 isMCPOriginated: existingEntry.isMCPOriginated || session.isMCPOriginated,
                 worktreeBindingSummaries: existingEntry.worktreeBindingSummaries,
-                activeWorktreeMergeSummaries: existingEntry.activeWorktreeMergeSummaries
+                activeWorktreeMergeSummaries: existingEntry.activeWorktreeMergeSummaries,
+                originWorkflowID: existingEntry.originWorkflowID,
+                originWorkflowDisplayName: existingEntry.originWorkflowDisplayName,
+                lastRunStartedAt: existingEntry.lastRunStartedAt
             )
             guard repairedEntry != existingEntry else { return }
             applyLocalSessionIndexUpsert(repairedEntry)
@@ -9739,7 +9748,10 @@ final class AgentModeViewModel: ObservableObject {
         hasUnknownConversationContent: Bool = false,
         isMCPOriginated: Bool = false,
         worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = [],
-        activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary] = []
+        activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary] = [],
+        originWorkflowID: String? = nil,
+        originWorkflowDisplayName: String? = nil,
+        lastRunStartedAt: Date? = nil
     ) {
         applyLocalSessionIndexUpsert(AgentSessionIndexEntry(
             id: sessionID,
@@ -9757,7 +9769,10 @@ final class AgentModeViewModel: ObservableObject {
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: isMCPOriginated,
             worktreeBindingSummaries: worktreeBindingSummaries,
-            activeWorktreeMergeSummaries: activeWorktreeMergeSummaries
+            activeWorktreeMergeSummaries: activeWorktreeMergeSummaries,
+            originWorkflowID: originWorkflowID,
+            originWorkflowDisplayName: originWorkflowDisplayName,
+            lastRunStartedAt: lastRunStartedAt
         ))
     }
 
@@ -10986,6 +11001,9 @@ final class AgentModeViewModel: ObservableObject {
             agentModel: session.selectedModelRaw,
             agentReasoningEffort: session.selectedReasoningEffortRaw,
             lastRunState: session.runState.rawValue,
+            originWorkflowID: session.originWorkflowID,
+            originWorkflowDisplayName: session.originWorkflowDisplayName,
+            lastRunStartedAt: session.lastRunStartedAt,
             providerSessionID: session.providerSessionID,
             autoEditEnabled: session.autoEditEnabled,
             providerTokenUsageByTurn: session.providerTokenUsageByTurn,
@@ -11040,7 +11058,10 @@ final class AgentModeViewModel: ObservableObject {
                 parentSessionID: agentSession.parentSessionID,
                 isMCPOriginated: agentSession.isMCPOriginated,
                 worktreeBindingSummaries: agentSession.worktreeBindings.worktreeBindingSummaries,
-                activeWorktreeMergeSummaries: agentSession.worktreeMergeOperations.activeWorktreeMergeSummaries
+                activeWorktreeMergeSummaries: agentSession.worktreeMergeOperations.activeWorktreeMergeSummaries,
+                originWorkflowID: agentSession.originWorkflowID,
+                originWorkflowDisplayName: agentSession.originWorkflowDisplayName,
+                lastRunStartedAt: agentSession.lastRunStartedAt
             )
             #if DEBUG
                 if let diagnosticsStartMS {
@@ -12057,7 +12078,8 @@ final class AgentModeViewModel: ObservableObject {
                     initialMessage: wrappedText,
                     attachments: attachmentsToSend,
                     taggedFileAttachments: taggedFilesToSend,
-                    codexFallbackContext: fallbackContext
+                    codexFallbackContext: fallbackContext,
+                    appliedWorkflow: activeWorkflow
                 )
                 if sendOutcome?.didSend != true {
                     self.clearPendingCodexComputerUseActivationIfMatched(
@@ -12117,7 +12139,8 @@ final class AgentModeViewModel: ObservableObject {
                         tabID: tabID,
                         initialMessage: wrappedText,
                         attachments: attachmentsToSend,
-                        taggedFileAttachments: taggedFilesToSend
+                        taggedFileAttachments: taggedFilesToSend,
+                        appliedWorkflow: activeWorkflow
                     )
                 }
                 return UserTurnSubmissionResult.submitted
@@ -12163,7 +12186,8 @@ final class AgentModeViewModel: ObservableObject {
                     tabID: tabID,
                     initialMessage: wrappedText,
                     attachments: attachmentsToSend,
-                    taggedFileAttachments: taggedFilesToSend
+                    taggedFileAttachments: taggedFilesToSend,
+                    appliedWorkflow: activeWorkflow
                 )
             }
         } else if let route = activeProviderSteeringRoute(for: session, attachments: attachmentsToSend) {
@@ -13415,9 +13439,11 @@ final class AgentModeViewModel: ObservableObject {
         initialMessage: String,
         attachments: [AgentImageAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
-        codexFallbackContext: TabSession.CodexFallbackSubmissionContext? = nil
+        codexFallbackContext: TabSession.CodexFallbackSubmissionContext? = nil,
+        appliedWorkflow: AgentWorkflowDefinition? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         let session = session(for: tabID)
+        let wasActiveBeforeStart = session.runState.isActive
         let codexDispatchTicket = codexFallbackContext?.dispatchTicket
         if let codexDispatchTicket {
             guard await session.codexDispatchSerialGate.awaitTurn(codexDispatchTicket) else {
@@ -13473,7 +13499,9 @@ final class AgentModeViewModel: ObservableObject {
             )
         }
 
-        return await runService.startRun(
+        let runStartedAt = Date()
+        let acceptedRunStartGeneration = session.acceptedRunStartGeneration
+        let outcome = await runService.startRun(
             tabID: tabID,
             session: session,
             initialUserMessage: augmentedInitialMessage,
@@ -13481,6 +13509,18 @@ final class AgentModeViewModel: ObservableObject {
             attachments: attachments,
             codexFallbackContext: preparedCodexFallbackContext
         )
+        let dispatchAccepted = outcome?.didSend == true
+            || session.acceptedRunStartGeneration != acceptedRunStartGeneration
+        if session.recordRunMetadataIfAccepted(
+            wasActiveBeforeStart: wasActiveBeforeStart,
+            dispatchAccepted: dispatchAccepted,
+            workflow: appliedWorkflow,
+            startedAt: runStartedAt
+        ) {
+            updateBindingsFromSession(session)
+            scheduleSave(for: tabID)
+        }
+        return outcome
     }
 
     private func buildHeadlessAgentMessage(

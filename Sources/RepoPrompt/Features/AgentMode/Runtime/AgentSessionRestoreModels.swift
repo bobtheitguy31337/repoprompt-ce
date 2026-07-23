@@ -17,6 +17,51 @@ struct AgentSessionIndexEntry: Identifiable, Equatable {
     var isMCPOriginated: Bool
     var worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
     var activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary]
+    var originWorkflowID: String?
+    var originWorkflowDisplayName: String?
+    var lastRunStartedAt: Date?
+
+    init(
+        id: UUID,
+        tabID: UUID,
+        name: String,
+        lastUserMessageAt: Date?,
+        savedAt: Date,
+        lastRunStateRaw: String?,
+        itemCount: Int,
+        agentKindRaw: String?,
+        agentModelRaw: String?,
+        agentReasoningEffortRaw: String?,
+        autoEditEnabled: Bool,
+        parentSessionID: UUID?,
+        hasUnknownConversationContent: Bool,
+        isMCPOriginated: Bool,
+        worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary],
+        activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary],
+        originWorkflowID: String? = nil,
+        originWorkflowDisplayName: String? = nil,
+        lastRunStartedAt: Date? = nil
+    ) {
+        self.id = id
+        self.tabID = tabID
+        self.name = name
+        self.lastUserMessageAt = lastUserMessageAt
+        self.savedAt = savedAt
+        self.lastRunStateRaw = lastRunStateRaw
+        self.itemCount = itemCount
+        self.agentKindRaw = agentKindRaw
+        self.agentModelRaw = agentModelRaw
+        self.agentReasoningEffortRaw = agentReasoningEffortRaw
+        self.autoEditEnabled = autoEditEnabled
+        self.parentSessionID = parentSessionID
+        self.hasUnknownConversationContent = hasUnknownConversationContent
+        self.isMCPOriginated = isMCPOriginated
+        self.worktreeBindingSummaries = worktreeBindingSummaries
+        self.activeWorktreeMergeSummaries = activeWorktreeMergeSummaries
+        self.originWorkflowID = originWorkflowID
+        self.originWorkflowDisplayName = originWorkflowDisplayName
+        self.lastRunStartedAt = lastRunStartedAt
+    }
 }
 
 struct AgentSessionSidebarBuildRequest {

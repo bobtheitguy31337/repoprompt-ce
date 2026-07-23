@@ -1,14 +1,70 @@
 import Foundation
 import RepoPromptRemoteProtocol
 
-struct RemoteTranscriptPageRecord: Sendable {
+struct RemoteTranscriptPageRecord {
     let sessionID: UUID
     let items: [RemoteTranscriptItem]
     let nextSequenceIndex: Int?
     let hasMore: Bool
+    let pagingMode: RemoteTranscriptPagingMode?
+    let olderCursor: RemoteTranscriptCursor?
+    let hasOlder: Bool?
+    let transcriptRevision: UInt64?
+
+    init(
+        sessionID: UUID,
+        items: [RemoteTranscriptItem],
+        nextSequenceIndex: Int? = nil,
+        hasMore: Bool = false,
+        pagingMode: RemoteTranscriptPagingMode? = nil,
+        olderCursor: RemoteTranscriptCursor? = nil,
+        hasOlder: Bool? = nil,
+        transcriptRevision: UInt64? = nil
+    ) {
+        self.sessionID = sessionID
+        self.items = items
+        self.nextSequenceIndex = nextSequenceIndex
+        self.hasMore = hasMore
+        self.pagingMode = pagingMode
+        self.olderCursor = olderCursor
+        self.hasOlder = hasOlder
+        self.transcriptRevision = transcriptRevision
+    }
 }
 
-struct RemoteHistoryPageRecord: Sendable {
+enum RemoteTranscriptPageRequest: Equatable {
+    case legacyForward(afterSequenceIndex: Int?)
+    case recentBackward(before: RemoteTranscriptCursor?)
+    case exactItem(UUID)
+}
+
+enum RemoteTranscriptCursorCodec {
+    static func encode(_ cursor: RemoteTranscriptCursor) throws -> String {
+        try JSONEncoder().encode(cursor)
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "="))
+    }
+
+    static func decode(_ encoded: String) throws -> RemoteTranscriptCursor {
+        var base64 = encoded
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let padding = (4 - base64.count % 4) % 4
+        base64.append(String(repeating: "=", count: padding))
+        guard let data = Data(base64Encoded: base64) else {
+            throw RemoteReadServiceError.invalidCursor
+        }
+        do {
+            return try JSONDecoder().decode(RemoteTranscriptCursor.self, from: data)
+        } catch {
+            throw RemoteReadServiceError.invalidCursor
+        }
+    }
+}
+
+struct RemoteHistoryPageRecord {
     let entries: [RemoteHistoryEntry]
     let hasMore: Bool
 }
@@ -17,7 +73,7 @@ struct RemoteHistoryPageRecord: Sendable {
 protocol RemoteTranscriptReadService: AnyObject {
     func transcript(
         sessionID: UUID,
-        afterSequenceIndex: Int?,
+        paging: RemoteTranscriptPageRequest,
         limit: Int,
         includeDetails: Bool
     ) async throws -> RemoteTranscriptPageRecord
@@ -34,29 +90,37 @@ protocol RemoteHistoryReadService: AnyObject {
 @MainActor
 final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryReadService {
     private let contexts: [(agentMode: AgentModeViewModel, workspaceManager: WorkspaceManagerViewModel)]
+    private let revisionTracker: RemoteTranscriptRevisionTracker?
 
-    init(contexts: [(agentMode: AgentModeViewModel, workspaceManager: WorkspaceManagerViewModel)]) {
+    init(
+        contexts: [(agentMode: AgentModeViewModel, workspaceManager: WorkspaceManagerViewModel)],
+        revisionTracker: RemoteTranscriptRevisionTracker? = nil
+    ) {
         self.contexts = contexts
+        self.revisionTracker = revisionTracker
     }
 
     func transcript(
         sessionID: UUID,
-        afterSequenceIndex: Int?,
+        paging: RemoteTranscriptPageRequest,
         limit: Int,
         includeDetails: Bool
     ) async throws -> RemoteTranscriptPageRecord {
         let boundedLimit = min(max(limit, 1), 200)
         var transcript: AgentTranscript?
+        var revisionFingerprint: RemoteTranscriptRevisionFingerprint?
 
         for context in contexts {
             if let liveSession = context.agentMode.sessions.values.first(where: { $0.activeAgentSessionID == sessionID }) {
                 transcript = liveSession.transcript
+                revisionFingerprint = .live(transcript: liveSession.transcript)
                 break
             }
 
             for workspace in context.workspaceManager.workspaces where !workspace.isEphemeral {
                 if let persisted = try? await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace) {
                     transcript = persisted.transcript ?? .empty
+                    revisionFingerprint = .persisted(transcript: transcript ?? .empty)
                     break
                 }
             }
@@ -68,17 +132,21 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         }
 
         let allItems = Self.project(transcript: transcript, includeDetails: includeDetails)
-        let start = afterSequenceIndex.map { index in
-            allItems.firstIndex(where: { $0.sequenceIndex > index }) ?? allItems.count
-        } ?? 0
-        let end = min(start + boundedLimit, allItems.count)
-        let pageItems = Array(allItems[start ..< end])
-        let hasMore = end < allItems.count
-        return RemoteTranscriptPageRecord(
+        if case let .exactItem(itemID) = paging,
+           !allItems.contains(where: { $0.id == itemID })
+        {
+            throw RemoteReadServiceError.transcriptItemNotFound
+        }
+        let transcriptRevision = revisionTracker?.observe(
             sessionID: sessionID,
-            items: pageItems,
-            nextSequenceIndex: hasMore ? pageItems.last?.sequenceIndex : nil,
-            hasMore: hasMore
+            fingerprint: revisionFingerprint ?? .live(transcript: transcript)
+        )
+        return Self.page(
+            sessionID: sessionID,
+            allItems: allItems,
+            paging: paging,
+            limit: boundedLimit,
+            transcriptRevision: transcriptRevision
         )
     }
 
@@ -89,7 +157,7 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
 
         for context in contexts {
             for workspace in context.workspaceManager.workspaces where !workspace.isEphemeral {
-                let records = (try? await AgentSessionDataService.shared.indexedAgentSessionMetadataRecords(for: workspace)) ?? []
+                let records = await (try? AgentSessionDataService.shared.indexedAgentSessionMetadataRecords(for: workspace)) ?? []
                 entries.append(contentsOf: records.compactMap { record in
                     let workspaceID = record.workspaceID ?? workspace.id
                     let searchable = "\(record.name) \(record.id.uuidString)".lowercased()
@@ -120,7 +188,62 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         )
     }
 
-    private static func project(
+    static func page(
+        sessionID: UUID,
+        allItems: [RemoteTranscriptItem],
+        paging: RemoteTranscriptPageRequest,
+        limit: Int,
+        transcriptRevision: UInt64? = nil
+    ) -> RemoteTranscriptPageRecord {
+        switch paging {
+        case let .exactItem(itemID):
+            guard let item = allItems.first(where: { $0.id == itemID }) else {
+                return RemoteTranscriptPageRecord(
+                    sessionID: sessionID,
+                    items: [],
+                    transcriptRevision: transcriptRevision
+                )
+            }
+            return RemoteTranscriptPageRecord(
+                sessionID: sessionID,
+                items: [item],
+                transcriptRevision: transcriptRevision
+            )
+
+        case let .legacyForward(afterSequenceIndex):
+            let start = afterSequenceIndex.map { index in
+                allItems.firstIndex(where: { $0.sequenceIndex > index }) ?? allItems.count
+            } ?? 0
+            let end = min(start + limit, allItems.count)
+            let items = Array(allItems[start ..< end])
+            let hasMore = end < allItems.count
+            return RemoteTranscriptPageRecord(
+                sessionID: sessionID,
+                items: items,
+                nextSequenceIndex: hasMore ? items.last?.sequenceIndex : nil,
+                hasMore: hasMore,
+                transcriptRevision: transcriptRevision
+            )
+
+        case let .recentBackward(before):
+            let candidates = before.map { cursor in
+                allItems.filter { Self.cursor(for: $0) < cursor }
+            } ?? allItems
+            let pageCount = min(limit, candidates.count)
+            let items = Array(candidates.suffix(pageCount))
+            let hasOlder = candidates.count > pageCount
+            return RemoteTranscriptPageRecord(
+                sessionID: sessionID,
+                items: items,
+                pagingMode: .recentBackward,
+                olderCursor: hasOlder ? items.first.map(Self.cursor(for:)) : nil,
+                hasOlder: hasOlder,
+                transcriptRevision: transcriptRevision
+            )
+        }
+    }
+
+    static func project(
         transcript: AgentTranscript,
         includeDetails: Bool
     ) -> [RemoteTranscriptItem] {
@@ -134,8 +257,9 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                         timestamp: request.timestamp,
                         sequenceIndex: request.sequenceIndex,
                         kind: .request,
+                        semanticKind: .userRequest,
                         role: "user",
-                        text: request.text,
+                        text: sanitizeVisibleText(request.text),
                         summaryOnly: turn.retentionTier != .full,
                         detailAvailable: false
                     )
@@ -143,16 +267,29 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
             }
 
             for activity in turn.allActivities {
+                let semanticKind = semanticKind(for: activity, conclusionActivityID: turn.conclusionActivityID)
                 let detail = includeDetails ? remoteDetail(for: activity) : nil
+                let visibleText: String? = if let summary = activity.toolExecution?.summaryText,
+                                              !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                {
+                    sanitizeVisibleText(summary)
+                } else if activity.toolExecution != nil {
+                    nil
+                } else if activity.text.isEmpty {
+                    nil
+                } else {
+                    sanitizeVisibleText(activity.text)
+                }
                 projected.append(
                     RemoteTranscriptItem(
                         id: activity.id,
                         turnID: turn.id,
                         timestamp: activity.timestamp,
                         sequenceIndex: activity.sequenceIndex,
-                        kind: .activity,
+                        kind: semanticKind == .assistantAnswer ? .conclusion : .activity,
+                        semanticKind: semanticKind,
                         role: activity.role.rawValue,
-                        text: activity.text.isEmpty ? nil : activity.text,
+                        text: visibleText,
                         toolName: activity.toolExecution?.toolName,
                         toolStatus: activity.toolExecution?.status.rawValue,
                         summaryOnly: turn.retentionTier != .full || activity.toolExecution?.summaryOnly == true,
@@ -165,7 +302,10 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
 
             if turn.retentionTier != .full,
                let summary = turn.summary,
-               let text = summary.conclusionText ?? summary.middleSummaryText ?? summary.requestText
+               let text = summary.conclusionText
+               ?? summary.compactConclusionText
+               ?? summary.middleSummaryText
+               ?? summary.requestText
             {
                 let summarySequenceIndex = turn.allActivities.map(\.sequenceIndex).max()
                     ?? turn.request?.sequenceIndex
@@ -177,8 +317,9 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                         timestamp: turn.lastActivityAt ?? turn.startedAt,
                         sequenceIndex: summarySequenceIndex + 1,
                         kind: .summary,
+                        semanticKind: .summary,
                         role: "summary",
-                        text: text,
+                        text: sanitizeVisibleText(text),
                         summaryOnly: true,
                         detailAvailable: false
                     )
@@ -186,8 +327,46 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
             }
         }
         return projected.sorted {
-            if $0.sequenceIndex == $1.sequenceIndex { return $0.timestamp < $1.timestamp }
-            return $0.sequenceIndex < $1.sequenceIndex
+            cursor(for: $0) < cursor(for: $1)
+        }
+    }
+
+    private static func cursor(for item: RemoteTranscriptItem) -> RemoteTranscriptCursor {
+        RemoteTranscriptCursor(
+            sequenceIndex: item.sequenceIndex,
+            timestamp: item.timestamp,
+            itemID: item.id
+        )
+    }
+
+    private static func semanticKind(
+        for activity: AgentTranscriptActivity,
+        conclusionActivityID: UUID?
+    ) -> RemoteTranscriptSemanticKind {
+        if activity.id == conclusionActivityID || activity.sealsAssistantBoundary {
+            return .assistantAnswer
+        }
+        if activity.role == .assistant,
+           AgentDisplayableText.hasDisplayableBody(activity.text)
+        {
+            return activity.isSubstantiveAssistant ? .assistantAnswer : .assistantPreamble
+        }
+        if activity.role == .error
+            || activity.itemKind == .error
+            || activity.toolExecution?.status == .failed
+            || activity.toolExecution?.toolIsError == true
+        {
+            return .error
+        }
+        switch activity.toolExecution?.toolName?.lowercased() {
+        case "ask_user", "request_user_input":
+            return .question
+        case "request_permission", "request_permissions":
+            return .permission
+        case "request_approval", "approval":
+            return .approval
+        default:
+            return .compactActivity
         }
     }
 
@@ -244,29 +423,37 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         }
         guard !sections.isEmpty else { return "No additional detail." }
         let rendered = sections.joined(separator: "\n\n")
-        return rendered.count > 16_000 ? String(rendered.prefix(16_000)) + "\n…" : rendered
+        return rendered.count > 16000 ? String(rendered.prefix(16000)) + "\n…" : rendered
+    }
+
+    private static func sanitizeVisibleText(_ raw: String) -> String {
+        sanitizeText(raw, characterLimit: 32000)
     }
 
     private static func sanitizeDetailText(_ raw: String) -> String {
-        var detail = raw
+        sanitizeText(raw, characterLimit: 8000)
+    }
+
+    private static func sanitizeText(_ raw: String, characterLimit: Int) -> String {
+        var text = raw
         let secretPattern = #"(?i)("(?:api[_-]?key|token|password|secret|authorization)"\s*:\s*")([^"]*)(")"#
         if let regex = try? NSRegularExpression(pattern: secretPattern) {
-            let range = NSRange(detail.startIndex..., in: detail)
-            detail = regex.stringByReplacingMatches(
-                in: detail,
+            let range = NSRange(text.startIndex..., in: text)
+            text = regex.stringByReplacingMatches(
+                in: text,
                 range: range,
                 withTemplate: "$1[REDACTED]$3"
             )
         }
-        detail = detail.replacingOccurrences(
+        text = text.replacingOccurrences(
             of: #"(?i)Bearer\s+[A-Za-z0-9._~+/=-]+"#,
             with: "Bearer [REDACTED]",
             options: .regularExpression
         )
-        if detail.count > 8_000 {
-            detail = String(detail.prefix(8_000)) + "\n…"
+        if text.count > characterLimit {
+            text = String(text.prefix(characterLimit)) + "\n…"
         }
-        return detail
+        return text
     }
 
     private static func mapRunState(_ rawValue: String?) -> RemoteRunState {
@@ -285,10 +472,14 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
 
 enum RemoteReadServiceError: LocalizedError {
     case sessionNotFound
+    case transcriptItemNotFound
+    case invalidCursor
 
     var errorDescription: String? {
         switch self {
         case .sessionNotFound: "The requested session could not be found."
+        case .transcriptItemNotFound: "The requested transcript item is no longer available."
+        case .invalidCursor: "The transcript cursor is invalid."
         }
     }
 }

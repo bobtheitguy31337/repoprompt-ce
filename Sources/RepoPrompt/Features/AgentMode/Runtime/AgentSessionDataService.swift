@@ -147,6 +147,9 @@ actor AgentSessionDataService {
         let agentModel: String?
         let agentReasoningEffort: String?
         let lastRunState: String?
+        let originWorkflowID: String?
+        let originWorkflowDisplayName: String?
+        let lastRunStartedAt: Date?
         let providerSessionID: String?
         let autoEditEnabled: Bool
         let codexConversationID: String?
@@ -1074,6 +1077,9 @@ actor AgentSessionDataService {
                 agentModel: header.agentModel,
                 agentReasoningEffort: header.agentReasoningEffort,
                 lastRunState: AgentSessionRestoreSupport.coldRestoredLastRunStateRaw(header.lastRunState),
+                originWorkflowID: header.originWorkflowID,
+                originWorkflowDisplayName: header.originWorkflowDisplayName,
+                lastRunStartedAt: header.lastRunStartedAt,
                 providerSessionID: header.providerSessionID,
                 autoEditEnabled: header.autoEditEnabled,
                 codexConversationID: header.codexConversationID,

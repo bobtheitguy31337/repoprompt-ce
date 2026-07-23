@@ -1,7 +1,7 @@
 import Foundation
+@testable import RepoPromptApp
 import RepoPromptRemoteProtocol
 import XCTest
-@testable import RepoPromptApp
 
 @MainActor
 final class RemoteSnapshotProjectionTests: XCTestCase {
@@ -39,6 +39,7 @@ final class RemoteSnapshotProjectionTests: XCTestCase {
             workflowCatalog: StaticRemoteCatalogService()
         )
 
+        let revisionEpoch = UUID()
         let snapshot = await builder.build(
             desktop: RemoteDesktopSummary(
                 instanceID: "lifecycle-desktop",
@@ -47,9 +48,11 @@ final class RemoteSnapshotProjectionTests: XCTestCase {
                 isAvailable: true
             ),
             connection: RemoteConnectionSummary(state: .connected),
-            authorization: RemoteAuthorizationState()
+            authorization: RemoteAuthorizationState(),
+            transcriptRevisionEpoch: revisionEpoch
         )
 
+        XCTAssertEqual(snapshot.transcriptRevisionEpoch, revisionEpoch)
         XCTAssertTrue(snapshot.sessions.contains { $0.runState == .opening })
         XCTAssertTrue(snapshot.sessions.contains { $0.runState == .blocked })
         XCTAssertTrue(snapshot.sessions.contains { $0.runState == .cancelled })
@@ -227,7 +230,7 @@ final class RemoteSnapshotProjectionTests: XCTestCase {
     func testProjectionHandlesLargeFleetWithParentChildRelationships() async {
         let workspaceID = UUID()
         let now = Date(timeIntervalSince1970: 300)
-        let sessionIDs = (0 ..< 2_000).map { _ in UUID() }
+        let sessionIDs = (0 ..< 2000).map { _ in UUID() }
         let records = sessionIDs.enumerated().map { index, sessionID in
             RemoteSessionRecord(
                 sessionID: sessionID,
@@ -277,9 +280,9 @@ final class RemoteSnapshotProjectionTests: XCTestCase {
         )
 
         XCTAssertEqual(snapshot.workspaces.count, 1)
-        XCTAssertEqual(snapshot.sessions.count, 2_000)
-        XCTAssertEqual(snapshot.sessions.filter { !$0.childSessionIDs.isEmpty }.count, 200)
-        XCTAssertEqual(snapshot.sessions.reduce(0) { $0 + $1.childSessionIDs.count }, 1_800)
+        XCTAssertEqual(snapshot.sessions.count, 2000)
+        XCTAssertEqual(snapshot.sessions.count(where: { !$0.childSessionIDs.isEmpty }), 200)
+        XCTAssertEqual(snapshot.sessions.reduce(0) { $0 + $1.childSessionIDs.count }, 1800)
     }
 
     func testFixtureProjectsLiveWaitingFailedCompletedAndChildSessions() async {
@@ -332,7 +335,10 @@ final class RemoteSnapshotProjectionTests: XCTestCase {
                     mergeAttention: nil,
                     failureSummary: nil,
                     lastUpdatedAt: now,
-                    isLive: true
+                    isLive: true,
+                    workflowID: AgentWorkflow.orchestrate.definition.id,
+                    runStartedAt: now.addingTimeInterval(-5),
+                    transcriptRevision: 7
                 ),
                 RemoteSessionRecord(
                     sessionID: waitingSessionID,
@@ -403,7 +409,12 @@ final class RemoteSnapshotProjectionTests: XCTestCase {
         XCTAssertEqual(snapshot.workspaces.count, 2)
         XCTAssertTrue(snapshot.workspaces.contains { $0.workspaceID == closedWorkspaceID.uuidString && !$0.isOpen })
         XCTAssertEqual(snapshot.sessions.count, 5)
-        XCTAssertEqual(snapshot.sessions.first { $0.sessionID == liveSessionID }?.childSessionIDs, [childSessionID])
+        let liveSummary = snapshot.sessions.first { $0.sessionID == liveSessionID }
+        XCTAssertEqual(liveSummary?.childSessionIDs, [childSessionID])
+        XCTAssertEqual(liveSummary?.workflow, "Engineer")
+        XCTAssertEqual(liveSummary?.workflowID, AgentWorkflow.orchestrate.definition.id)
+        XCTAssertEqual(liveSummary?.runStartedAt, now.addingTimeInterval(-5))
+        XCTAssertEqual(liveSummary?.transcriptRevision, 7)
         XCTAssertTrue(snapshot.sessions.contains { $0.runState == .waitingForInput })
         XCTAssertTrue(snapshot.sessions.contains { $0.runState == .failed })
         XCTAssertTrue(snapshot.sessions.contains { $0.runState == .completed })
@@ -448,7 +459,9 @@ private final class FixtureWorkspaceCatalog: WorkspaceCatalogService {
         self.records = records
     }
 
-    func allSavedWorkspaces() async -> [RemoteWorkspaceRecord] { records }
+    func allSavedWorkspaces() async -> [RemoteWorkspaceRecord] {
+        records
+    }
 }
 
 @MainActor
@@ -459,5 +472,7 @@ private final class FixtureSessionQuery: SessionQueryService {
         self.records = records
     }
 
-    func remoteSessions() async -> [RemoteSessionRecord] { records }
+    func remoteSessions() async -> [RemoteSessionRecord] {
+        records
+    }
 }

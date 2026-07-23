@@ -46,7 +46,7 @@ enum RemoteAgentControlServiceError: LocalizedError {
     }
 }
 
-enum RemoteMutationFailureDisposition: Equatable, Sendable {
+enum RemoteMutationFailureDisposition: Equatable {
     case rollbackProvisionalSession
     case preserveExistingSession
 }
@@ -74,7 +74,7 @@ enum RemoteMutationFailurePolicy {
     }
 }
 
-enum RemoteWorkspaceActivationDecision: Equatable, Sendable {
+enum RemoteWorkspaceActivationDecision: Equatable {
     case reuseExistingWindow
     case openNewWindow
     case workspaceNotFound
@@ -134,16 +134,16 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         let workspaceID = try parseWorkspaceID(request.workspaceID)
         let context = try await activateWorkspace(workspaceID)
         let message = try requiredMessage(request.message)
-        let effectiveMessage: String
+        let workflow: AgentWorkflowDefinition?
         if let workflowID = request.workflowID {
-            guard let workflow = AgentWorkflowStore.shared.resolveWorkflowReference(workflowID) else {
+            guard let resolvedWorkflow = AgentWorkflowStore.shared.resolveWorkflowReference(workflowID) else {
                 throw RemoteAgentControlServiceError.commandRejected(
                     "The requested workflow is no longer available on the Mac."
                 )
             }
-            effectiveMessage = workflow.wrapUserText(message)
+            workflow = resolvedWorkflow
         } else {
-            effectiveMessage = message
+            workflow = nil
         }
         let target = try await context.agentMode.mcpResolveOrCreateSessionTarget(
             tabID: nil,
@@ -172,8 +172,9 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             )
             _ = try await context.agentMode.mcpDispatchInstruction(
                 sessionID: sessionID,
-                text: effectiveMessage,
-                allowStartingRun: true
+                text: message,
+                allowStartingRun: true,
+                workflow: workflow
             )
             return await response(
                 request: request,
@@ -235,9 +236,9 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             }
             throw error
         }
-        return await response(
+        return try await response(
             request: request,
-            workspaceID: try workspaceID(for: context, fallback: request.workspaceID),
+            workspaceID: workspaceID(for: context, fallback: request.workspaceID),
             sessionID: sessionID,
             context: context
         )
@@ -303,9 +304,9 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             }
             throw error
         }
-        return await response(
+        return try await response(
             request: request,
-            workspaceID: try workspaceID(for: context, fallback: request.workspaceID),
+            workspaceID: workspaceID(for: context, fallback: request.workspaceID),
             sessionID: sessionID,
             context: context
         )
@@ -335,9 +336,9 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 "The run changed before cancellation could be applied."
             )
         }
-        return await response(
+        return try await response(
             request: request,
-            workspaceID: try workspaceID(for: context, fallback: request.workspaceID),
+            workspaceID: workspaceID(for: context, fallback: request.workspaceID),
             sessionID: sessionID,
             context: context
         )
@@ -422,18 +423,18 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             return WindowContext(window: window)
         case .openNewWindow:
             do {
-            let newWindow = try await manager.openNewMainWindow()
-            await newWindow.workspaceManager.awaitInitialized()
-            guard let workspace = newWindow.workspaceManager.workspace(withID: workspaceID) else {
-                throw RemoteAgentControlServiceError.workspaceNotFound
-            }
-            let result = await newWindow.workspaceManager.requestWorkspaceSwitch(to: workspace, saveState: true)
-            guard result.didSwitch || newWindow.workspaceManager.activeWorkspaceID == workspaceID else {
-                throw RemoteAgentControlServiceError.commandRejected(
-                    result.message ?? "The workspace could not be activated in the new window."
-                )
-            }
-            return WindowContext(window: newWindow)
+                let newWindow = try await manager.openNewMainWindow()
+                await newWindow.workspaceManager.awaitInitialized()
+                guard let workspace = newWindow.workspaceManager.workspace(withID: workspaceID) else {
+                    throw RemoteAgentControlServiceError.workspaceNotFound
+                }
+                let result = await newWindow.workspaceManager.requestWorkspaceSwitch(to: workspace, saveState: true)
+                guard result.didSwitch || newWindow.workspaceManager.activeWorkspaceID == workspaceID else {
+                    throw RemoteAgentControlServiceError.commandRejected(
+                        result.message ?? "The workspace could not be activated in the new window."
+                    )
+                }
+                return WindowContext(window: newWindow)
             } catch let error as RemoteAgentControlServiceError {
                 throw error
             } catch {
@@ -553,7 +554,12 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
     private struct WindowContext {
         let window: WindowState
 
-        var agentMode: AgentModeViewModel { window.agentModeViewModel }
-        var workspaceManager: WorkspaceManagerViewModel { window.workspaceManager }
+        var agentMode: AgentModeViewModel {
+            window.agentModeViewModel
+        }
+
+        var workspaceManager: WorkspaceManagerViewModel {
+            window.workspaceManager
+        }
     }
 }

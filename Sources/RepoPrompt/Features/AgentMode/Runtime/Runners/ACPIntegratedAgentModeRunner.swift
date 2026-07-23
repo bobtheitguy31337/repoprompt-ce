@@ -140,6 +140,7 @@ final class ACPIntegratedAgentModeRunner {
                         }
                     }
                 }
+                session.markRunStartAccepted()
                 session.agentTask = Task { [weak self, weak session] in
                     guard let self, let session else { return }
                     if let clientNameHint = runRequest.agentKind.mcpClientNameHint {
@@ -257,6 +258,7 @@ final class ACPIntegratedAgentModeRunner {
                 }
             }
         }
+        session.markRunStartAccepted()
         session.agentTask = Task { [weak self, weak session] in
             guard let self, let session else { return }
             if let clientNameHint = runRequest.agentKind.mcpClientNameHint {

@@ -6,7 +6,7 @@ import RepoPromptRemoteProtocol
 /// A sanitized, immutable workspace record used by remote projections. The
 /// adapter deliberately exposes only a repository-root summary, never a raw
 /// filesystem path.
-struct RemoteWorkspaceRecord: Equatable, Sendable {
+struct RemoteWorkspaceRecord: Equatable {
     let workspaceID: UUID
     let name: String
     let repositoryRootSummary: String?
@@ -15,13 +15,16 @@ struct RemoteWorkspaceRecord: Equatable, Sendable {
     let lastActivityAt: Date?
 }
 
-struct RemoteSessionRecord: Equatable, Sendable {
+struct RemoteSessionRecord: Equatable {
     let sessionID: UUID
     let workspaceID: UUID
     let composeTabID: UUID?
     let parentSessionID: UUID?
     let sessionName: String?
     let workflow: String?
+    let workflowID: String?
+    let runStartedAt: Date?
+    let transcriptRevision: UInt64?
     let agent: String?
     let model: String?
     let reasoningEffort: String?
@@ -34,9 +37,55 @@ struct RemoteSessionRecord: Equatable, Sendable {
     let failureSummary: String?
     let lastUpdatedAt: Date
     let isLive: Bool
+
+    init(
+        sessionID: UUID,
+        workspaceID: UUID,
+        composeTabID: UUID?,
+        parentSessionID: UUID?,
+        sessionName: String?,
+        workflow: String?,
+        agent: String?,
+        model: String?,
+        reasoningEffort: String?,
+        runState: RemoteRunState,
+        lifecycleStage: String?,
+        latestMeaningfulActivity: String?,
+        pendingInteraction: RemoteInteractionSummary?,
+        worktreeSummary: String?,
+        mergeAttention: String?,
+        failureSummary: String?,
+        lastUpdatedAt: Date,
+        isLive: Bool,
+        workflowID: String? = nil,
+        runStartedAt: Date? = nil,
+        transcriptRevision: UInt64? = nil
+    ) {
+        self.sessionID = sessionID
+        self.workspaceID = workspaceID
+        self.composeTabID = composeTabID
+        self.parentSessionID = parentSessionID
+        self.sessionName = sessionName
+        self.workflow = workflow
+        self.workflowID = workflowID
+        self.runStartedAt = runStartedAt
+        self.transcriptRevision = transcriptRevision
+        self.agent = agent
+        self.model = model
+        self.reasoningEffort = reasoningEffort
+        self.runState = runState
+        self.lifecycleStage = lifecycleStage
+        self.latestMeaningfulActivity = latestMeaningfulActivity
+        self.pendingInteraction = pendingInteraction
+        self.worktreeSummary = worktreeSummary
+        self.mergeAttention = mergeAttention
+        self.failureSummary = failureSummary
+        self.lastUpdatedAt = lastUpdatedAt
+        self.isLive = isLive
+    }
 }
 
-struct RemoteCatalogRecord: Equatable, Sendable {
+struct RemoteCatalogRecord: Equatable {
     let workflows: [RemoteWorkflowDescriptor]
     let agents: [RemoteAgentDescriptor]
 
@@ -53,14 +102,14 @@ protocol WorkspaceActivationService: AnyObject {
     func activate(workspaceID: UUID) async -> Result<RemoteWorkspaceActivationResult, RemoteWorkspaceActivationError>
 }
 
-struct RemoteWorkspaceActivationResult: Equatable, Sendable {
+struct RemoteWorkspaceActivationResult: Equatable {
     let workspaceID: UUID
     let composeTabID: UUID?
     let windowID: Int?
     let reusedExistingWindow: Bool
 }
 
-enum RemoteWorkspaceActivationError: Error, Equatable, Sendable {
+enum RemoteWorkspaceActivationError: Error, Equatable {
     case invalidWorkspaceID
     case workspaceNotFound
     case activationBlocked(String)
@@ -104,7 +153,8 @@ final class RemoteSnapshotBuilder {
         desktop: RemoteDesktopSummary,
         connection: RemoteConnectionSummary,
         authorization: RemoteAuthorizationState,
-        eventCursor: UInt64 = 0
+        eventCursor: UInt64 = 0,
+        transcriptRevisionEpoch: UUID? = nil
     ) async -> RemoteSnapshot {
         let workspaces = await workspaceCatalog.allSavedWorkspaces()
             .map {
@@ -132,6 +182,9 @@ final class RemoteSnapshotBuilder {
                 parentSessionID: $0.parentSessionID,
                 sessionName: $0.sessionName,
                 workflow: $0.workflow,
+                workflowID: $0.workflowID,
+                runStartedAt: $0.runStartedAt,
+                transcriptRevision: $0.transcriptRevision,
                 agent: $0.agent,
                 model: $0.model,
                 reasoningEffort: $0.reasoningEffort,
@@ -180,7 +233,8 @@ final class RemoteSnapshotBuilder {
             attentionItems: attentionItems,
             workflowCatalog: catalog.workflows,
             agentCatalog: catalog.agents,
-            eventCursor: eventCursor
+            eventCursor: eventCursor,
+            transcriptRevisionEpoch: transcriptRevisionEpoch
         )
     }
 }
@@ -265,13 +319,23 @@ final class WorkspaceManagerRemoteActivationService: WorkspaceActivationService 
 @MainActor
 final class AgentModeRemoteSessionQueryService: SessionQueryService {
     private let contexts: [(agentMode: AgentModeViewModel, workspaceManager: WorkspaceManagerViewModel)]
+    private let revisionTracker: RemoteTranscriptRevisionTracker?
 
-    init(agentMode: AgentModeViewModel, workspaceManager: WorkspaceManagerViewModel) {
+    init(
+        agentMode: AgentModeViewModel,
+        workspaceManager: WorkspaceManagerViewModel,
+        revisionTracker: RemoteTranscriptRevisionTracker? = nil
+    ) {
         contexts = [(agentMode, workspaceManager)]
+        self.revisionTracker = revisionTracker
     }
 
-    init(contexts: [(agentMode: AgentModeViewModel, workspaceManager: WorkspaceManagerViewModel)]) {
+    init(
+        contexts: [(agentMode: AgentModeViewModel, workspaceManager: WorkspaceManagerViewModel)],
+        revisionTracker: RemoteTranscriptRevisionTracker? = nil
+    ) {
         self.contexts = contexts
+        self.revisionTracker = revisionTracker
     }
 
     func remoteSessions() async -> [RemoteSessionRecord] {
@@ -282,16 +346,44 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
             guard let workspaceID else { continue }
             let liveByTabID = context.agentMode.sessions
             for entry in context.agentMode.sessionIndex.values {
-                let live = liveByTabID[entry.tabID]
+                let live = Self.matchingLiveSession(
+                    entryID: entry.id,
+                    tabID: entry.tabID,
+                    liveByTabID: liveByTabID
+                )
                 let runState = live.map { Self.mapRunState($0.runState) }
                     ?? Self.mapPersistedRunState(entry.lastRunStateRaw)
+                let transcriptRevision: UInt64? = if let live {
+                    revisionTracker?.observe(
+                        sessionID: entry.id,
+                        fingerprint: .live(transcript: live.transcript)
+                    )
+                } else if let cached = revisionTracker?.cachedPersistedRevision(
+                    sessionID: entry.id,
+                    savedAt: entry.savedAt
+                ) {
+                    cached
+                } else if let workspace = context.workspaceManager.workspaces.first(where: { $0.id == workspaceID }),
+                          let persisted = try? await AgentSessionDataService.shared.loadAgentSession(
+                              id: entry.id,
+                              for: workspace
+                          )
+                {
+                    revisionTracker?.observePersisted(
+                        sessionID: entry.id,
+                        savedAt: entry.savedAt,
+                        fingerprint: .persisted(transcript: persisted.transcript ?? .empty)
+                    )
+                } else {
+                    revisionTracker?.revision(for: entry.id)
+                }
                 let record = RemoteSessionRecord(
                     sessionID: entry.id,
                     workspaceID: workspaceID,
                     composeTabID: entry.tabID,
                     parentSessionID: entry.parentSessionID,
                     sessionName: entry.name,
-                    workflow: nil,
+                    workflow: live?.originWorkflowDisplayName ?? entry.originWorkflowDisplayName,
                     agent: entry.agentKindRaw,
                     model: entry.agentModelRaw,
                     reasoningEffort: entry.agentReasoningEffortRaw,
@@ -303,7 +395,10 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
                     mergeAttention: entry.activeWorktreeMergeSummaries.isEmpty ? nil : "Merge review available",
                     failureSummary: runState == .failed ? "Agent run failed" : nil,
                     lastUpdatedAt: max(entry.savedAt, live?.activeAgentRunStartedAt ?? .distantPast),
-                    isLive: live != nil
+                    isLive: live != nil,
+                    workflowID: live?.originWorkflowID ?? entry.originWorkflowID,
+                    runStartedAt: live?.lastRunStartedAt ?? entry.lastRunStartedAt,
+                    transcriptRevision: transcriptRevision
                 )
                 if let existing = records[record.sessionID], existing.lastUpdatedAt >= record.lastUpdatedAt {
                     continue
@@ -312,6 +407,17 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
             }
         }
         return Array(records.values)
+    }
+
+    static func matchingLiveSession(
+        entryID: UUID,
+        tabID: UUID,
+        liveByTabID: [UUID: AgentModeViewModel.TabSession]
+    ) -> AgentModeViewModel.TabSession? {
+        guard let live = liveByTabID[tabID], live.activeAgentSessionID == entryID else {
+            return nil
+        }
+        return live
     }
 
     private static func mapRunState(_ state: AgentSessionRunState) -> RemoteRunState {
@@ -391,7 +497,9 @@ final class StaticRemoteCatalogService: WorkflowCatalogService {
         self.catalog = catalog
     }
 
-    func remoteCatalog() async -> RemoteCatalogRecord { catalog }
+    func remoteCatalog() async -> RemoteCatalogRecord {
+        catalog
+    }
 }
 
 /// Projects the desktop's live workflow and provider stores into the compact
@@ -400,15 +508,35 @@ final class StaticRemoteCatalogService: WorkflowCatalogService {
 /// on the Mac.
 @MainActor
 final class DesktopRemoteCatalogService: WorkflowCatalogService {
-    func remoteCatalog() async -> RemoteCatalogRecord {
-        let workflows = AgentWorkflowStore.shared.allWorkflows.map {
+    static func workflowDescriptors(
+        workflows: [AgentWorkflowDefinition],
+        featuredWorkflowIDs: [String]
+    ) -> [RemoteWorkflowDescriptor] {
+        let featuredRankByID = featuredWorkflowIDs.enumerated().reduce(into: [String: Int]()) { ranks, entry in
+            if ranks[entry.element] == nil {
+                ranks[entry.element] = entry.offset
+            }
+        }
+        return workflows.map {
             RemoteWorkflowDescriptor(
                 id: $0.id,
                 displayName: $0.displayName,
                 isBuiltIn: $0.isBuiltIn,
-                requiredAuthority: .control
+                requiredAuthority: .control,
+                iconName: $0.iconName,
+                accentColorHex: $0.accentColorHex,
+                descriptionText: $0.descriptionText,
+                featuredRank: featuredRankByID[$0.id]
             )
         }
+    }
+
+    func remoteCatalog() async -> RemoteCatalogRecord {
+        let store = AgentWorkflowStore.shared
+        let workflows = Self.workflowDescriptors(
+            workflows: store.allWorkflows,
+            featuredWorkflowIDs: store.featuredWorkflowIDs
+        )
 
         let availability = AgentModelCatalog.AvailabilityContext.current
         let agents = AgentModelCatalog

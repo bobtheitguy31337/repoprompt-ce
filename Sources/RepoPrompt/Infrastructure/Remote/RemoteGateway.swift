@@ -41,6 +41,9 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     private let tlsIdentityStore = RemoteTLSIdentityStore()
     private let availabilityController = RemoteAvailabilityController.shared
     private let replayBuffer = RemoteEventReplayBuffer(capacity: 512)
+    private let transcriptRevisionTracker = RemoteTranscriptRevisionTracker()
+    /// Changes only when the CE process restarts. Gateway stop/start preserves it.
+    private let transcriptRevisionEpoch = UUID()
 
     private var tlsIdentity: RemoteTLSIdentity?
     private var listener: NWListener?
@@ -50,10 +53,15 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     private var lastPublishedSnapshot: RemoteSnapshot?
     private(set) var activePort: UInt16?
 
-    var notificationRelayConfigured: Bool { notificationRelay.isConfigured }
-    var notificationRegistrationAvailable: Bool { pairingManager.registeredNotification != nil }
+    var notificationRelayConfigured: Bool {
+        notificationRelay.isConfigured
+    }
 
-    private override init() {
+    var notificationRegistrationAvailable: Bool {
+        pairingManager.registeredNotification != nil
+    }
+
+    override private init() {
         isEnabled = UserDefaults.standard.bool(forKey: Self.enabledKey)
         isPaired = pairingManager.isPaired
         super.init()
@@ -206,12 +214,12 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     }
 
     func diagnostics() async -> RemoteDiagnostics {
-        RemoteDiagnostics(
+        await RemoteDiagnostics(
             gatewayState: isRunning ? "running" : "stopped",
             lastRequestAt: lastRequestAt,
             lastSuccessfulRequestAt: lastSuccessfulRequestAt,
             lastSnapshotAt: lastSnapshotAt,
-            lastEventCursor: await replayBuffer.latestCursor(),
+            lastEventCursor: replayBuffer.latestCursor(),
             pairedDevice: pairingManager.isPaired,
             notificationRegistration: notificationRegistrationAvailable,
             notificationRelayConfigured: notificationRelayConfigured,
@@ -251,7 +259,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 guard !Task.isCancelled else { return }
-                await self.publishLiveStateChanges()
+                await publishLiveStateChanges()
             }
         }
     }
@@ -318,24 +326,33 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 continue
             }
             guard old != session else { continue }
-            let type: RemoteEventType
-            if old.runState != session.runState {
+            if let event = Self.transcriptRevisionEvent(
+                old: old,
+                current: session,
+                desktopInstanceID: pairingManager.desktopInstanceID
+            ) {
+                pendingEvents.append(event)
+            }
+            guard Self.hasSessionChangeExcludingTranscriptRevision(old: old, current: session) else {
+                continue
+            }
+            let type: RemoteEventType = if old.runState != session.runState {
                 switch session.runState {
-                case .working: type = .runStarted
-                case .waitingForInput: type = .runWaitingForInput
-                case .completed: type = .runCompleted
-                case .failed: type = .runFailed
-                case .cancelled: type = .runCancelled
-                default: type = .sessionUpdated
+                case .working: .runStarted
+                case .waitingForInput: .runWaitingForInput
+                case .completed: .runCompleted
+                case .failed: .runFailed
+                case .cancelled: .runCancelled
+                default: .sessionUpdated
                 }
             } else if old.latestMeaningfulActivity != session.latestMeaningfulActivity {
-                type = .runProgressed
+                .runProgressed
             } else if old.pendingInteraction == nil, session.pendingInteraction != nil {
-                type = .interactionCreated
+                .interactionCreated
             } else if old.pendingInteraction != nil, session.pendingInteraction == nil {
-                type = .interactionResolved
+                .interactionResolved
             } else {
-                type = .sessionUpdated
+                .sessionUpdated
             }
             pendingEvents.append(RemoteEvent(
                 desktopInstanceID: pairingManager.desktopInstanceID,
@@ -372,6 +389,50 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         }
 
         lastPublishedSnapshot = current
+    }
+
+    static func transcriptRevisionEvent(
+        old: RemoteSessionSummary,
+        current: RemoteSessionSummary,
+        desktopInstanceID: String
+    ) -> RemoteEvent? {
+        guard old.transcriptRevision != current.transcriptRevision,
+              let revision = current.transcriptRevision
+        else { return nil }
+        return RemoteEvent(
+            desktopInstanceID: desktopInstanceID,
+            type: .transcriptItemsAppended,
+            workspaceID: current.workspaceID,
+            sessionID: current.sessionID,
+            payload: .text(String(revision))
+        )
+    }
+
+    static func hasSessionChangeExcludingTranscriptRevision(
+        old: RemoteSessionSummary,
+        current: RemoteSessionSummary
+    ) -> Bool {
+        old.sessionID != current.sessionID
+            || old.workspaceID != current.workspaceID
+            || old.composeTabID != current.composeTabID
+            || old.parentSessionID != current.parentSessionID
+            || old.sessionName != current.sessionName
+            || old.workflow != current.workflow
+            || old.workflowID != current.workflowID
+            || old.runStartedAt != current.runStartedAt
+            || old.agent != current.agent
+            || old.model != current.model
+            || old.reasoningEffort != current.reasoningEffort
+            || old.runState != current.runState
+            || old.lifecycleStage != current.lifecycleStage
+            || old.latestMeaningfulActivity != current.latestMeaningfulActivity
+            || old.pendingInteraction != current.pendingInteraction
+            || old.childSessionIDs != current.childSessionIDs
+            || old.worktreeSummary != current.worktreeSummary
+            || old.mergeAttention != current.mergeAttention
+            || old.failureSummary != current.failureSummary
+            || old.lastUpdatedAt != current.lastUpdatedAt
+            || old.isLive != current.isLive
     }
 
     private static func notificationCategory(
@@ -534,42 +595,42 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
                 return
             }
-            sendJSON(await snapshot(), status: 200, on: connection)
+            await sendJSON(snapshot(), status: 200, on: connection)
 
         case ("GET", RemoteProtocol.diagnosticsPath):
             guard pairingManager.isAuthorized(request.headers["authorization"]) else {
                 sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
                 return
             }
-            sendJSON(await diagnostics(), status: 200, on: connection)
+            await sendJSON(diagnostics(), status: 200, on: connection)
 
         case ("GET", RemoteProtocol.workspacesPath):
             guard pairingManager.isAuthorized(request.headers["authorization"]) else {
                 sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
                 return
             }
-            sendJSON((await snapshot()).workspaces, status: 200, on: connection)
+            await sendJSON(snapshot().workspaces, status: 200, on: connection)
 
         case ("GET", RemoteProtocol.sessionsPath):
             guard pairingManager.isAuthorized(request.headers["authorization"]) else {
                 sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
                 return
             }
-            sendJSON((await snapshot()).sessions, status: 200, on: connection)
+            await sendJSON(snapshot().sessions, status: 200, on: connection)
 
         case ("GET", RemoteProtocol.agentsPath):
             guard pairingManager.isAuthorized(request.headers["authorization"]) else {
                 sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
                 return
             }
-            sendJSON((await snapshot()).agentCatalog, status: 200, on: connection)
+            await sendJSON(snapshot().agentCatalog, status: 200, on: connection)
 
         case ("GET", RemoteProtocol.workflowsPath):
             guard pairingManager.isAuthorized(request.headers["authorization"]) else {
                 sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
                 return
             }
-            sendJSON((await snapshot()).workflowCatalog, status: 200, on: connection)
+            await sendJSON(snapshot().workflowCatalog, status: 200, on: connection)
 
         case ("GET", RemoteProtocol.historyPath):
             guard pairingManager.isAuthorized(request.headers["authorization"]) else {
@@ -601,6 +662,29 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             let after = components.queryItems?.first(where: { $0.name == "after" })?.value.flatMap(Int.init)
             let limit = components.queryItems?.first(where: { $0.name == "limit" })?.value.flatMap(Int.init) ?? 100
             let includeDetails = components.queryItems?.first(where: { $0.name == "details" })?.value == "1"
+            let itemIDValue = components.queryItems?.first(where: { $0.name == "item_id" })?.value
+            if itemIDValue != nil, itemIDValue.flatMap(UUID.init) == nil {
+                sendError(.init(code: "invalid_transcript_item", message: "A valid item_id is required."), status: 400, on: connection)
+                return
+            }
+            let paging: RemoteTranscriptPageRequest
+            if let itemID = itemIDValue.flatMap(UUID.init) {
+                paging = .exactItem(itemID)
+            } else if components.queryItems?.first(where: { $0.name == "order" })?.value == "recent" {
+                let beforeValue = components.queryItems?.first(where: { $0.name == "before" })?.value
+                do {
+                    paging = try .recentBackward(before: beforeValue.map(RemoteTranscriptCursorCodec.decode))
+                } catch {
+                    sendError(
+                        .init(code: "invalid_transcript_cursor", message: "The transcript cursor is invalid."),
+                        status: 400,
+                        on: connection
+                    )
+                    return
+                }
+            } else {
+                paging = .legacyForward(afterSequenceIndex: after)
+            }
             guard let readService = makeReadService() else {
                 sendError(.init(code: "unavailable", message: "Remote read services are not ready.", retryable: true), status: 503, on: connection)
                 return
@@ -608,23 +692,39 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             do {
                 let page = try await readService.transcript(
                     sessionID: sessionID,
-                    afterSequenceIndex: after,
+                    paging: paging,
                     limit: limit,
                     includeDetails: includeDetails
                 )
-                sendJSON(
+                await sendJSON(
                     RemoteTranscriptPage(
                         sessionID: page.sessionID,
                         items: page.items,
                         nextSequenceIndex: page.nextSequenceIndex,
                         hasMore: page.hasMore,
-                        eventCursor: await replayBuffer.latestCursor()
+                        eventCursor: replayBuffer.latestCursor(),
+                        pagingMode: page.pagingMode,
+                        olderCursor: page.olderCursor,
+                        hasOlder: page.hasOlder,
+                        transcriptRevision: page.transcriptRevision,
+                        transcriptRevisionEpoch: transcriptRevisionEpoch
                     ),
                     status: 200,
                     on: connection
                 )
             } catch let error as RemoteReadServiceError {
-                sendError(.init(code: "session_not_found", message: error.localizedDescription), status: 404, on: connection)
+                switch error {
+                case .sessionNotFound:
+                    sendError(.init(code: "session_not_found", message: error.localizedDescription), status: 404, on: connection)
+                case .transcriptItemNotFound:
+                    sendError(
+                        .init(code: "transcript_item_not_found", message: error.localizedDescription, retryable: true),
+                        status: 404,
+                        on: connection
+                    )
+                case .invalidCursor:
+                    sendError(.init(code: "invalid_transcript_cursor", message: error.localizedDescription), status: 400, on: connection)
+                }
             } catch {
                 sendError(.init(code: "transcript_failed", message: "The transcript could not be loaded.", retryable: true), status: 500, on: connection)
             }
@@ -634,7 +734,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
                 return
             }
-            let cursor = components.queryItems?.first(where: { $0.name == "after" }).flatMap { $0.value }.flatMap(UInt64.init)
+            let cursor = components.queryItems?.first(where: { $0.name == "after" }).flatMap(\.value).flatMap(UInt64.init)
             switch await replayBuffer.replay(after: cursor, desktopInstanceID: pairingManager.desktopInstanceID) {
             case let .events(events):
                 let body = events.map { event in
@@ -672,12 +772,12 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 }
                 do {
                     try pairingManager.registerNotifications(registration)
-                    sendJSON(
+                    await sendJSON(
                         RemoteCommandResponse(
                             commandID: command.commandID,
                             accepted: true,
                             message: "Notification registration saved.",
-                            eventCursor: await replayBuffer.latestCursor()
+                            eventCursor: replayBuffer.latestCursor()
                         ),
                         status: 200,
                         on: connection
@@ -702,7 +802,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             }
             do {
                 let response = try await controlService.execute(command)
-                let responseWithCursor = RemoteCommandResponse(
+                let responseWithCursor = await RemoteCommandResponse(
                     protocolVersion: response.protocolVersion,
                     commandID: response.commandID,
                     accepted: response.accepted,
@@ -710,7 +810,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                     sessionID: response.sessionID,
                     runState: response.runState,
                     message: response.message,
-                    eventCursor: await replayBuffer.latestCursor(),
+                    eventCursor: replayBuffer.latestCursor(),
                     contextBuilderResult: response.contextBuilderResult
                 )
                 sendJSON(responseWithCursor, status: 200, on: connection)
@@ -741,7 +841,10 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         let contexts = windowStatesManager.allWindows
             .filter { !$0.isClosing }
             .map { (agentMode: $0.agentModeViewModel, workspaceManager: $0.workspaceManager) }
-        return WindowRemoteReadService(contexts: contexts)
+        return WindowRemoteReadService(
+            contexts: contexts,
+            revisionTracker: transcriptRevisionTracker
+        )
     }
 
     private var desktopSummary: RemoteDesktopSummary {
@@ -758,11 +861,12 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         lastSnapshotAt = Date()
         let authorization = authorizationState
         guard let window = windowStatesManager?.allWindows.first else {
-            let snapshot = RemoteSnapshot(
+            let snapshot = await RemoteSnapshot(
                 desktop: desktopSummary,
                 connection: .init(state: .connected, transport: "lan_https"),
                 authorization: authorization,
-                eventCursor: await replayBuffer.latestCursor()
+                eventCursor: replayBuffer.latestCursor(),
+                transcriptRevisionEpoch: transcriptRevisionEpoch
             )
             availabilityController.update(snapshot: snapshot)
             return snapshot
@@ -775,20 +879,24 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             workspaceCatalog: WorkspaceManagerRemoteCatalogService(
                 managers: windows.map(\.workspaceManager)
             ),
-            sessionQuery: AgentModeRemoteSessionQueryService(contexts: contexts),
+            sessionQuery: AgentModeRemoteSessionQueryService(
+                contexts: contexts,
+                revisionTracker: transcriptRevisionTracker
+            ),
             workflowCatalog: DesktopRemoteCatalogService()
         )
         let snapshot = await builder.build(
             desktop: desktopSummary,
             connection: .init(state: .connected, transport: "lan_https", lastConnectedAt: Date()),
             authorization: authorization,
-            eventCursor: await replayBuffer.latestCursor()
+            eventCursor: replayBuffer.latestCursor(),
+            transcriptRevisionEpoch: transcriptRevisionEpoch
         )
         availabilityController.update(snapshot: snapshot)
         return snapshot
     }
 
-    private func sendJSON<T: Encodable>(_ value: T, status: Int, on connection: NWConnection) {
+    private func sendJSON(_ value: some Encodable, status: Int, on connection: NWConnection) {
         guard let data = try? JSONEncoder().encode(value) else {
             sendError(.init(code: "encoding_failed", message: "The response could not be encoded."), status: 500, on: connection)
             return

@@ -220,7 +220,7 @@ final class RemoteTLSIdentityStore {
     }
 }
 
-struct RemoteStoredDeviceCredential: Codable, Equatable, Sendable {
+struct RemoteStoredDeviceCredential: Codable, Equatable {
     let deviceID: String
     let credential: String
     let expiresAt: Date
@@ -242,7 +242,7 @@ enum RemoteCredentialAuthority {
     }
 }
 
-private struct RemoteStoredNotificationRegistration: Codable, Equatable, Sendable {
+private struct RemoteStoredNotificationRegistration: Codable, Equatable {
     let registration: RemoteNotificationRegistration
     let updatedAt: Date
 }
