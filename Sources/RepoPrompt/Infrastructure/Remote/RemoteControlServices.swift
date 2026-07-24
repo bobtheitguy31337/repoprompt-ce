@@ -393,10 +393,17 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
                 } else {
                     revisionTracker?.revision(for: entry.id)
                 }
-                let selectionCapabilities = live.flatMap {
+                let selectionCapabilities: AgentSessionSelectionCapabilities? = if let live {
                     context.agentMode.mcpSessionSelectionCapabilities(
-                        tabID: $0.tabID,
+                        tabID: live.tabID,
                         sessionID: entry.id
+                    )
+                } else {
+                    context.agentMode.mcpPersistedSessionSelectionCapabilities(
+                        agentRaw: entry.agentKindRaw,
+                        modelRaw: entry.agentModelRaw,
+                        reasoningEffortRaw: entry.agentReasoningEffortRaw,
+                        isMutable: Self.isConfigurationMutable(runState: runState)
                     )
                 }
                 let record = RemoteSessionRecord(
@@ -451,6 +458,15 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
         case .completed: .completed
         case .cancelled: .cancelled
         case .failed: .failed
+        }
+    }
+
+    private static func isConfigurationMutable(runState: RemoteRunState) -> Bool {
+        switch runState {
+        case .opening, .working, .waitingForInput:
+            false
+        case .idle, .blocked, .completed, .failed, .cancelled:
+            true
         }
     }
 

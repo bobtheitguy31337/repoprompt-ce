@@ -6246,22 +6246,55 @@ final class AgentModeViewModel: ObservableObject {
         sessionID: UUID
     ) -> AgentSessionSelectionCapabilities? {
         guard let session = sessions[tabID], session.activeAgentSessionID == sessionID else { return nil }
-        guard let discoveryAgent = remoteSelectableDiscoveryAgent(for: session.selectedAgent) else { return nil }
-        let discoveryModel = Self.discoveryModel(matching: session.selectedModelRaw, in: discoveryAgent)
-        let isMutable = !session.runState.isActive && !Self.hasBlockingInteraction(session)
-        let allowedAgents = [session.selectedAgent.rawValue]
+        return remoteSessionSelectionCapabilities(
+            agent: session.selectedAgent,
+            modelRaw: session.selectedModelRaw,
+            reasoningEffortRaw: session.selectedReasoningEffortRaw,
+            isMutable: !session.runState.isActive && !Self.hasBlockingInteraction(session)
+        )
+    }
+
+    func mcpPersistedSessionSelectionCapabilities(
+        agentRaw: String?,
+        modelRaw: String?,
+        reasoningEffortRaw: String?,
+        isMutable: Bool
+    ) -> AgentSessionSelectionCapabilities? {
+        guard let agentRaw,
+              let agent = AgentProviderKind(rawValue: agentRaw),
+              let modelRaw,
+              !modelRaw.isEmpty
+        else {
+            return nil
+        }
+        return remoteSessionSelectionCapabilities(
+            agent: agent,
+            modelRaw: modelRaw,
+            reasoningEffortRaw: reasoningEffortRaw,
+            isMutable: isMutable
+        )
+    }
+
+    private func remoteSessionSelectionCapabilities(
+        agent: AgentProviderKind,
+        modelRaw: String,
+        reasoningEffortRaw: String?,
+        isMutable: Bool
+    ) -> AgentSessionSelectionCapabilities? {
+        guard let discoveryAgent = remoteSelectableDiscoveryAgent(for: agent) else { return nil }
+        let discoveryModel = Self.discoveryModel(matching: modelRaw, in: discoveryAgent)
         let lockedAgentReason = "The agent is locked for this chat. Start a new chat to change agents."
         let selectionReason = isMutable ? nil : "Model and effort controls are locked during an active run."
-        let efforts = session.selectedAgent == .codexExec
+        let efforts = agent == .codexExec
             ? discoveryModel?.supportedReasoningEfforts.map(\.rawValue) ?? []
             : []
 
         return AgentSessionSelectionCapabilities(
-            allowedAgentRawValues: allowedAgents,
+            allowedAgentRawValues: [agent.rawValue],
             allowedModelRawValues: discoveryAgent.models.filter(\.available).map(\.id),
             allowedReasoningEffortRawValues: efforts,
-            resolvedModelRaw: discoveryModel?.id ?? session.selectedModelRaw,
-            resolvedReasoningEffortRaw: session.selectedReasoningEffortRaw,
+            resolvedModelRaw: discoveryModel?.id ?? modelRaw,
+            resolvedReasoningEffortRaw: reasoningEffortRaw,
             isMutable: isMutable,
             agentUnavailableReason: lockedAgentReason,
             selectionUnavailableReason: selectionReason
