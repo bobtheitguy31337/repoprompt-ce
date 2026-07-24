@@ -119,6 +119,7 @@ final class RemoteSnapshotProjectionTests: XCTestCase {
             Set([
                 .startRun,
                 .configureSession,
+                .configureTools,
                 .followUp,
                 .steer,
                 .respond,

@@ -553,6 +553,12 @@ final class StaticRemoteCatalogService: WorkflowCatalogService {
 /// on the Mac.
 @MainActor
 final class DesktopRemoteCatalogService: WorkflowCatalogService {
+    private let agentModes: [AgentModeViewModel]
+
+    init(agentModes: [AgentModeViewModel] = []) {
+        self.agentModes = agentModes
+    }
+
     static func workflowDescriptors(
         workflows: [AgentWorkflowDefinition],
         featuredWorkflowIDs: [String]
@@ -583,63 +589,97 @@ final class DesktopRemoteCatalogService: WorkflowCatalogService {
             featuredWorkflowIDs: store.featuredWorkflowIDs
         )
 
-        let availability = AgentModelCatalog.AvailabilityContext.current
-        let discoveryAgents = AgentModelCatalog.discoveryAgents(availability: availability)
-            .filter(\.available)
-        let agents = discoveryAgents.map { discovery in
-            let supportsRemoteReasoningEffort = discovery.agent == .codexExec
-            let modelDescriptors = discovery.models.map { model in
-                let defaultEffort = supportsRemoteReasoningEffort
-                    ? model.defaultReasoningEffort ?? model.startTargets.first(where: \.isDefault)?.reasoningEffort
-                    : nil
-                return RemoteModelDescriptor(
-                    id: model.id,
-                    displayName: model.name,
-                    isAvailable: model.available,
-                    reasoningEfforts: supportsRemoteReasoningEffort
-                        ? model.supportedReasoningEfforts.map {
+        guard let source = agentModes.first else {
+            return RemoteCatalogRecord(workflows: workflows, agents: [])
+        }
+        let agents = source.availableAgents.compactMap { agent -> RemoteAgentDescriptor? in
+            let options = source.modelOptions(for: agent, includeClaudeEffortVariants: false)
+            let visible = options.filter { !$0.isPlaceholderDefault }
+            let selectable = visible.isEmpty ? options : visible
+            guard !selectable.isEmpty else { return nil }
+            let models: [RemoteModelDescriptor]
+            let defaultModelID: String?
+            if agent == .codexExec {
+                let discovered = source.remoteSelectableDiscoveryAgent(for: agent)?.models ?? []
+                models = discovered.map { model in
+                    let defaultEffort = model.defaultReasoningEffort
+                        ?? model.startTargets.first(where: \.isDefault)?.reasoningEffort
+                    return RemoteModelDescriptor(
+                        id: model.id,
+                        displayName: model.name,
+                        isAvailable: model.available,
+                        reasoningEfforts: model.supportedReasoningEfforts.map {
                             RemoteReasoningEffortDescriptor(id: $0.rawValue, displayName: $0.displayName)
-                        }
-                        : [],
-                    defaultReasoningEffortID: defaultEffort?.rawValue
-                )
-            }
-            let defaultModelID = discovery.models.first(where: {
-                $0.startTargets.contains(where: \.isDefault)
-            })?.id ?? discovery.defaults.modelRaw.flatMap { defaultRaw in
-                discovery.models.first(where: { model in
-                    model.id.caseInsensitiveCompare(defaultRaw) == .orderedSame
+                        },
+                        defaultReasoningEffortID: defaultEffort?.rawValue
+                    )
+                }
+                defaultModelID = discovered.first(where: { model in
+                    model.id.caseInsensitiveCompare(source.selectedModelRaw) == .orderedSame
                         || model.startTargets.contains(where: {
-                            $0.modelRaw.caseInsensitiveCompare(defaultRaw) == .orderedSame
+                            $0.modelRaw.caseInsensitiveCompare(source.selectedModelRaw) == .orderedSame
                         })
                 })?.id
+            } else {
+                models = selectable.map { option in
+                    RemoteModelDescriptor(id: option.rawValue, displayName: option.displayName)
+                }
+                defaultModelID = agent == source.selectedAgent ? source.selectedModelRaw : nil
             }
+            guard !models.isEmpty else { return nil }
             return RemoteAgentDescriptor(
-                id: discovery.agent.rawValue,
-                displayName: discovery.agent.displayName,
-                models: AgentModelCatalog
-                    .options(for: discovery.agent, availability: availability)
-                    .map(\.rawValue),
-                isAvailable: discovery.available,
-                modelDescriptors: modelDescriptors,
-                defaultModelID: defaultModelID
+                id: agent.rawValue,
+                displayName: agent.displayName,
+                models: models.map(\.id),
+                isAvailable: true,
+                modelDescriptors: models,
+                defaultModelID: agent == source.selectedAgent ? defaultModelID : nil
             )
         }
-        let defaultSelection = AgentModeViewModel.remoteDefaultSelection(availability: availability)
-        let defaultAgent = agents.first(where: { $0.id == defaultSelection.agentRaw })
-        let hasDefaultModel = defaultAgent?.modelDescriptors?.contains(where: {
-            $0.isAvailable && $0.id == defaultSelection.modelRaw
-        }) == true
-        let resolvedDefault = hasDefaultModel
-            ? RemoteAgentSelection(
-                agentID: defaultSelection.agentRaw,
-                modelID: defaultSelection.modelRaw,
-                reasoningEffort: defaultSelection.reasoningEffortRaw
+        let selectedAgent = agents.first(where: { $0.id == source.selectedAgent.rawValue })
+        let selectedModel = selectedAgent?.modelDescriptors?.first(where: {
+            $0.id.caseInsensitiveCompare(selectedAgent?.defaultModelID ?? source.selectedModelRaw) == .orderedSame
+        })
+        let resolvedDefault = selectedModel.map {
+            RemoteAgentSelection(
+                agentID: source.selectedAgent.rawValue,
+                modelID: $0.id,
+                reasoningEffort: source.selectedAgent == .codexExec ? source.selectedReasoningEffortRaw : nil
             )
-            : nil
+        }
+        let toolState = source.remoteCodexToolBinding()
+        let toolsAreMutable = agentModes.allSatisfy { $0.remoteCodexToolBinding().isMutable }
+        let toolCatalog = toolState.binding.codexTools.map { tools in
+            var settings = [
+                RemoteToolSettingDescriptor(id: "bash", displayName: "Bash", category: "tools", isEnabled: tools.bashToolEnabled),
+                RemoteToolSettingDescriptor(id: "search", displayName: "Search", category: "tools", isEnabled: tools.searchToolEnabled),
+                RemoteToolSettingDescriptor(id: "goals", displayName: "Goals", category: "tools", isEnabled: tools.goalSupportEnabled),
+                RemoteToolSettingDescriptor(id: "reasoning_summaries", displayName: "Reasoning Summaries", category: "tools", isEnabled: tools.reasoningSummariesEnabled)
+            ]
+            settings += tools.mcpServerEntries.map { entry in
+                let required = entry.normalizedName.caseInsensitiveCompare(MCPIntegrationHelper.repoPromptMCPServerName) == .orderedSame
+                let key = entry.normalizedName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                return RemoteToolSettingDescriptor(
+                    id: "mcp:\(entry.normalizedName)",
+                    displayName: entry.normalizedName,
+                    category: "mcp_servers",
+                    isEnabled: required || (tools.mcpServerStatesByNormalizedName[key] ?? false),
+                    isMutable: toolsAreMutable && !required,
+                    isRequired: required
+                )
+            }
+            return RemoteToolCatalog(
+                providerID: AgentProviderKind.codexExec.rawValue,
+                revision: toolState.binding.revision,
+                settings: settings,
+                isMutable: toolsAreMutable,
+                unavailableReason: toolsAreMutable ? nil : "Tool controls are locked during an active Codex run."
+            )
+        }
         let metadata = RemoteCatalogMetadata(
-            defaultAgentID: resolvedDefault?.agentID ?? agents.first?.id,
+            defaultAgentID: resolvedDefault?.agentID,
             defaultSelection: resolvedDefault,
+            toolCatalog: toolCatalog,
             supportsStartSelection: true,
             supportsSessionConfiguration: true
         )

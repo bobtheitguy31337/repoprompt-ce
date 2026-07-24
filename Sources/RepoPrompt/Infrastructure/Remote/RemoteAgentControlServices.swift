@@ -55,6 +55,7 @@ enum RemoteMutationFailurePolicy {
     static let mutationOperations: [RemoteCommandOperation] = [
         .startRun,
         .configureSession,
+        .configureTools,
         .followUp,
         .steer,
         .respond,
@@ -67,7 +68,7 @@ enum RemoteMutationFailurePolicy {
         switch operation {
         case .startRun:
             .rollbackProvisionalSession
-        case .configureSession, .followUp, .steer, .respond, .cancel, .resume, .contextBuilder:
+        case .configureSession, .configureTools, .followUp, .steer, .respond, .cancel, .resume, .contextBuilder:
             .preserveExistingSession
         case .registerNotifications:
             .preserveExistingSession
@@ -119,6 +120,8 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 return try await start(request)
             case .configureSession:
                 return try await configureSession(request)
+            case .configureTools:
+                return try await configureTools(request)
             case .followUp, .steer, .resume:
                 return try await continueRun(request)
             case .respond:
@@ -238,6 +241,55 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             }
             throw error
         }
+    }
+
+    private func configureTools(_ request: RemoteCommandRequest) async throws -> RemoteCommandResponse {
+        guard let mutation = request.toolMutation else {
+            throw RemoteAgentControlServiceError.commandRejected("A tool setting mutation is required.")
+        }
+
+        let context: WindowContext
+        if let sessionID = request.sessionID {
+            context = try await contextForSession(sessionID, requestedWorkspaceID: request.workspaceID)
+            let target = try await context.agentMode.mcpResolveOrCreateSessionTarget(
+                tabID: nil,
+                sessionID: sessionID,
+                createIfNeeded: true,
+                sessionName: nil
+            )
+            guard let session = context.agentMode.sessions[target.tabID],
+                  session.activeAgentSessionID == sessionID
+            else { throw RemoteAgentControlServiceError.sessionNotFound }
+            guard session.selectedAgent == .codexExec else {
+                throw RemoteAgentControlServiceError.commandRejected(
+                    "Tool controls are only available for Codex chats."
+                )
+            }
+        } else {
+            context = try await activateWorkspace(parseWorkspaceID(request.workspaceID))
+        }
+
+        if let manager = windowStatesManager,
+           manager.allWindows.contains(where: {
+               !$0.isClosing && !$0.agentModeViewModel.remoteCodexToolBinding().isMutable
+           })
+        {
+            throw RemoteAgentControlServiceError.commandRejected(
+                "Tool controls are locked during an active Codex run."
+            )
+        }
+        _ = try context.agentMode.mcpApplyRemoteCodexToolMutation(
+            settingID: mutation.settingID,
+            enabled: mutation.enabled,
+            expectedRevision: mutation.expectedRevision
+        )
+        return try RemoteCommandResponse(
+            commandID: request.commandID,
+            accepted: true,
+            workspaceID: workspaceID(for: context, fallback: request.workspaceID).uuidString,
+            sessionID: request.sessionID,
+            message: "Codex tool settings updated."
+        )
     }
 
     private func configureSession(_ request: RemoteCommandRequest) async throws -> RemoteCommandResponse {

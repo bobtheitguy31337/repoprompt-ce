@@ -831,7 +831,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         switch operation {
         case .respond:
             .respond
-        case .startRun, .configureSession, .followUp, .steer, .cancel, .resume, .contextBuilder:
+        case .startRun, .configureSession, .configureTools, .followUp, .steer, .cancel, .resume, .contextBuilder:
             .control
         case .registerNotifications:
             .observe
@@ -885,7 +885,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 contexts: contexts,
                 revisionTracker: transcriptRevisionTracker
             ),
-            workflowCatalog: DesktopRemoteCatalogService()
+            workflowCatalog: DesktopRemoteCatalogService(agentModes: contexts.map(\.agentMode))
         )
         let snapshot = await builder.build(
             desktop: desktopSummary,

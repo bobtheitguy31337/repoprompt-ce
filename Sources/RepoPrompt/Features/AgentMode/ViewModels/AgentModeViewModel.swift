@@ -6168,13 +6168,85 @@ final class AgentModeViewModel: ObservableObject {
         return createdTab.id
     }
 
+    func remoteCodexToolBinding() -> (binding: AgentProviderControlsBinding, isMutable: Bool) {
+        let binding = providerBindingService.topLevelSettingsControlsBinding(providerID: .codex)
+        let hasActiveCodexRun = sessions.values.contains {
+            $0.selectedAgent == .codexExec && $0.runState.isActive
+        }
+        return (binding, !hasActiveCodexRun)
+    }
+
+    func mcpApplyRemoteCodexToolMutation(
+        settingID: String,
+        enabled: Bool,
+        expectedRevision: Int
+    ) throws -> AgentProviderControlsBinding {
+        let current = remoteCodexToolBinding()
+        guard current.isMutable else {
+            throw MCPError.invalidParams("Tool controls are locked during an active Codex run.")
+        }
+        guard current.binding.revision == expectedRevision else {
+            throw MCPError.invalidParams("Tool settings changed on the Mac. Refresh and try again.")
+        }
+        let mutation: CodexToolSettingMutation
+        switch settingID {
+        case "bash": mutation = .bashTool(enabled: enabled)
+        case "search": mutation = .searchTool(enabled: enabled)
+        case "goals": mutation = .goalSupport(enabled: enabled)
+        case "reasoning_summaries": mutation = .reasoningSummaries(enabled: enabled)
+        default:
+            guard settingID.hasPrefix("mcp:"),
+                  let tools = current.binding.codexTools
+            else { throw MCPError.invalidParams("Unknown Codex tool setting.") }
+            let serverName = String(settingID.dropFirst(4))
+            guard let entry = tools.mcpServerEntries.first(where: {
+                $0.normalizedName.caseInsensitiveCompare(serverName) == .orderedSame
+            }) else { throw MCPError.invalidParams("That MCP server is no longer available.") }
+            guard entry.normalizedName.caseInsensitiveCompare(MCPIntegrationHelper.repoPromptMCPServerName) != .orderedSame else {
+                throw MCPError.invalidParams("RepoPromptCE is required and cannot be disabled.")
+            }
+            mutation = .mcpServer(normalizedName: entry.normalizedName, enabled: enabled)
+        }
+        applyCodexToolSettingMutation(mutation)
+        return providerBindingService.topLevelSettingsControlsBinding(providerID: .codex)
+    }
+
+    func remoteSelectableDiscoveryAgent(
+        for agent: AgentProviderKind
+    ) -> AgentModelCatalog.DiscoveryAgent? {
+        guard availableAgents.contains(agent),
+              let discovery = AgentModelCatalog.discoveryAgents(availability: agentAvailabilityContext)
+              .first(where: { $0.agent == agent })
+        else { return nil }
+
+        let options = modelOptions(for: agent, includeClaudeEffortVariants: false)
+        let visible = options.filter { !$0.isPlaceholderDefault }
+        let selectable = visible.isEmpty ? options : visible
+        let allowedModelRaws = Set(selectable.map { $0.rawValue.lowercased() })
+        let models = discovery.models.filter { model in
+            model.available && (
+                allowedModelRaws.contains(model.id.lowercased())
+                    || model.startTargets.contains { allowedModelRaws.contains($0.modelRaw.lowercased()) }
+            )
+        }
+        guard !models.isEmpty else { return nil }
+        return AgentModelCatalog.DiscoveryAgent(
+            agent: discovery.agent,
+            description: discovery.description,
+            available: discovery.available,
+            runtime: discovery.runtime,
+            capabilities: discovery.capabilities,
+            defaults: discovery.defaults,
+            models: models
+        )
+    }
+
     func mcpSessionSelectionCapabilities(
         tabID: UUID,
         sessionID: UUID
     ) -> AgentSessionSelectionCapabilities? {
         guard let session = sessions[tabID], session.activeAgentSessionID == sessionID else { return nil }
-        let discoveryAgents = AgentModelCatalog.discoveryAgents(availability: agentAvailabilityContext)
-        guard let discoveryAgent = discoveryAgents.first(where: { $0.agent == session.selectedAgent }) else { return nil }
+        guard let discoveryAgent = remoteSelectableDiscoveryAgent(for: session.selectedAgent) else { return nil }
         let discoveryModel = Self.discoveryModel(matching: session.selectedModelRaw, in: discoveryAgent)
         let isMutable = !session.runState.isActive && !Self.hasBlockingInteraction(session)
         let allowedAgents = [session.selectedAgent.rawValue]
@@ -6203,7 +6275,6 @@ final class AgentModeViewModel: ObservableObject {
         reasoningEffortRaw: String?
     ) async throws -> AgentSessionResolvedConfiguration {
         let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
-        let discoveryAgents = AgentModelCatalog.discoveryAgents(availability: agentAvailabilityContext)
         let requestedAgent: AgentProviderKind
         if let agentRaw {
             guard let exactAgent = availableAgents.first(where: {
@@ -6215,7 +6286,7 @@ final class AgentModeViewModel: ObservableObject {
         } else {
             requestedAgent = session.selectedAgent
         }
-        guard let discoveryAgent = discoveryAgents.first(where: { $0.agent == requestedAgent }) else {
+        guard let discoveryAgent = remoteSelectableDiscoveryAgent(for: requestedAgent) else {
             throw MCPError.invalidParams("The requested agent is unavailable on this Mac.")
         }
 
@@ -6224,9 +6295,9 @@ final class AgentModeViewModel: ObservableObject {
             : nil
         let requestedModel: AgentModelCatalog.DiscoveryModel
         if let modelRaw {
-            guard let exactModel = discoveryAgent.models.first(where: {
-                $0.available && $0.id.caseInsensitiveCompare(modelRaw) == .orderedSame
-            }) else {
+            guard let exactModel = Self.discoveryModel(matching: modelRaw, in: discoveryAgent),
+                  exactModel.available
+            else {
                 throw MCPError.invalidParams("The requested model is unavailable for \(requestedAgent.displayName).")
             }
             requestedModel = exactModel
@@ -6264,8 +6335,7 @@ final class AgentModeViewModel: ObservableObject {
             modelRaw: requestedModel.id,
             reasoningEffortRaw: requestedEffort?.rawValue
         )
-        let resolvedAgent = AgentModelCatalog.discoveryAgents(availability: agentAvailabilityContext)
-            .first(where: { $0.agent == session.selectedAgent }) ?? discoveryAgent
+        let resolvedAgent = remoteSelectableDiscoveryAgent(for: session.selectedAgent) ?? discoveryAgent
         let resolvedModel = Self.discoveryModel(matching: session.selectedModelRaw, in: resolvedAgent)
         return AgentSessionResolvedConfiguration(
             agentRaw: session.selectedAgent.rawValue,
@@ -6295,7 +6365,6 @@ final class AgentModeViewModel: ObservableObject {
             throw MCPError.invalidParams("Model and effort controls are locked during an active run.")
         }
 
-        let discoveryAgents = AgentModelCatalog.discoveryAgents(availability: agentAvailabilityContext)
         let requestedAgent: AgentProviderKind
         if let agentRaw {
             guard let exactAgent = availableAgents.first(where: {
@@ -6307,7 +6376,7 @@ final class AgentModeViewModel: ObservableObject {
         } else {
             requestedAgent = session.selectedAgent
         }
-        guard let discoveryAgent = discoveryAgents.first(where: { $0.agent == requestedAgent }) else {
+        guard let discoveryAgent = remoteSelectableDiscoveryAgent(for: requestedAgent) else {
             throw MCPError.invalidParams("The requested agent is unavailable on this Mac.")
         }
 
@@ -6316,9 +6385,9 @@ final class AgentModeViewModel: ObservableObject {
             : nil
         let requestedModel: AgentModelCatalog.DiscoveryModel
         if let modelRaw {
-            guard let exactModel = discoveryAgent.models.first(where: {
-                $0.available && $0.id.caseInsensitiveCompare(modelRaw) == .orderedSame
-            }) else {
+            guard let exactModel = Self.discoveryModel(matching: modelRaw, in: discoveryAgent),
+                  exactModel.available
+            else {
                 throw MCPError.invalidParams("The requested model is unavailable for \(requestedAgent.displayName).")
             }
             requestedModel = exactModel
