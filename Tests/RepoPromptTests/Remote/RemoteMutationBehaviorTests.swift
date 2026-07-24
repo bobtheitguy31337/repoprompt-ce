@@ -75,6 +75,38 @@ final class RemoteMutationBehaviorTests: XCTestCase {
         XCTAssertEqual(session.runState, .completed)
     }
 
+    func testConfigureSessionRejectsActiveRunWithoutChangingSelection() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let agentMode = window.agentModeViewModel
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.composeTabs.first?.id)
+        let session = await agentMode.ensureSessionReady(tabID: tabID)
+        let sessionID = UUID()
+        _ = agentMode.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        session.runState = .running
+        let originalAgent = session.selectedAgent
+        let originalModel = session.selectedModelRaw
+
+        do {
+            _ = try await agentMode.mcpConfigureRemoteSession(
+                tabID: tabID,
+                sessionID: sessionID,
+                agentRaw: nil,
+                modelRaw: "unavailable-model",
+                reasoningEffortRaw: nil
+            )
+            XCTFail("An active run must reject selection changes.")
+        } catch let error as MCPError {
+            XCTAssertEqual(
+                WindowRemoteAgentControlService.remoteRejectionMessage(for: error),
+                "Model and effort controls are locked during an active run."
+            )
+        }
+        XCTAssertEqual(session.selectedAgent, originalAgent)
+        XCTAssertEqual(session.selectedModelRaw, originalModel)
+    }
+
     func testProvisionalSessionRollbackReportsCompleteCleanup() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }

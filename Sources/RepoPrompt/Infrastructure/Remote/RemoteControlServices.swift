@@ -28,6 +28,7 @@ struct RemoteSessionRecord: Equatable {
     let agent: String?
     let model: String?
     let reasoningEffort: String?
+    let configurationControls: RemoteSessionConfigurationControls?
     let runState: RemoteRunState
     let lifecycleStage: String?
     let latestMeaningfulActivity: String?
@@ -59,7 +60,8 @@ struct RemoteSessionRecord: Equatable {
         isLive: Bool,
         workflowID: String? = nil,
         runStartedAt: Date? = nil,
-        transcriptRevision: UInt64? = nil
+        transcriptRevision: UInt64? = nil,
+        configurationControls: RemoteSessionConfigurationControls? = nil
     ) {
         self.sessionID = sessionID
         self.workspaceID = workspaceID
@@ -73,6 +75,7 @@ struct RemoteSessionRecord: Equatable {
         self.agent = agent
         self.model = model
         self.reasoningEffort = reasoningEffort
+        self.configurationControls = configurationControls
         self.runState = runState
         self.lifecycleStage = lifecycleStage
         self.latestMeaningfulActivity = latestMeaningfulActivity
@@ -88,6 +91,17 @@ struct RemoteSessionRecord: Equatable {
 struct RemoteCatalogRecord: Equatable {
     let workflows: [RemoteWorkflowDescriptor]
     let agents: [RemoteAgentDescriptor]
+    let metadata: RemoteCatalogMetadata?
+
+    init(
+        workflows: [RemoteWorkflowDescriptor],
+        agents: [RemoteAgentDescriptor],
+        metadata: RemoteCatalogMetadata? = nil
+    ) {
+        self.workflows = workflows
+        self.agents = agents
+        self.metadata = metadata
+    }
 
     static let empty = Self(workflows: [], agents: [])
 }
@@ -188,6 +202,7 @@ final class RemoteSnapshotBuilder {
                 agent: $0.agent,
                 model: $0.model,
                 reasoningEffort: $0.reasoningEffort,
+                configurationControls: $0.configurationControls,
                 runState: $0.runState,
                 lifecycleStage: $0.lifecycleStage,
                 latestMeaningfulActivity: $0.latestMeaningfulActivity,
@@ -233,6 +248,7 @@ final class RemoteSnapshotBuilder {
             attentionItems: attentionItems,
             workflowCatalog: catalog.workflows,
             agentCatalog: catalog.agents,
+            agentCatalogMetadata: catalog.metadata,
             eventCursor: eventCursor,
             transcriptRevisionEpoch: transcriptRevisionEpoch
         )
@@ -377,6 +393,12 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
                 } else {
                     revisionTracker?.revision(for: entry.id)
                 }
+                let selectionCapabilities = live.flatMap {
+                    context.agentMode.mcpSessionSelectionCapabilities(
+                        tabID: $0.tabID,
+                        sessionID: entry.id
+                    )
+                }
                 let record = RemoteSessionRecord(
                     sessionID: entry.id,
                     workspaceID: workspaceID,
@@ -384,9 +406,9 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
                     parentSessionID: entry.parentSessionID,
                     sessionName: entry.name,
                     workflow: live?.originWorkflowDisplayName ?? entry.originWorkflowDisplayName,
-                    agent: entry.agentKindRaw,
-                    model: entry.agentModelRaw,
-                    reasoningEffort: entry.agentReasoningEffortRaw,
+                    agent: live?.selectedAgent.rawValue ?? entry.agentKindRaw,
+                    model: selectionCapabilities?.resolvedModelRaw ?? entry.agentModelRaw,
+                    reasoningEffort: selectionCapabilities?.resolvedReasoningEffortRaw ?? entry.agentReasoningEffortRaw,
                     runState: runState,
                     lifecycleStage: live?.runState.rawValue,
                     latestMeaningfulActivity: live?.runningStatusText ?? live?.waitingPrompt,
@@ -398,7 +420,8 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
                     isLive: live != nil,
                     workflowID: live?.originWorkflowID ?? entry.originWorkflowID,
                     runStartedAt: live?.lastRunStartedAt ?? entry.lastRunStartedAt,
-                    transcriptRevision: transcriptRevision
+                    transcriptRevision: transcriptRevision,
+                    configurationControls: selectionCapabilities.map(Self.remoteConfigurationControls)
                 )
                 if let existing = records[record.sessionID], existing.lastUpdatedAt >= record.lastUpdatedAt {
                     continue
@@ -442,6 +465,28 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
         case AgentSessionRunState.failed.rawValue: .failed
         default: .idle
         }
+    }
+
+    private static func remoteConfigurationControls(
+        _ capabilities: AgentSessionSelectionCapabilities
+    ) -> RemoteSessionConfigurationControls {
+        RemoteSessionConfigurationControls(
+            agent: RemoteSelectionControl(
+                isMutable: capabilities.isMutable && capabilities.allowedAgentRawValues.count > 1,
+                allowedValueIDs: capabilities.allowedAgentRawValues,
+                unavailableReason: capabilities.agentUnavailableReason
+            ),
+            model: RemoteSelectionControl(
+                isMutable: capabilities.isMutable && !capabilities.allowedModelRawValues.isEmpty,
+                allowedValueIDs: capabilities.allowedModelRawValues,
+                unavailableReason: capabilities.selectionUnavailableReason
+            ),
+            reasoningEffort: RemoteSelectionControl(
+                isMutable: capabilities.isMutable && !capabilities.allowedReasoningEffortRawValues.isEmpty,
+                allowedValueIDs: capabilities.allowedReasoningEffortRawValues,
+                unavailableReason: capabilities.selectionUnavailableReason
+            )
+        )
     }
 
     private static func pendingInteraction(for session: AgentModeViewModel.TabSession?) -> RemoteInteractionSummary? {
@@ -539,20 +584,67 @@ final class DesktopRemoteCatalogService: WorkflowCatalogService {
         )
 
         let availability = AgentModelCatalog.AvailabilityContext.current
-        let agents = AgentModelCatalog
-            .selectableAgents(availability: availability)
-            .map { agent in
-                RemoteAgentDescriptor(
-                    id: agent.rawValue,
-                    displayName: agent.displayName,
-                    models: AgentModelCatalog
-                        .options(for: agent, availability: availability)
-                        .map(\.rawValue),
-                    isAvailable: true
+        let discoveryAgents = AgentModelCatalog.discoveryAgents(availability: availability)
+            .filter(\.available)
+        let agents = discoveryAgents.map { discovery in
+            let supportsRemoteReasoningEffort = discovery.agent == .codexExec
+            let modelDescriptors = discovery.models.map { model in
+                let defaultEffort = supportsRemoteReasoningEffort
+                    ? model.defaultReasoningEffort ?? model.startTargets.first(where: \.isDefault)?.reasoningEffort
+                    : nil
+                return RemoteModelDescriptor(
+                    id: model.id,
+                    displayName: model.name,
+                    isAvailable: model.available,
+                    reasoningEfforts: supportsRemoteReasoningEffort
+                        ? model.supportedReasoningEfforts.map {
+                            RemoteReasoningEffortDescriptor(id: $0.rawValue, displayName: $0.displayName)
+                        }
+                        : [],
+                    defaultReasoningEffortID: defaultEffort?.rawValue
                 )
             }
+            let defaultModelID = discovery.models.first(where: {
+                $0.startTargets.contains(where: \.isDefault)
+            })?.id ?? discovery.defaults.modelRaw.flatMap { defaultRaw in
+                discovery.models.first(where: { model in
+                    model.id.caseInsensitiveCompare(defaultRaw) == .orderedSame
+                        || model.startTargets.contains(where: {
+                            $0.modelRaw.caseInsensitiveCompare(defaultRaw) == .orderedSame
+                        })
+                })?.id
+            }
+            return RemoteAgentDescriptor(
+                id: discovery.agent.rawValue,
+                displayName: discovery.agent.displayName,
+                models: AgentModelCatalog
+                    .options(for: discovery.agent, availability: availability)
+                    .map(\.rawValue),
+                isAvailable: discovery.available,
+                modelDescriptors: modelDescriptors,
+                defaultModelID: defaultModelID
+            )
+        }
+        let defaultSelection = AgentModeViewModel.remoteDefaultSelection(availability: availability)
+        let defaultAgent = agents.first(where: { $0.id == defaultSelection.agentRaw })
+        let hasDefaultModel = defaultAgent?.modelDescriptors?.contains(where: {
+            $0.isAvailable && $0.id == defaultSelection.modelRaw
+        }) == true
+        let resolvedDefault = hasDefaultModel
+            ? RemoteAgentSelection(
+                agentID: defaultSelection.agentRaw,
+                modelID: defaultSelection.modelRaw,
+                reasoningEffort: defaultSelection.reasoningEffortRaw
+            )
+            : nil
+        let metadata = RemoteCatalogMetadata(
+            defaultAgentID: resolvedDefault?.agentID ?? agents.first?.id,
+            defaultSelection: resolvedDefault,
+            supportsStartSelection: true,
+            supportsSessionConfiguration: true
+        )
 
-        return RemoteCatalogRecord(workflows: workflows, agents: agents)
+        return RemoteCatalogRecord(workflows: workflows, agents: agents, metadata: metadata)
     }
 }
 

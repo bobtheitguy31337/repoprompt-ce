@@ -54,6 +54,7 @@ enum RemoteMutationFailureDisposition: Equatable {
 enum RemoteMutationFailurePolicy {
     static let mutationOperations: [RemoteCommandOperation] = [
         .startRun,
+        .configureSession,
         .followUp,
         .steer,
         .respond,
@@ -66,7 +67,7 @@ enum RemoteMutationFailurePolicy {
         switch operation {
         case .startRun:
             .rollbackProvisionalSession
-        case .followUp, .steer, .respond, .cancel, .resume, .contextBuilder:
+        case .configureSession, .followUp, .steer, .respond, .cancel, .resume, .contextBuilder:
             .preserveExistingSession
         case .registerNotifications:
             .preserveExistingSession
@@ -116,6 +117,8 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             switch request.operation {
             case .startRun:
                 return try await start(request)
+            case .configureSession:
+                return try await configureSession(request)
             case .followUp, .steer, .resume:
                 return try await continueRun(request)
             case .respond:
@@ -145,13 +148,13 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
              let .internalError(detail),
              let .parseError(detail),
              let .methodNotFound(detail):
-            return detail ?? "The Mac could not deliver this command to the agent session."
+            detail ?? "The Mac could not deliver this command to the agent session."
         case let .serverError(_, message):
-            return message
+            message
         case let .urlElicitationRequired(message, _):
-            return message
+            message
         case .connectionClosed, .transportError:
-            return "The Mac lost its connection to the agent while delivering this command. Try again."
+            "The Mac lost its connection to the agent while delivering this command. Try again."
         }
     }
 
@@ -178,7 +181,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         )
 
         do {
-            try await context.agentMode.mcpConfigureSession(
+            let resolved = try await context.agentMode.mcpConfigureRemoteLaunch(
                 tabID: target.tabID,
                 agentRaw: request.agentID,
                 modelRaw: request.modelID,
@@ -201,11 +204,25 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 allowStartingRun: true,
                 workflow: workflow
             )
-            return await response(
+            let response = await response(
                 request: request,
                 workspaceID: workspaceID,
                 sessionID: sessionID,
                 context: context
+            )
+            return RemoteCommandResponse(
+                commandID: response.commandID,
+                accepted: response.accepted,
+                workspaceID: response.workspaceID,
+                sessionID: response.sessionID,
+                runState: response.runState,
+                message: response.message,
+                eventCursor: response.eventCursor,
+                resolvedSelection: RemoteAgentSelection(
+                    agentID: resolved.agentRaw,
+                    modelID: resolved.modelRaw,
+                    reasoningEffort: resolved.reasoningEffortRaw
+                )
             )
         } catch {
             switch RemoteMutationFailurePolicy.disposition(for: request.operation) {
@@ -221,6 +238,50 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             }
             throw error
         }
+    }
+
+    private func configureSession(_ request: RemoteCommandRequest) async throws -> RemoteCommandResponse {
+        let sessionID = try requiredSessionID(request.sessionID)
+        guard request.agentID != nil || request.modelID != nil || request.reasoningEffort != nil else {
+            throw RemoteAgentControlServiceError.commandRejected(
+                "Choose an agent, model, or reasoning effort to configure."
+            )
+        }
+        let context = try await contextForSession(sessionID, requestedWorkspaceID: request.workspaceID)
+        let target = try await context.agentMode.mcpResolveOrCreateSessionTarget(
+            tabID: nil,
+            sessionID: sessionID,
+            createIfNeeded: true,
+            sessionName: nil
+        )
+        let resolved = try await context.agentMode.mcpConfigureRemoteSession(
+            tabID: target.tabID,
+            sessionID: sessionID,
+            agentRaw: request.agentID,
+            modelRaw: request.modelID,
+            reasoningEffortRaw: request.reasoningEffort
+        )
+        let workspaceID = try workspaceID(for: context, fallback: request.workspaceID)
+        let response = await response(
+            request: request,
+            workspaceID: workspaceID,
+            sessionID: sessionID,
+            context: context
+        )
+        return RemoteCommandResponse(
+            commandID: response.commandID,
+            accepted: response.accepted,
+            workspaceID: response.workspaceID,
+            sessionID: response.sessionID,
+            runState: response.runState,
+            message: response.message,
+            eventCursor: response.eventCursor,
+            resolvedSelection: RemoteAgentSelection(
+                agentID: resolved.agentRaw,
+                modelID: resolved.modelRaw,
+                reasoningEffort: resolved.reasoningEffortRaw
+            )
+        )
     }
 
     private func continueRun(_ request: RemoteCommandRequest) async throws -> RemoteCommandResponse {

@@ -118,6 +118,7 @@ final class RemoteSnapshotProjectionTests: XCTestCase {
             Set(RemoteMutationFailurePolicy.mutationOperations),
             Set([
                 .startRun,
+                .configureSession,
                 .followUp,
                 .steer,
                 .respond,

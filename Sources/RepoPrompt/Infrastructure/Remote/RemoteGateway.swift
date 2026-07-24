@@ -289,6 +289,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
         if previous.workflowCatalog != current.workflowCatalog
             || previous.agentCatalog != current.agentCatalog
+            || previous.agentCatalogMetadata != current.agentCatalogMetadata
         {
             pendingEvents.append(RemoteEvent(
                 desktopInstanceID: pairingManager.desktopInstanceID,
@@ -296,7 +297,8 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 payload: .catalog(
                     RemoteCatalogPayload(
                         workflows: current.workflowCatalog,
-                        agents: current.agentCatalog
+                        agents: current.agentCatalog,
+                        metadata: current.agentCatalogMetadata
                     )
                 )
             ))
@@ -829,7 +831,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         switch operation {
         case .respond:
             .respond
-        case .startRun, .followUp, .steer, .cancel, .resume, .contextBuilder:
+        case .startRun, .configureSession, .followUp, .steer, .cancel, .resume, .contextBuilder:
             .control
         case .registerNotifications:
             .observe
