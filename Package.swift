@@ -46,7 +46,9 @@ var packageDependencies: [Package.Dependency] = [
     // Local during the two-repository extraction. The package will be tagged
     // in https://github.com/bobtheitguy31337/repoprompt-remote before CI uses
     // a versioned repository dependency.
-    .package(path: "../repoprompt-remote/Packages/RepoPromptRemoteProtocol")
+    .package(path: "../repoprompt-remote/Packages/RepoPromptRemoteProtocol"),
+    // Isolated Work item 1 spike only; production RepoPromptApp does not depend on it.
+    .package(path: "../repoprompt-remote/Packages/RepoPromptIrohTransport")
 ]
 
 var repoPromptAppDependencies: [Target.Dependency] = [
@@ -113,7 +115,8 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "RepoPrompt", targets: ["RepoPrompt"]),
-        .executable(name: "repoprompt-mcp", targets: ["RepoPromptMCP"])
+        .executable(name: "repoprompt-mcp", targets: ["RepoPromptMCP"]),
+        .executable(name: "repoprompt-iroh-spike", targets: ["RepoPromptIrohSpikeMac"])
     ],
     dependencies: packageDependencies,
     targets: [
@@ -167,6 +170,13 @@ let package = Package(
             dependencies: ["RepoPromptShared", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
             path: "Sources/RepoPromptMCP",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .executableTarget(
+            name: "RepoPromptIrohSpikeMac",
+            dependencies: [
+                .product(name: "RepoPromptIrohTransport", package: "RepoPromptIrohTransport")
+            ],
+            path: "Spikes/IrohTransportSpikeMac"
         ),
         .target(
             name: "RepoPromptShared",
