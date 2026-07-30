@@ -1289,6 +1289,42 @@ class GlobalSettingsStore: ObservableObject {
         CodexReasoningSummaries.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexReasoningSummariesEnabled())
     }
 
+    func providerConversationCleanupAction() -> ProviderConversationCleanupAction {
+        guard let raw = scalarPreferences.agentMode?.providerConversationCleanupAction,
+              let action = ProviderConversationCleanupAction(rawValue: raw)
+        else {
+            return .archive
+        }
+        return action
+    }
+
+    func setProviderConversationCleanupAction(_ action: ProviderConversationCleanupAction, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.providerConversationCleanupAction = action.rawValue
+        }
+    }
+
+    func agentSessionHandoffInstructions() -> String {
+        scalarPreferences.agentMode?.agentSessionHandoffInstructions ?? ""
+    }
+
+    @discardableResult
+    func setAgentSessionHandoffInstructions(_ instructions: String, commit: Bool = true) -> Bool {
+        guard case .valid = AgentSessionHandoffInstructionsPolicy.validation(of: instructions) else {
+            return false
+        }
+
+        let proposedValue = instructions.isEmpty ? nil : instructions
+        guard scalarPreferences.agentMode?.agentSessionHandoffInstructions != proposedValue else {
+            return true
+        }
+
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.agentSessionHandoffInstructions = proposedValue
+        }
+        return true
+    }
+
     #if DEBUG
         func claudeRawEventLoggingEnabled() -> Bool {
             defaults.bool(forKey: "claudeRawEventLoggingEnabled")

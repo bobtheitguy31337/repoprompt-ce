@@ -389,8 +389,11 @@ final class CodexCLIProvider: AIProvider {
 
         do {
             try await withTaskCancellationHandler(operation: {
-                try await ensureAppServerReady(appServerClient: appServerClient)
-                _ = try await controller.startOrResume(
+                try await ensureAppServerReady(
+                    appServerClient: appServerClient,
+                    requestTimeout: requestTimeout
+                )
+                let sessionRef = try await controller.startOrResume(
                     existing: nil,
                     baseInstructions: baseInstructions,
                     model: selection.model,
@@ -452,7 +455,7 @@ final class CodexCLIProvider: AIProvider {
                         switch status {
                         case .completed:
                             sawCompletion = true
-                            continuation.yield(Self.messageStopEvent())
+                            continuation.yield(Self.messageStopEvent(sessionRef: sessionRef))
                             break eventLoop
                         case .interrupted:
                             throw CancellationError()
@@ -561,7 +564,10 @@ final class CodexCLIProvider: AIProvider {
 
         do {
             let text = try await withTaskCancellationHandler(operation: {
-                try await ensureAppServerReady(appServerClient: appServerClient)
+                try await ensureAppServerReady(
+                    appServerClient: appServerClient,
+                    requestTimeout: requestTimeout
+                )
                 _ = try await controller.startOrResume(
                     existing: nil,
                     baseInstructions: baseInstructions,
@@ -692,7 +698,10 @@ final class CodexCLIProvider: AIProvider {
         }
     }
 
-    private func ensureAppServerReady(appServerClient: CodexAppServerClient?) async throws {
+    private func ensureAppServerReady(
+        appServerClient: CodexAppServerClient?,
+        requestTimeout: TimeInterval
+    ) async throws {
         if let appServerReadyHook {
             try await appServerReadyHook()
             return
@@ -708,6 +717,7 @@ final class CodexCLIProvider: AIProvider {
                 )
             )
         }
+        await appServerClient.updateDefaultRequestTimeout(requestTimeout)
         try await appServerClient.startIfNeeded()
     }
 
@@ -753,12 +763,10 @@ final class CodexCLIProvider: AIProvider {
             preconditionFailure("CodexCLIProvider requires an app-server client when no custom session controller factory is provided.")
         }
 
+        let interactiveConfigOverrides = interactiveConfigOverrides(excludeServers: excludeServers)
         let options = CodexNativeSessionController.Options(
             requestTimeout: requestTimeout,
-            configOverridesProvider: { [weak self] in
-                guard let self else { return [:] }
-                return interactiveConfigOverrides(excludeServers: excludeServers)
-            },
+            configOverridesProvider: { interactiveConfigOverrides },
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
             approvalReviewerProvider: { .user },
@@ -773,7 +781,7 @@ final class CodexCLIProvider: AIProvider {
             runID: UUID(),
             tabID: UUID(),
             windowID: 0,
-            workspacePath: workingDirectory,
+            workspacePaths: .uniform(workingDirectory),
             options: options,
             // The transport is owned by the outer request lifecycle, not by the
             // single-turn controller.
@@ -939,18 +947,8 @@ final class CodexCLIProvider: AIProvider {
         if isTimeoutDetail(detail) {
             return timeoutError(for: timeoutValue)
         }
-        if lower.contains("command not found")
-            || lower.contains("no such file")
-            || lower.contains("spawnfailed(errno: 2)")
-            || lower.contains("errno: 2")
-        {
-            return AIProviderError.invalidConfiguration(detail: "Codex CLI is not installed or not in PATH. Install it and run `codex login`.")
-        }
-        if lower.contains("permission denied") || lower.contains("spawnfailed(errno: 13)") || lower.contains("errno: 13") {
-            return AIProviderError.invalidConfiguration(detail: "Permission denied. Ensure the 'codex' executable is accessible.")
-        }
         if lower.contains("unauthorized") || lower.contains("not authenticated") {
-            return AIProviderError.invalidConfiguration(detail: "Codex CLI is not authenticated. Run `codex login` in your terminal.")
+            return AIProviderError.invalidConfiguration(detail: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
         }
         if lower.contains("rate limit") || lower.contains("too many requests") || lower.contains("429") {
             return AIProviderError.invalidConfiguration(detail: "Codex CLI rate limited. Please wait a moment and try again.")
@@ -995,6 +993,8 @@ final class CodexCLIProvider: AIProvider {
                 return message
             case .processNotRunning:
                 return "Codex app-server process is not running."
+            case .processExited:
+                return clientError.localizedDescription
             case .invalidResponse:
                 return "Codex app-server returned an invalid response."
             case .jsonDecodeFailed:
@@ -1008,14 +1008,24 @@ final class CodexCLIProvider: AIProvider {
         return String(describing: error)
     }
 
-    private static func messageStopEvent() -> AIStreamResult {
-        AIStreamResult(
+    private static func messageStopEvent(
+        sessionRef: CodexNativeSessionController.SessionRef? = nil
+    ) -> AIStreamResult {
+        let cleanupHandle = sessionRef.map {
+            ProviderConversationCleanupHandle(
+                provider: String(describing: AIProviderType.codex),
+                conversationID: $0.conversationID,
+                rolloutPath: $0.rolloutPath
+            )
+        }
+        return AIStreamResult(
             type: "message_stop",
             text: nil,
             reasoning: nil,
             promptTokens: nil,
             completionTokens: nil,
-            cost: nil
+            cost: nil,
+            cleanupHandle: cleanupHandle
         )
     }
 

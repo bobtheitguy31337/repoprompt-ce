@@ -37,8 +37,7 @@ struct SettingsView: View {
 
     /// Canonical sidebar order. Agent-mode first, then General (app-wide
     /// preferences), MCP, models/providers, workspaces, and the copy-&-chat
-    /// workflow. Benchmark is intentionally grouped under Models & Providers
-    /// rather than being its own top-level section.
+    /// workflow.
     private static let sidebarSectionOrder: [TabSection] = [
         .agentMode, .general, .mcp, .api, .workspaces, .copyChat
     ]
@@ -250,7 +249,7 @@ struct SettingsView: View {
         case .mcp:
             [.mcp, .mcpTools, .permissions, .modelPresets]
         case .api:
-            [.apiGeneral, .openRouter, .customProvider, .modelOverrides, .benchmark]
+            [.apiGeneral, .openRouter, .customProvider, .modelOverrides]
         case .workspaces:
             [.manageWorkspaces, .managePresets]
         case .general:
@@ -310,12 +309,6 @@ struct SettingsView: View {
         case .chatSettings:
             ChatSettingsView(promptViewModel: promptViewModel, windowID: windowState.windowID, closeAction: closeAction)
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
-        case .benchmark:
-            BenchmarkSettingsView(
-                promptViewModel: promptViewModel,
-                apiSettingsViewModel: apiSettingsViewModel
-            )
-            .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .apiGeneral:
             APISettingsView(
                 viewModel: apiSettingsViewModel,
@@ -526,7 +519,6 @@ enum SettingsTab: String, CaseIterable {
     case telemetry
     case remote
     case chatSettings
-    case benchmark
     case apiGeneral
     case openRouter
     case customProvider
@@ -557,7 +549,6 @@ enum SettingsTab: String, CaseIterable {
         case .telemetry: "Telemetry"
         case .remote: "Remote"
         case .chatSettings: "Chat Settings"
-        case .benchmark: "Benchmark"
         case .apiGeneral: "API Providers"
         case .openRouter: "OpenRouter"
         case .customProvider: "Custom API"
@@ -590,7 +581,6 @@ enum SettingsTab: String, CaseIterable {
         case .telemetry: "lock.shield"
         case .remote: "antenna.radiowaves.left.and.right"
         case .chatSettings: "message"
-        case .benchmark: "gauge"
         case .apiGeneral: "key"
         case .openRouter: "network"
         case .customProvider: "server.rack"
@@ -626,9 +616,8 @@ enum SettingsTab: String, CaseIterable {
         case .mcp, .mcpTools, .permissions, .modelPresets:
             .mcp
 
-        // Models & Providers (Oracle + API key providers). Benchmark lives here
-        // rather than being its own top-level section.
-        case .apiGeneral, .openRouter, .customProvider, .modelOverrides, .benchmark:
+        // Models & Providers (Oracle + API key providers)
+        case .apiGeneral, .openRouter, .customProvider, .modelOverrides:
             .api
 
         // Workspaces
@@ -772,20 +761,6 @@ enum SettingsTab: String, CaseIterable {
                 "clear chat",
                 "chat history",
                 "built-in chat"
-            ]
-        case .benchmark:
-            [
-                "benchmark",
-                "bench",
-                "score",
-                "ranking",
-                "model benchmark",
-                "run benchmark",
-                "benchmark history",
-                "benchmark leaderboard",
-                "seed",
-                "performance test",
-                "model evaluation"
             ]
         case .apiGeneral:
             [

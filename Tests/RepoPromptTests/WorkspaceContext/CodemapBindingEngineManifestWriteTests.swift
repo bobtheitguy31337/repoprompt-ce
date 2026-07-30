@@ -89,19 +89,19 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         }
     }
 
-    func testProjectionMutationKeepsAdmissionOrderAheadOfLaterSessionMutation() {
+    func testGraphIndexMutationKeepsAdmissionOrderAheadOfLaterSessionMutation() {
         var queue = WorkspaceCodemapManifestFIFO<ManifestQueueTestItem>()
-        queue.append(ManifestQueueTestItem(revision: 2, proof: .projection, byteCount: 1))
+        queue.append(ManifestQueueTestItem(revision: 2, proof: .graphIndex, byteCount: 1))
         queue.append(ManifestQueueTestItem(revision: 3, proof: .session, byteCount: 1))
         queue.append(ManifestQueueTestItem(revision: 4, proof: .session, byteCount: 1))
 
-        let projection = queue.popBatch(
+        let graphIndex = queue.popBatch(
             maximumItemCount: 64,
             maximumByteCount: 64,
             byteCount: { $0.byteCount },
             canAppend: ManifestQueueTestItem.compatible
         )
-        XCTAssertEqual(projection.map(\.revision), [2])
+        XCTAssertEqual(graphIndex.map(\.revision), [2])
 
         let sessions = queue.popBatch(
             maximumItemCount: 64,
@@ -113,15 +113,15 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
 
         queue.append(ManifestQueueTestItem(revision: 6, proof: .session, byteCount: 1))
         queue.prepend(contentsOf: [
-            ManifestQueueTestItem(revision: 5, proof: .projection, byteCount: 1)
+            ManifestQueueTestItem(revision: 5, proof: .graphIndex, byteCount: 1)
         ])
-        let retainedProjection = queue.popBatch(
+        let retainedGraphIndex = queue.popBatch(
             maximumItemCount: 64,
             maximumByteCount: 64,
             byteCount: { $0.byteCount },
             canAppend: ManifestQueueTestItem.compatible
         )
-        XCTAssertEqual(retainedProjection.map(\.revision), [5])
+        XCTAssertEqual(retainedGraphIndex.map(\.revision), [5])
         XCTAssertEqual(queue.first?.revision, 6)
     }
 
@@ -146,8 +146,8 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
                 )
             ),
             policy: WorkspaceCodemapBindingEnginePolicy(
-                maximumQueuedProjectionManifestMutationByteCountPerRoot: 1,
-                maximumQueuedProjectionManifestMutationByteCount: 1
+                maximumQueuedGraphIndexManifestMutationByteCountPerRoot: 1,
+                maximumQueuedGraphIndexManifestMutationByteCount: 1
             ),
             hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
         )
@@ -377,9 +377,10 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         XCTAssertEqual(fault.triggeredCount, 1)
         XCTAssertEqual(accounting.counters.manifestWrites, 2)
         XCTAssertEqual(accounting.counters.manifestFailures, 1)
-        XCTAssertEqual(accounting.counters.manifestWriteBatches, 3)
-        XCTAssertEqual(accounting.counters.manifestWriteItems, 5)
-        XCTAssertEqual(accounting.counters.manifestWriteCoalescedItems, 2)
+        XCTAssertEqual(accounting.counters.manifestWriteBatches, 2)
+        XCTAssertEqual(accounting.counters.manifestWriteRetries, 1)
+        XCTAssertEqual(accounting.counters.manifestWriteItems, 3)
+        XCTAssertEqual(accounting.counters.manifestWriteCoalescedItems, 1)
         XCTAssertEqual(accounting.dirtyManifestCount, 0)
         XCTAssertEqual(hookEvents.values(kind: .manifestFailure).count, 1)
     }
@@ -437,8 +438,9 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let accounting = await fixture.engine.accounting()
         XCTAssertEqual(accounting.counters.manifestFailures, 1)
         XCTAssertEqual(accounting.counters.manifestWrites, 2)
-        XCTAssertEqual(accounting.counters.manifestWriteBatches, 3)
-        XCTAssertEqual(accounting.counters.manifestWriteItems, 3)
+        XCTAssertEqual(accounting.counters.manifestWriteBatches, 2)
+        XCTAssertEqual(accounting.counters.manifestWriteRetries, 1)
+        XCTAssertEqual(accounting.counters.manifestWriteItems, 2)
         XCTAssertEqual(accounting.dirtyManifestCount, 0)
 
         await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
@@ -506,8 +508,9 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let accounting = await fixture.engine.accounting()
         XCTAssertEqual(accounting.counters.manifestFailures, 1)
         XCTAssertEqual(accounting.counters.manifestWrites, 2)
-        XCTAssertEqual(accounting.counters.manifestWriteBatches, 3)
-        XCTAssertEqual(accounting.counters.manifestWriteItems, 4)
+        XCTAssertEqual(accounting.counters.manifestWriteBatches, 2)
+        XCTAssertEqual(accounting.counters.manifestWriteRetries, 1)
+        XCTAssertEqual(accounting.counters.manifestWriteItems, 3)
         XCTAssertEqual(accounting.counters.manifestWriteCoalescedItems, 1)
         XCTAssertEqual(accounting.dirtyManifestCount, 1)
 
@@ -684,8 +687,9 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let accounting = await fixture.engine.accounting()
         XCTAssertEqual(accounting.counters.manifestFailures, 3)
         XCTAssertEqual(accounting.counters.manifestWrites, 1)
-        XCTAssertEqual(accounting.counters.manifestWriteBatches, 4)
-        XCTAssertEqual(accounting.counters.manifestWriteItems, 4)
+        XCTAssertEqual(accounting.counters.manifestWriteBatches, 2)
+        XCTAssertEqual(accounting.counters.manifestWriteRetries, 2)
+        XCTAssertEqual(accounting.counters.manifestWriteItems, 2)
         XCTAssertEqual(accounting.counters.manifestWriterPeakQueuedItems, 3)
         XCTAssertEqual(accounting.dirtyManifestCount, 1)
 
@@ -766,8 +770,9 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let accounting = await fixture.engine.accounting()
         XCTAssertEqual(accounting.counters.manifestFailures, 3)
         XCTAssertEqual(accounting.counters.manifestWrites, 1)
-        XCTAssertEqual(accounting.counters.manifestWriteBatches, 5)
-        XCTAssertEqual(accounting.counters.manifestWriteItems, 5)
+        XCTAssertEqual(accounting.counters.manifestWriteBatches, 2)
+        XCTAssertEqual(accounting.counters.manifestWriteRetries, 3)
+        XCTAssertEqual(accounting.counters.manifestWriteItems, 2)
         XCTAssertEqual(accounting.dirtyManifestCount, 0)
 
         let capability = try await eligible(fixture.capabilityService.state(for: fixture.rootEpoch))
@@ -890,8 +895,9 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let accounting = await fixture.engine.accounting()
         XCTAssertEqual(accounting.counters.manifestFailures, 6)
         XCTAssertEqual(accounting.counters.manifestWrites, 0)
-        XCTAssertEqual(accounting.counters.manifestWriteBatches, 6)
-        XCTAssertEqual(accounting.counters.manifestWriteItems, 6)
+        XCTAssertEqual(accounting.counters.manifestWriteBatches, 2)
+        XCTAssertEqual(accounting.counters.manifestWriteRetries, 4)
+        XCTAssertEqual(accounting.counters.manifestWriteItems, 2)
         XCTAssertEqual(accounting.counters.manifestWriterPeakQueuedItems, 2)
         XCTAssertEqual(accounting.dirtyManifestCount, 1)
     }
@@ -940,8 +946,9 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         XCTAssertEqual(retryWaiterInvocationCount, 1)
         XCTAssertEqual(accounting.counters.manifestFailures, 1)
         XCTAssertEqual(accounting.counters.manifestWrites, 1)
-        XCTAssertEqual(accounting.counters.manifestWriteBatches, 2)
-        XCTAssertEqual(accounting.counters.manifestWriteItems, 2)
+        XCTAssertEqual(accounting.counters.manifestWriteBatches, 1)
+        XCTAssertEqual(accounting.counters.manifestWriteRetries, 1)
+        XCTAssertEqual(accounting.counters.manifestWriteItems, 1)
         XCTAssertEqual(accounting.dirtyManifestCount, 0)
     }
 
@@ -988,9 +995,10 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let accounting = await fixture.engine.accounting()
         XCTAssertEqual(accounting.counters.manifestWrites, 2)
         XCTAssertEqual(accounting.counters.manifestFailures, 1)
-        XCTAssertEqual(accounting.counters.manifestWriteBatches, 3)
-        XCTAssertEqual(accounting.counters.manifestWriteItems, 5)
-        XCTAssertEqual(accounting.counters.manifestWriteCoalescedItems, 2)
+        XCTAssertEqual(accounting.counters.manifestWriteBatches, 2)
+        XCTAssertEqual(accounting.counters.manifestWriteRetries, 1)
+        XCTAssertEqual(accounting.counters.manifestWriteItems, 3)
+        XCTAssertEqual(accounting.counters.manifestWriteCoalescedItems, 1)
         XCTAssertEqual(accounting.dirtyManifestCount, 0)
         XCTAssertEqual(hookEvents.values(kind: .manifestFailure).count, 1)
 
@@ -1047,9 +1055,10 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let accounting = await fixture.engine.accounting()
         XCTAssertEqual(accounting.counters.manifestWrites, 2)
         XCTAssertEqual(accounting.counters.manifestFailures, 2)
-        XCTAssertEqual(accounting.counters.manifestWriteBatches, 4)
-        XCTAssertEqual(accounting.counters.manifestWriteItems, 7)
-        XCTAssertEqual(accounting.counters.manifestWriteCoalescedItems, 3)
+        XCTAssertEqual(accounting.counters.manifestWriteBatches, 2)
+        XCTAssertEqual(accounting.counters.manifestWriteRetries, 2)
+        XCTAssertEqual(accounting.counters.manifestWriteItems, 3)
+        XCTAssertEqual(accounting.counters.manifestWriteCoalescedItems, 1)
         XCTAssertEqual(accounting.dirtyManifestCount, 0)
         XCTAssertEqual(hookEvents.values(kind: .manifestFailure).count, 2)
     }
@@ -1085,7 +1094,8 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let accounting = await fixture.engine.accounting()
         XCTAssertEqual(accounting.counters.manifestWrites, 4)
         XCTAssertEqual(accounting.counters.manifestFailures, 3)
-        XCTAssertEqual(accounting.counters.manifestWriteBatches, 7)
+        XCTAssertEqual(accounting.counters.manifestWriteBatches, 4)
+        XCTAssertEqual(accounting.counters.manifestWriteRetries, 3)
         XCTAssertEqual(hookEvents.values(kind: .manifestFailure).count, 3)
 
         await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
@@ -1138,9 +1148,10 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let accounting = await fixture.engine.accounting()
         XCTAssertEqual(accounting.counters.manifestWrites, 1)
         XCTAssertEqual(accounting.counters.manifestFailures, 3)
-        XCTAssertEqual(accounting.counters.manifestWriteBatches, 4)
-        XCTAssertEqual(accounting.counters.manifestWriteItems, 7)
-        XCTAssertEqual(accounting.counters.manifestWriteCoalescedItems, 3)
+        XCTAssertEqual(accounting.counters.manifestWriteBatches, 2)
+        XCTAssertEqual(accounting.counters.manifestWriteRetries, 2)
+        XCTAssertEqual(accounting.counters.manifestWriteItems, 3)
+        XCTAssertEqual(accounting.counters.manifestWriteCoalescedItems, 1)
         XCTAssertEqual(accounting.dirtyManifestCount, 1)
         XCTAssertEqual(hookEvents.values(kind: .manifestFailure).count, 3)
 
@@ -1519,7 +1530,7 @@ private actor ManifestRetryStepper {
 private struct ManifestQueueTestItem: Equatable {
     enum Proof: Equatable {
         case session
-        case projection
+        case graphIndex
     }
 
     let revision: UInt64

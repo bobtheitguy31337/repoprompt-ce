@@ -554,7 +554,9 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var showBuiltInWorkflowCleanupGuidance: Bool?
         var codexGoalSupportEnabled: Bool?
         var codexReasoningSummariesEnabled: Bool?
+        var providerConversationCleanupAction: String?
         var restrictMCPAgentDiscoveryToRoleLabels: Bool?
+        var agentSessionHandoffInstructions: String?
 
         init(
             proEditAgentMode: Bool? = nil,
@@ -566,7 +568,9 @@ struct GlobalScalarPreferences: Codable, Equatable {
             showBuiltInWorkflowCleanupGuidance: Bool? = nil,
             codexGoalSupportEnabled: Bool? = nil,
             codexReasoningSummariesEnabled: Bool? = nil,
-            restrictMCPAgentDiscoveryToRoleLabels: Bool? = nil
+            providerConversationCleanupAction: String? = nil,
+            restrictMCPAgentDiscoveryToRoleLabels: Bool? = nil,
+            agentSessionHandoffInstructions: String? = nil
         ) {
             self.proEditAgentMode = proEditAgentMode
             self.proEditAgentKind = proEditAgentKind
@@ -577,7 +581,9 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.showBuiltInWorkflowCleanupGuidance = showBuiltInWorkflowCleanupGuidance
             self.codexGoalSupportEnabled = codexGoalSupportEnabled
             self.codexReasoningSummariesEnabled = codexReasoningSummariesEnabled
+            self.providerConversationCleanupAction = providerConversationCleanupAction
             self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
+            self.agentSessionHandoffInstructions = agentSessionHandoffInstructions
         }
     }
 }
