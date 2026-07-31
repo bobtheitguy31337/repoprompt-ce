@@ -445,6 +445,7 @@ allowed_tracked_docs=(
   "docs/architecture/codex-app-server-schema-gate.md"
   "docs/architecture/provider-plugins.md"
   "docs/architecture/remote-control.md"
+  "docs/architecture/remote-iroh-transport.md"
   "docs/architecture/settings-persistence.md"
   "docs/architecture/source-layout.md"
   "docs/architecture/xcode-workspace.md"

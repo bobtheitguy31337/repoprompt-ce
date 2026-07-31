@@ -43,7 +43,8 @@ var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/loopwork-ai/JSONSchema.git", exact: "1.3.0"),
     .package(url: "https://github.com/loopwork-ai/ontology.git", exact: "0.6.0"),
     .package(url: "https://github.com/getsentry/sentry-cocoa", exact: "9.17.1"),
-    .package(path: "Packages/RepoPromptAgentProviders")
+    .package(path: "Packages/RepoPromptAgentProviders"),
+    .package(path: "Packages/RepoPromptIrohTransport")
 ]
 
 var repoPromptAppDependencies: [Target.Dependency] = [
@@ -64,7 +65,8 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     .product(name: "Cuchardet", package: "UniversalCharsetDetection"),
     .product(name: "JSONSchema", package: "JSONSchema"),
     .product(name: "Ontology", package: "ontology"),
-    .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders")
+    .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders"),
+    .product(name: "RepoPromptIrohTransport", package: "RepoPromptIrohTransport")
 ]
 
 var repoPromptAppSwiftSettings: [SwiftSetting] = [
@@ -114,7 +116,8 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "RepoPrompt", targets: ["RepoPrompt"]),
-        .executable(name: "repoprompt-mcp", targets: ["RepoPromptMCP"])
+        .executable(name: "repoprompt-mcp", targets: ["RepoPromptMCP"]),
+        .executable(name: "repoprompt-iroh-spike", targets: ["RepoPromptIrohSpikeMac"])
     ],
     dependencies: packageDependencies,
     targets: [
@@ -168,6 +171,13 @@ let package = Package(
             dependencies: ["RepoPromptShared", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
             path: "Sources/RepoPromptMCP",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .executableTarget(
+            name: "RepoPromptIrohSpikeMac",
+            dependencies: [
+                .product(name: "RepoPromptIrohTransport", package: "RepoPromptIrohTransport")
+            ],
+            path: "Spikes/IrohTransportSpikeMac"
         ),
         .target(
             name: "RepoPromptRemoteProtocol",

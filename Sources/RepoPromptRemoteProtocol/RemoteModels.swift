@@ -21,6 +21,9 @@ public enum RemoteProtocol {
     public static let historyPath = versionedPath + "/history"
     public static let transcriptPath = versionedPath + "/transcript"
     public static let diagnosticsPath = versionedPath + "/diagnostics"
+    public static let transportBootstrapPath = versionedPath + "/transport/bootstrap"
+    public static let irohBindingPath = versionedPath + "/transport/bind"
+    public static let irohALPN = "repoprompt-remote/1"
 
     public static func supports(_ version: Int) -> Bool {
         (minimumSupportedVersion ... currentVersion).contains(version)
@@ -29,8 +32,9 @@ public enum RemoteProtocol {
 
 /// Data encoded in the QR code. It identifies the desktop and gives the phone
 /// enough information to establish a TLS-verified connection; it never
-/// contains the issued device credential. Pairing codes remain valid until
-/// they are used or explicitly regenerated on the desktop.
+/// contains the issued device credential. Newly issued codes expire after a
+/// short interval and are invalidated when used or regenerated. Legacy codes
+/// without `expiresAt` remain decodable during migration.
 public struct RemotePairingAdvertisement: Codable, Sendable, Equatable {
     public let protocolVersion: Int
     public let desktopInstanceID: String
@@ -39,6 +43,7 @@ public struct RemotePairingAdvertisement: Codable, Sendable, Equatable {
     public let port: Int?
     public let certificateSHA256: String
     public let oneTimeSecret: String
+    public let expiresAt: Date?
 
     public init(
         protocolVersion: Int = RemoteProtocol.currentVersion,
@@ -47,7 +52,8 @@ public struct RemotePairingAdvertisement: Codable, Sendable, Equatable {
         host: String? = nil,
         port: Int? = nil,
         certificateSHA256: String,
-        oneTimeSecret: String
+        oneTimeSecret: String,
+        expiresAt: Date? = nil
     ) {
         self.protocolVersion = protocolVersion
         self.desktopInstanceID = desktopInstanceID
@@ -56,6 +62,7 @@ public struct RemotePairingAdvertisement: Codable, Sendable, Equatable {
         self.port = port
         self.certificateSHA256 = certificateSHA256
         self.oneTimeSecret = oneTimeSecret
+        self.expiresAt = expiresAt
     }
 
 }
@@ -258,6 +265,12 @@ public struct RemoteDiagnostics: Codable, Sendable, Equatable {
     public let notificationRelayConfigured: Bool
     public let notificationLastAttemptAt: Date?
     public let notificationLastError: String?
+    public let irohState: String?
+    public let irohEndpointID: String?
+    public let irohPath: RemoteIrohPathKind?
+    public let irohActivePeerCount: Int?
+    public let irohLastTransitionAt: Date?
+    public let irohLastError: String?
 
     public init(
         protocolVersion: Int = RemoteProtocol.currentVersion,
@@ -270,7 +283,13 @@ public struct RemoteDiagnostics: Codable, Sendable, Equatable {
         notificationRegistration: Bool = false,
         notificationRelayConfigured: Bool = false,
         notificationLastAttemptAt: Date? = nil,
-        notificationLastError: String? = nil
+        notificationLastError: String? = nil,
+        irohState: String? = nil,
+        irohEndpointID: String? = nil,
+        irohPath: RemoteIrohPathKind? = nil,
+        irohActivePeerCount: Int? = nil,
+        irohLastTransitionAt: Date? = nil,
+        irohLastError: String? = nil
     ) {
         self.protocolVersion = protocolVersion
         self.gatewayState = gatewayState
@@ -283,6 +302,12 @@ public struct RemoteDiagnostics: Codable, Sendable, Equatable {
         self.notificationRelayConfigured = notificationRelayConfigured
         self.notificationLastAttemptAt = notificationLastAttemptAt
         self.notificationLastError = notificationLastError
+        self.irohState = irohState
+        self.irohEndpointID = irohEndpointID
+        self.irohPath = irohPath
+        self.irohActivePeerCount = irohActivePeerCount
+        self.irohLastTransitionAt = irohLastTransitionAt
+        self.irohLastError = irohLastError
     }
 }
 

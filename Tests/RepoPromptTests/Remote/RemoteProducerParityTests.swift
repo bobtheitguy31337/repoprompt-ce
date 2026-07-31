@@ -615,7 +615,7 @@ final class RemoteProducerParityTests: XCTestCase {
             resolvedToolCatalog: tools
         )
 
-        let attached = RemoteGatewayController.attachingEventCursor(to: response, eventCursor: 42)
+        let attached = RemoteGatewayRequestRouter.attachingEventCursor(to: response, eventCursor: 42)
 
         XCTAssertEqual(attached.eventCursor, 42)
         XCTAssertEqual(attached.resolvedSelection, selection)
