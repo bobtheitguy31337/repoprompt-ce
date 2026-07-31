@@ -47,7 +47,7 @@ var packageDependencies: [Package.Dependency] = [
     // in https://github.com/bobtheitguy31337/repoprompt-remote before CI uses
     // a versioned repository dependency.
     .package(path: "../repoprompt-remote/Packages/RepoPromptRemoteProtocol"),
-    // Isolated Work item 1 spike only; production RepoPromptApp does not depend on it.
+    // Shared locked Rust/UniFFI transport used by the production Remote gateway and spike.
     .package(path: "../repoprompt-remote/Packages/RepoPromptIrohTransport")
 ]
 
@@ -71,7 +71,8 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     .product(name: "Cuchardet", package: "UniversalCharsetDetection"),
     .product(name: "JSONSchema", package: "JSONSchema"),
     .product(name: "Ontology", package: "ontology"),
-    .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders")
+    .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders"),
+    .product(name: "RepoPromptIrohTransport", package: "RepoPromptIrohTransport")
 ]
 
 var repoPromptAppSwiftSettings: [SwiftSetting] = [

@@ -6,6 +6,7 @@ import SwiftUI
 struct RemoteSettingsView: View {
     @ObservedObject private var gateway = RemoteGatewayController.shared
     @ObservedObject private var availability = RemoteAvailabilityController.shared
+    @State private var showsLegacyPairingCode = false
 
     private static let authorityLevels: [RemoteAuthorityLevel] = [
         .observe, .respond, .control, .danger
@@ -48,6 +49,31 @@ struct RemoteSettingsView: View {
                         Task { await gateway.setEnabled(enabled) }
                     }
                 ))
+                Toggle("Prefer Iroh (direct, then relay)", isOn: Binding(
+                    get: { gateway.isIrohEnabled },
+                    set: { enabled in
+                        Task { await gateway.setIrohEnabled(enabled) }
+                    }
+                ))
+                .disabled(!gateway.isEnabled)
+
+                if gateway.isIrohEnabled {
+                    LabeledContent("Iroh") {
+                        Text(gateway.irohDiagnostics.state.capitalized)
+                            .foregroundStyle(gateway.irohDiagnostics.state == "running" ? .green : .secondary)
+                    }
+                    if gateway.irohDiagnostics.path != .unknown {
+                        LabeledContent("Iroh path") {
+                            Text(gateway.irohDiagnostics.path.rawValue.replacingOccurrences(of: "_", with: " ").capitalized)
+                        }
+                    }
+                    if let error = gateway.irohDiagnostics.lastError {
+                        Text("Iroh: \(error)")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .textSelection(.enabled)
+                    }
+                }
 
                 if gateway.isPaired {
                     LabeledContent("Status") {
@@ -103,7 +129,7 @@ struct RemoteSettingsView: View {
         } else {
             GroupBox("Pair your phone") {
                 VStack(alignment: .leading, spacing: 14) {
-                    if let pairingCode = gateway.pairingCode {
+                    if let pairingCode = displayedPairingCode {
                         HStack(alignment: .top, spacing: 20) {
                             PairingQRCodeView(payload: pairingCode)
                                 .frame(width: 220, height: 220)
@@ -114,10 +140,17 @@ struct RemoteSettingsView: View {
                             VStack(alignment: .leading, spacing: 10) {
                                 Text("Scan this code with RepoPrompt Remote")
                                     .font(.headline)
-                                Text("The code stays valid until it is used or you generate a new code. Generating a new code invalidates the previous one.")
+                                Text("The code expires after five minutes, is single-use, and is invalidated when you generate a replacement.")
                                     .font(.callout)
                                     .foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
+                                if gateway.irohPairingCode != nil, gateway.legacyPairingCode != nil {
+                                    Picker("Pairing transport", selection: $showsLegacyPairingCode) {
+                                        Text("Iroh").tag(false)
+                                        Text("LAN HTTPS").tag(true)
+                                    }
+                                    .pickerStyle(.segmented)
+                                }
                                 HStack {
                                     Button("Generate new code") {
                                         gateway.refreshPairingAdvertisement()
@@ -125,7 +158,7 @@ struct RemoteSettingsView: View {
                                     Button("Copy pairing link") {
                                         copyPairingLink()
                                     }
-                                    .disabled(gateway.pairingCode == nil)
+                                    .disabled(displayedPairingCode == nil)
                                 }
                             }
                         }
@@ -194,8 +227,13 @@ struct RemoteSettingsView: View {
         }
     }
 
+    private var displayedPairingCode: String? {
+        if showsLegacyPairingCode { return gateway.legacyPairingCode }
+        return gateway.irohPairingCode ?? gateway.legacyPairingCode
+    }
+
     private func copyPairingLink() {
-        guard let pairingCode = gateway.pairingCode else { return }
+        guard let pairingCode = displayedPairingCode else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(pairingCode, forType: .string)
     }

@@ -1,15 +1,7 @@
 import AppKit
 import Foundation
-import Network
+import OSLog
 import RepoPromptRemoteProtocol
-import Security
-
-private struct RemoteHTTPRequest {
-    let method: String
-    let target: String
-    let headers: [String: String]
-    let body: Data
-}
 
 /// Opt-in LAN gateway for the Remote control surface. The gateway is
 /// intentionally independent from the Unix-socket MCP server and talks to
@@ -17,10 +9,15 @@ private struct RemoteHTTPRequest {
 @MainActor
 final class RemoteGatewayController: NSObject, ObservableObject {
     static let shared = RemoteGatewayController()
+    private static let unpairLogger = Logger(subsystem: "com.pvncher.repoprompt.ce", category: "RemoteUnpair")
 
     @Published private(set) var isRunning = false
     @Published private(set) var pairingAdvertisement: RemotePairingAdvertisement?
+    @Published private(set) var irohPairingAdvertisement: RemoteIrohPairingAdvertisement?
     @Published private(set) var pairingCode: String?
+    @Published private(set) var legacyPairingCode: String?
+    @Published private(set) var irohPairingCode: String?
+    @Published private(set) var irohDiagnostics = RemoteIrohGatewayDiagnostics()
     @Published private(set) var lastError: String?
     @Published private(set) var lastRequestAt: Date?
     @Published private(set) var lastSuccessfulRequestAt: Date?
@@ -30,15 +27,20 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         didSet { UserDefaults.standard.set(isEnabled, forKey: Self.enabledKey) }
     }
 
+    @Published var isIrohEnabled: Bool {
+        didSet { UserDefaults.standard.set(isIrohEnabled, forKey: Self.irohEnabledKey) }
+    }
+
     private static let enabledKey = "RepoPrompt.remote.gatewayEnabled"
+    private static let irohEnabledKey = "RepoPrompt.remote.irohEnabled"
     private static let defaultAuthorityKey = "RepoPrompt.remote.defaultAuthority"
-    private static let maximumBufferedRequestBytes = 1_048_576
 
     private weak var windowStatesManager: WindowStatesManager?
     private var controlService: (any RemoteAgentControlService)?
     private let pairingManager = RemotePairingManager.shared
     private lazy var notificationRelay = RemoteNotificationRelay(pairingManager: pairingManager)
     private let tlsIdentityStore = RemoteTLSIdentityStore()
+    private let irohIdentityStore = RemoteIrohIdentityStore()
     private let availabilityController = RemoteAvailabilityController.shared
     private let replayBuffer = RemoteEventReplayBuffer(capacity: 512)
     private let transcriptRevisionTracker = RemoteTranscriptRevisionTracker()
@@ -46,12 +48,33 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     private let transcriptRevisionEpoch = UUID()
 
     private var tlsIdentity: RemoteTLSIdentity?
-    private var listener: NWListener?
-    private var bonjourService: NetService?
-    private var connectionBuffers: [ObjectIdentifier: Data] = [:]
+    private var irohGeneration: UInt64 = 0
     private var eventPollTask: Task<Void, Never>?
     private var lastPublishedSnapshot: RemoteSnapshot?
     private(set) var activePort: UInt16?
+
+    private lazy var requestRouter = RemoteGatewayRequestRouter(services: makeRoutingServices())
+    private lazy var irohAdapter = RemoteIrohGatewayAdapter(
+        router: requestRouter,
+        stateChanged: { [weak self] diagnostics in
+            self?.irohDiagnostics = diagnostics
+        },
+        requestReceived: { [weak self] in
+            self?.lastRequestAt = Date()
+        },
+        successfulResponseSent: { [weak self] in
+            self?.lastSuccessfulRequestAt = Date()
+        }
+    )
+    private lazy var legacyAdapter = RemoteLegacyHTTPSGatewayAdapter(
+        router: requestRouter,
+        requestReceived: { [weak self] in
+            self?.lastRequestAt = Date()
+        },
+        successfulResponseSent: { [weak self] in
+            self?.lastSuccessfulRequestAt = Date()
+        }
+    )
 
     var notificationRelayConfigured: Bool {
         notificationRelay.isConfigured
@@ -63,6 +86,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
     override private init() {
         isEnabled = UserDefaults.standard.bool(forKey: Self.enabledKey)
+        isIrohEnabled = UserDefaults.standard.object(forKey: Self.irohEnabledKey) as? Bool ?? true
         isPaired = pairingManager.isPaired
         super.init()
     }
@@ -77,7 +101,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         }
     }
 
-    private static func makePairingCode(for advertisement: RemotePairingAdvertisement) -> String? {
+    private static func makePairingCode(for advertisement: some Encodable) -> String? {
         guard let data = try? JSONEncoder().encode(advertisement) else { return nil }
         let payload = data.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
@@ -92,11 +116,29 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
     func refreshPairingAdvertisement() {
         guard let activePort else { return }
-        setPairingAdvertisement(pairingManager.issueAdvertisement(
-            port: activePort,
-            serviceName: bonjourName,
-            host: RemoteLocalAddress.preferredIPv4Address()
-        ))
+        do {
+            if let server = irohAdapter.currentAddress, isIrohEnabled {
+                let issued = try pairingManager.issuePairingAdvertisements(
+                    port: activePort,
+                    serviceName: bonjourName,
+                    host: RemoteLocalAddress.preferredIPv4Address(),
+                    server: server
+                )
+                setPairingAdvertisements(legacy: issued.legacy, iroh: issued.iroh)
+            } else {
+                try setPairingAdvertisements(
+                    legacy: pairingManager.issueAdvertisement(
+                        port: activePort,
+                        serviceName: bonjourName,
+                        host: RemoteLocalAddress.preferredIPv4Address()
+                    ),
+                    iroh: nil
+                )
+            }
+            lastError = nil
+        } catch {
+            lastError = error.localizedDescription
+        }
     }
 
     var defaultAuthority: RemoteAuthorityLevel {
@@ -124,73 +166,37 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             if identity.wasCreated {
                 // A new TLS identity invalidates the certificate pin held by
                 // existing phones, so do not leave an unusable device paired.
-                pairingManager.revokeDevice()
+                try pairingManager.revokeDevice()
                 isPaired = false
             }
             pairingManager.setCertificateSHA256(identity.certificateSHA256)
 
-            let tlsOptions = NWProtocolTLS.Options()
-            sec_protocol_options_set_min_tls_protocol_version(
-                tlsOptions.securityProtocolOptions,
-                .TLSv12
+            let port = try await legacyAdapter.start(
+                identity: identity,
+                serviceName: bonjourName,
+                desktopInstanceID: pairingManager.desktopInstanceID
             )
-            guard let secIdentity = sec_identity_create(identity.identity)
-            else { throw RemoteGatewaySecurityError.certificateUnavailable }
-            sec_protocol_options_set_local_identity(
-                tlsOptions.securityProtocolOptions,
-                secIdentity
-            )
-
-            let parameters = NWParameters(tls: tlsOptions)
-            parameters.allowLocalEndpointReuse = true
-            let listener = try NWListener(using: parameters, on: .any)
-            self.listener = listener
-
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                var resumed = false
-                listener.stateUpdateHandler = { [weak controller = self, weak listener] state in
-                    Task { @MainActor in
-                        guard let controller, let listener else { return }
-                        switch state {
-                        case .ready:
-                            guard !resumed else { return }
-                            resumed = true
-                            guard let port = listener.port?.rawValue else {
-                                continuation.resume(throwing: RemoteGatewayError.listenerUnavailable)
-                                return
-                            }
-                            controller.activePort = port
-                            controller.setPairingAdvertisement(controller.pairingManager.issueAdvertisement(
-                                port: port,
-                                serviceName: controller.bonjourName,
-                                host: RemoteLocalAddress.preferredIPv4Address()
-                            ))
-                            controller.publishBonjour(port: port)
-                            controller.isRunning = true
-                            controller.lastError = nil
-                            controller.startEventPolling()
-                            continuation.resume()
-                        case let .failed(error):
-                            guard !resumed else { return }
-                            resumed = true
-                            controller.lastError = error.localizedDescription
-                            continuation.resume(throwing: error)
-                        case .cancelled:
-                            guard !resumed else { return }
-                            resumed = true
-                            continuation.resume(throwing: RemoteGatewayError.listenerUnavailable)
-                        default:
-                            break
-                        }
+            activePort = port
+            if isIrohEnabled {
+                do {
+                    let identity = try irohIdentityStore.loadOrCreate()
+                    if identity.origin == .replacedCorruptValue {
+                        try pairingManager.clearIrohPeerBinding()
                     }
+                    irohGeneration &+= 1
+                    _ = try await irohAdapter.start(
+                        secret: identity.secret,
+                        desktopInstanceID: pairingManager.desktopInstanceID,
+                        generation: irohGeneration
+                    )
+                } catch {
+                    irohDiagnostics.lastError = error.localizedDescription
                 }
-                listener.newConnectionHandler = { [weak self] connection in
-                    Task { @MainActor in
-                        self?.accept(connection)
-                    }
-                }
-                listener.start(queue: .main)
             }
+            refreshPairingAdvertisement()
+            isRunning = true
+            lastError = nil
+            startEventPolling()
         } catch {
             stop()
             lastError = error.localizedDescription
@@ -202,12 +208,9 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         eventPollTask?.cancel()
         eventPollTask = nil
         lastPublishedSnapshot = nil
-        listener?.cancel()
-        listener = nil
-        bonjourService?.stop()
-        bonjourService = nil
-        connectionBuffers.removeAll()
-        setPairingAdvertisement(nil)
+        legacyAdapter.stop()
+        irohAdapter.stop()
+        setPairingAdvertisements(legacy: nil, iroh: nil)
         activePort = nil
         isRunning = false
         availabilityController.releaseSleepAssertion()
@@ -224,7 +227,13 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             notificationRegistration: notificationRegistrationAvailable,
             notificationRelayConfigured: notificationRelayConfigured,
             notificationLastAttemptAt: notificationRelay.lastAttemptAt,
-            notificationLastError: notificationRelay.lastError
+            notificationLastError: notificationRelay.lastError,
+            irohState: irohDiagnostics.state,
+            irohEndpointID: irohDiagnostics.endpointID,
+            irohPath: irohDiagnostics.path,
+            irohActivePeerCount: irohDiagnostics.activePeerCount,
+            irohLastTransitionAt: irohDiagnostics.lastTransitionAt,
+            irohLastError: irohDiagnostics.lastError
         )
     }
 
@@ -237,19 +246,211 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         }
     }
 
-    private func setPairingAdvertisement(_ advertisement: RemotePairingAdvertisement?) {
-        pairingAdvertisement = advertisement
-        pairingCode = advertisement.flatMap(Self.makePairingCode(for:))
+    func setIrohEnabled(_ enabled: Bool) async {
+        isIrohEnabled = enabled
+        guard isRunning else { return }
+        if enabled {
+            do {
+                let identity = try irohIdentityStore.loadOrCreate()
+                irohGeneration &+= 1
+                _ = try await irohAdapter.start(
+                    secret: identity.secret,
+                    desktopInstanceID: pairingManager.desktopInstanceID,
+                    generation: irohGeneration
+                )
+            } catch {
+                irohDiagnostics.lastError = error.localizedDescription
+            }
+        } else {
+            irohAdapter.stop()
+        }
+        refreshPairingAdvertisement()
+    }
+
+    private func setPairingAdvertisements(
+        legacy: RemotePairingAdvertisement?,
+        iroh: RemoteIrohPairingAdvertisement?
+    ) {
+        pairingAdvertisement = legacy
+        irohPairingAdvertisement = iroh
+        legacyPairingCode = legacy.flatMap(Self.makePairingCode(for:))
+        irohPairingCode = iroh.flatMap { Self.makePairingCode(for: RemotePairingCode.iroh($0)) }
+        pairingCode = irohPairingCode ?? legacyPairingCode
     }
 
     func revokePairedDevice() {
-        pairingManager.revokeDevice()
-        isPaired = false
-        refreshPairingAdvertisement()
+        do {
+            try pairingManager.revokeDevice()
+            irohAdapter.revokePeerSessions()
+            isPaired = false
+            lastError = nil
+            refreshPairingAdvertisement()
+        } catch {
+            isPaired = pairingManager.isPaired
+            lastError = error.localizedDescription
+        }
     }
 
     func publish(_ event: RemoteEvent) async -> RemoteEvent {
         await replayBuffer.append(event)
+    }
+
+    private func makeRoutingServices() -> RemoteGatewayRoutingServices {
+        RemoteGatewayRoutingServices(
+            authorize: { [unowned self] context in
+                switch context.transport {
+                case .legacyHTTPS:
+                    pairingManager.isAuthorized(context.authorizationHeader)
+                case let .authenticatedPeer(endpointID, deviceID):
+                    pairingManager.isAuthorizedIroh(
+                        authorizationHeader: context.authorizationHeader,
+                        deviceID: deviceID,
+                        authenticatedPeerEndpointID: endpointID
+                    )
+                }
+            },
+            pair: { [unowned self] request in
+                do {
+                    let response = try pairingManager.pair(request: request, desktop: desktopSummary)
+                    isPaired = true
+                    return .success(response)
+                } catch let error as RemoteGatewaySecurityError {
+                    return .forbidden(error.localizedDescription)
+                } catch {
+                    return .failed
+                }
+            },
+            unpair: { [unowned self] in
+                Self.unpairLogger.info("Authenticated remote Unpair request received")
+                do {
+                    // Delete the durable credential first. Only then invalidate
+                    // Iroh sessions and publish the unpaired UI state.
+                    try pairingManager.revokeDevice()
+                    irohAdapter.revokePeerSessions()
+                    isPaired = false
+                    lastError = nil
+                    refreshPairingAdvertisement()
+                    Self.unpairLogger.info("Durable credential revocation succeeded; Iroh sessions invalidated")
+                    return .success
+                } catch {
+                    isPaired = pairingManager.isPaired
+                    lastError = error.localizedDescription
+                    Self.unpairLogger.error("Durable credential revocation failed: \(error.localizedDescription, privacy: .public)")
+                    return .failed
+                }
+            },
+            snapshot: { [unowned self] in
+                await snapshot()
+            },
+            diagnostics: { [unowned self] in
+                await diagnostics()
+            },
+            history: { [unowned self] query, limit in
+                guard let readService = makeReadService() else { return nil }
+                let page = await readService.history(query: query, limit: limit)
+                return RemoteHistoryPage(
+                    protocolVersion: RemoteProtocol.currentVersion,
+                    entries: page.entries,
+                    hasMore: page.hasMore
+                )
+            },
+            transcript: { [unowned self] request in
+                guard let readService = makeReadService() else { return .unavailable }
+                do {
+                    let page = try await readService.transcript(
+                        sessionID: request.sessionID,
+                        paging: request.paging,
+                        limit: request.limit,
+                        includeDetails: request.includeDetails
+                    )
+                    return await .success(RemoteTranscriptPage(
+                        sessionID: page.sessionID,
+                        items: page.items,
+                        nextSequenceIndex: page.nextSequenceIndex,
+                        hasMore: page.hasMore,
+                        eventCursor: replayBuffer.latestCursor(),
+                        pagingMode: page.pagingMode,
+                        olderCursor: page.olderCursor,
+                        hasOlder: page.hasOlder,
+                        transcriptRevision: page.transcriptRevision,
+                        transcriptRevisionEpoch: transcriptRevisionEpoch
+                    ))
+                } catch let error as RemoteReadServiceError {
+                    switch error {
+                    case .sessionNotFound:
+                        return .sessionNotFound(error.localizedDescription)
+                    case .transcriptItemNotFound:
+                        return .itemNotFound(error.localizedDescription)
+                    case .invalidCursor:
+                        return .invalidCursor(error.localizedDescription)
+                    }
+                } catch {
+                    return .failed
+                }
+            },
+            replay: { [unowned self] cursor in
+                await replayBuffer.replay(
+                    after: cursor,
+                    desktopInstanceID: pairingManager.desktopInstanceID
+                )
+            },
+            registerNotifications: { [unowned self] registration in
+                do {
+                    try pairingManager.registerNotifications(registration)
+                    return .success
+                } catch {
+                    return .failed
+                }
+            },
+            authorizationState: { [unowned self] in
+                authorizationState
+            },
+            execute: { [unowned self] command in
+                guard let controlService else { return .unavailable }
+                do {
+                    return try await .success(controlService.execute(command))
+                } catch let error as RemoteAgentControlServiceError {
+                    return .rejected(error.localizedDescription)
+                } catch {
+                    return .failed
+                }
+            },
+            eventCursor: { [unowned self] in
+                await replayBuffer.latestCursor()
+            },
+            pairIroh: { [unowned self] request, peerEndpointID in
+                do {
+                    let response = try pairingManager.pairIroh(
+                        request: request,
+                        authenticatedPeerEndpointID: peerEndpointID,
+                        serverEndpointID: irohAdapter.currentAddress?.endpointID ?? "",
+                        desktop: desktopSummary
+                    )
+                    isPaired = true
+                    return .success(response)
+                } catch {
+                    return .failure(error)
+                }
+            },
+            transportBootstrap: { [unowned self] in
+                guard let server = irohAdapter.currentAddress, isIrohEnabled else { return nil }
+                return RemoteTransportBootstrapResponse(
+                    desktopInstanceID: pairingManager.desktopInstanceID,
+                    server: server
+                )
+            },
+            bindIrohEndpoint: { [unowned self] request, authorizationHeader in
+                do {
+                    return try .success(pairingManager.bindIrohEndpoint(
+                        request: request,
+                        authorizationHeader: authorizationHeader,
+                        serverEndpointID: irohAdapter.currentAddress?.endpointID ?? ""
+                    ))
+                } catch {
+                    return .failure(error)
+                }
+            }
+        )
     }
 
     private func startEventPolling() {
@@ -452,392 +653,6 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         }
     }
 
-    private var bonjourName: String {
-        "RepoPrompt-\(pairingManager.desktopInstanceID.prefix(8))"
-    }
-
-    private func publishBonjour(port: UInt16) {
-        bonjourService?.stop()
-        let service = NetService(
-            domain: "local.",
-            type: "_repoprompt-remote._tcp.",
-            name: bonjourName,
-            port: Int32(port)
-        )
-        service.setTXTRecord(NetService.data(fromTXTRecord: [
-            "desktopInstanceID": pairingManager.desktopInstanceID.data(using: .utf8) ?? Data(),
-            "protocol": "v1".data(using: .utf8) ?? Data()
-        ]))
-        service.schedule(in: .main, forMode: .common)
-        service.publish(options: [.listenForConnections])
-        bonjourService = service
-    }
-
-    private func accept(_ connection: NWConnection) {
-        let identifier = ObjectIdentifier(connection)
-        connectionBuffers[identifier] = Data()
-        connection.stateUpdateHandler = { [weak self, weak connection] state in
-            Task { @MainActor in
-                guard let self, let connection else { return }
-                switch state {
-                case .ready:
-                    self.receive(on: connection)
-                case .failed, .cancelled:
-                    self.connectionBuffers.removeValue(forKey: ObjectIdentifier(connection))
-                default:
-                    break
-                }
-            }
-        }
-        connection.start(queue: .main)
-    }
-
-    private func receive(on connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self, weak connection] data, _, isComplete, error in
-            Task { @MainActor in
-                guard let self, let connection else { return }
-                let identifier = ObjectIdentifier(connection)
-                if let data, !data.isEmpty {
-                    self.connectionBuffers[identifier, default: Data()].append(data)
-                    guard self.connectionBuffers[identifier, default: Data()].count <= Self.maximumBufferedRequestBytes else {
-                        self.connectionBuffers.removeValue(forKey: identifier)
-                        connection.cancel()
-                        return
-                    }
-                    await self.processBufferedRequests(on: connection)
-                }
-                guard !isComplete, error == nil else {
-                    self.connectionBuffers.removeValue(forKey: identifier)
-                    return
-                }
-                self.receive(on: connection)
-            }
-        }
-    }
-
-    private func processBufferedRequests(on connection: NWConnection) async {
-        let identifier = ObjectIdentifier(connection)
-        while var buffer = connectionBuffers[identifier],
-              let request = nextRequest(from: &buffer)
-        {
-            connectionBuffers[identifier] = buffer
-            await handle(request, on: connection)
-            if connectionBuffers[identifier] == nil { return }
-        }
-    }
-
-    private func nextRequest(from buffer: inout Data) -> RemoteHTTPRequest? {
-        let separator = Data([13, 10, 13, 10])
-        guard let headerRange = buffer.range(of: separator) else { return nil }
-        let headerData = buffer.subdata(in: buffer.startIndex ..< headerRange.lowerBound)
-        guard let headerText = String(data: headerData, encoding: .utf8) else {
-            buffer.removeAll()
-            return nil
-        }
-        let lines = headerText.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first else { return nil }
-        let requestParts = requestLine.split(separator: " ", maxSplits: 2).map(String.init)
-        guard requestParts.count == 3 else { return nil }
-
-        var headers: [String: String] = [:]
-        for line in lines.dropFirst() {
-            guard let separatorIndex = line.firstIndex(of: ":") else { continue }
-            let name = line[..<separatorIndex].lowercased()
-            let value = line[line.index(after: separatorIndex)...]
-                .trimmingCharacters(in: .whitespaces)
-            headers[name] = value
-        }
-        let contentLength = Int(headers["content-length"] ?? "0") ?? 0
-        guard contentLength >= 0, contentLength <= Self.maximumBufferedRequestBytes else {
-            buffer.removeAll(keepingCapacity: true)
-            return nil
-        }
-        let bodyStart = headerRange.upperBound
-        guard buffer.count >= bodyStart + contentLength else { return nil }
-        let bodyEnd = bodyStart + contentLength
-        let body = buffer.subdata(in: bodyStart ..< bodyEnd)
-        buffer.removeSubrange(buffer.startIndex ..< bodyEnd)
-        return RemoteHTTPRequest(method: requestParts[0], target: requestParts[1], headers: headers, body: body)
-    }
-
-    private func handle(_ request: RemoteHTTPRequest, on connection: NWConnection) async {
-        lastRequestAt = Date()
-        guard let components = URLComponents(string: request.target) else {
-            sendError(.init(code: "invalid_request", message: "Invalid request target."), status: 400, on: connection)
-            return
-        }
-        switch (request.method, components.path) {
-        case ("POST", RemoteProtocol.pairingPath):
-            guard let pairingRequest = try? JSONDecoder().decode(RemotePairingRequest.self, from: request.body) else {
-                sendError(.init(code: "invalid_pairing_request", message: "Invalid pairing request."), status: 400, on: connection)
-                return
-            }
-            do {
-                let response = try pairingManager.pair(request: pairingRequest, desktop: desktopSummary)
-                isPaired = true
-                sendJSON(response, status: 200, on: connection)
-            } catch let error as RemoteGatewaySecurityError {
-                sendError(.init(code: "pairing_failed", message: error.localizedDescription), status: 403, on: connection)
-            } catch {
-                sendError(.init(code: "pairing_failed", message: "Pairing could not be completed."), status: 500, on: connection)
-            }
-
-        case ("POST", RemoteProtocol.unpairPath):
-            guard pairingManager.isAuthorized(request.headers["authorization"]) else {
-                sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
-                return
-            }
-            pairingManager.revokeDevice()
-            isPaired = false
-            refreshPairingAdvertisement()
-            sendJSON(RemoteUnpairResponse(), status: 200, on: connection)
-
-        case ("GET", RemoteProtocol.snapshotPath):
-            guard pairingManager.isAuthorized(request.headers["authorization"]) else {
-                sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
-                return
-            }
-            await sendJSON(snapshot(), status: 200, on: connection)
-
-        case ("GET", RemoteProtocol.diagnosticsPath):
-            guard pairingManager.isAuthorized(request.headers["authorization"]) else {
-                sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
-                return
-            }
-            await sendJSON(diagnostics(), status: 200, on: connection)
-
-        case ("GET", RemoteProtocol.workspacesPath):
-            guard pairingManager.isAuthorized(request.headers["authorization"]) else {
-                sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
-                return
-            }
-            await sendJSON(snapshot().workspaces, status: 200, on: connection)
-
-        case ("GET", RemoteProtocol.sessionsPath):
-            guard pairingManager.isAuthorized(request.headers["authorization"]) else {
-                sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
-                return
-            }
-            await sendJSON(snapshot().sessions, status: 200, on: connection)
-
-        case ("GET", RemoteProtocol.agentsPath):
-            guard pairingManager.isAuthorized(request.headers["authorization"]) else {
-                sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
-                return
-            }
-            await sendJSON(snapshot().agentCatalog, status: 200, on: connection)
-
-        case ("GET", RemoteProtocol.workflowsPath):
-            guard pairingManager.isAuthorized(request.headers["authorization"]) else {
-                sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
-                return
-            }
-            await sendJSON(snapshot().workflowCatalog, status: 200, on: connection)
-
-        case ("GET", RemoteProtocol.historyPath):
-            guard pairingManager.isAuthorized(request.headers["authorization"]) else {
-                sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
-                return
-            }
-            let query = components.queryItems?.first(where: { $0.name == "q" })?.value
-            let limit = components.queryItems?.first(where: { $0.name == "limit" })?.value.flatMap(Int.init) ?? 50
-            guard let readService = makeReadService() else {
-                sendError(.init(code: "unavailable", message: "Remote read services are not ready.", retryable: true), status: 503, on: connection)
-                return
-            }
-            let page = await readService.history(query: query, limit: limit)
-            sendJSON(
-                RemoteHistoryPage(protocolVersion: RemoteProtocol.currentVersion, entries: page.entries, hasMore: page.hasMore),
-                status: 200,
-                on: connection
-            )
-
-        case ("GET", RemoteProtocol.transcriptPath):
-            guard pairingManager.isAuthorized(request.headers["authorization"]) else {
-                sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
-                return
-            }
-            guard let sessionID = components.queryItems?.first(where: { $0.name == "session_id" })?.value.flatMap(UUID.init) else {
-                sendError(.init(code: "invalid_session", message: "A valid session_id is required."), status: 400, on: connection)
-                return
-            }
-            let after = components.queryItems?.first(where: { $0.name == "after" })?.value.flatMap(Int.init)
-            let limit = components.queryItems?.first(where: { $0.name == "limit" })?.value.flatMap(Int.init) ?? 100
-            let includeDetails = components.queryItems?.first(where: { $0.name == "details" })?.value == "1"
-            let itemIDValue = components.queryItems?.first(where: { $0.name == "item_id" })?.value
-            if itemIDValue != nil, itemIDValue.flatMap(UUID.init) == nil {
-                sendError(.init(code: "invalid_transcript_item", message: "A valid item_id is required."), status: 400, on: connection)
-                return
-            }
-            let paging: RemoteTranscriptPageRequest
-            if let itemID = itemIDValue.flatMap(UUID.init) {
-                paging = .exactItem(itemID)
-            } else if components.queryItems?.first(where: { $0.name == "order" })?.value == "recent" {
-                let beforeValue = components.queryItems?.first(where: { $0.name == "before" })?.value
-                do {
-                    paging = try .recentBackward(before: beforeValue.map(RemoteTranscriptCursorCodec.decode))
-                } catch {
-                    sendError(
-                        .init(code: "invalid_transcript_cursor", message: "The transcript cursor is invalid."),
-                        status: 400,
-                        on: connection
-                    )
-                    return
-                }
-            } else {
-                paging = .legacyForward(afterSequenceIndex: after)
-            }
-            guard let readService = makeReadService() else {
-                sendError(.init(code: "unavailable", message: "Remote read services are not ready.", retryable: true), status: 503, on: connection)
-                return
-            }
-            do {
-                let page = try await readService.transcript(
-                    sessionID: sessionID,
-                    paging: paging,
-                    limit: limit,
-                    includeDetails: includeDetails
-                )
-                await sendJSON(
-                    RemoteTranscriptPage(
-                        sessionID: page.sessionID,
-                        items: page.items,
-                        nextSequenceIndex: page.nextSequenceIndex,
-                        hasMore: page.hasMore,
-                        eventCursor: replayBuffer.latestCursor(),
-                        pagingMode: page.pagingMode,
-                        olderCursor: page.olderCursor,
-                        hasOlder: page.hasOlder,
-                        transcriptRevision: page.transcriptRevision,
-                        transcriptRevisionEpoch: transcriptRevisionEpoch
-                    ),
-                    status: 200,
-                    on: connection
-                )
-            } catch let error as RemoteReadServiceError {
-                switch error {
-                case .sessionNotFound:
-                    sendError(.init(code: "session_not_found", message: error.localizedDescription), status: 404, on: connection)
-                case .transcriptItemNotFound:
-                    sendError(
-                        .init(code: "transcript_item_not_found", message: error.localizedDescription, retryable: true),
-                        status: 404,
-                        on: connection
-                    )
-                case .invalidCursor:
-                    sendError(.init(code: "invalid_transcript_cursor", message: error.localizedDescription), status: 400, on: connection)
-                }
-            } catch {
-                sendError(.init(code: "transcript_failed", message: "The transcript could not be loaded.", retryable: true), status: 500, on: connection)
-            }
-
-        case ("GET", RemoteProtocol.eventsPath):
-            guard pairingManager.isAuthorized(request.headers["authorization"]) else {
-                sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
-                return
-            }
-            let cursor = components.queryItems?.first(where: { $0.name == "after" }).flatMap(\.value).flatMap(UInt64.init)
-            switch await replayBuffer.replay(after: cursor, desktopInstanceID: pairingManager.desktopInstanceID) {
-            case let .events(events):
-                let body = events.map { event in
-                    let data = (try? JSONEncoder().encode(event)) ?? Data()
-                    return "id: \(event.sequence)\ndata: \(String(decoding: data, as: UTF8.self))\n\n"
-                }.joined()
-                sendSSE(body.isEmpty ? ": connected\n\n" : body, on: connection)
-            case .snapshotRequired:
-                sendError(
-                    .init(code: "snapshot_required", message: "The event cursor is no longer retained.", retryable: true),
-                    status: 409,
-                    on: connection
-                )
-            }
-
-        case ("POST", RemoteProtocol.commandsPath), ("POST", RemoteProtocol.contextBuilderPath):
-            guard pairingManager.isAuthorized(request.headers["authorization"]) else {
-                sendError(.init(code: "unauthorized", message: "A valid paired-device credential is required."), status: 401, on: connection)
-                return
-            }
-            guard let command = try? JSONDecoder().decode(RemoteCommandRequest.self, from: request.body) else {
-                sendError(.init(code: "invalid_command", message: "Invalid remote command request."), status: 400, on: connection)
-                return
-            }
-            if components.path == RemoteProtocol.contextBuilderPath,
-               command.operation != .contextBuilder
-            {
-                sendError(.init(code: "invalid_context_builder_command", message: "The context-builder endpoint accepts only context_builder commands."), status: 400, on: connection)
-                return
-            }
-            if command.operation == .registerNotifications {
-                guard let registration = command.notificationRegistration else {
-                    sendError(.init(code: "invalid_notification_registration", message: "A notification registration is required."), status: 400, on: connection)
-                    return
-                }
-                do {
-                    try pairingManager.registerNotifications(registration)
-                    await sendJSON(
-                        RemoteCommandResponse(
-                            commandID: command.commandID,
-                            accepted: true,
-                            message: "Notification registration saved.",
-                            eventCursor: replayBuffer.latestCursor()
-                        ),
-                        status: 200,
-                        on: connection
-                    )
-                } catch {
-                    sendError(.init(code: "notification_registration_failed", message: "Notification registration could not be saved."), status: 409, on: connection)
-                }
-                return
-            }
-            let requiredAuthority = Self.requiredAuthority(for: command.operation)
-            guard authorizationState.allows(requiredAuthority) else {
-                sendError(
-                    .init(code: "forbidden", message: "The paired device does not have sufficient authority for this command."),
-                    status: 403,
-                    on: connection
-                )
-                return
-            }
-            guard let controlService else {
-                sendError(.init(code: "unavailable", message: "Remote control services are not ready.", retryable: true), status: 503, on: connection)
-                return
-            }
-            do {
-                let response = try await controlService.execute(command)
-                let responseWithCursor = await RemoteCommandResponse(
-                    protocolVersion: response.protocolVersion,
-                    commandID: response.commandID,
-                    accepted: response.accepted,
-                    workspaceID: response.workspaceID,
-                    sessionID: response.sessionID,
-                    runState: response.runState,
-                    message: response.message,
-                    eventCursor: replayBuffer.latestCursor(),
-                    contextBuilderResult: response.contextBuilderResult
-                )
-                sendJSON(responseWithCursor, status: 200, on: connection)
-            } catch let error as RemoteAgentControlServiceError {
-                sendError(.init(code: "command_rejected", message: error.localizedDescription), status: 409, on: connection)
-            } catch {
-                sendError(.init(code: "command_failed", message: "The remote command could not be completed."), status: 500, on: connection)
-            }
-
-        default:
-            sendError(.init(code: "not_found", message: "Remote endpoint not found."), status: 404, on: connection)
-        }
-    }
-
-    private static func requiredAuthority(for operation: RemoteCommandOperation) -> RemoteAuthorityLevel {
-        switch operation {
-        case .respond:
-            .respond
-        case .startRun, .configureSession, .configureTools, .followUp, .steer, .cancel, .resume, .contextBuilder:
-            .control
-        case .registerNotifications:
-            .observe
-        }
-    }
-
     private func makeReadService() -> WindowRemoteReadService? {
         guard let windowStatesManager else { return nil }
         let contexts = windowStatesManager.allWindows
@@ -847,6 +662,10 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             contexts: contexts,
             revisionTracker: transcriptRevisionTracker
         )
+    }
+
+    private var bonjourName: String {
+        "RepoPrompt-\(pairingManager.desktopInstanceID.prefix(8))"
     }
 
     private var desktopSummary: RemoteDesktopSummary {
@@ -896,70 +715,6 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         )
         availabilityController.update(snapshot: snapshot)
         return snapshot
-    }
-
-    private func sendJSON(_ value: some Encodable, status: Int, on connection: NWConnection) {
-        guard let data = try? JSONEncoder().encode(value) else {
-            sendError(.init(code: "encoding_failed", message: "The response could not be encoded."), status: 500, on: connection)
-            return
-        }
-        send(
-            status: status,
-            contentType: "application/json; charset=utf-8",
-            body: data,
-            on: connection
-        )
-    }
-
-    private func sendSSE(_ body: String, on connection: NWConnection) {
-        send(
-            status: 200,
-            contentType: "text/event-stream; charset=utf-8",
-            body: Data(body.utf8),
-            on: connection
-        )
-    }
-
-    private func sendError(_ error: RemoteErrorResponse, status: Int, on connection: NWConnection) {
-        sendJSON(error, status: status, on: connection)
-    }
-
-    private func send(status: Int, contentType: String, body: Data, on connection: NWConnection) {
-        if (200 ..< 300).contains(status) {
-            lastSuccessfulRequestAt = Date()
-        }
-        let reason = Self.reasonPhrase(for: status)
-        let header = "HTTP/1.1 \(status) \(reason)\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.count)\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n"
-        var response = Data(header.utf8)
-        response.append(body)
-        connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
-    }
-
-    private static func reasonPhrase(for status: Int) -> String {
-        switch status {
-        case 200: "OK"
-        case 400: "Bad Request"
-        case 401: "Unauthorized"
-        case 403: "Forbidden"
-        case 404: "Not Found"
-        case 409: "Conflict"
-        case 503: "Service Unavailable"
-        default: "Internal Server Error"
-        }
-    }
-
-    private static func certificate(from identity: SecIdentity) throws -> SecCertificate? {
-        var certificate: SecCertificate?
-        let status = SecIdentityCopyCertificate(identity, &certificate)
-        guard status == errSecSuccess else { throw RemoteGatewaySecurityError.certificateUnavailable }
-        return certificate
-    }
-
-    private static func privateKey(from identity: SecIdentity) throws -> SecKey? {
-        var key: SecKey?
-        let status = SecIdentityCopyPrivateKey(identity, &key)
-        guard status == errSecSuccess else { throw RemoteGatewaySecurityError.certificateUnavailable }
-        return key
     }
 }
 
