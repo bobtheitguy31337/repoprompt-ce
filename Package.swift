@@ -43,11 +43,7 @@ var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/loopwork-ai/JSONSchema.git", exact: "1.3.0"),
     .package(url: "https://github.com/loopwork-ai/ontology.git", exact: "0.6.0"),
     .package(url: "https://github.com/getsentry/sentry-cocoa", exact: "9.17.1"),
-    .package(path: "Packages/RepoPromptAgentProviders"),
-    // Local during the two-repository extraction. The package will be tagged
-    // in https://github.com/bobtheitguy31337/repoprompt-remote before CI uses
-    // a versioned repository dependency.
-    .package(path: "../repoprompt-remote/Packages/RepoPromptRemoteProtocol")
+    .package(path: "Packages/RepoPromptAgentProviders")
 ]
 
 var repoPromptAppDependencies: [Target.Dependency] = [
@@ -174,6 +170,10 @@ let package = Package(
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
         .target(
+            name: "RepoPromptRemoteProtocol",
+            path: "Sources/RepoPromptRemoteProtocol"
+        ),
+        .target(
             name: "RepoPromptShared",
             dependencies: ["RepoPromptRemoteProtocol"],
             path: "Sources/RepoPromptShared",
@@ -189,6 +189,12 @@ let package = Package(
             name: "RepoPromptWorkspaceCoreTests",
             dependencies: ["RepoPromptWorkspaceCore"],
             path: "Tests/RepoPromptWorkspaceCoreTests"
+        ),
+        .testTarget(
+            name: "RepoPromptRemoteProtocolTests",
+            dependencies: ["RepoPromptRemoteProtocol"],
+            path: "Tests/RepoPromptRemoteProtocolTests",
+            resources: [.process("Fixtures")]
         ),
         .testTarget(
             name: "RepoPromptRegexCoreTests",

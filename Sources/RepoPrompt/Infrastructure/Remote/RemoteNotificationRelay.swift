@@ -1,7 +1,7 @@
 import Foundation
 import RepoPromptRemoteProtocol
 
-enum RemoteNotificationDeliveryResult: Equatable, Sendable {
+enum RemoteNotificationDeliveryResult: Equatable {
     case notConfigured
     case delivered
     case failed(String)
@@ -122,7 +122,7 @@ final class RemoteNotificationRelay {
         return host == "localhost" || host == "127.0.0.1" || host == "::1"
     }
 
-    private struct RelayDeliveryRequest: Codable, Sendable {
+    private struct RelayDeliveryRequest: Codable {
         let platform: RemoteNotificationPlatform
         let deviceToken: String
         let desktopInstanceID: String

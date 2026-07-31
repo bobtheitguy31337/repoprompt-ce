@@ -11,25 +11,6 @@ struct RemoteSettingsView: View {
         .observe, .respond, .control, .danger
     ]
 
-    private enum ElevationPreset: String, CaseIterable, Identifiable {
-        case once
-        case fifteenMinutes
-        case persistent
-
-        var id: String { rawValue }
-
-        var title: String {
-            switch self {
-            case .once: "Next command only"
-            case .fifteenMinutes: "15 minutes"
-            case .persistent: "Until revoked"
-            }
-        }
-    }
-
-    @State private var elevationLevel: RemoteAuthorityLevel = .control
-    @State private var elevationPreset: ElevationPreset = .once
-
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
@@ -50,31 +31,41 @@ struct RemoteSettingsView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Remote Control")
+            Text("Connect your phone")
                 .font(.largeTitle.weight(.semibold))
-            Text("Optionally connect the RepoPrompt Remote app over your local network. The Mac remains the runtime, authority boundary, and source of truth.")
+            Text("Connect RepoPrompt Remote to this Mac. Your Mac remains in control of its projects and agents.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
 
     private var gatewaySection: some View {
-        GroupBox("Local gateway") {
+        GroupBox("Remote access") {
             VStack(alignment: .leading, spacing: 14) {
-                Toggle("Enable local HTTPS gateway", isOn: Binding(
+                Toggle("Enable pairing", isOn: Binding(
                     get: { gateway.isEnabled },
                     set: { enabled in
                         Task { await gateway.setEnabled(enabled) }
                     }
                 ))
 
-                Text("Only devices on the same LAN can reach the listener. Pairing is required before a snapshot or event stream is served.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-
-                if gateway.isRunning, let port = gateway.activePort {
+                if gateway.isPaired {
                     LabeledContent("Status") {
-                        Label("Running on HTTPS port \(port)", systemImage: "checkmark.circle.fill")
+                        if gateway.isRunning {
+                            Label("Connected", systemImage: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                        } else {
+                            Label(gateway.lastError ?? "Paired, but disabled", systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                    LabeledContent("Paired phone") {
+                        Text(gateway.pairedDeviceName ?? "Paired device")
+                            .foregroundStyle(.primary)
+                    }
+                } else if gateway.isRunning {
+                    LabeledContent("Status") {
+                        Label("Ready for pairing", systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.green)
                     }
                 } else {
@@ -82,6 +73,9 @@ struct RemoteSettingsView: View {
                         Text(gateway.lastError ?? "Disabled")
                             .foregroundStyle(gateway.lastError == nil ? Color.secondary : Color.red)
                     }
+                    Text("Allow RepoPrompt Remote to connect to this Mac. Pairing is required before anything can be viewed or controlled.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                 }
 
                 if let error = gateway.lastError, !error.isEmpty {
@@ -95,63 +89,57 @@ struct RemoteSettingsView: View {
         }
     }
 
+    @ViewBuilder
     private var pairingSection: some View {
-        GroupBox("Pair a phone") {
-            VStack(alignment: .leading, spacing: 14) {
-                if let image = qrImage {
-                    HStack(alignment: .top, spacing: 20) {
-                        image
-                            .interpolation(.none)
-                            .resizable()
-                            .frame(width: 220, height: 220)
-                            .padding(10)
-                            .background(.white)
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
+        if gateway.isPaired {
+            GroupBox("Paired phone") {
+                VStack(alignment: .leading, spacing: 14) {
+                    Button("Unpair phone", role: .destructive) {
+                        gateway.revokePairedDevice()
+                    }
+                }
+                .padding(8)
+            }
+        } else {
+            GroupBox("Pair your phone") {
+                VStack(alignment: .leading, spacing: 14) {
+                    if let pairingCode = gateway.pairingCode {
+                        HStack(alignment: .top, spacing: 20) {
+                            PairingQRCodeView(payload: pairingCode)
+                                .frame(width: 220, height: 220)
+                                .padding(10)
+                                .background(.white)
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
 
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("Scan this code in RepoPrompt Remote")
-                                .font(.headline)
-                            Text("The code expires after two minutes and is single-use. Generating a new code invalidates the previous one.")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                            HStack {
-                                Button("Generate new code") {
-                                    gateway.refreshPairingAdvertisement()
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("Scan this code with RepoPrompt Remote")
+                                    .font(.headline)
+                                Text("The code stays valid until it is used or you generate a new code. Generating a new code invalidates the previous one.")
+                                    .font(.callout)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                HStack {
+                                    Button("Generate new code") {
+                                        gateway.refreshPairingAdvertisement()
+                                    }
+                                    Button("Copy pairing link") {
+                                        copyPairingLink()
+                                    }
+                                    .disabled(gateway.pairingCode == nil)
                                 }
-                                Button("Copy pairing link") {
-                                    copyPairingLink()
-                                }
-                                .disabled(gateway.pairingCode == nil)
                             }
                         }
+                    } else {
+                        Text(gateway.isEnabled ? "Start pairing to generate a code." : "Enable pairing to generate a code.")
+                            .foregroundStyle(.secondary)
+                        Button("Generate pairing code") {
+                            gateway.refreshPairingAdvertisement()
+                        }
+                        .disabled(!gateway.isRunning)
                     }
-                } else {
-                    Text(gateway.isEnabled ? "Start the gateway to generate a pairing code." : "Enable the gateway to generate a pairing code.")
-                        .foregroundStyle(.secondary)
-                    Button("Generate pairing code") {
-                        gateway.refreshPairingAdvertisement()
-                    }
-                    .disabled(!gateway.isRunning)
                 }
-
-                if let advertisement = gateway.pairingAdvertisement {
-                    Text("Code expires \(advertisement.expiresAt, style: .relative)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                LabeledContent("Paired device") {
-                    Text(gateway.isPaired ? "One device paired" : "None")
-                        .foregroundStyle(gateway.isPaired ? .primary : .secondary)
-                }
-
-                Button("Revoke paired device", role: .destructive) {
-                    gateway.revokePairedDevice()
-                }
-                .disabled(!gateway.isPaired)
+                .padding(8)
             }
-            .padding(8)
         }
     }
 
@@ -172,48 +160,6 @@ struct RemoteSettingsView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-
-                Divider()
-
-                Text("Temporary elevation")
-                    .font(.headline)
-                Picker("Grant authority", selection: $elevationLevel) {
-                    ForEach(Self.authorityLevels.filter { $0 > .observe }, id: \.rawValue) { level in
-                        Text(authorityTitle(level)).tag(level)
-                    }
-                }
-                .pickerStyle(.menu)
-                Picker("Duration", selection: $elevationPreset) {
-                    ForEach(ElevationPreset.allCases) { preset in
-                        Text(preset.title).tag(preset)
-                    }
-                }
-                .pickerStyle(.menu)
-                HStack {
-                    Button("Grant temporary authority") {
-                        switch elevationPreset {
-                        case .once:
-                            gateway.grantAuthority(level: elevationLevel, duration: .once)
-                        case .fifteenMinutes:
-                            gateway.grantAuthority(
-                                level: elevationLevel,
-                                duration: .limited(until: Date().addingTimeInterval(15 * 60))
-                            )
-                        case .persistent:
-                            gateway.grantAuthority(level: elevationLevel, duration: .persistent)
-                        }
-                    }
-                    if gateway.activeAuthorityGrant != nil {
-                        Button("Revoke elevation", role: .destructive) {
-                            gateway.clearAuthorityGrant()
-                        }
-                    }
-                }
-                if let grant = gateway.activeAuthorityGrant {
-                    Text(grantDescription(grant))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
             }
             .padding(8)
         }
@@ -232,7 +178,7 @@ struct RemoteSettingsView: View {
                         .foregroundStyle(availability.preventsIdleSleepForActiveRun ? .green : .secondary)
                 }
 
-                Text("The sleep assertion is held only while an agent is opening, working, blocked, or waiting for input. The Remote gateway itself does not keep the Mac awake.")
+                Text("The Mac stays awake only while an agent is opening, working, blocked, or waiting for input.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -246,17 +192,6 @@ struct RemoteSettingsView: View {
             }
             .padding(8)
         }
-    }
-
-    private var qrImage: Image? {
-        guard gateway.isRunning, let pairingCode = gateway.pairingCode else { return nil }
-        let filter = CIFilter(name: "CIQRCodeGenerator")
-        filter?.setValue(Data(pairingCode.utf8), forKey: "inputMessage")
-        filter?.setValue("Q", forKey: "inputCorrectionLevel")
-        guard let output = filter?.outputImage else { return nil }
-        let scaled = output.transformed(by: CGAffineTransform(scaleX: 8, y: 8))
-        guard let cgImage = CIContext().createCGImage(scaled, from: scaled.extent) else { return nil }
-        return Image(decorative: cgImage, scale: 1, orientation: .up)
     }
 
     private func copyPairingLink() {
@@ -273,18 +208,54 @@ struct RemoteSettingsView: View {
         case .danger: "Danger"
         }
     }
+}
 
-    private func grantDescription(_ grant: RemoteAuthorityGrant) -> String {
-        let level = authorityTitle(grant.level)
-        switch grant.duration {
-        case .once:
-            return "\(level) is granted for the next successful command."
-        case .session:
-            return "\(level) is granted for the current session."
-        case let .limited(until):
-            return "\(level) is granted until \(until.formatted(date: .omitted, time: .shortened))."
-        case .persistent:
-            return "\(level) remains granted until revoked."
+private struct PairingQRCodeView: NSViewRepresentable {
+    let payload: String
+
+    private static let imageCache = NSCache<NSString, NSImage>()
+    private static let imageContext = CIContext()
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(payload: payload)
+    }
+
+    func makeNSView(context: Context) -> NSImageView {
+        let imageView = NSImageView()
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.imageAlignment = .alignCenter
+        imageView.image = Self.image(for: payload)
+        return imageView
+    }
+
+    func updateNSView(_ imageView: NSImageView, context: Context) {
+        guard context.coordinator.payload != payload else { return }
+        context.coordinator.payload = payload
+        imageView.image = Self.image(for: payload)
+    }
+
+    final class Coordinator {
+        var payload: String
+
+        init(payload: String) {
+            self.payload = payload
         }
+    }
+
+    private static func image(for payload: String) -> NSImage? {
+        let cacheKey = payload as NSString
+        if let cached = imageCache.object(forKey: cacheKey) {
+            return cached
+        }
+
+        let filter = CIFilter(name: "CIQRCodeGenerator")
+        filter?.setValue(Data(payload.utf8), forKey: "inputMessage")
+        filter?.setValue("Q", forKey: "inputCorrectionLevel")
+        guard let output = filter?.outputImage else { return nil }
+        let scaled = output.transformed(by: CGAffineTransform(scaleX: 8, y: 8))
+        guard let cgImage = imageContext.createCGImage(scaled, from: scaled.extent) else { return nil }
+        let image = NSImage(cgImage: cgImage, size: NSSize(width: 220, height: 220))
+        imageCache.setObject(image, forKey: cacheKey)
+        return image
     }
 }
