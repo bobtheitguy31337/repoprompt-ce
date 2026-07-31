@@ -13,7 +13,8 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "IrohTransportFFI",
-            path: "Artifacts/IrohTransportFFI.xcframework"
+            url: "https://github.com/bobtheitguy31337/repoprompt-ce/releases/download/iroh-ffi-v0.1.0/IrohTransportFFI.xcframework.zip",
+            checksum: "02dfc51f930e8bd7eaa67536363264b1e7a36026f21b2a7ed5322b6b46fc4764"
         ),
         .target(
             name: "RepoPromptIrohTransport",
