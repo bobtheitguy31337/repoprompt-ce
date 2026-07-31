@@ -56,6 +56,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var agentModelRaw: String?
     var agentReasoningEffortRaw: String?
     var lastRunStateRaw: String?
+    var originWorkflowID: String?
+    var originWorkflowDisplayName: String?
+    var lastRunStartedAt: Date?
     var autoEditEnabled: Bool
     var parentSessionID: UUID?
     var isMCPOriginated: Bool
@@ -137,7 +140,10 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         keyPaths: Set<String> = [],
         coveredTurnDurationSeconds: Int = 0,
         interActiveIntervalGapSeconds: [Int] = [],
-        toolCallCount: Int = 0
+        toolCallCount: Int = 0,
+        originWorkflowID: String? = nil,
+        originWorkflowDisplayName: String? = nil,
+        lastRunStartedAt: Date? = nil
     ) {
         self.id = id
         self.filename = filename
@@ -153,6 +159,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.agentModelRaw = agentModelRaw
         self.agentReasoningEffortRaw = agentReasoningEffortRaw
         self.lastRunStateRaw = lastRunStateRaw
+        self.originWorkflowID = originWorkflowID
+        self.originWorkflowDisplayName = originWorkflowDisplayName
+        self.lastRunStartedAt = lastRunStartedAt
         self.autoEditEnabled = autoEditEnabled
         self.parentSessionID = parentSessionID
         self.isMCPOriginated = isMCPOriginated
@@ -185,6 +194,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case agentModelRaw
         case agentReasoningEffortRaw
         case lastRunStateRaw
+        case originWorkflowID
+        case originWorkflowDisplayName
+        case lastRunStartedAt
         case autoEditEnabled
         case parentSessionID
         case isMCPOriginated
@@ -218,6 +230,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         agentModelRaw = try container.decodeIfPresent(String.self, forKey: .agentModelRaw)
         agentReasoningEffortRaw = try container.decodeIfPresent(String.self, forKey: .agentReasoningEffortRaw)
         lastRunStateRaw = try container.decodeIfPresent(String.self, forKey: .lastRunStateRaw)
+        originWorkflowID = try container.decodeIfPresent(String.self, forKey: .originWorkflowID)
+        originWorkflowDisplayName = try container.decodeIfPresent(String.self, forKey: .originWorkflowDisplayName)
+        lastRunStartedAt = try container.decodeIfPresent(Date.self, forKey: .lastRunStartedAt)
         autoEditEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoEditEnabled) ?? true
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
         isMCPOriginated = try container.decodeIfPresent(Bool.self, forKey: .isMCPOriginated) ?? false
@@ -253,7 +268,10 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: isMCPOriginated,
             worktreeBindingSummaries: worktreeBindingSummaries,
-            activeWorktreeMergeSummaries: activeWorktreeMergeSummaries
+            activeWorktreeMergeSummaries: activeWorktreeMergeSummaries,
+            originWorkflowID: originWorkflowID,
+            originWorkflowDisplayName: originWorkflowDisplayName,
+            lastRunStartedAt: lastRunStartedAt
         )
     }
 
@@ -289,6 +307,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && agentModelRaw == other.agentModelRaw
             && agentReasoningEffortRaw == other.agentReasoningEffortRaw
             && lastRunStateRaw == other.lastRunStateRaw
+            && originWorkflowID == other.originWorkflowID
+            && originWorkflowDisplayName == other.originWorkflowDisplayName
+            && lastRunStartedAt == other.lastRunStartedAt
             && autoEditEnabled == other.autoEditEnabled
             && parentSessionID == other.parentSessionID
             && isMCPOriginated == other.isMCPOriginated
@@ -347,7 +368,10 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             keyPaths: aggregatedKeyPaths,
             coveredTurnDurationSeconds: durationPrimitives.coveredSeconds,
             interActiveIntervalGapSeconds: durationPrimitives.gapSeconds,
-            toolCallCount: computedToolCallCount
+            toolCallCount: computedToolCallCount,
+            originWorkflowID: session.originWorkflowID,
+            originWorkflowDisplayName: session.originWorkflowDisplayName,
+            lastRunStartedAt: session.lastRunStartedAt
         )
     }
 

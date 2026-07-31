@@ -90,6 +90,7 @@ final class ClaudeIntegratedAgentModeRunner {
         hooks.setAgentRunActive(tabID, true)
         hooks.updateBindings(session)
 
+        session.markRunStartAccepted()
         session.agentTask = Task { [weak self, weak session] in
             guard let self, let session else { return }
             await withTaskCancellationHandler {

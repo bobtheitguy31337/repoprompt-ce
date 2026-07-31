@@ -6,7 +6,7 @@ import RepoPromptRemoteProtocol
 /// A sanitized, immutable workspace record used by remote projections. The
 /// adapter deliberately exposes only a repository-root summary, never a raw
 /// filesystem path.
-struct RemoteWorkspaceRecord: Equatable, Sendable {
+struct RemoteWorkspaceRecord: Equatable {
     let workspaceID: UUID
     let name: String
     let repositoryRootSummary: String?
@@ -15,16 +15,20 @@ struct RemoteWorkspaceRecord: Equatable, Sendable {
     let lastActivityAt: Date?
 }
 
-struct RemoteSessionRecord: Equatable, Sendable {
+struct RemoteSessionRecord: Equatable {
     let sessionID: UUID
     let workspaceID: UUID
     let composeTabID: UUID?
     let parentSessionID: UUID?
     let sessionName: String?
     let workflow: String?
+    let workflowID: String?
+    let runStartedAt: Date?
+    let transcriptRevision: UInt64?
     let agent: String?
     let model: String?
     let reasoningEffort: String?
+    let configurationControls: RemoteSessionConfigurationControls?
     let runState: RemoteRunState
     let lifecycleStage: String?
     let latestMeaningfulActivity: String?
@@ -34,11 +38,70 @@ struct RemoteSessionRecord: Equatable, Sendable {
     let failureSummary: String?
     let lastUpdatedAt: Date
     let isLive: Bool
+
+    init(
+        sessionID: UUID,
+        workspaceID: UUID,
+        composeTabID: UUID?,
+        parentSessionID: UUID?,
+        sessionName: String?,
+        workflow: String?,
+        agent: String?,
+        model: String?,
+        reasoningEffort: String?,
+        runState: RemoteRunState,
+        lifecycleStage: String?,
+        latestMeaningfulActivity: String?,
+        pendingInteraction: RemoteInteractionSummary?,
+        worktreeSummary: String?,
+        mergeAttention: String?,
+        failureSummary: String?,
+        lastUpdatedAt: Date,
+        isLive: Bool,
+        workflowID: String? = nil,
+        runStartedAt: Date? = nil,
+        transcriptRevision: UInt64? = nil,
+        configurationControls: RemoteSessionConfigurationControls? = nil
+    ) {
+        self.sessionID = sessionID
+        self.workspaceID = workspaceID
+        self.composeTabID = composeTabID
+        self.parentSessionID = parentSessionID
+        self.sessionName = sessionName
+        self.workflow = workflow
+        self.workflowID = workflowID
+        self.runStartedAt = runStartedAt
+        self.transcriptRevision = transcriptRevision
+        self.agent = agent
+        self.model = model
+        self.reasoningEffort = reasoningEffort
+        self.configurationControls = configurationControls
+        self.runState = runState
+        self.lifecycleStage = lifecycleStage
+        self.latestMeaningfulActivity = latestMeaningfulActivity
+        self.pendingInteraction = pendingInteraction
+        self.worktreeSummary = worktreeSummary
+        self.mergeAttention = mergeAttention
+        self.failureSummary = failureSummary
+        self.lastUpdatedAt = lastUpdatedAt
+        self.isLive = isLive
+    }
 }
 
-struct RemoteCatalogRecord: Equatable, Sendable {
+struct RemoteCatalogRecord: Equatable {
     let workflows: [RemoteWorkflowDescriptor]
     let agents: [RemoteAgentDescriptor]
+    let metadata: RemoteCatalogMetadata?
+
+    init(
+        workflows: [RemoteWorkflowDescriptor],
+        agents: [RemoteAgentDescriptor],
+        metadata: RemoteCatalogMetadata? = nil
+    ) {
+        self.workflows = workflows
+        self.agents = agents
+        self.metadata = metadata
+    }
 
     static let empty = Self(workflows: [], agents: [])
 }
@@ -53,14 +116,14 @@ protocol WorkspaceActivationService: AnyObject {
     func activate(workspaceID: UUID) async -> Result<RemoteWorkspaceActivationResult, RemoteWorkspaceActivationError>
 }
 
-struct RemoteWorkspaceActivationResult: Equatable, Sendable {
+struct RemoteWorkspaceActivationResult: Equatable {
     let workspaceID: UUID
     let composeTabID: UUID?
     let windowID: Int?
     let reusedExistingWindow: Bool
 }
 
-enum RemoteWorkspaceActivationError: Error, Equatable, Sendable {
+enum RemoteWorkspaceActivationError: Error, Equatable {
     case invalidWorkspaceID
     case workspaceNotFound
     case activationBlocked(String)
@@ -104,7 +167,8 @@ final class RemoteSnapshotBuilder {
         desktop: RemoteDesktopSummary,
         connection: RemoteConnectionSummary,
         authorization: RemoteAuthorizationState,
-        eventCursor: UInt64 = 0
+        eventCursor: UInt64 = 0,
+        transcriptRevisionEpoch: UUID? = nil
     ) async -> RemoteSnapshot {
         let workspaces = await workspaceCatalog.allSavedWorkspaces()
             .map {
@@ -132,9 +196,13 @@ final class RemoteSnapshotBuilder {
                 parentSessionID: $0.parentSessionID,
                 sessionName: $0.sessionName,
                 workflow: $0.workflow,
+                workflowID: $0.workflowID,
+                runStartedAt: $0.runStartedAt,
+                transcriptRevision: $0.transcriptRevision,
                 agent: $0.agent,
                 model: $0.model,
                 reasoningEffort: $0.reasoningEffort,
+                configurationControls: $0.configurationControls,
                 runState: $0.runState,
                 lifecycleStage: $0.lifecycleStage,
                 latestMeaningfulActivity: $0.latestMeaningfulActivity,
@@ -180,7 +248,9 @@ final class RemoteSnapshotBuilder {
             attentionItems: attentionItems,
             workflowCatalog: catalog.workflows,
             agentCatalog: catalog.agents,
-            eventCursor: eventCursor
+            agentCatalogMetadata: catalog.metadata,
+            eventCursor: eventCursor,
+            transcriptRevisionEpoch: transcriptRevisionEpoch
         )
     }
 }
@@ -265,13 +335,23 @@ final class WorkspaceManagerRemoteActivationService: WorkspaceActivationService 
 @MainActor
 final class AgentModeRemoteSessionQueryService: SessionQueryService {
     private let contexts: [(agentMode: AgentModeViewModel, workspaceManager: WorkspaceManagerViewModel)]
+    private let revisionTracker: RemoteTranscriptRevisionTracker?
 
-    init(agentMode: AgentModeViewModel, workspaceManager: WorkspaceManagerViewModel) {
+    init(
+        agentMode: AgentModeViewModel,
+        workspaceManager: WorkspaceManagerViewModel,
+        revisionTracker: RemoteTranscriptRevisionTracker? = nil
+    ) {
         contexts = [(agentMode, workspaceManager)]
+        self.revisionTracker = revisionTracker
     }
 
-    init(contexts: [(agentMode: AgentModeViewModel, workspaceManager: WorkspaceManagerViewModel)]) {
+    init(
+        contexts: [(agentMode: AgentModeViewModel, workspaceManager: WorkspaceManagerViewModel)],
+        revisionTracker: RemoteTranscriptRevisionTracker? = nil
+    ) {
         self.contexts = contexts
+        self.revisionTracker = revisionTracker
     }
 
     func remoteSessions() async -> [RemoteSessionRecord] {
@@ -282,19 +362,62 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
             guard let workspaceID else { continue }
             let liveByTabID = context.agentMode.sessions
             for entry in context.agentMode.sessionIndex.values {
-                let live = liveByTabID[entry.tabID]
+                let live = Self.matchingLiveSession(
+                    entryID: entry.id,
+                    tabID: entry.tabID,
+                    liveByTabID: liveByTabID
+                )
                 let runState = live.map { Self.mapRunState($0.runState) }
                     ?? Self.mapPersistedRunState(entry.lastRunStateRaw)
+                let transcriptRevision: UInt64? = if let live {
+                    revisionTracker?.observeLive(
+                        sessionID: entry.id,
+                        transcript: live.transcript,
+                        mutationRevision: live.remoteTranscriptMutationRevision,
+                        ownerID: ObjectIdentifier(live)
+                    )
+                } else if let cached = revisionTracker?.cachedPersistedRevision(
+                    sessionID: entry.id,
+                    savedAt: entry.savedAt
+                ) {
+                    cached
+                } else if let workspace = context.workspaceManager.workspaces.first(where: { $0.id == workspaceID }),
+                          let persisted = try? await AgentSessionDataService.shared.loadAgentSession(
+                              id: entry.id,
+                              for: workspace
+                          )
+                {
+                    revisionTracker?.observePersisted(
+                        sessionID: entry.id,
+                        savedAt: entry.savedAt,
+                        fingerprint: .persisted(transcript: persisted.transcript ?? .empty)
+                    )
+                } else {
+                    revisionTracker?.revision(for: entry.id)
+                }
+                let selectionCapabilities: AgentSessionSelectionCapabilities? = if let live {
+                    context.agentMode.mcpSessionSelectionCapabilities(
+                        tabID: live.tabID,
+                        sessionID: entry.id
+                    )
+                } else {
+                    context.agentMode.mcpPersistedSessionSelectionCapabilities(
+                        agentRaw: entry.agentKindRaw,
+                        modelRaw: entry.agentModelRaw,
+                        reasoningEffortRaw: entry.agentReasoningEffortRaw,
+                        isMutable: Self.isConfigurationMutable(runState: runState)
+                    )
+                }
                 let record = RemoteSessionRecord(
                     sessionID: entry.id,
                     workspaceID: workspaceID,
                     composeTabID: entry.tabID,
                     parentSessionID: entry.parentSessionID,
                     sessionName: entry.name,
-                    workflow: nil,
-                    agent: entry.agentKindRaw,
-                    model: entry.agentModelRaw,
-                    reasoningEffort: entry.agentReasoningEffortRaw,
+                    workflow: live?.originWorkflowDisplayName ?? entry.originWorkflowDisplayName,
+                    agent: live?.selectedAgent.rawValue ?? entry.agentKindRaw,
+                    model: selectionCapabilities?.resolvedModelRaw ?? entry.agentModelRaw,
+                    reasoningEffort: selectionCapabilities?.resolvedReasoningEffortRaw ?? entry.agentReasoningEffortRaw,
                     runState: runState,
                     lifecycleStage: live?.runState.rawValue,
                     latestMeaningfulActivity: live?.runningStatusText ?? live?.waitingPrompt,
@@ -303,7 +426,11 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
                     mergeAttention: entry.activeWorktreeMergeSummaries.isEmpty ? nil : "Merge review available",
                     failureSummary: runState == .failed ? "Agent run failed" : nil,
                     lastUpdatedAt: max(entry.savedAt, live?.activeAgentRunStartedAt ?? .distantPast),
-                    isLive: live != nil
+                    isLive: live != nil,
+                    workflowID: live?.originWorkflowID ?? entry.originWorkflowID,
+                    runStartedAt: live?.lastRunStartedAt ?? entry.lastRunStartedAt,
+                    transcriptRevision: transcriptRevision,
+                    configurationControls: selectionCapabilities.map(Self.remoteConfigurationControls)
                 )
                 if let existing = records[record.sessionID], existing.lastUpdatedAt >= record.lastUpdatedAt {
                     continue
@@ -314,6 +441,17 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
         return Array(records.values)
     }
 
+    static func matchingLiveSession(
+        entryID: UUID,
+        tabID: UUID,
+        liveByTabID: [UUID: AgentModeViewModel.TabSession]
+    ) -> AgentModeViewModel.TabSession? {
+        guard let live = liveByTabID[tabID], live.activeAgentSessionID == entryID else {
+            return nil
+        }
+        return live
+    }
+
     private static func mapRunState(_ state: AgentSessionRunState) -> RemoteRunState {
         switch state {
         case .idle: .idle
@@ -322,6 +460,15 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
         case .completed: .completed
         case .cancelled: .cancelled
         case .failed: .failed
+        }
+    }
+
+    private static func isConfigurationMutable(runState: RemoteRunState) -> Bool {
+        switch runState {
+        case .opening, .working, .waitingForInput:
+            false
+        case .idle, .blocked, .completed, .failed, .cancelled:
+            true
         }
     }
 
@@ -336,6 +483,28 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
         case AgentSessionRunState.failed.rawValue: .failed
         default: .idle
         }
+    }
+
+    private static func remoteConfigurationControls(
+        _ capabilities: AgentSessionSelectionCapabilities
+    ) -> RemoteSessionConfigurationControls {
+        RemoteSessionConfigurationControls(
+            agent: RemoteSelectionControl(
+                isMutable: capabilities.isMutable && capabilities.allowedAgentRawValues.count > 1,
+                allowedValueIDs: capabilities.allowedAgentRawValues,
+                unavailableReason: capabilities.agentUnavailableReason
+            ),
+            model: RemoteSelectionControl(
+                isMutable: capabilities.isMutable && !capabilities.allowedModelRawValues.isEmpty,
+                allowedValueIDs: capabilities.allowedModelRawValues,
+                unavailableReason: capabilities.selectionUnavailableReason
+            ),
+            reasoningEffort: RemoteSelectionControl(
+                isMutable: capabilities.isMutable && !capabilities.allowedReasoningEffortRawValues.isEmpty,
+                allowedValueIDs: capabilities.allowedReasoningEffortRawValues,
+                unavailableReason: capabilities.selectionUnavailableReason
+            )
+        )
     }
 
     private static func pendingInteraction(for session: AgentModeViewModel.TabSession?) -> RemoteInteractionSummary? {
@@ -391,7 +560,9 @@ final class StaticRemoteCatalogService: WorkflowCatalogService {
         self.catalog = catalog
     }
 
-    func remoteCatalog() async -> RemoteCatalogRecord { catalog }
+    func remoteCatalog() async -> RemoteCatalogRecord {
+        catalog
+    }
 }
 
 /// Projects the desktop's live workflow and provider stores into the compact
@@ -400,31 +571,182 @@ final class StaticRemoteCatalogService: WorkflowCatalogService {
 /// on the Mac.
 @MainActor
 final class DesktopRemoteCatalogService: WorkflowCatalogService {
-    func remoteCatalog() async -> RemoteCatalogRecord {
-        let workflows = AgentWorkflowStore.shared.allWorkflows.map {
+    private let agentModes: [AgentModeViewModel]
+
+    init(agentModes: [AgentModeViewModel] = []) {
+        self.agentModes = agentModes
+    }
+
+    static func workflowDescriptors(
+        workflows: [AgentWorkflowDefinition],
+        featuredWorkflowIDs: [String]
+    ) -> [RemoteWorkflowDescriptor] {
+        let featuredRankByID = featuredWorkflowIDs.enumerated().reduce(into: [String: Int]()) { ranks, entry in
+            if ranks[entry.element] == nil {
+                ranks[entry.element] = entry.offset
+            }
+        }
+        return workflows.map {
             RemoteWorkflowDescriptor(
                 id: $0.id,
                 displayName: $0.displayName,
                 isBuiltIn: $0.isBuiltIn,
-                requiredAuthority: .control
+                requiredAuthority: .control,
+                iconName: $0.iconName,
+                accentColorHex: $0.accentColorHex,
+                descriptionText: $0.descriptionText,
+                featuredRank: featuredRankByID[$0.id]
             )
         }
+    }
 
-        let availability = AgentModelCatalog.AvailabilityContext.current
-        let agents = AgentModelCatalog
-            .selectableAgents(availability: availability)
-            .map { agent in
-                RemoteAgentDescriptor(
-                    id: agent.rawValue,
-                    displayName: agent.displayName,
-                    models: AgentModelCatalog
-                        .options(for: agent, availability: availability)
-                        .map(\.rawValue),
-                    isAvailable: true
+    func remoteCatalog() async -> RemoteCatalogRecord {
+        let store = AgentWorkflowStore.shared
+        let workflows = Self.workflowDescriptors(
+            workflows: store.allWorkflows,
+            featuredWorkflowIDs: store.featuredWorkflowIDs
+        )
+
+        guard let source = agentModes.first else {
+            return RemoteCatalogRecord(workflows: workflows, agents: [])
+        }
+        let persistedDefault = AgentModeViewModel.remoteDefaultSelection(
+            availability: source.remoteAgentAvailabilityContext
+        )
+        let preferredDefault = RemoteAgentSelection(
+            agentID: persistedDefault.agentRaw,
+            modelID: persistedDefault.modelRaw,
+            reasoningEffort: persistedDefault.reasoningEffortRaw
+        )
+        let agents = source.availableAgents.compactMap { agent -> RemoteAgentDescriptor? in
+            let options = source.modelOptions(for: agent, includeClaudeEffortVariants: false)
+            let visible = options.filter { !$0.isPlaceholderDefault }
+            let selectable = visible.isEmpty ? options : visible
+            guard !selectable.isEmpty else { return nil }
+            let models: [RemoteModelDescriptor]
+            let defaultModelID: String?
+            if agent == .codexExec {
+                let discovered = source.remoteSelectableDiscoveryAgent(for: agent)?.models ?? []
+                models = discovered.map { model in
+                    let defaultEffort = model.defaultReasoningEffort
+                        ?? model.startTargets.first(where: \.isDefault)?.reasoningEffort
+                    return RemoteModelDescriptor(
+                        id: model.id,
+                        displayName: model.name,
+                        isAvailable: model.available,
+                        reasoningEfforts: model.supportedReasoningEfforts.map {
+                            RemoteReasoningEffortDescriptor(id: $0.rawValue, displayName: $0.displayName)
+                        },
+                        defaultReasoningEffortID: defaultEffort?.rawValue
+                    )
+                }
+                defaultModelID = if agent.rawValue == preferredDefault.agentID {
+                    discovered.first(where: { model in
+                        model.id.caseInsensitiveCompare(preferredDefault.modelID) == .orderedSame
+                            || model.startTargets.contains(where: {
+                                $0.modelRaw.caseInsensitiveCompare(preferredDefault.modelID) == .orderedSame
+                            })
+                    })?.id
+                } else {
+                    nil
+                }
+            } else {
+                models = selectable.map { option in
+                    RemoteModelDescriptor(id: option.rawValue, displayName: option.displayName)
+                }
+                defaultModelID = if agent.rawValue == preferredDefault.agentID {
+                    selectable.first(where: {
+                        $0.rawValue.caseInsensitiveCompare(preferredDefault.modelID) == .orderedSame
+                    })?.rawValue
+                } else {
+                    nil
+                }
+            }
+            guard !models.isEmpty else { return nil }
+            return RemoteAgentDescriptor(
+                id: agent.rawValue,
+                displayName: agent.displayName,
+                models: models.map(\.id),
+                isAvailable: true,
+                modelDescriptors: models,
+                defaultModelID: defaultModelID
+            )
+        }
+        let resolvedDefault = Self.resolvedDefaultSelection(
+            preferredDefault,
+            agents: agents
+        )
+        let toolState = source.remoteCodexToolBinding()
+        let toolsAreMutable = agentModes.allSatisfy { $0.remoteCodexToolBinding().isMutable }
+        let toolCatalog = Self.toolCatalog(
+            binding: toolState.binding,
+            isMutable: toolsAreMutable
+        )
+        let metadata = RemoteCatalogMetadata(
+            defaultAgentID: resolvedDefault?.agentID,
+            defaultSelection: resolvedDefault,
+            toolCatalog: toolCatalog,
+            supportsStartSelection: true,
+            supportsSessionConfiguration: true
+        )
+
+        return RemoteCatalogRecord(workflows: workflows, agents: agents, metadata: metadata)
+    }
+
+    static func resolvedDefaultSelection(
+        _ preferred: RemoteAgentSelection,
+        agents: [RemoteAgentDescriptor]
+    ) -> RemoteAgentSelection? {
+        guard let agent = agents.first(where: {
+            $0.id.caseInsensitiveCompare(preferred.agentID) == .orderedSame
+        }) else { return nil }
+        let modelIDs = agent.modelDescriptors?.map(\.id) ?? agent.models
+        let resolvedModelID = modelIDs.first(where: {
+            $0.caseInsensitiveCompare(preferred.modelID) == .orderedSame
+        }) ?? agent.defaultModelID.flatMap { fallback in
+            modelIDs.first(where: { $0.caseInsensitiveCompare(fallback) == .orderedSame })
+        }
+        guard let resolvedModelID else { return nil }
+        return RemoteAgentSelection(
+            agentID: agent.id,
+            modelID: resolvedModelID,
+            reasoningEffort: agent.id == AgentProviderKind.codexExec.rawValue
+                ? preferred.reasoningEffort
+                : nil
+        )
+    }
+
+    static func toolCatalog(
+        binding: AgentProviderControlsBinding,
+        isMutable: Bool
+    ) -> RemoteToolCatalog? {
+        binding.codexTools.map { tools in
+            var settings = [
+                RemoteToolSettingDescriptor(id: "bash", displayName: "Bash", category: "tools", isEnabled: tools.bashToolEnabled),
+                RemoteToolSettingDescriptor(id: "search", displayName: "Search", category: "tools", isEnabled: tools.searchToolEnabled),
+                RemoteToolSettingDescriptor(id: "goals", displayName: "Goals", category: "tools", isEnabled: tools.goalSupportEnabled),
+                RemoteToolSettingDescriptor(id: "reasoning_summaries", displayName: "Reasoning Summaries", category: "tools", isEnabled: tools.reasoningSummariesEnabled)
+            ]
+            settings += tools.mcpServerEntries.map { entry in
+                let required = entry.normalizedName.caseInsensitiveCompare(MCPIntegrationHelper.repoPromptMCPServerName) == .orderedSame
+                let key = entry.normalizedName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                return RemoteToolSettingDescriptor(
+                    id: "mcp:\(entry.normalizedName)",
+                    displayName: entry.normalizedName,
+                    category: "mcp_servers",
+                    isEnabled: required || (tools.mcpServerStatesByNormalizedName[key] ?? false),
+                    isMutable: isMutable && !required,
+                    isRequired: required
                 )
             }
-
-        return RemoteCatalogRecord(workflows: workflows, agents: agents)
+            return RemoteToolCatalog(
+                providerID: AgentProviderKind.codexExec.rawValue,
+                revision: binding.revision,
+                settings: settings,
+                isMutable: isMutable,
+                unavailableReason: isMutable ? nil : "Tool controls are locked during an active Codex run."
+            )
+        }
     }
 }
 

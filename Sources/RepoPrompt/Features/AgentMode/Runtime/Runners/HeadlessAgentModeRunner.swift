@@ -96,6 +96,7 @@ final class HeadlessAgentModeRunner {
             }
         }
 
+        session.markRunStartAccepted()
         session.agentTask = Task { [weak self, weak session] in
             guard let self, let session else { return }
             await withTaskCancellationHandler {

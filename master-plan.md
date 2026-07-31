@@ -230,7 +230,7 @@ Implemented foundation:
 
 Files added or changed in the current implementation:
 
-- `Packages/RepoPromptRemoteProtocol/`
+- `Sources/RepoPromptRemoteProtocol/`
 - `Sources/RepoPromptShared/RemoteProtocolExports.swift`
 - `Sources/RepoPrompt/Infrastructure/Remote/`
 - `Sources/RepoPrompt/Features/Settings/Views/RemoteSettingsView.swift`
@@ -316,23 +316,25 @@ review-ready. Do not rewrite history or force-push without explicit approval.
 
 ## 5. Master implementation roadmap
 
-### Phase 0 — Repository and protocol ownership
+### Phase 0 — Standalone repositories and wire protocol ownership
 
-Goal: make the two-repository boundary explicit and buildable.
+Goal: keep the desktop and mobile applications independently buildable while
+preserving a compatible versioned wire protocol.
 
-- [x] Create/configure the GitHub remote for `repoprompt-remote`.
-- [x] Decide where the shared Foundation protocol package is versioned: it lives
-      under `Packages/RepoPromptRemoteProtocol/` in `repoprompt-remote`.
-- [x] Extract the Remote DTOs into a small platform-neutral Swift package
-      consumed by desktop and mobile. Desktop uses a local path dependency while
-      the package is developed; a tagged remote dependency is release work.
-- [x] Add CI for the iOS simulator build and protocol tests.
+- [x] Keep the desktop protocol implementation in
+      `Sources/RepoPromptRemoteProtocol/` inside RepoPrompt CE.
+- [x] Remove all desktop package, path, submodule, and build dependencies on the
+      companion mobile application repository.
+- [x] Keep each standalone application responsible for its own protocol source.
+- [x] Freeze desktop protocol-v1 contract tests and fixtures against the shipped
+      TestFlight source commit `0bfa18f2a480791cddde24bb79fa79b40d0dd934`.
 - [x] Add a compatibility policy: both peers accept only the declared supported
       range (`RemoteProtocol.minimumSupportedVersion...currentVersion`); a
       future incompatible contract gets a new versioned path.
 
-Exit criteria: both repositories build in CI, and the mobile app does not own a
-second incompatible copy of the Remote protocol.
+Exit criteria: each repository builds from its own checkout, and compatibility
+with the shipped client is enforced through wire fixtures rather than shared
+source code.
 
 ### Phase 1 — Shared desktop control services
 

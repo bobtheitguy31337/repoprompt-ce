@@ -3,15 +3,22 @@
 RepoPrompt Remote is a RepoPrompt-specific control protocol for a paired mobile
 client. It is not a network version of the existing Unix-socket MCP transport.
 
-## Shared contract
+## Standalone wire contract
 
-The contract lives in the Foundation-only Swift package at
-`Packages/RepoPromptRemoteProtocol/` in the `repoprompt-remote` repository. The
-desktop target consumes it through the local development dependency declared in
-`Package.swift` and re-exports it from
-`Sources/RepoPromptShared/RemoteProtocolExports.swift`. This keeps the same
-types available to the macOS gateway, iOS client, future Android client, and
-protocol tests without importing the desktop UI or MCP implementation.
+RepoPrompt CE owns its Foundation-only protocol implementation in
+`Sources/RepoPromptRemoteProtocol/` and builds it as an internal SwiftPM target.
+It has no source, package, path, submodule, or build dependency on any companion
+application repository. `Sources/RepoPromptShared/RemoteProtocolExports.swift`
+re-exports the internal target for desktop consumers without importing the app
+UI or MCP implementation.
+
+Companion clients own their protocol implementations independently. Compatibility
+is defined only by the versioned wire format. The protocol-v1 baseline in this
+repository is frozen against the RepoPrompt Remote TestFlight source commit
+`0bfa18f2a480791cddde24bb79fa79b40d0dd934`; the contract tests and JSON fixtures
+under `Tests/RepoPromptRemoteProtocolTests/` protect decoding and additive-field
+compatibility with that shipped client. Neither application needs the other
+application's checkout to build.
 
 `RemoteSnapshot` is the authoritative fleet projection sent after pairing and
 on reconnect. It contains desktop and connection state, authorization, all saved
@@ -113,7 +120,7 @@ identity and the single paired-device credential in separate Keychain records.
    existing Agent Mode and workspace state.
 2. Add the opt-in desktop listener, pairing, credential rotation, snapshot and
    command endpoints, and replayable event stream.
-3. Build the separate iOS client against this shared contract.
+3. Build the separate iOS client against the same protocol-v1 wire contract.
 4. Add Context Builder/workflow operations and explicit detail expansion on top
    of the established command/read boundaries. Context Builder clarify,
    question, plan, and review flows now use the desktop window-tool service;
@@ -161,8 +168,7 @@ than the bounded replay buffer. Built-in and custom workflows are projected
 provider-backed relay URL remains environment configuration rather than a
 desktop runtime dependency.
 
-The security threat model, residual risks, and release gates are maintained in
-the companion mobile repository at
-`docs/security/remote-threat-model.md`. The two implementation repositories are
-the agreed `bobtheitguy31337/repoprompt-ce` desktop fork and
-`bobtheitguy31337/repoprompt-remote` mobile repository.
+The desktop gateway remains responsible for its own threat model, residual risks,
+and release gates. Companion applications maintain their security documentation
+and release process independently; they are wire-compatible peers, not build-time
+dependencies.

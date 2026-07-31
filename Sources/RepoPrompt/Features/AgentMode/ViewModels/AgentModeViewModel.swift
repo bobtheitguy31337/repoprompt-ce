@@ -10,6 +10,23 @@ struct AgentContextUsage: Codable, Equatable {
     var totalTotalTokens: Int?
 }
 
+struct AgentSessionSelectionCapabilities: Equatable {
+    let allowedAgentRawValues: [String]
+    let allowedModelRawValues: [String]
+    let allowedReasoningEffortRawValues: [String]
+    let resolvedModelRaw: String
+    let resolvedReasoningEffortRaw: String?
+    let isMutable: Bool
+    let agentUnavailableReason: String?
+    let selectionUnavailableReason: String?
+}
+
+struct AgentSessionResolvedConfiguration: Equatable {
+    let agentRaw: String
+    let modelRaw: String
+    let reasoningEffortRaw: String?
+}
+
 // MARK: - Agent Mode View Model
 
 /// View model for Agent mode - manages per-tab agent chat sessions with long-running agent interactions
@@ -1054,6 +1071,36 @@ final class AgentModeViewModel: ObservableObject {
     private static func lastUsedModelRaw(forAgentRaw agentRaw: String) -> String? {
         let dict = UserDefaults.standard.dictionary(forKey: lastUsedModelsByAgentKey) as? [String: String]
         return dict?[agentRaw]
+    }
+
+    static func remoteDefaultSelection(
+        availability: AgentModelCatalog.AvailabilityContext = .current
+    ) -> AgentSessionResolvedConfiguration {
+        let savedAgentRaw = UserDefaults.standard.string(forKey: lastUsedAgentKey)
+        let savedModelRaw = savedAgentRaw.flatMap { lastUsedModelRaw(forAgentRaw: $0) }
+        let normalized = AgentModelCatalog.normalizeSelection(
+            agentRaw: savedAgentRaw,
+            modelRaw: savedModelRaw,
+            availability: availability
+        )
+        let discoveryAgent = AgentModelCatalog.discoveryAgents(availability: availability)
+            .first(where: { $0.agent == normalized.agent })
+        let discoveryModel = discoveryAgent.flatMap {
+            Self.discoveryModel(matching: normalized.modelRaw, in: $0)
+        }
+        let supportedEfforts: [CodexReasoningEffort] = discoveryModel?.supportedReasoningEfforts ?? []
+        let preferredEffort: CodexReasoningEffort? = normalized.agent == .codexExec
+            ? CodexAgentToolPreferences.lastUsedReasoningEffort(forModelRaw: normalized.modelRaw)
+            : nil
+        let resolvedEffort: CodexReasoningEffort? = preferredEffort.flatMap {
+            supportedEfforts.contains($0) ? $0 : nil
+        } ?? discoveryModel?.defaultReasoningEffort
+            ?? (supportedEfforts.contains(CodexReasoningEffort.medium) ? CodexReasoningEffort.medium : supportedEfforts.first)
+        return AgentSessionResolvedConfiguration(
+            agentRaw: normalized.agent.rawValue,
+            modelRaw: discoveryModel?.id ?? normalized.modelRaw,
+            reasoningEffortRaw: normalized.agent == .codexExec ? resolvedEffort?.rawValue : nil
+        )
     }
 
     private func restoreLastUsedAgentSelectionIfNeeded() {
@@ -4136,6 +4183,9 @@ final class AgentModeViewModel: ObservableObject {
         session.hasSentFirstMessage = payload.transcript.turns.contains { $0.request != nil }
         session.parentSessionID = agentSession.parentSessionID
         session.isMCPOriginated = agentSession.isMCPOriginated
+        session.originWorkflowID = agentSession.originWorkflowID
+        session.originWorkflowDisplayName = agentSession.originWorkflowDisplayName
+        session.lastRunStartedAt = agentSession.lastRunStartedAt
         session.worktreeBindings = agentSession.worktreeBindings
         session.worktreeMergeOperations = agentSession.worktreeMergeOperations
         session.nextSequenceIndex = payload.transcript.nextSequenceIndex
@@ -4405,6 +4455,9 @@ final class AgentModeViewModel: ObservableObject {
         session.setRunningStatus(nil, source: nil)
         session.activeAgentRunStartedAt = nil
         session.deferredActiveAgentRunTimerRollback = nil
+        session.originWorkflowID = nil
+        session.originWorkflowDisplayName = nil
+        session.lastRunStartedAt = nil
         session.waitingPrompt = nil
         session.pendingAskUser = nil
         session.pendingUserInputRequest = nil
@@ -6189,7 +6242,10 @@ final class AgentModeViewModel: ObservableObject {
                 hasUnknownConversationContent: existingEntry.hasUnknownConversationContent,
                 isMCPOriginated: existingEntry.isMCPOriginated || session.isMCPOriginated,
                 worktreeBindingSummaries: existingEntry.worktreeBindingSummaries,
-                activeWorktreeMergeSummaries: existingEntry.activeWorktreeMergeSummaries
+                activeWorktreeMergeSummaries: existingEntry.activeWorktreeMergeSummaries,
+                originWorkflowID: existingEntry.originWorkflowID,
+                originWorkflowDisplayName: existingEntry.originWorkflowDisplayName,
+                lastRunStartedAt: existingEntry.lastRunStartedAt
             )
             guard repairedEntry != existingEntry else { return }
             applyLocalSessionIndexUpsert(repairedEntry)
@@ -6337,6 +6393,352 @@ final class AgentModeViewModel: ObservableObject {
         return createdTab.id
     }
 
+    var remoteAgentAvailabilityContext: AgentModelCatalog.AvailabilityContext {
+        agentAvailabilityContext
+    }
+
+    func remoteCodexToolBinding() -> (binding: AgentProviderControlsBinding, isMutable: Bool) {
+        let binding = providerBindingService.topLevelSettingsControlsBinding(providerID: .codex)
+        let hasActiveCodexRun = sessions.values.contains {
+            $0.selectedAgent == .codexExec && $0.runState.isActive
+        }
+        return (binding, !hasActiveCodexRun)
+    }
+
+    func mcpApplyRemoteCodexToolMutation(
+        settingID: String,
+        enabled: Bool,
+        expectedRevision: Int
+    ) throws -> AgentProviderControlsBinding {
+        let current = remoteCodexToolBinding()
+        guard current.isMutable else {
+            throw MCPError.invalidParams("Tool controls are locked during an active Codex run.")
+        }
+        guard current.binding.revision == expectedRevision else {
+            throw MCPError.invalidParams("Tool settings changed on the Mac. Refresh and try again.")
+        }
+        let mutation: CodexToolSettingMutation
+        switch settingID {
+        case "bash": mutation = .bashTool(enabled: enabled)
+        case "search": mutation = .searchTool(enabled: enabled)
+        case "goals": mutation = .goalSupport(enabled: enabled)
+        case "reasoning_summaries": mutation = .reasoningSummaries(enabled: enabled)
+        default:
+            guard settingID.hasPrefix("mcp:"),
+                  let tools = current.binding.codexTools
+            else { throw MCPError.invalidParams("Unknown Codex tool setting.") }
+            let serverName = String(settingID.dropFirst(4))
+            guard let entry = tools.mcpServerEntries.first(where: {
+                $0.normalizedName.caseInsensitiveCompare(serverName) == .orderedSame
+            }) else { throw MCPError.invalidParams("That MCP server is no longer available.") }
+            guard entry.normalizedName.caseInsensitiveCompare(MCPIntegrationHelper.repoPromptMCPServerName) != .orderedSame else {
+                throw MCPError.invalidParams("RepoPromptCE is required and cannot be disabled.")
+            }
+            mutation = .mcpServer(normalizedName: entry.normalizedName, enabled: enabled)
+        }
+        applyCodexToolSettingMutation(mutation)
+        return providerBindingService.topLevelSettingsControlsBinding(providerID: .codex)
+    }
+
+    func remoteSelectableDiscoveryAgent(
+        for agent: AgentProviderKind
+    ) -> AgentModelCatalog.DiscoveryAgent? {
+        guard availableAgents.contains(agent),
+              let discovery = AgentModelCatalog.discoveryAgents(availability: agentAvailabilityContext)
+              .first(where: { $0.agent == agent })
+        else { return nil }
+
+        let options = modelOptions(for: agent, includeClaudeEffortVariants: false)
+        let visible = options.filter { !$0.isPlaceholderDefault }
+        let selectable = visible.isEmpty ? options : visible
+        let allowedModelRaws = Set(selectable.map { $0.rawValue.lowercased() })
+        let models = discovery.models.filter { model in
+            model.available && (
+                allowedModelRaws.contains(model.id.lowercased())
+                    || model.startTargets.contains { allowedModelRaws.contains($0.modelRaw.lowercased()) }
+            )
+        }
+        guard !models.isEmpty else { return nil }
+        return AgentModelCatalog.DiscoveryAgent(
+            agent: discovery.agent,
+            description: discovery.description,
+            available: discovery.available,
+            runtime: discovery.runtime,
+            capabilities: discovery.capabilities,
+            defaults: discovery.defaults,
+            models: models
+        )
+    }
+
+    func mcpSessionSelectionCapabilities(
+        tabID: UUID,
+        sessionID: UUID
+    ) -> AgentSessionSelectionCapabilities? {
+        guard let session = sessions[tabID], session.activeAgentSessionID == sessionID else { return nil }
+        return remoteSessionSelectionCapabilities(
+            agent: session.selectedAgent,
+            modelRaw: session.selectedModelRaw,
+            reasoningEffortRaw: session.selectedReasoningEffortRaw,
+            isMutable: !session.runState.isActive && !Self.hasBlockingInteraction(session)
+        )
+    }
+
+    func mcpPersistedSessionSelectionCapabilities(
+        agentRaw: String?,
+        modelRaw: String?,
+        reasoningEffortRaw: String?,
+        isMutable: Bool
+    ) -> AgentSessionSelectionCapabilities? {
+        guard let agentRaw,
+              let agent = AgentProviderKind(rawValue: agentRaw),
+              let modelRaw,
+              !modelRaw.isEmpty
+        else {
+            return nil
+        }
+        return remoteSessionSelectionCapabilities(
+            agent: agent,
+            modelRaw: modelRaw,
+            reasoningEffortRaw: reasoningEffortRaw,
+            isMutable: isMutable
+        )
+    }
+
+    private func remoteSessionSelectionCapabilities(
+        agent: AgentProviderKind,
+        modelRaw: String,
+        reasoningEffortRaw: String?,
+        isMutable: Bool
+    ) -> AgentSessionSelectionCapabilities? {
+        guard let discoveryAgent = remoteSelectableDiscoveryAgent(for: agent) else { return nil }
+        let discoveryModel = Self.discoveryModel(matching: modelRaw, in: discoveryAgent)
+        let lockedAgentReason = "The agent is locked for this chat. Start a new chat to change agents."
+        let selectionReason = isMutable ? nil : "Model and effort controls are locked during an active run."
+        let efforts = agent == .codexExec
+            ? discoveryModel?.supportedReasoningEfforts.map(\.rawValue) ?? []
+            : []
+
+        return AgentSessionSelectionCapabilities(
+            allowedAgentRawValues: [agent.rawValue],
+            allowedModelRawValues: discoveryAgent.models.filter(\.available).map(\.id),
+            allowedReasoningEffortRawValues: efforts,
+            resolvedModelRaw: discoveryModel?.id ?? modelRaw,
+            resolvedReasoningEffortRaw: reasoningEffortRaw,
+            isMutable: isMutable,
+            agentUnavailableReason: lockedAgentReason,
+            selectionUnavailableReason: selectionReason
+        )
+    }
+
+    func mcpConfigureRemoteLaunch(
+        tabID: UUID,
+        agentRaw: String?,
+        modelRaw: String?,
+        reasoningEffortRaw: String?
+    ) async throws -> AgentSessionResolvedConfiguration {
+        let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
+        let requestedAgent: AgentProviderKind
+        if let agentRaw {
+            guard let exactAgent = availableAgents.first(where: {
+                $0.rawValue.caseInsensitiveCompare(agentRaw) == .orderedSame
+            }) else {
+                throw MCPError.invalidParams("The requested agent is unavailable on this Mac.")
+            }
+            requestedAgent = exactAgent
+        } else {
+            requestedAgent = session.selectedAgent
+        }
+        guard let discoveryAgent = remoteSelectableDiscoveryAgent(for: requestedAgent) else {
+            throw MCPError.invalidParams("The requested agent is unavailable on this Mac.")
+        }
+
+        let currentModel = requestedAgent == session.selectedAgent
+            ? Self.discoveryModel(matching: session.selectedModelRaw, in: discoveryAgent)
+            : nil
+        let requestedModel: AgentModelCatalog.DiscoveryModel
+        if let modelRaw {
+            guard let exactModel = Self.discoveryModel(matching: modelRaw, in: discoveryAgent),
+                  exactModel.available
+            else {
+                throw MCPError.invalidParams("The requested model is unavailable for \(requestedAgent.displayName).")
+            }
+            requestedModel = exactModel
+        } else if let currentModel {
+            requestedModel = currentModel
+        } else if let defaultModel = Self.defaultDiscoveryModel(in: discoveryAgent) {
+            requestedModel = defaultModel
+        } else {
+            throw MCPError.invalidParams("No configurable model is available for \(requestedAgent.displayName).")
+        }
+
+        let supportedEfforts = requestedAgent == .codexExec
+            ? requestedModel.supportedReasoningEfforts
+            : []
+        let requestedEffort: CodexReasoningEffort?
+        if let reasoningEffortRaw {
+            guard let parsed = CodexReasoningEffort.parse(reasoningEffortRaw), supportedEfforts.contains(parsed) else {
+                throw MCPError.invalidParams("The requested reasoning effort is unavailable for \(requestedModel.name).")
+            }
+            requestedEffort = parsed
+        } else if requestedAgent == session.selectedAgent,
+                  requestedModel.id.caseInsensitiveCompare(currentModel?.id ?? "") == .orderedSame,
+                  let current = CodexReasoningEffort.parse(session.selectedReasoningEffortRaw),
+                  supportedEfforts.contains(current)
+        {
+            requestedEffort = current
+        } else {
+            requestedEffort = requestedModel.defaultReasoningEffort
+                ?? (supportedEfforts.contains(.medium) ? .medium : supportedEfforts.first)
+        }
+
+        try await mcpConfigureSession(
+            tabID: tabID,
+            agentRaw: requestedAgent.rawValue,
+            modelRaw: requestedModel.id,
+            reasoningEffortRaw: requestedEffort?.rawValue
+        )
+        let resolvedAgent = remoteSelectableDiscoveryAgent(for: session.selectedAgent) ?? discoveryAgent
+        let resolvedModel = Self.discoveryModel(matching: session.selectedModelRaw, in: resolvedAgent)
+        return AgentSessionResolvedConfiguration(
+            agentRaw: session.selectedAgent.rawValue,
+            modelRaw: resolvedModel?.id ?? session.selectedModelRaw,
+            reasoningEffortRaw: session.selectedReasoningEffortRaw
+        )
+    }
+
+    func mcpConfigureRemoteSession(
+        tabID: UUID,
+        sessionID: UUID,
+        agentRaw: String?,
+        modelRaw: String?,
+        reasoningEffortRaw: String?
+    ) async throws -> AgentSessionResolvedConfiguration {
+        if let existing = sessions[tabID],
+           existing.activeAgentSessionID == sessionID,
+           existing.runState.isActive || Self.hasBlockingInteraction(existing)
+        {
+            throw MCPError.invalidParams("Model and effort controls are locked during an active run.")
+        }
+        let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
+        guard session.activeAgentSessionID == sessionID else {
+            throw MCPError.invalidParams("The requested agent session is not currently available.")
+        }
+        guard !session.runState.isActive, !Self.hasBlockingInteraction(session) else {
+            throw MCPError.invalidParams("Model and effort controls are locked during an active run.")
+        }
+
+        let requestedAgent: AgentProviderKind
+        if let agentRaw {
+            guard let exactAgent = availableAgents.first(where: {
+                $0.rawValue.caseInsensitiveCompare(agentRaw) == .orderedSame
+            }), exactAgent == session.selectedAgent else {
+                throw MCPError.invalidParams("The agent is locked for this chat. Start a new chat to change agents.")
+            }
+            requestedAgent = exactAgent
+        } else {
+            requestedAgent = session.selectedAgent
+        }
+        guard let discoveryAgent = remoteSelectableDiscoveryAgent(for: requestedAgent) else {
+            throw MCPError.invalidParams("The requested agent is unavailable on this Mac.")
+        }
+
+        let currentModel = requestedAgent == session.selectedAgent
+            ? Self.discoveryModel(matching: session.selectedModelRaw, in: discoveryAgent)
+            : nil
+        let requestedModel: AgentModelCatalog.DiscoveryModel
+        if let modelRaw {
+            guard let exactModel = Self.discoveryModel(matching: modelRaw, in: discoveryAgent),
+                  exactModel.available
+            else {
+                throw MCPError.invalidParams("The requested model is unavailable for \(requestedAgent.displayName).")
+            }
+            requestedModel = exactModel
+        } else if let currentModel {
+            requestedModel = currentModel
+        } else if let defaultModel = Self.defaultDiscoveryModel(in: discoveryAgent) {
+            requestedModel = defaultModel
+        } else {
+            throw MCPError.invalidParams("No configurable model is available for \(requestedAgent.displayName).")
+        }
+
+        let supportedEfforts = requestedAgent == .codexExec
+            ? requestedModel.supportedReasoningEfforts
+            : []
+        let requestedEffort: CodexReasoningEffort?
+        if let reasoningEffortRaw {
+            guard let parsed = CodexReasoningEffort.parse(reasoningEffortRaw), supportedEfforts.contains(parsed) else {
+                throw MCPError.invalidParams("The requested reasoning effort is unavailable for \(requestedModel.name).")
+            }
+            requestedEffort = parsed
+        } else if requestedAgent == session.selectedAgent,
+                  requestedModel.id.caseInsensitiveCompare(currentModel?.id ?? "") == .orderedSame,
+                  let current = CodexReasoningEffort.parse(session.selectedReasoningEffortRaw),
+                  supportedEfforts.contains(current)
+        {
+            requestedEffort = current
+        } else {
+            requestedEffort = requestedModel.defaultReasoningEffort
+                ?? (supportedEfforts.contains(.medium) ? .medium : supportedEfforts.first)
+        }
+
+        applyMCPSelection(
+            AgentModelCatalog.NormalizedAgentSelection(
+                agent: requestedAgent,
+                modelRaw: requestedModel.id
+            ),
+            reasoningEffortRaw: requestedEffort?.rawValue,
+            to: session,
+            tabID: tabID
+        )
+        let resolvedModel = Self.discoveryModel(matching: session.selectedModelRaw, in: discoveryAgent)
+        return AgentSessionResolvedConfiguration(
+            agentRaw: session.selectedAgent.rawValue,
+            modelRaw: resolvedModel?.id ?? session.selectedModelRaw,
+            reasoningEffortRaw: session.selectedReasoningEffortRaw
+        )
+    }
+
+    private static func discoveryModel(
+        matching rawModel: String,
+        in agent: AgentModelCatalog.DiscoveryAgent
+    ) -> AgentModelCatalog.DiscoveryModel? {
+        if let exact = agent.models.first(where: { $0.id.caseInsensitiveCompare(rawModel) == .orderedSame }) {
+            return exact
+        }
+        if let targetMatch = agent.models.first(where: { model in
+            model.startTargets.contains { $0.modelRaw.caseInsensitiveCompare(rawModel) == .orderedSame }
+        }) {
+            return targetMatch
+        }
+        guard agent.agent == .codexExec else { return nil }
+        let requestedSlug = CodexAgentToolPreferences.reasoningEffortPreferenceSlug(forModelRaw: rawModel)
+        return agent.models.first { model in
+            CodexAgentToolPreferences.reasoningEffortPreferenceSlug(forModelRaw: model.id)
+                .caseInsensitiveCompare(requestedSlug) == .orderedSame
+        }
+    }
+
+    private static func defaultDiscoveryModel(
+        in agent: AgentModelCatalog.DiscoveryAgent
+    ) -> AgentModelCatalog.DiscoveryModel? {
+        if let defaultTargetModel = agent.models.first(where: { $0.startTargets.contains(where: \.isDefault) }) {
+            return defaultTargetModel
+        }
+        if let defaultRaw = agent.defaults.modelRaw,
+           let match = discoveryModel(matching: defaultRaw, in: agent)
+        {
+            return match
+        }
+        return agent.models.first(where: \.available)
+    }
+
+    private static func hasBlockingInteraction(_ session: TabSession) -> Bool {
+        session.pendingAskUser != nil
+            || session.pendingUserInputRequest != nil
+            || session.pendingMCPElicitationRequest != nil
+            || session.pendingApproval != nil
+    }
+
     func mcpConfigureSession(
         tabID: UUID,
         agentRaw: String?,
@@ -6368,6 +6770,20 @@ final class AgentModeViewModel: ObservableObject {
             )
         }
 
+        applyMCPSelection(
+            normalized,
+            reasoningEffortRaw: reasoningEffortRaw,
+            to: session,
+            tabID: tabID
+        )
+    }
+
+    private func applyMCPSelection(
+        _ normalized: AgentModelCatalog.NormalizedAgentSelection,
+        reasoningEffortRaw: String?,
+        to session: TabSession,
+        tabID: UUID
+    ) {
         session.selectedAgent = normalized.agent
         session.selectedModelRaw = normalized.modelRaw
         if let reasoningEffortRaw {
@@ -10049,7 +10465,10 @@ final class AgentModeViewModel: ObservableObject {
         hasUnknownConversationContent: Bool = false,
         isMCPOriginated: Bool = false,
         worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = [],
-        activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary] = []
+        activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary] = [],
+        originWorkflowID: String? = nil,
+        originWorkflowDisplayName: String? = nil,
+        lastRunStartedAt: Date? = nil
     ) {
         applyLocalSessionIndexUpsert(AgentSessionIndexEntry(
             id: sessionID,
@@ -10067,7 +10486,10 @@ final class AgentModeViewModel: ObservableObject {
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: isMCPOriginated,
             worktreeBindingSummaries: worktreeBindingSummaries,
-            activeWorktreeMergeSummaries: activeWorktreeMergeSummaries
+            activeWorktreeMergeSummaries: activeWorktreeMergeSummaries,
+            originWorkflowID: originWorkflowID,
+            originWorkflowDisplayName: originWorkflowDisplayName,
+            lastRunStartedAt: lastRunStartedAt
         ))
     }
 
@@ -11296,6 +11718,9 @@ final class AgentModeViewModel: ObservableObject {
             agentModel: session.selectedModelRaw,
             agentReasoningEffort: session.selectedReasoningEffortRaw,
             lastRunState: session.runState.rawValue,
+            originWorkflowID: session.originWorkflowID,
+            originWorkflowDisplayName: session.originWorkflowDisplayName,
+            lastRunStartedAt: session.lastRunStartedAt,
             providerSessionID: session.providerSessionID,
             providerCleanupHandle: providerCleanupHandle(
                 provider: session.selectedAgent.rawValue,
@@ -11357,7 +11782,10 @@ final class AgentModeViewModel: ObservableObject {
                 parentSessionID: agentSession.parentSessionID,
                 isMCPOriginated: agentSession.isMCPOriginated,
                 worktreeBindingSummaries: agentSession.worktreeBindings.worktreeBindingSummaries,
-                activeWorktreeMergeSummaries: agentSession.worktreeMergeOperations.activeWorktreeMergeSummaries
+                activeWorktreeMergeSummaries: agentSession.worktreeMergeOperations.activeWorktreeMergeSummaries,
+                originWorkflowID: agentSession.originWorkflowID,
+                originWorkflowDisplayName: agentSession.originWorkflowDisplayName,
+                lastRunStartedAt: agentSession.lastRunStartedAt
             )
             #if DEBUG
                 if let diagnosticsStartMS {
@@ -12443,7 +12871,8 @@ final class AgentModeViewModel: ObservableObject {
                         initialMessage: wrappedText,
                         attachments: attachmentsToSend,
                         taggedFileAttachments: taggedFilesToSend,
-                        codexFallbackContext: fallbackContext
+                        codexFallbackContext: fallbackContext,
+                        appliedWorkflow: activeWorkflow
                     )
                 } else {
                     .preDispatchRejected(
@@ -12540,7 +12969,8 @@ final class AgentModeViewModel: ObservableObject {
                         tabID: tabID,
                         initialMessage: wrappedText,
                         attachments: attachmentsToSend,
-                        taggedFileAttachments: taggedFilesToSend
+                        taggedFileAttachments: taggedFilesToSend,
+                        appliedWorkflow: activeWorkflow
                     )
                 }
                 return UserTurnSubmissionResult.submitted
@@ -12586,7 +13016,8 @@ final class AgentModeViewModel: ObservableObject {
                     tabID: tabID,
                     initialMessage: wrappedText,
                     attachments: attachmentsToSend,
-                    taggedFileAttachments: taggedFilesToSend
+                    taggedFileAttachments: taggedFilesToSend,
+                    appliedWorkflow: activeWorkflow
                 )
             }
         } else if let route = activeProviderSteeringRoute(for: session, attachments: attachmentsToSend) {
@@ -13838,9 +14269,11 @@ final class AgentModeViewModel: ObservableObject {
         initialMessage: String,
         attachments: [AgentImageAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
-        codexFallbackContext: TabSession.CodexFallbackSubmissionContext? = nil
+        codexFallbackContext: TabSession.CodexFallbackSubmissionContext? = nil,
+        appliedWorkflow: AgentWorkflowDefinition? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         let session = session(for: tabID)
+        let wasActiveBeforeStart = session.runState.isActive
         guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
             if session.mcpFollowUpRunPending {
                 session.mcpFollowUpRunPending = false
@@ -13885,7 +14318,9 @@ final class AgentModeViewModel: ObservableObject {
             )
         }
 
-        return await runService.startRun(
+        let runStartedAt = Date()
+        let acceptedRunStartGeneration = session.acceptedRunStartGeneration
+        let outcome = await runService.startRun(
             tabID: tabID,
             session: session,
             initialUserMessage: augmentedInitialMessage,
@@ -13893,6 +14328,18 @@ final class AgentModeViewModel: ObservableObject {
             attachments: attachments,
             codexFallbackContext: preparedCodexFallbackContext
         )
+        let dispatchAccepted = outcome?.didSend == true
+            || session.acceptedRunStartGeneration != acceptedRunStartGeneration
+        if session.recordRunMetadataIfAccepted(
+            wasActiveBeforeStart: wasActiveBeforeStart,
+            dispatchAccepted: dispatchAccepted,
+            workflow: appliedWorkflow,
+            startedAt: runStartedAt
+        ) {
+            updateBindingsFromSession(session)
+            scheduleSave(for: tabID)
+        }
+        return outcome
     }
 
     private func buildHeadlessAgentMessage(

@@ -1,10 +1,51 @@
 import Foundation
+import MCP
 import RepoPromptRemoteProtocol
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
 @MainActor
 final class RemoteMutationBehaviorTests: XCTestCase {
+    func testMCPInvalidParamsBecomeActionableRemoteRejection() {
+        let message = WindowRemoteAgentControlService.remoteRejectionMessage(
+            for: MCPError.invalidParams("The requested agent session is not currently available.")
+        )
+
+        XCTAssertEqual(message, "The requested agent session is not currently available.")
+    }
+
+    func testMCPInternalFailuresDoNotExposeInternalDetails() {
+        let sensitive = "/private/sensitive/provider-state.json"
+        let failures: [MCPError] = [
+            .internalError(sensitive),
+            .serverError(code: -32000, message: sensitive),
+            .parseError(sensitive),
+            .methodNotFound(sensitive)
+        ]
+
+        for failure in failures {
+            let message = WindowRemoteAgentControlService.remoteRejectionMessage(for: failure)
+            XCTAssertEqual(message, "The Mac could not deliver this command to the agent session.")
+            XCTAssertFalse(message.contains(sensitive))
+        }
+    }
+
+    func testMCPTransportFailureDoesNotExposeInternalDetails() {
+        let message = WindowRemoteAgentControlService.remoteRejectionMessage(
+            for: MCPError.transportError(NSError(
+                domain: "fixture",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "/private/sensitive/socket failed"]
+            ))
+        )
+
+        XCTAssertEqual(
+            message,
+            "The Mac lost its connection to the agent while delivering this command. Try again."
+        )
+        XCTAssertFalse(message.contains("/private/sensitive"))
+    }
+
     func testRemoteMutationBoundaryRejectsIncompleteRequestsForEveryMutation() async {
         let service = WindowRemoteAgentControlService(windowStatesManager: WindowStatesManager.shared)
 
@@ -48,6 +89,38 @@ final class RemoteMutationBehaviorTests: XCTestCase {
             }
         }
         XCTAssertEqual(session.runState, .completed)
+    }
+
+    func testConfigureSessionRejectsActiveRunWithoutChangingSelection() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let agentMode = window.agentModeViewModel
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.composeTabs.first?.id)
+        let session = await agentMode.ensureSessionReady(tabID: tabID)
+        let sessionID = UUID()
+        _ = agentMode.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        session.runState = .running
+        let originalAgent = session.selectedAgent
+        let originalModel = session.selectedModelRaw
+
+        do {
+            _ = try await agentMode.mcpConfigureRemoteSession(
+                tabID: tabID,
+                sessionID: sessionID,
+                agentRaw: nil,
+                modelRaw: "unavailable-model",
+                reasoningEffortRaw: nil
+            )
+            XCTFail("An active run must reject selection changes.")
+        } catch let error as MCPError {
+            XCTAssertEqual(
+                WindowRemoteAgentControlService.remoteRejectionMessage(for: error),
+                "Model and effort controls are locked during an active run."
+            )
+        }
+        XCTAssertEqual(session.selectedAgent, originalAgent)
+        XCTAssertEqual(session.selectedModelRaw, originalModel)
     }
 
     func testProvisionalSessionRollbackReportsCompleteCleanup() async throws {
