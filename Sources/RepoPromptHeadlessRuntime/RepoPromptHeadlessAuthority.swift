@@ -1247,7 +1247,16 @@ public actor RepoPromptHeadlessAuthority {
         await providerAdapter.prepareRun(kind: snapshot.provider, runID: binding.runID)
         let workingDirectory = try await workingDirectory(session: snapshot)
         let prompt = snapshot.transcript.last(where: { $0.kind == .human })?.content ?? "Continue the repository task."
-        providerTasks[binding.runID] = Task { await self.performProviderRun(sessionID: sessionID, binding: binding, run: run, prompt: prompt, workingDirectory: workingDirectory) }
+        providerTasks[binding.runID] = Task {
+            await self.performProviderRun(
+                sessionID: sessionID,
+                binding: binding,
+                run: run,
+                prompt: prompt,
+                workingDirectory: workingDirectory,
+                permissions: permissions
+            )
+        }
         return receipt
     }
 
@@ -1353,14 +1362,29 @@ public actor RepoPromptHeadlessAuthority {
         }
     }
 
-    private func performProviderRun(sessionID: UUID, binding: RunBindingIdentity, run: ProviderRunSnapshot, prompt: String, workingDirectory: String) async {
+    private func performProviderRun(sessionID: UUID, binding: RunBindingIdentity, run: ProviderRunSnapshot, prompt: String, workingDirectory: String, permissions: ExecutionPermissionSnapshot) async {
         guard let providerAdapter, let session = sessions[sessionID] else { return }
         defer { Task { await providerAdapter.forgetRun(runID: binding.runID) } }
         let initial = await session.snapshot()
         do {
             let eventState = ProviderEventPublicationState()
+            let executionMode: ProviderExecutionMode = switch permissions.mode {
+            case "readOnly": .readOnly
+            case "workspaceWrite": .workspaceWrite
+            case "fullAccess": .fullAccess
+            default: throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Execution permission mode is invalid")
+            }
             let result = try await providerAdapter.executeStreaming(
-                .init(kind: initial.provider, model: initial.model, prompt: prompt, workingDirectory: workingDirectory, maximumBytes: 8_388_608, runID: binding.runID, resumeProviderSessionID: run.providerSessionID)
+                .init(
+                    kind: initial.provider,
+                    model: initial.model,
+                    prompt: prompt,
+                    workingDirectory: workingDirectory,
+                    maximumBytes: 8_388_608,
+                    runID: binding.runID,
+                    resumeProviderSessionID: run.providerSessionID,
+                    policy: .init(mode: executionMode, writableRoots: executionMode == .workspaceWrite ? [workingDirectory] : [], providerSettings: permissions.providerSettings)
+                )
             ) { event in
                 await eventState.observe(event)
                 await self.handleProviderEvent(event, sessionID: sessionID, run: run, binding: binding)

@@ -129,15 +129,16 @@ public struct ProviderContextBuilderRuntimeService: ContextBuilderRuntimeService
         // guess. Every tool call executes against the frozen authority bridge;
         // the final selection remains staged until the caller's revision CAS.
         for turn in 0 ..< 64 {
-            let result = try await providers.execute(
+            let result = try await providers.executeStreaming(.init(
                 kind: request.provider,
                 model: request.model,
                 prompt: nextPrompt,
                 workingDirectory: request.workspace.workingDirectory,
                 maximumBytes: 8_388_608,
                 runID: request.runID,
-                resumeProviderSessionID: providerSessionID
-            )
+                resumeProviderSessionID: providerSessionID,
+                policy: .init(mode: .readOnly)
+            )) { _ in }
             providerSessionID = result.providerSessionID ?? providerSessionID
             rawTurns.append(result.output)
             let action = try Self.decodeAction(result.output)
@@ -496,15 +497,16 @@ public struct ProviderOracleRuntimeService: OracleRuntimeService, Sendable {
         \(request.prompt)
         </request>
         """
-        let execution = try await providers.execute(
+        let execution = try await providers.executeStreaming(.init(
             kind: request.provider,
             model: request.model,
             prompt: prompt,
             workingDirectory: request.workingDirectory,
             maximumBytes: 8_388_608,
             runID: request.runID,
-            resumeProviderSessionID: request.providerSessionID
-        )
+            resumeProviderSessionID: request.providerSessionID,
+            policy: .init(mode: .readOnly)
+        )) { _ in }
         return OracleRuntimeResult(
             response: execution.output,
             providerSessionID: execution.providerSessionID ?? request.providerSessionID,

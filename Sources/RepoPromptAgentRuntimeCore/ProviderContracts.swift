@@ -67,6 +67,24 @@ public enum ProviderRuntimeEvent: Sendable, Equatable {
     case completed(providerSessionID: String?)
 }
 
+public enum ProviderExecutionMode: String, Codable, Hashable, Sendable {
+    case readOnly
+    case workspaceWrite
+    case fullAccess
+}
+
+public struct ProviderExecutionPolicy: Codable, Hashable, Sendable {
+    public let mode: ProviderExecutionMode
+    public let writableRoots: [String]
+    public let providerSettings: [String: String]
+
+    public init(mode: ProviderExecutionMode = .workspaceWrite, writableRoots: [String] = [], providerSettings: [String: String] = [:]) {
+        self.mode = mode
+        self.writableRoots = writableRoots
+        self.providerSettings = providerSettings
+    }
+}
+
 public struct ProviderExecutionRequest: Sendable {
     public let kind: ProviderKind
     public let model: String?
@@ -75,8 +93,9 @@ public struct ProviderExecutionRequest: Sendable {
     public let maximumBytes: Int
     public let runID: UUID
     public let resumeProviderSessionID: String?
+    public let policy: ProviderExecutionPolicy
 
-    public init(kind: ProviderKind, model: String?, prompt: String, workingDirectory: String, maximumBytes: Int = 8_388_608, runID: UUID, resumeProviderSessionID: String? = nil) {
+    public init(kind: ProviderKind, model: String?, prompt: String, workingDirectory: String, maximumBytes: Int = 8_388_608, runID: UUID, resumeProviderSessionID: String? = nil, policy: ProviderExecutionPolicy = .init()) {
         self.kind = kind
         self.model = model
         self.prompt = prompt
@@ -84,6 +103,7 @@ public struct ProviderExecutionRequest: Sendable {
         self.maximumBytes = maximumBytes
         self.runID = runID
         self.resumeProviderSessionID = resumeProviderSessionID
+        self.policy = policy
     }
 }
 

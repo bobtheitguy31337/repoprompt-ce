@@ -73,6 +73,11 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         let stdout = try FileHandle(forWritingTo: URL(fileURLWithPath: stdoutPath))
         let stderr = try FileHandle(forWritingTo: URL(fileURLWithPath: stderrPath))
         let input = Pipe()
+        #if os(Linux)
+            _ = Glibc.signal(SIGPIPE, SIG_IGN)
+        #else
+            _ = fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
+        #endif
         do {
             let identity = try await launchProcess(executable: executable, arguments: arguments, environment: environment, workingDirectory: workingDirectory, helperToken: helperToken, stdin: input, stdout: stdout, stderr: stderr)
             standardInputs[identity.pid] = input.fileHandleForWriting
@@ -128,7 +133,10 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
             }
             try await Task.sleep(for: .milliseconds(50))
         }
-        process.waitUntilExit()
+        // Polling `isRunning` above has already made Foundation observe the
+        // child's termination. A second `waitUntilExit()` can deadlock when
+        // several Process instances terminate close together because
+        // Foundation's shared child-status source has already consumed it.
         try? (process.standardOutput as? FileHandle)?.close()
         try? (process.standardError as? FileHandle)?.close()
         let stdout = (try? Data(contentsOf: URL(fileURLWithPath: captured.stdoutPath))) ?? Data()
@@ -232,9 +240,13 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
     }
 
     public func reap(pid: Int32) async throws {
-        var status: Int32 = 0
-        _ = rp_waitpid_nohang(pid, &status)
-        if let process = processes[pid], !process.isRunning { process.waitUntilExit() }
+        // Foundation owns the wait status for every child launched through
+        // `Process`. Reaping it with waitpid, or redundantly waiting after
+        // `isRunning` observed exit, can leave another Process blocked.
+        if processes[pid] == nil {
+            var status: Int32 = 0
+            _ = rp_waitpid_nohang(pid, &status)
+        }
         processes[pid] = nil
         identities[pid] = nil
         try? standardInputs.removeValue(forKey: pid)?.close()
@@ -243,8 +255,10 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
     }
 
     public func reapAdoptedChildren() throws {
-        var status: Int32 = 0
-        while rp_waitpid_nohang(-1, &status) > 0 {}
+        #if os(Linux)
+            var status: Int32 = 0
+            while rp_waitpid_nohang(-1, &status) > 0 {}
+        #endif
     }
 
     private func inspectLinux(pid: Int32, helperTokenDigest: String) async throws -> ProcessIdentity? {

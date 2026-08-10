@@ -102,6 +102,28 @@ final class AuthorityTests: XCTestCase {
         }
     }
 
+    func testExecutionPermissionSnapshotIsAppliedToNativeProviderRequest() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let runtime = PolicyRecordingProviderRuntime()
+        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: ProviderCLIAdapter(runtimes: [runtime]))
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-policy-runtime", requestDigest: "p-policy-runtime")
+        let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "inspect"), externalActor: actor, idempotencyKey: "s-policy-runtime", requestDigest: "s-policy-runtime")
+        _ = try await authority.updatePermissions(sessionID: session.sessionID, expectedRevision: 1, mode: "readOnly", providerSettings: ["codex.approvalPolicy": "never"], actor: actor)
+        _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "run-policy-runtime", requestDigest: "run-policy-runtime")
+        await authority.waitForProviderRunsToSettle()
+        let recordedPolicy = await runtime.lastPolicy()
+        let policy = try XCTUnwrap(recordedPolicy)
+        XCTAssertEqual(policy.mode, .readOnly)
+        XCTAssertTrue(policy.writableRoots.isEmpty)
+        XCTAssertEqual(policy.providerSettings["codex.approvalPolicy"], "never")
+        try await authority.quiesce()
+        try await store.close()
+    }
+
     func testProviderEventsAndInteractionDeliveryUseDurableAuthority() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -491,6 +513,33 @@ private actor InteractiveEventProviderRuntime: AgentProviderRuntime {
         guard activeRunID == runID else { throw ServiceAPIError(code: .notFound, message: "run missing") }
         deliveredID = providerRequestID
         answered = true
+    }
+}
+
+private actor PolicyRecordingProviderRuntime: AgentProviderRuntime {
+    let kind = ProviderKind.codex
+    private var policy: ProviderExecutionPolicy?
+
+    func capability() -> ProviderCapability {
+        .init(kind: kind, enabled: true, executable: "/test/codex", supportsResume: true, supportsSteering: true)
+    }
+
+    func preflight() -> ProviderCapability {
+        capability()
+    }
+
+    func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
+        policy = request.policy
+        await onEvent(.providerIdentity("policy-thread"))
+        await onEvent(.assistantFinal("done"))
+        await onEvent(.completed(providerSessionID: "policy-thread"))
+        return .init(output: "done", providerSessionID: "policy-thread")
+    }
+
+    func interrupt(runID _: UUID) {}
+
+    func lastPolicy() -> ProviderExecutionPolicy? {
+        policy
     }
 }
 

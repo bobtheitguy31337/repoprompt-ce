@@ -55,6 +55,7 @@ final class CanonicalWorkspaceRuntimeTests: XCTestCase {
         XCTAssertTrue(request.prompt.contains("<authorized_roots>\n\(rootID.uuidString)"))
         XCTAssertTrue(request.prompt.contains("Response mode is plan"))
         XCTAssertEqual(request.workingDirectory, "/worktree")
+        XCTAssertEqual(request.policy?.mode, .readOnly)
         XCTAssertEqual(requests.count, 5)
         XCTAssertNil(requests[0].resumeProviderSessionID)
         XCTAssertEqual(requests.dropFirst().map(\.resumeProviderSessionID), Array(repeating: "builder-native", count: 4))
@@ -161,6 +162,7 @@ private actor RecordingWorkspaceProvider: AgentProviderDispatcher {
         let workingDirectory: String
         let runID: UUID?
         let resumeProviderSessionID: String?
+        let policy: ProviderExecutionPolicy?
     }
 
     private var pendingResults: [ProviderExecutionResult]
@@ -191,12 +193,24 @@ private actor RecordingWorkspaceProvider: AgentProviderDispatcher {
         resumeProviderSessionID: String?,
         onProviderSessionIdentity: @escaping @Sendable (String) async -> Void
     ) async throws -> ProviderExecutionResult {
-        recorded.append(.init(kind: kind, model: model, prompt: prompt, workingDirectory: workingDirectory, runID: runID, resumeProviderSessionID: resumeProviderSessionID))
+        recorded.append(.init(kind: kind, model: model, prompt: prompt, workingDirectory: workingDirectory, runID: runID, resumeProviderSessionID: resumeProviderSessionID, policy: nil))
         guard !pendingResults.isEmpty else {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "No provider fixture result")
         }
         let result = pendingResults.removeFirst()
         if let identity = result.providerSessionID { await onProviderSessionIdentity(identity) }
+        return result
+    }
+
+    func executeStreaming(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
+        recorded.append(.init(kind: request.kind, model: request.model, prompt: request.prompt, workingDirectory: request.workingDirectory, runID: request.runID, resumeProviderSessionID: request.resumeProviderSessionID, policy: request.policy))
+        guard !pendingResults.isEmpty else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "No provider fixture result")
+        }
+        let result = pendingResults.removeFirst()
+        if let identity = result.providerSessionID { await onEvent(.providerIdentity(identity)) }
+        await onEvent(.assistantFinal(result.output))
+        await onEvent(.completed(providerSessionID: result.providerSessionID))
         return result
     }
 

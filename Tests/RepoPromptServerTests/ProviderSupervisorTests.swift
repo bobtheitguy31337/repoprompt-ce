@@ -185,6 +185,177 @@ final class ProviderSupervisorTests: XCTestCase {
         XCTAssertNil(reaped)
     }
 
+    func testNativeProviderProtocolsReceiveReadOnlyExecutionPolicy() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixtures: [(ProviderKind, String)] = [
+            (.codex, Self.policyCodexScript()),
+            (.claudeCompatible, Self.policyClaudeScript()),
+            (.openCodeACP, Self.policyACPScript()),
+            (.headlessAdapter, Self.policyHeadlessScript())
+        ]
+        var configurations: [ProviderCLIConfiguration] = []
+        for (kind, script) in fixtures {
+            let executable = directory.appendingPathComponent(kind.rawValue)
+            try Data(script.utf8).write(to: executable)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+            configurations.append(.init(kind: kind, executable: executable.path))
+        }
+        let adapter = try ProviderCLIAdapter(
+            configurations: configurations,
+            processPort: PortableProcessSupervisionPort(),
+            outputDirectory: directory.appendingPathComponent("output").path,
+            ephemeralHomeRoot: directory.appendingPathComponent("homes").path
+        )
+        for (kind, _) in fixtures {
+            _ = try await adapter.executeStreaming(.init(
+                kind: kind,
+                model: nil,
+                prompt: "inspect",
+                workingDirectory: directory.path,
+                runID: UUID(),
+                policy: .init(mode: .readOnly)
+            )) { _ in }
+        }
+        let codex = try String(contentsOf: directory.appendingPathComponent("codex.log"), encoding: .utf8)
+        XCTAssertTrue(codex.contains(#""sandbox":"read-only""#))
+        XCTAssertTrue(codex.contains(#""type":"readOnly""#))
+        let claude = try String(contentsOf: directory.appendingPathComponent("claude.log"), encoding: .utf8)
+        XCTAssertTrue(claude.contains("--permission-mode plan"))
+        XCTAssertTrue(claude.contains("--disallowedTools Bash,Write,Edit,NotebookEdit"))
+        let acp = try String(contentsOf: directory.appendingPathComponent("acp.log"), encoding: .utf8)
+        XCTAssertTrue(acp.contains("set_config_option"), acp)
+        XCTAssertTrue(acp.contains(#""value":"plan""#), acp)
+        let headless = try String(contentsOf: directory.appendingPathComponent("headless.log"), encoding: .utf8)
+        XCTAssertTrue(headless.contains(#""mode":"readOnly""#))
+        XCTAssertTrue(headless.contains(#""writableRoots":[]"#))
+    }
+
+    func testNativeCodexResumeSteerAndApprovalUseOneLiveTransportReader() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let executable = directory.appendingPathComponent("codex")
+        try Data(Self.controlCodexScript().utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let adapter = try ProviderCLIAdapter(
+            configurations: [.init(kind: .codex, executable: executable.path)],
+            processPort: PortableProcessSupervisionPort(),
+            outputDirectory: directory.appendingPathComponent("output").path,
+            ephemeralHomeRoot: directory.appendingPathComponent("homes").path
+        )
+        let runID = UUID()
+        let events = ProviderEventRecorder()
+        let task = Task {
+            try await adapter.executeStreaming(.init(
+                kind: .codex,
+                model: nil,
+                prompt: "continue",
+                workingDirectory: directory.path,
+                runID: runID,
+                resumeProviderSessionID: "existing-thread"
+            )) { event in
+                await events.record(event)
+            }
+        }
+        for _ in 0 ..< 100 {
+            if await events.values().contains(where: {
+                if case .interactionRequested = $0 { true } else { false }
+            }) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let observedInteraction = await events.values().contains(where: {
+            if case .interactionRequested = $0 { true } else { false }
+        })
+        XCTAssertTrue(observedInteraction)
+        try await adapter.deliverInteraction(runID: runID, providerRequestID: "99", answer: Data(#"{"decision":"accept"}"#.utf8))
+        try await adapter.steer(runID: runID, text: "steer now", targetTurnEpoch: 1)
+        let result = try await task.value
+
+        XCTAssertEqual(result.providerSessionID, "existing-thread")
+        XCTAssertEqual(result.output, "steered done")
+        let log = try String(contentsOf: directory.appendingPathComponent("control.log"), encoding: .utf8)
+        XCTAssertTrue(log.contains(#"thread\/resume"#), log)
+        XCTAssertTrue(log.contains(#"turn\/steer"#), log)
+        XCTAssertTrue(log.contains(#""id":99"#), log)
+        XCTAssertTrue(log.contains(#""decision":"accept""#), log)
+
+        let interruptedRunID = UUID()
+        let interruptedEvents = ProviderEventRecorder()
+        let interrupted = Task {
+            try await adapter.executeStreaming(.init(
+                kind: .codex,
+                model: nil,
+                prompt: "interrupt",
+                workingDirectory: directory.path,
+                runID: interruptedRunID,
+                resumeProviderSessionID: "existing-thread"
+            )) { event in
+                await interruptedEvents.record(event)
+            }
+        }
+        for _ in 0 ..< 100 {
+            if await interruptedEvents.values().contains(where: {
+                if case .interactionRequested = $0 { true } else { false }
+            }) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try await adapter.cancel(runID: interruptedRunID)
+        do {
+            _ = try await interrupted.value
+            XCTFail("Interrupted native Codex run unexpectedly completed")
+        } catch {}
+        let interruptedLog = try String(contentsOf: directory.appendingPathComponent("control.log"), encoding: .utf8)
+        XCTAssertTrue(interruptedLog.contains(#"turn\/interrupt"#), interruptedLog)
+    }
+
+    func testNativeACPResumeSteerAndApprovalFenceTheLatestPrompt() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let executable = directory.appendingPathComponent("opencode")
+        try Data(Self.controlACPScript().utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let adapter = try ProviderCLIAdapter(
+            configurations: [.init(kind: .openCodeACP, executable: executable.path)],
+            processPort: PortableProcessSupervisionPort(),
+            outputDirectory: directory.appendingPathComponent("output").path,
+            ephemeralHomeRoot: directory.appendingPathComponent("homes").path
+        )
+        let runID = UUID()
+        let events = ProviderEventRecorder()
+        let task = Task {
+            try await adapter.executeStreaming(.init(
+                kind: .openCodeACP,
+                model: nil,
+                prompt: "continue",
+                workingDirectory: directory.path,
+                runID: runID,
+                resumeProviderSessionID: "existing-acp"
+            )) { event in
+                await events.record(event)
+            }
+        }
+        for _ in 0 ..< 100 {
+            if await events.values().contains(where: {
+                if case .interactionRequested = $0 { true } else { false }
+            }) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try await adapter.deliverInteraction(runID: runID, providerRequestID: "50", answer: Data(#"{"optionId":"allow"}"#.utf8))
+        try await adapter.steer(runID: runID, text: "replacement", targetTurnEpoch: 2)
+        let result = try await task.value
+
+        XCTAssertEqual(result.providerSessionID, "existing-acp")
+        XCTAssertEqual(result.output, "replacement done")
+        let log = try String(contentsOf: directory.appendingPathComponent("control.log"), encoding: .utf8)
+        XCTAssertTrue(log.contains(#"session\/load"#), log)
+        XCTAssertTrue(log.contains(#"session\/cancel"#), log)
+        XCTAssertTrue(log.contains(#""id":50"#), log)
+        XCTAssertTrue(log.contains(#""optionId":"allow""#), log)
+    }
+
     func testProcStatParserHandlesSpacesAndParenthesesInCommand() {
         let fields = ["S", "1", "42", "42"] + Array(repeating: "0", count: 15) + ["987654"]
         let line = "123 (provider worker (sandbox)) " + fields.joined(separator: " ")
@@ -338,6 +509,105 @@ final class ProviderSupervisorTests: XCTestCase {
           case "$line" in
             *initialize*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}' ;;
             *tools*list*) echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"read_file"},{"name":"file_search"}]}}' ;;
+          esac
+        done
+        """
+    }
+
+    private static func policyCodexScript() -> String {
+        """
+        #!/bin/sh
+        while IFS= read -r line; do
+          echo "$line" >> "$PWD/codex.log"
+          case "$line" in
+            *'"method":"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+            *method*thread*start*) echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"policy-thread"}}}' ;;
+            *method*turn*start*)
+              echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+              echo '{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"message-1","type":"agentMessage","text":"done"}}}'
+              echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"turn-1"}}}' ;;
+          esac
+        done
+        """
+    }
+
+    private static func policyClaudeScript() -> String {
+        """
+        #!/bin/sh
+        echo "$*" > "$PWD/claude.log"
+        while IFS= read -r line; do
+          echo '{"type":"result","session_id":"claude-policy","result":"done"}'
+          break
+        done
+        """
+    }
+
+    private static func policyACPScript() -> String {
+        """
+        #!/bin/sh
+        while IFS= read -r line; do
+          echo "$line" >> "$PWD/acp.log"
+          case "$line" in
+            *initialize*) echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}' ;;
+            *session*new*) echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"acp-policy","configOptions":[{"id":"mode","category":"mode","currentValue":"build","options":[{"value":"plan"},{"value":"build"}]}]}}' ;;
+            *session*set_config_option*) echo '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"mode","category":"mode","currentValue":"plan","options":[{"value":"plan"},{"value":"build"}]}]}}' ;;
+            *session*prompt*)
+              echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"done"}}}}'
+              echo '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}' ;;
+          esac
+        done
+        """
+    }
+
+    private static func policyHeadlessScript() -> String {
+        """
+        #!/bin/sh
+        while IFS= read -r line; do
+          echo "$line" > "$PWD/headless.log"
+          echo '{"type":"finalMessage","content":"done"}'
+          echo '{"type":"completion","providerSessionID":"headless-policy"}'
+          break
+        done
+        """
+    }
+
+    private static func controlCodexScript() -> String {
+        """
+        #!/bin/sh
+        while IFS= read -r line; do
+          echo "$line" >> "$PWD/control.log"
+          case "$line" in
+            *'"method":"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+            *method*thread*resume*) echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"existing-thread"}}}' ;;
+            *method*turn*start*)
+              echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-control"}}}'
+              echo '{"jsonrpc":"2.0","id":99,"method":"item/commandExecution/requestApproval","params":{"reason":"approve control"}}' ;;
+            *method*turn*steer*)
+              echo '{"jsonrpc":"2.0","id":4,"result":{}}'
+              echo '{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"message-control","type":"agentMessage","text":"steered done"}}}'
+              echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"turn-control"}}}' ;;
+          esac
+        done
+        """
+    }
+
+    private static func controlACPScript() -> String {
+        """
+        #!/bin/sh
+        prompts=0
+        while IFS= read -r line; do
+          echo "$line" >> "$PWD/control.log"
+          case "$line" in
+            *initialize*) echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}' ;;
+            *session*load*) echo '{"jsonrpc":"2.0","id":2,"result":{}}' ;;
+            *session*prompt*)
+              prompts=$((prompts + 1))
+              if [ "$prompts" -eq 1 ]; then
+                echo '{"jsonrpc":"2.0","id":50,"method":"session/request_permission","params":{"toolCall":{"title":"approve acp"},"options":[{"optionId":"allow"},{"optionId":"deny"}]}}'
+              else
+                echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"replacement done"}}}}'
+                echo '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
+              fi ;;
           esac
         done
         """
