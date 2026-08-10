@@ -90,7 +90,6 @@ public struct RepoPromptServerConfiguration: Sendable {
             projectSourcePolicy = .disabled
         }
         let projectSourceGitCredentials = try ProjectSourceGitCredentials(
-            globalConfigPath: environment["REPOPROMPT_GIT_CONFIG_FILE"],
             sshPrivateKeyPath: environment["REPOPROMPT_GIT_SSH_KEY_FILE"],
             sshKnownHostsPath: environment["REPOPROMPT_GIT_KNOWN_HOSTS_FILE"]
         )
@@ -219,7 +218,13 @@ public enum RepoPromptServerRunner {
         )
         let processOutput = URL(fileURLWithPath: stateDirectory).appendingPathComponent("provider-output").path
         try FileManager.default.createDirectory(atPath: processOutput, withIntermediateDirectories: true)
-        let reconciler = OwnedResourceReconciliationService(
+        let projectSources = try ProjectSourceProvisioningService(
+            cloneRoot: configuration.projectDirectory,
+            policy: configuration.projectSourcePolicy,
+            credentials: configuration.projectSourceGitCredentials,
+            resources: store
+        )
+        let reconciler = try OwnedResourceReconciliationService(
             repository: store,
             artifactRoot: configuration.artifactDirectory,
             worktreeRoot: configuration.worktreeDirectory,
@@ -227,7 +232,7 @@ public enum RepoPromptServerRunner {
             providerOutputRoot: processOutput,
             projectRoot: configuration.projectDirectory
         )
-        _ = await reconciler.reconcileStartup()
+        _ = try await reconciler.reconcileStartup()
         let durabilityOperations = DurabilityOperationsService(store: store, reconciler: reconciler)
         _ = await durabilityOperations.runOnce()
 
@@ -247,12 +252,6 @@ public enum RepoPromptServerRunner {
             processStore: store,
             outputDirectory: processOutput,
             ephemeralHomeRoot: configuration.providerHomeDirectory
-        )
-        let projectSources = try ProjectSourceProvisioningService(
-            cloneRoot: configuration.projectDirectory,
-            policy: configuration.projectSourcePolicy,
-            credentials: configuration.projectSourceGitCredentials,
-            resources: store
         )
         let authority = RepoPromptHeadlessAuthority(
             store: store,

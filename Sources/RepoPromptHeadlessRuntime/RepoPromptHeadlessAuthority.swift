@@ -5,6 +5,11 @@ import RepoPromptServiceProtocol
 import RepoPromptWorkspaceRuntimeCore
 
 public actor RepoPromptHeadlessAuthority {
+    private struct InFlightProjectSourceOperation {
+        let requestDigest: String
+        var waiters: [UUID: CheckedContinuation<ProjectSourceOperationWireSnapshot, Error>]
+    }
+
     private let store: SQLiteServiceStore
     private let clock: any RuntimeClock
     private let ids: any RuntimeIDGenerator
@@ -28,6 +33,7 @@ public actor RepoPromptHeadlessAuthority {
     private var providerToolInvocations: [UUID: [String: ToolInvocationSnapshot]] = [:]
     private var providerControlReadyRuns: Set<UUID> = []
     private var cancellationBarriers: Set<UUID> = []
+    private var inFlightProjectSourceOperations: [String: InFlightProjectSourceOperation] = [:]
     private var quiescing = false
 
     public init(
@@ -139,6 +145,53 @@ public actor RepoPromptHeadlessAuthority {
     }
 
     public func createProjectFromSource(
+        input: ProjectSourceOperationInput,
+        externalActor: ExternalActor,
+        idempotencyKey: String,
+        requestDigest: String
+    ) async throws -> ProjectSourceOperationWireSnapshot {
+        let scope = externalActor.goblinUserID + "\u{0}" + idempotencyKey
+        if var existing = inFlightProjectSourceOperations[scope] {
+            guard existing.requestDigest == requestDigest else {
+                throw ServiceAPIError(code: .idempotencyConflict, message: "Idempotency key was reused with a different request")
+            }
+            let waiterID = UUID()
+            return try await withTaskCancellationHandler(operation: {
+                try await withCheckedThrowingContinuation { continuation in
+                    existing.waiters[waiterID] = continuation
+                    inFlightProjectSourceOperations[scope] = existing
+                }
+            }, onCancel: {
+                Task { await self.cancelProjectSourceWaiter(scope: scope, waiterID: waiterID) }
+            })
+        }
+        inFlightProjectSourceOperations[scope] = .init(requestDigest: requestDigest, waiters: [:])
+        do {
+            let result = try await performCreateProjectFromSource(
+                input: input,
+                externalActor: externalActor,
+                idempotencyKey: idempotencyKey,
+                requestDigest: requestDigest
+            )
+            let waiters = inFlightProjectSourceOperations.removeValue(forKey: scope)?.waiters ?? [:]
+            waiters.values.forEach { $0.resume(returning: result) }
+            return result
+        } catch {
+            let waiters = inFlightProjectSourceOperations.removeValue(forKey: scope)?.waiters ?? [:]
+            waiters.values.forEach { $0.resume(throwing: error) }
+            throw error
+        }
+    }
+
+    private func cancelProjectSourceWaiter(scope: String, waiterID: UUID) {
+        guard var flight = inFlightProjectSourceOperations[scope],
+              let waiter = flight.waiters.removeValue(forKey: waiterID)
+        else { return }
+        inFlightProjectSourceOperations[scope] = flight
+        waiter.resume(throwing: CancellationError())
+    }
+
+    private func performCreateProjectFromSource(
         input: ProjectSourceOperationInput,
         externalActor: ExternalActor,
         idempotencyKey: String,

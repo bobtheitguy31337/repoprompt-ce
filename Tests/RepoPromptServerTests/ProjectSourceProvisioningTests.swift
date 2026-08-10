@@ -1,5 +1,10 @@
 import Foundation
-import RepoPromptHeadlessRuntime
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+@testable import RepoPromptHeadlessRuntime
 @testable import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 import RepoPromptWorkspaceRuntimeCore
@@ -179,6 +184,118 @@ final class ProjectSourceProvisioningTests: XCTestCase {
         XCTAssertTrue(invocations.isEmpty)
     }
 
+    func testRefPolicyPatternsMatchTheEntireRef() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let git = FakeProjectSourceGitRunner()
+        let service = try ProjectSourceProvisioningService(
+            cloneRoot: fixture.cloneRoot.path,
+            policy: try ProjectSourcePolicy.decode(fixture.policy(
+                configuredPath: fixture.directory.path,
+                allowedRefPatterns: ["main"],
+                deniedRefPatterns: []
+            )),
+            credentials: ProjectSourceGitCredentials(),
+            resources: store,
+            git: git
+        )
+        do {
+            _ = try await service.provision(
+                input: .init(
+                    operationID: UUID(), expectedRevision: 0, name: "Clone", logicalName: "root",
+                    source: .gitClone(remote: "https://github.com/degentlemen/chat-server.git", ref: "main-old")
+                ),
+                projectID: UUID(),
+                rootID: UUID()
+            )
+            XCTFail("Expected a partial ref regex match to be rejected")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .rootUnauthorized)
+        }
+        let invocations = await git.recorded()
+        XCTAssertTrue(invocations.isEmpty)
+    }
+
+    func testSSHRemoteRulesRequireRuntimeIdentityAndKnownHosts() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let policy = try ProjectSourcePolicy.decode(fixture.policy(
+            configuredPath: fixture.directory.path,
+            remoteRules: [["scheme": "ssh", "host": "github.com", "pathPrefix": "/degentlemen/"]]
+        ))
+        XCTAssertThrowsError(try ProjectSourceProvisioningService(
+            cloneRoot: fixture.cloneRoot.path,
+            policy: policy,
+            credentials: ProjectSourceGitCredentials(),
+            resources: store,
+            git: FakeProjectSourceGitRunner()
+        )) { error in
+            XCTAssertEqual((error as? ServiceAPIError)?.code, .invalidRequest)
+        }
+    }
+
+    func testRealGitRunnerRejectsFastOutputOverrunAfterExit() async throws {
+        let fixture = try RealRunnerFixture(script: "#!/bin/sh\ndd if=/dev/zero bs=65536 count=1 2>/dev/null\n")
+        defer { fixture.cleanup() }
+        do {
+            _ = try await LocalProjectSourceGitRunner().run(fixture.invocation(maximumOutputBytes: 4_096, timeoutSeconds: 5))
+            XCTFail("Expected output limit rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .dependencyUnavailable)
+        }
+    }
+
+    func testRealGitRunnerTimeoutTerminatesAndReapsProcess() async throws {
+        let fixture = try RealRunnerFixture(script: "#!/bin/sh\necho $$ > process.pid\nwhile :; do :; done\n")
+        defer { fixture.cleanup() }
+        do {
+            _ = try await LocalProjectSourceGitRunner().run(fixture.invocation(timeoutSeconds: 1))
+            XCTFail("Expected timeout")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .dependencyUnavailable)
+        }
+        let processID = try fixture.processID(named: "process.pid")
+        let gone = await processIsGone(processID)
+        XCTAssertTrue(gone)
+    }
+
+    func testRealGitRunnerCancellationTerminatesAndReapsProcess() async throws {
+        let fixture = try RealRunnerFixture(script: "#!/bin/sh\necho $$ > process.pid\nwhile :; do :; done\n")
+        defer { fixture.cleanup() }
+        let task = Task { try await LocalProjectSourceGitRunner().run(fixture.invocation(timeoutSeconds: 30)) }
+        try await fixture.waitForFile(named: "process.pid")
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        let processID = try fixture.processID(named: "process.pid")
+        let gone = await processIsGone(processID)
+        XCTAssertTrue(gone)
+    }
+
+    #if os(Linux)
+    func testRealGitRunnerTimeoutTerminatesDescendantProcessGroup() async throws {
+        let fixture = try RealRunnerFixture(script: "#!/bin/sh\nsleep 30 &\necho $! > child.pid\nwait\n")
+        defer { fixture.cleanup() }
+        do {
+            _ = try await LocalProjectSourceGitRunner().run(fixture.invocation(timeoutSeconds: 1))
+            XCTFail("Expected timeout")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .dependencyUnavailable)
+        }
+        let childID = try fixture.processID(named: "child.pid")
+        let gone = await processIsGone(childID)
+        XCTAssertTrue(gone)
+    }
+    #endif
+
     func testCloneFailureCleansOnlyItsOwnedStagingDirectory() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanup() }
@@ -316,6 +433,214 @@ final class ProjectSourceProvisioningTests: XCTestCase {
             XCTAssertEqual(error.currentRevision, 0)
         }
     }
+
+    func testConcurrentIdenticalConfiguredRootRequestsJoinOneOperation() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let configured = fixture.directory.appendingPathComponent("configured", isDirectory: true)
+        try FileManager.default.createDirectory(at: configured, withIntermediateDirectories: true)
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let service = try ProjectSourceProvisioningService(
+            cloneRoot: fixture.cloneRoot.path,
+            policy: try ProjectSourcePolicy.decode(fixture.policy(configuredPath: configured.path)),
+            credentials: ProjectSourceGitCredentials(),
+            resources: store,
+            git: FakeProjectSourceGitRunner()
+        )
+        let authority = RepoPromptHeadlessAuthority(store: store, projectSourceService: service)
+        let actor = ExternalActor(goblinUserID: "concurrent-configured", username: "alice", displayName: "Alice")
+        let input = ProjectSourceOperationInput(
+            operationID: UUID(), expectedRevision: 0, name: "Configured", logicalName: "workspace",
+            source: .configuredRoot(alias: "chat-server")
+        )
+        async let first = authority.createProjectFromSource(
+            input: input, externalActor: actor, idempotencyKey: "same-key", requestDigest: "same-digest"
+        )
+        async let second = authority.createProjectFromSource(
+            input: input, externalActor: actor, idempotencyKey: "same-key", requestDigest: "same-digest"
+        )
+        let results = try await (first, second)
+        XCTAssertEqual(results.0, results.1)
+        let projectCount = await authority.projectSnapshots().count
+        XCTAssertEqual(projectCount, 1)
+    }
+
+    func testConcurrentIdenticalCloneRequestsShareOneStagingOperation() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let git = FakeProjectSourceGitRunner(cloneDelay: .milliseconds(200))
+        let service = try ProjectSourceProvisioningService(
+            cloneRoot: fixture.cloneRoot.path,
+            policy: try ProjectSourcePolicy.decode(fixture.policy(configuredPath: fixture.directory.path)),
+            credentials: ProjectSourceGitCredentials(),
+            resources: store,
+            git: git
+        )
+        let authority = RepoPromptHeadlessAuthority(store: store, projectSourceService: service)
+        let actor = ExternalActor(goblinUserID: "concurrent-clone", username: "alice", displayName: "Alice")
+        let input = ProjectSourceOperationInput(
+            operationID: UUID(), expectedRevision: 0, name: "Clone", logicalName: "workspace",
+            source: .gitClone(remote: "https://github.com/degentlemen/chat-server.git", ref: "main")
+        )
+        async let first = authority.createProjectFromSource(
+            input: input, externalActor: actor, idempotencyKey: "same-key", requestDigest: "same-digest"
+        )
+        async let second = authority.createProjectFromSource(
+            input: input, externalActor: actor, idempotencyKey: "same-key", requestDigest: "same-digest"
+        )
+        let results = try await (first, second)
+        XCTAssertEqual(results.0, results.1)
+        let invocations = await git.recorded()
+        XCTAssertEqual(invocations.filter { $0.arguments.contains("clone") }.count, 1)
+        let projectCount = await authority.projectSnapshots().count
+        XCTAssertEqual(projectCount, 1)
+    }
+
+    func testCanceledJoinedCloneWaiterReturnsPromptlyWithoutCancelingSharedOperation() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let git = FakeProjectSourceGitRunner(cloneDelay: .milliseconds(300))
+        let service = try ProjectSourceProvisioningService(
+            cloneRoot: fixture.cloneRoot.path,
+            policy: try ProjectSourcePolicy.decode(fixture.policy(configuredPath: fixture.directory.path)),
+            credentials: ProjectSourceGitCredentials(),
+            resources: store,
+            git: git
+        )
+        let authority = RepoPromptHeadlessAuthority(store: store, projectSourceService: service)
+        let actor = ExternalActor(goblinUserID: "canceled-waiter", username: "alice", displayName: "Alice")
+        let input = ProjectSourceOperationInput(
+            operationID: UUID(), expectedRevision: 0, name: "Clone", logicalName: "workspace",
+            source: .gitClone(remote: "https://github.com/degentlemen/chat-server.git", ref: "main")
+        )
+        let primary = Task { try await authority.createProjectFromSource(
+            input: input, externalActor: actor, idempotencyKey: "same-key", requestDigest: "same-digest"
+        ) }
+        var cloneStarted = false
+        for _ in 0 ..< 100 {
+            if await git.recorded().contains(where: { $0.arguments.contains("clone") }) {
+                cloneStarted = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(cloneStarted)
+        let waiter = Task { try await authority.createProjectFromSource(
+            input: input, externalActor: actor, idempotencyKey: "same-key", requestDigest: "same-digest"
+        ) }
+        try await Task.sleep(for: .milliseconds(30))
+        waiter.cancel()
+        do {
+            _ = try await waiter.value
+            XCTFail("Expected joined waiter cancellation")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        _ = try await primary.value
+        let invocations = await git.recorded()
+        XCTAssertEqual(invocations.filter { $0.arguments.contains("clone") }.count, 1)
+    }
+
+    func testConcurrentDifferentPayloadsWithSameKeyConflictAtomically() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let configured = fixture.directory.appendingPathComponent("configured", isDirectory: true)
+        try FileManager.default.createDirectory(at: configured, withIntermediateDirectories: true)
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let service = try ProjectSourceProvisioningService(
+            cloneRoot: fixture.cloneRoot.path,
+            policy: try ProjectSourcePolicy.decode(fixture.policy(configuredPath: configured.path)),
+            credentials: ProjectSourceGitCredentials(),
+            resources: store,
+            git: FakeProjectSourceGitRunner(cloneDelay: .milliseconds(200))
+        )
+        let authority = RepoPromptHeadlessAuthority(store: store, projectSourceService: service)
+        let actor = ExternalActor(goblinUserID: "concurrent-conflict", username: "alice", displayName: "Alice")
+        let clone = ProjectSourceOperationInput(
+            operationID: UUID(), expectedRevision: 0, name: "Clone", logicalName: "workspace",
+            source: .gitClone(remote: "https://github.com/degentlemen/chat-server.git", ref: "main")
+        )
+        let configuredInput = ProjectSourceOperationInput(
+            operationID: UUID(), expectedRevision: 0, name: "Configured", logicalName: "workspace",
+            source: .configuredRoot(alias: "chat-server")
+        )
+        let first = Task { try await authority.createProjectFromSource(
+            input: clone, externalActor: actor, idempotencyKey: "reused-key", requestDigest: "digest-a"
+        ) }
+        let second = Task { try await authority.createProjectFromSource(
+            input: configuredInput, externalActor: actor, idempotencyKey: "reused-key", requestDigest: "digest-b"
+        ) }
+        let outcomes = [await first.result, await second.result]
+        XCTAssertEqual(outcomes.filter { if case .success = $0 { true } else { false } }.count, 1)
+        let errors = outcomes.compactMap { result -> Error? in
+            if case let .failure(error) = result { return error }
+            return nil
+        }
+        XCTAssertEqual(errors.count, 1)
+        XCTAssertEqual((errors.first as? ServiceAPIError)?.code, .idempotencyConflict)
+        let projectCount = await authority.projectSnapshots().count
+        XCTAssertEqual(projectCount, 1)
+    }
+}
+
+private struct RealRunnerFixture {
+    let directory: URL
+    let script: URL
+
+    init(script contents: String) throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        script = directory.appendingPathComponent("runner-script")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data(contents.utf8).write(to: script)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+    }
+
+    func invocation(maximumOutputBytes: Int = 16_384, timeoutSeconds: Int) -> ProjectSourceGitInvocation {
+        ProjectSourceGitInvocation(
+            executable: script.path,
+            arguments: [],
+            environment: ["PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"],
+            workingDirectory: directory.path,
+            outputPath: directory.appendingPathComponent("output").path,
+            observedDirectory: directory.path,
+            maximumOutputBytes: maximumOutputBytes,
+            maximumDirectoryBytes: 10_485_760,
+            timeoutSeconds: timeoutSeconds
+        )
+    }
+
+    func waitForFile(named name: String) async throws {
+        let path = directory.appendingPathComponent(name).path
+        for _ in 0 ..< 100 {
+            if FileManager.default.fileExists(atPath: path) { return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        throw ServiceAPIError(code: .dependencyUnavailable, message: "Fixture process did not start")
+    }
+
+    func processID(named name: String) throws -> pid_t {
+        let value = try String(contentsOf: directory.appendingPathComponent(name), encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return try XCTUnwrap(pid_t(value))
+    }
+
+    func cleanup() {
+        try? FileManager.default.removeItem(at: directory)
+    }
+}
+
+private func processIsGone(_ processID: pid_t) async -> Bool {
+    for _ in 0 ..< 100 {
+        if kill(processID, 0) != 0 { return true }
+        try? await Task.sleep(for: .milliseconds(20))
+    }
+    return false
 }
 
 private struct Fixture {
@@ -332,14 +657,19 @@ private struct Fixture {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    func policy(configuredPath: String) throws -> Data {
+    func policy(
+        configuredPath: String,
+        remoteRules: [[String: String]] = [["scheme": "https", "host": "github.com", "pathPrefix": "/degentlemen/"]],
+        allowedRefPatterns: [String] = ["^(main|release/[A-Za-z0-9._-]+)$"],
+        deniedRefPatterns: [String] = ["^private/.*$"]
+    ) throws -> Data {
         try JSONSerialization.data(withJSONObject: [
             "schemaVersion": 1,
             "configuredRoots": [["alias": "chat-server", "path": configuredPath, "writable": true]],
             "git": [
-                "remoteRules": [["scheme": "https", "host": "github.com", "pathPrefix": "/degentlemen/"]],
-                "allowedRefPatterns": ["^(main|release/[A-Za-z0-9._-]+)$"],
-                "deniedRefPatterns": ["^private/"],
+                "remoteRules": remoteRules,
+                "allowedRefPatterns": allowedRefPatterns,
+                "deniedRefPatterns": deniedRefPatterns,
                 "maximumCloneBytes": 8_388_608,
                 "maximumCloneSeconds": 5,
                 "maximumConcurrentClones": 1,
@@ -352,10 +682,12 @@ private struct Fixture {
 private actor FakeProjectSourceGitRunner: ProjectSourceGitRunning {
     private var invocations: [ProjectSourceGitInvocation] = []
     private let failClone: Bool
+    private let cloneDelay: Duration?
     private var origin = "https://github.com/degentlemen/chat-server.git"
 
-    init(failClone: Bool = false) {
+    init(failClone: Bool = false, cloneDelay: Duration? = nil) {
         self.failClone = failClone
+        self.cloneDelay = cloneDelay
     }
 
     func recorded() -> [ProjectSourceGitInvocation] {
@@ -365,6 +697,7 @@ private actor FakeProjectSourceGitRunner: ProjectSourceGitRunning {
     func run(_ invocation: ProjectSourceGitInvocation) async throws -> String {
         invocations.append(invocation)
         if invocation.arguments.contains("clone") {
+            if let cloneDelay { try await Task.sleep(for: cloneDelay) }
             let destination = try XCTUnwrap(invocation.arguments.last)
             try FileManager.default.createDirectory(atPath: destination, withIntermediateDirectories: true)
             try FileManager.default.createDirectory(atPath: URL(fileURLWithPath: destination).appendingPathComponent(".git").path, withIntermediateDirectories: true)

@@ -161,8 +161,11 @@ public struct ProjectSourcePolicy: Sendable {
             throw ServiceAPIError(code: .invalidRequest, message: "Git ref is invalid")
         }
         let range = NSRange(ref.startIndex ..< ref.endIndex, in: ref)
-        guard !deniedRefPatterns.contains(where: { $0.firstMatch(in: ref, range: range) != nil }),
-              allowedRefPatterns.isEmpty || allowedRefPatterns.contains(where: { $0.firstMatch(in: ref, range: range) != nil })
+        func matchesEntire(_ expression: NSRegularExpression) -> Bool {
+            expression.firstMatch(in: ref, range: range)?.range == range
+        }
+        guard !deniedRefPatterns.contains(where: matchesEntire),
+              allowedRefPatterns.isEmpty || allowedRefPatterns.contains(where: matchesEntire)
         else {
             throw ServiceAPIError(code: .rootUnauthorized, message: "Git ref is not approved")
         }
@@ -245,11 +248,10 @@ public struct ProjectSourcePolicy: Sendable {
 }
 
 public struct ProjectSourceGitCredentials: Sendable {
-    public let globalConfigPath: String?
     public let sshPrivateKeyPath: String?
     public let sshKnownHostsPath: String?
 
-    public init(globalConfigPath: String? = nil, sshPrivateKeyPath: String? = nil, sshKnownHostsPath: String? = nil) throws {
+    public init(sshPrivateKeyPath: String? = nil, sshKnownHostsPath: String? = nil) throws {
         func validated(_ path: String?) throws -> String? {
             guard let path, !path.isEmpty else { return nil }
             let values = try? URL(fileURLWithPath: path).resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
@@ -260,7 +262,6 @@ public struct ProjectSourceGitCredentials: Sendable {
             }
             return path
         }
-        self.globalConfigPath = try validated(globalConfigPath)
         self.sshPrivateKeyPath = try validated(sshPrivateKeyPath)
         self.sshKnownHostsPath = try validated(sshKnownHostsPath)
         guard (self.sshPrivateKeyPath == nil) == (self.sshKnownHostsPath == nil) else {
@@ -285,15 +286,75 @@ public protocol ProjectSourceGitRunning: Sendable {
     func run(_ invocation: ProjectSourceGitInvocation) async throws -> String
 }
 
-private final class SendableProcess: @unchecked Sendable {
-    let value = Process()
+private final class ManagedProjectSourceProcess: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var processGroup: pid_t?
+
+    func prepare(_ process: Process) {
+        lock.lock()
+        self.process = process
+        lock.unlock()
+    }
+
+    func activateProcessGroup(_ processGroup: pid_t?) {
+        lock.lock()
+        self.processGroup = processGroup
+        lock.unlock()
+    }
+
+    func signal(_ signal: Int32) {
+        lock.lock()
+        let process = self.process
+        let processGroup = self.processGroup
+        let processID = process?.processIdentifier ?? 0
+        lock.unlock()
+        if let processGroup, processGroup > 1 {
+            _ = kill(-processGroup, signal)
+        } else if processID > 1 {
+            _ = kill(processID, signal)
+        }
+    }
+
+    func isRunning() -> Bool {
+        lock.lock()
+        let running = process?.isRunning == true
+        lock.unlock()
+        return running
+    }
+
+    func terminationStatus() -> Int32? {
+        lock.lock()
+        let process = self.process
+        let running = process?.isRunning == true
+        lock.unlock()
+        guard let process, !running else { return nil }
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
 }
 
 public struct LocalProjectSourceGitRunner: ProjectSourceGitRunning {
     public init() {}
 
     public func run(_ invocation: ProjectSourceGitInvocation) async throws -> String {
-        try await Task.detached(priority: .utility) {
+        let lifecycle = ManagedProjectSourceProcess()
+        return try await withTaskCancellationHandler(operation: {
+            do {
+                return try await Self.execute(invocation, lifecycle: lifecycle)
+            } catch {
+                await Self.terminateAndReap(lifecycle)
+                throw error
+            }
+        }, onCancel: {
+            lifecycle.signal(SIGTERM)
+        })
+    }
+
+    private static func execute(
+        _ invocation: ProjectSourceGitInvocation,
+        lifecycle: ManagedProjectSourceProcess
+    ) async throws -> String {
             let manager = FileManager.default
             guard manager.isExecutableFile(atPath: invocation.executable) else {
                 throw ServiceAPIError(code: .capabilityMissing, message: "Git executable is unavailable")
@@ -305,52 +366,85 @@ public struct LocalProjectSourceGitRunner: ProjectSourceGitRunning {
             let output = try FileHandle(forWritingTo: URL(fileURLWithPath: invocation.outputPath))
             defer { try? output.close() }
 
-            let box = SendableProcess()
-            let process = box.value
+            let process = Process()
+            #if os(Linux)
+            let sessionLauncher = "/usr/bin/setsid"
+            guard manager.isExecutableFile(atPath: sessionLauncher) else {
+                throw ServiceAPIError(code: .capabilityMissing, message: "Git process isolation is unavailable")
+            }
+            process.executableURL = URL(fileURLWithPath: sessionLauncher)
+            process.arguments = [invocation.executable] + invocation.arguments
+            #else
             process.executableURL = URL(fileURLWithPath: invocation.executable)
             process.arguments = invocation.arguments
+            #endif
             process.environment = invocation.environment
             process.currentDirectoryURL = URL(fileURLWithPath: invocation.workingDirectory)
             process.standardOutput = output
             process.standardError = output
+            lifecycle.prepare(process)
+            try Task.checkCancellation()
             do { try process.run() } catch {
                 throw ServiceAPIError(code: .dependencyUnavailable, message: "Git source operation could not start")
             }
+            #if os(Linux)
+            lifecycle.activateProcessGroup(process.processIdentifier)
+            #else
+            let processID = process.processIdentifier
+            lifecycle.activateProcessGroup(setpgid(processID, processID) == 0 ? processID : nil)
+            #endif
+            try Task.checkCancellation()
 
             let deadline = Date().addingTimeInterval(TimeInterval(invocation.timeoutSeconds))
-            var failureCode: String?
-            var forcedTerminationAt: Date?
-            while process.isRunning {
+            while lifecycle.isRunning() {
                 let now = Date()
-                if let forceAt = forcedTerminationAt, now >= forceAt {
-                    _ = kill(process.processIdentifier, SIGKILL)
-                    forcedTerminationAt = nil
-                } else if failureCode == nil, now >= deadline {
-                    failureCode = "git_timeout"
-                    process.terminate()
-                    forcedTerminationAt = now.addingTimeInterval(2)
-                } else if failureCode == nil, Self.fileSize(invocation.outputPath) > Int64(invocation.maximumOutputBytes) {
-                    failureCode = "git_output_limit"
-                    process.terminate()
-                    forcedTerminationAt = now.addingTimeInterval(2)
-                } else if failureCode == nil, Self.directorySize(invocation.observedDirectory, limit: invocation.maximumDirectoryBytes) > invocation.maximumDirectoryBytes {
-                    failureCode = "git_clone_size_limit"
-                    process.terminate()
-                    forcedTerminationAt = now.addingTimeInterval(2)
+                if now >= deadline
+                    || Self.fileSize(invocation.outputPath) > Int64(invocation.maximumOutputBytes)
+                    || Self.directorySize(invocation.observedDirectory, limit: invocation.maximumDirectoryBytes) > invocation.maximumDirectoryBytes
+                {
+                    await terminateAndReap(lifecycle)
+                    throw ServiceAPIError(code: .dependencyUnavailable, message: "Git source operation exceeded a configured limit")
                 }
                 try await Task.sleep(for: .milliseconds(100))
             }
-            process.waitUntilExit()
+            guard let terminationStatus = lifecycle.terminationStatus() else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "Git source operation did not terminate cleanly")
+            }
             try output.synchronize()
-            if failureCode != nil {
+            guard Self.fileSize(invocation.outputPath) <= Int64(invocation.maximumOutputBytes),
+                  Self.directorySize(invocation.observedDirectory, limit: invocation.maximumDirectoryBytes) <= invocation.maximumDirectoryBytes
+            else {
                 throw ServiceAPIError(code: .dependencyUnavailable, message: "Git source operation exceeded a configured limit")
             }
-            guard process.terminationStatus == 0 else {
+            guard terminationStatus == 0 else {
                 throw ServiceAPIError(code: .dependencyUnavailable, message: "Git source operation failed")
             }
             let data = try Data(contentsOf: URL(fileURLWithPath: invocation.outputPath), options: [.mappedIfSafe])
-            return String(decoding: data.prefix(invocation.maximumOutputBytes), as: UTF8.self)
-        }.value
+            return String(decoding: data, as: UTF8.self)
+    }
+
+    private static func terminateAndReap(_ lifecycle: ManagedProjectSourceProcess) async {
+        guard lifecycle.isRunning() else {
+            _ = lifecycle.terminationStatus()
+            return
+        }
+        lifecycle.signal(SIGTERM)
+        if await waitForExit(lifecycle, timeout: .milliseconds(500)) {
+            _ = lifecycle.terminationStatus()
+            return
+        }
+        lifecycle.signal(SIGKILL)
+        _ = await waitForExit(lifecycle, timeout: .seconds(2))
+        _ = lifecycle.terminationStatus()
+    }
+
+    private static func waitForExit(_ lifecycle: ManagedProjectSourceProcess, timeout: Duration) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while lifecycle.isRunning(), clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        return !lifecycle.isRunning()
     }
 
     private static func fileSize(_ path: String) -> Int64 {
@@ -385,6 +479,7 @@ public actor ProjectSourceProvisioningService {
 
     private let cloneRoot: String
     private let cloneRootIdentity: String
+    private let pinnedCloneRoot: PinnedFilesystemRoot
     private let policy: ProjectSourcePolicy
     private let configuredRoots: [String: ConfiguredRootAuthority]
     private let credentials: ProjectSourceGitCredentials
@@ -407,6 +502,11 @@ public actor ProjectSourceProvisioningService {
         self.resources = resources
         self.filesystem = filesystem
         self.git = git
+        guard !policy.remoteRules.contains(where: { $0.scheme == "ssh" })
+                || (credentials.sshPrivateKeyPath != nil && credentials.sshKnownHostsPath != nil)
+        else {
+            throw ServiceAPIError(code: .invalidRequest, message: "SSH Git policy requires runtime identity and known-hosts mounts")
+        }
         let standardizedCloneRoot = URL(fileURLWithPath: cloneRoot).standardizedFileURL.path
         let canonical = try filesystem.canonicalizeRoot(standardizedCloneRoot)
         guard canonical.path == standardizedCloneRoot, !Self.isSymbolicLink(standardizedCloneRoot) else {
@@ -414,6 +514,7 @@ public actor ProjectSourceProvisioningService {
         }
         self.cloneRoot = canonical.path
         cloneRootIdentity = canonical.identity
+        pinnedCloneRoot = try PinnedFilesystemRoot(path: canonical.path, identity: canonical.identity)
         configuredRoots = try Dictionary(uniqueKeysWithValues: policy.configuredRoots.map { alias, configuration in
             let standardized = URL(fileURLWithPath: configuration.path).standardizedFileURL.path
             let root = try filesystem.canonicalizeRoot(standardized)
@@ -577,11 +678,9 @@ public actor ProjectSourceProvisioningService {
             }
 
             try validateImmutableCloneRoot()
-            try FileManager.default.moveItem(atPath: checkout, toPath: final)
-            try DurableFilesystem.fsyncDirectory(cloneRoot)
+            try pinnedCloneRoot.moveAtomically(from: checkout, to: final)
             if FileManager.default.fileExists(atPath: operationDirectory) {
-                try FileManager.default.removeItem(atPath: operationDirectory)
-                try DurableFilesystem.fsyncDirectory(stagingParent)
+                try pinnedCloneRoot.removeTree(at: operationDirectory)
             }
             let canonical = try filesystem.canonicalizeRoot(final)
             guard try filesystem.contains(root: cloneRoot, candidate: canonical.path) else {
@@ -658,7 +757,7 @@ public actor ProjectSourceProvisioningService {
             "LC_ALL": "C",
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": credentials.globalConfigPath ?? "/dev/null",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_PROTOCOL_FROM_USER": "0",
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_ALLOW_PROTOCOL": Set(policy.remoteRules.map(\.scheme)).sorted().joined(separator: ":")
@@ -697,10 +796,7 @@ public actor ProjectSourceProvisioningService {
         guard try filesystem.contains(root: cloneRoot, candidate: path), !Self.isSymbolicLink(path) else {
             throw ServiceAPIError(code: .rootUnauthorized, message: "Project source cleanup path is unsafe")
         }
-        if FileManager.default.fileExists(atPath: path) {
-            try FileManager.default.removeItem(atPath: path)
-            try DurableFilesystem.fsyncDirectory(URL(fileURLWithPath: path).deletingLastPathComponent().path)
-        }
+        try pinnedCloneRoot.removeTree(at: path)
     }
 
     private static func isSymbolicLink(_ path: String) -> Bool {

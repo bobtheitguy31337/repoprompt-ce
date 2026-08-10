@@ -233,6 +233,12 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(child?.rootSessionID, parentID)
         XCTAssertEqual(child?.provider, .claudeCompatible)
         XCTAssertEqual(child?.state, .interrupted)
+        let importedEvents = try await store.events(after: nil, limit: 20).events
+        let projectEvent = try XCTUnwrap(importedEvents.first(where: { $0.projectID == projectID && $0.eventType == .projectCreated }))
+        let projectPayload = String(decoding: try JSONEncoder.serviceEncoder.encode(projectEvent.payload), as: UTF8.self)
+        XCTAssertFalse(projectPayload.contains(directory.path), projectPayload)
+        XCTAssertFalse(projectPayload.contains("canonicalPath"), projectPayload)
+        XCTAssertTrue(projectPayload.contains("rootCount"), projectPayload)
         try await store.close(clean: true)
 
         store = try await SQLiteServiceStore.open(storage: .file(database.path))

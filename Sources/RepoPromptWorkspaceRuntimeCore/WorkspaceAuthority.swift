@@ -1,6 +1,83 @@
 import Foundation
 import RepoPromptC
 import RepoPromptServiceProtocol
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+public final class PinnedFilesystemRoot: @unchecked Sendable {
+    public let path: String
+    public let identity: String
+    private let descriptor: Int32
+
+    public init(path: String, identity: String) throws {
+        let descriptor = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw ServiceAPIError(code: .rootUnauthorized, message: "Configured filesystem root could not be pinned")
+        }
+        var status = stat()
+        let identityParts = identity.split(separator: ":", omittingEmptySubsequences: false)
+        guard fstat(descriptor, &status) == 0,
+              identityParts.count >= 2,
+              identityParts[0] == Substring(String(status.st_dev)),
+              identityParts[1] == Substring(String(status.st_ino))
+        else {
+            close(descriptor)
+            throw ServiceAPIError(code: .rootUnauthorized, message: "Configured filesystem root identity changed while being pinned")
+        }
+        self.path = path
+        self.identity = identity
+        self.descriptor = descriptor
+    }
+
+    deinit {
+        close(descriptor)
+    }
+
+    public func removeTree(at candidate: String) throws {
+        let relative = try relativePath(for: candidate)
+        let result = relative.withCString { rp_remove_tree_at(descriptor, $0) }
+        guard result == 0 || result == ENOENT else {
+            throw ServiceAPIError(code: .rootUnauthorized, message: "Pinned filesystem cleanup was rejected")
+        }
+        guard fsync(descriptor) == 0 else {
+            throw ServiceAPIError(code: .persistenceUnavailable, message: "Pinned filesystem cleanup could not be synchronized")
+        }
+    }
+
+    public func moveAtomically(from source: String, to destination: String) throws {
+        let sourceRelative = try relativePath(for: source)
+        let destinationRelative = try relativePath(for: destination)
+        let result = sourceRelative.withCString { sourcePointer in
+            destinationRelative.withCString { destinationPointer in
+                rp_rename_at(descriptor, sourcePointer, destinationPointer)
+            }
+        }
+        guard result == 0 else {
+            throw ServiceAPIError(code: .worktreeConflict, message: "Pinned filesystem promotion failed")
+        }
+        guard fsync(descriptor) == 0 else {
+            throw ServiceAPIError(code: .persistenceUnavailable, message: "Pinned filesystem promotion could not be synchronized")
+        }
+    }
+
+    private func relativePath(for candidate: String) throws -> String {
+        let standardized = URL(fileURLWithPath: candidate).standardizedFileURL.path
+        let prefix = path.hasSuffix("/") ? path : path + "/"
+        guard standardized.hasPrefix(prefix) else {
+            throw ServiceAPIError(code: .rootUnauthorized, message: "Filesystem cleanup path escaped its pinned root")
+        }
+        let relative = String(standardized.dropFirst(prefix.count))
+        guard !relative.isEmpty,
+              relative.split(separator: "/", omittingEmptySubsequences: false).allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." })
+        else {
+            throw ServiceAPIError(code: .rootUnauthorized, message: "Filesystem cleanup path is invalid")
+        }
+        return relative
+    }
+}
 
 public struct CanonicalRoot: Hashable, Sendable {
     public let snapshot: ProjectRootSnapshot
