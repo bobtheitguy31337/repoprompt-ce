@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAgentRuntimeCore
 import RepoPromptHeadlessRuntime
+import RepoPromptServicePersistence
 import XCTest
 
 private struct ImmediateClock: RuntimeClock {
@@ -14,12 +15,15 @@ private struct ImmediateClock: RuntimeClock {
 private actor FakeProcessPort: ProcessSupervisionPort {
     private let leader: ProcessIdentity
     private let children: [ProcessIdentity]
+    private let lateChildren: [ProcessIdentity]
     private var observedSignals: [Int32] = []
     private var reapedPIDs: [Int32] = []
+    private var descendantScans = 0
 
-    init(leader: ProcessIdentity, children: [ProcessIdentity]) {
+    init(leader: ProcessIdentity, children: [ProcessIdentity], lateChildren: [ProcessIdentity] = []) {
         self.leader = leader
         self.children = children
+        self.lateChildren = lateChildren
     }
 
     func launch(executable: String, arguments: [String], environment: [String: String], workingDirectory: String, helperToken: String) async throws -> ProcessIdentity {
@@ -31,7 +35,9 @@ private actor FakeProcessPort: ProcessSupervisionPort {
     }
 
     func descendants(of pid: Int32) async throws -> [ProcessIdentity] {
-        pid == leader.pid ? children : []
+        descendantScans += 1
+        guard pid == leader.pid else { return [] }
+        return descendantScans >= 3 ? children + lateChildren : children
     }
 
     func signal(_ signal: Int32, processGroupID: Int32, verifiedMembers: [ProcessIdentity]) async throws {
@@ -78,12 +84,48 @@ final class ProviderSupervisorTests: XCTestCase {
         let port = FakeProcessPort(leader: leader, children: [child])
         let supervisor = ProviderProcessSupervisor(processPort: port, clock: ImmediateClock())
         let runID = UUID()
-        await supervisor.register(runID: runID, leader: leader)
+        try await supervisor.register(runID: runID, leader: leader)
 
         try await supervisor.cancel(runID: runID)
 
         let result = await port.result()
         XCTAssertEqual(result.signals, [15, 9])
         XCTAssertEqual(result.reaped.sorted(), [100, 101])
+    }
+
+    func testCancellationFindsLateForkDuringGraceWindow() async throws {
+        let leader = ProcessIdentity(pid: 200, parentPID: 1, processGroupID: 200, sessionID: 200, startTimeTicks: 20, bootID: "boot", executablePath: "/provider", helperTokenDigest: "token")
+        let late = ProcessIdentity(pid: 201, parentPID: 200, processGroupID: 200, sessionID: 200, startTimeTicks: 21, bootID: "boot", executablePath: "/late-helper", helperTokenDigest: "token")
+        let port = FakeProcessPort(leader: leader, children: [], lateChildren: [late])
+        let supervisor = ProviderProcessSupervisor(processPort: port, clock: ImmediateClock())
+        let runID = UUID()
+        try await supervisor.register(runID: runID, leader: leader)
+
+        try await supervisor.cancel(runID: runID)
+
+        let result = await port.result()
+        XCTAssertEqual(result.signals, [15, 9])
+        XCTAssertEqual(result.reaped.sorted(), [200, 201])
+    }
+
+    func testPersistedFamilyIsReconciledAfterSupervisorRestart() async throws {
+        let leader = ProcessIdentity(pid: 300, parentPID: 1, processGroupID: 300, sessionID: 300, startTimeTicks: 30, bootID: "boot", executablePath: "/provider", helperTokenDigest: "token")
+        let child = ProcessIdentity(pid: 301, parentPID: 300, processGroupID: 300, sessionID: 300, startTimeTicks: 31, bootID: "boot", executablePath: "/helper", helperTokenDigest: "token")
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let port = FakeProcessPort(leader: leader, children: [child])
+        let initial = ProviderProcessSupervisor(processPort: port, clock: ImmediateClock(), store: store)
+        let runID = UUID()
+        try await initial.register(runID: runID, leader: leader, connectionGeneration: 7)
+        let activeBeforeRecovery = try await store.activeProcessFamilies()
+        XCTAssertEqual(activeBeforeRecovery.map(\.runID), [runID])
+
+        let recovered = ProviderProcessSupervisor(processPort: port, clock: ImmediateClock(), store: store)
+        try await recovered.recoverPersistedFamilies()
+
+        let activeAfterRecovery = try await store.activeProcessFamilies()
+        XCTAssertTrue(activeAfterRecovery.isEmpty)
+        let result = await port.result()
+        XCTAssertEqual(result.reaped.sorted(), [300, 301])
+        try await store.close()
     }
 }

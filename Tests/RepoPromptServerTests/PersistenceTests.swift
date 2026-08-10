@@ -117,4 +117,82 @@ final class PersistenceTests: XCTestCase {
         }
         try await store.close()
     }
+
+    func testLegacyJSONImportPreservesHierarchyTranscriptAndIsIdempotent() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let database = directory.appendingPathComponent("state.sqlite")
+        let source = directory.appendingPathComponent("sessions.json")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let projectID = UUID()
+        let parentID = UUID()
+        let childID = UUID()
+        let records: [[String: Any]] = [
+            [
+                "id": parentID.uuidString, "workspaceID": projectID.uuidString, "name": "Parent", "agentKind": "codexExec", "agentModel": "gpt-test", "lastRunState": "completed",
+                "items": [["id": UUID().uuidString, "timestamp": 10.0, "kind": "user", "text": "hello", "sequenceIndex": 0], ["id": UUID().uuidString, "timestamp": 11.0, "kind": "assistant", "text": "world", "sequenceIndex": 1]]
+            ],
+            [
+                "id": childID.uuidString, "workspaceID": projectID.uuidString, "parentSessionID": parentID.uuidString, "name": "Child", "agentKind": "claudeCode", "lastRunState": "running",
+                "items": [["id": UUID().uuidString, "timestamp": 12.0, "kind": "user", "text": "continue", "sequenceIndex": 0]]
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: records, options: [.sortedKeys]).write(to: source)
+
+        var store = try await SQLiteServiceStore.open(storage: .file(database.path))
+        let report = try await LegacySessionJSONImporter.run(source: source, store: store, projectRoot: directory)
+        XCTAssertEqual(report.importedProjects, 1)
+        XCTAssertEqual(report.importedSessions, 2)
+        let parent = try await store.session(id: parentID)
+        let child = try await store.session(id: childID)
+        XCTAssertEqual(parent?.transcript.map(\.content), ["hello", "world"])
+        XCTAssertEqual(child?.parentSessionID, parentID)
+        XCTAssertEqual(child?.rootSessionID, parentID)
+        XCTAssertEqual(child?.provider, .claudeCompatible)
+        XCTAssertEqual(child?.state, .interrupted)
+        try await store.close(clean: true)
+
+        store = try await SQLiteServiceStore.open(storage: .file(database.path))
+        let repeated = try await LegacySessionJSONImporter.run(source: source, store: store, projectRoot: directory)
+        XCTAssertEqual(repeated.importedProjects, 0)
+        XCTAssertEqual(repeated.importedSessions, 0)
+        let repeatedSessions = try await store.allSessions()
+        XCTAssertEqual(repeatedSessions.count, 2)
+        try await store.close()
+    }
+
+    func testLegacyJSONImportResumesAfterFaultWithoutDuplicateEvents() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let database = directory.appendingPathComponent("state.sqlite")
+        let source = directory.appendingPathComponent("sessions.json")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let projectID = UUID()
+        let firstID = UUID()
+        let secondID = UUID()
+        let records: [[String: Any]] = [
+            ["id": firstID.uuidString, "workspaceID": projectID.uuidString, "name": "One", "items": []],
+            ["id": secondID.uuidString, "workspaceID": projectID.uuidString, "name": "Two", "items": []]
+        ]
+        try JSONSerialization.data(withJSONObject: records, options: [.sortedKeys]).write(to: source)
+
+        var store = try await SQLiteServiceStore.open(storage: .file(database.path))
+        do {
+            _ = try await LegacySessionJSONImporter.run(source: source, store: store, projectRoot: directory, faultAfterImportedSessions: 1)
+            XCTFail("expected injected import interruption")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .persistenceUnavailable)
+        }
+        try await store.close(clean: false)
+
+        store = try await SQLiteServiceStore.open(storage: .file(database.path))
+        let resumed = try await LegacySessionJSONImporter.run(source: source, store: store, projectRoot: directory)
+        XCTAssertEqual(resumed.importedProjects, 0)
+        XCTAssertEqual(resumed.importedSessions, 1)
+        let resumedSessions = try await store.allSessions()
+        XCTAssertEqual(resumedSessions.count, 2)
+        let events = try await store.events(after: nil, limit: 20)
+        XCTAssertEqual(events.events.filter { $0.eventType == .sessionCreated }.count, 2)
+        try await store.close()
+    }
 }

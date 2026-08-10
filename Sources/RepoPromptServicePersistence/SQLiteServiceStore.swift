@@ -2,6 +2,36 @@ import Foundation
 import RepoPromptServiceProtocol
 import SQLiteNIO
 
+public struct PersistedProcessIdentity: Codable, Hashable, Sendable {
+    public let pid: Int32
+    public let parentPID: Int32
+    public let processGroupID: Int32
+    public let sessionID: Int32
+    public let startTimeTicks: UInt64
+    public let bootID: String
+    public let executablePath: String
+    public let helperTokenDigest: String
+
+    public init(pid: Int32, parentPID: Int32, processGroupID: Int32, sessionID: Int32, startTimeTicks: UInt64, bootID: String, executablePath: String, helperTokenDigest: String) {
+        self.pid = pid
+        self.parentPID = parentPID
+        self.processGroupID = processGroupID
+        self.sessionID = sessionID
+        self.startTimeTicks = startTimeTicks
+        self.bootID = bootID
+        self.executablePath = executablePath
+        self.helperTokenDigest = helperTokenDigest
+    }
+}
+
+public struct PersistedProcessFamily: Codable, Hashable, Sendable {
+    public let runID: UUID
+    public let leader: PersistedProcessIdentity
+    public let connectionGeneration: Int64
+    public let containmentMode: String
+    public let state: String
+}
+
 public actor SQLiteServiceStore {
     public struct Metadata: Sendable {
         public let storeID: UUID
@@ -111,6 +141,72 @@ public actor SQLiteServiceStore {
             }
             return event
         }
+    }
+
+    public func persistImportedProject(_ snapshot: ProjectSnapshot, sourceDigest: String, actor: ExternalActor) async throws -> Bool {
+        try await transaction {
+            if try await importAuditExists(kind: "legacy.project", digest: sourceDigest) { return false }
+            if try await project(id: snapshot.projectID) != nil {
+                throw ServiceAPIError(code: .idempotencyConflict, message: "Legacy import project ID already exists with different provenance")
+            }
+            try await validateExpectedCursor(snapshot.cursor)
+            let snapshotJSON = try encodeText(snapshot)
+            _ = try await connection.query(
+                "INSERT INTO projects(project_id,schema_version,name,creator_json,lifecycle_state,revision,snapshot_json,created_at,updated_at) VALUES(?,1,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                [.text(snapshot.projectID.uuidString), .text(snapshot.name), .text(encodeText(actor)), .text(snapshot.state.rawValue), .integer(Int(snapshot.revision)), .text(snapshotJSON)]
+            )
+            for root in snapshot.roots {
+                _ = try await connection.query("INSERT INTO project_roots(root_id,project_id,schema_version,logical_name,canonical_path,filesystem_identity,writable,revision) VALUES(?,?,1,?,?,?,?,?)", [.text(root.rootID.uuidString), .text(snapshot.projectID.uuidString), .text(root.logicalName), .text(root.canonicalPath), .text("legacy-import"), .integer(root.writable ? 1 : 0), .integer(Int(root.revision))])
+            }
+            _ = try await appendEvent(projectID: snapshot.projectID, sessionID: nil, rootSessionID: nil, runID: nil, sessionSequence: nil, type: .projectCreated, generation: nil, turnEpoch: nil, actor: actor, correlationID: UUID(), payload: Data(snapshotJSON.utf8))
+            try await recordImportAudit(kind: "legacy.project", digest: sourceDigest)
+            return true
+        }
+    }
+
+    public func persistImportedSession(_ snapshot: SessionSnapshot, sourceDigest: String, actor: ExternalActor) async throws -> Bool {
+        try await transaction {
+            if try await importAuditExists(kind: "legacy.session", digest: sourceDigest) { return false }
+            if try await session(id: snapshot.sessionID) != nil {
+                throw ServiceAPIError(code: .idempotencyConflict, message: "Legacy import session ID already exists with different provenance")
+            }
+            try await validateExpectedCursor(snapshot.cursor)
+            let snapshotJSON = try encodeText(snapshot)
+            let bindings: [SQLiteData] = [
+                .text(snapshot.sessionID.uuidString), .text(snapshot.projectID.uuidString), snapshot.parentSessionID.map { .text($0.uuidString) } ?? .null,
+                .text(snapshot.rootSessionID.uuidString), .text(snapshot.creator.goblinUserID), .text(snapshot.state.rawValue), .text(snapshot.provider.rawValue),
+                snapshot.model.map(SQLiteData.text) ?? .null, .text(snapshot.visibility.rawValue), .integer(Int(snapshot.runGeneration)), .integer(Int(snapshot.turnEpoch)),
+                .integer(Int(snapshot.revision)), .text(snapshotJSON)
+            ]
+            _ = try await connection.query("INSERT INTO sessions(session_id,project_id,parent_session_id,root_session_id,schema_version,creator_external_id,lifecycle_state,provider_kind,model,visibility,run_generation,turn_epoch,revision,snapshot_json,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", bindings)
+            for entry in snapshot.transcript {
+                _ = try await connection.query("INSERT INTO transcript_entries(session_id,entry_id,schema_version,session_sequence,entry_json,content_digest) VALUES(?,?,1,?,?,?)", [.text(snapshot.sessionID.uuidString), .text(entry.entryID.uuidString), .integer(Int(entry.sessionSequence)), .text(encodeText(entry)), .text(CanonicalSigning.bodyDigest(encoder.encode(entry)))])
+            }
+            let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.rootSessionID, runID: nil, sessionSequence: Int64(snapshot.transcript.count), type: .sessionCreated, generation: snapshot.runGeneration, turnEpoch: snapshot.turnEpoch, actor: actor, correlationID: UUID(), payload: Data(snapshotJSON.utf8))
+            if [.completed, .failed, .canceled, .interrupted, .archived].contains(snapshot.state) {
+                try await saveCheckpoint(scope: "session:\(snapshot.sessionID.uuidString)", sequence: event.globalSequence, snapshot: Data(snapshotJSON.utf8))
+            }
+            try await recordImportAudit(kind: "legacy.session", digest: sourceDigest)
+            return true
+        }
+    }
+
+    public func beginLegacyImport(sourceDigest: String) async throws {
+        let meta = try await metadata()
+        let started = try await importAuditExists(kind: "legacy.import.started", digest: sourceDigest)
+        let completed = try await importAuditExists(kind: "legacy.import.completed", digest: sourceDigest)
+        let resumable = started && !completed
+        guard meta.lastCleanShutdown || meta.nextGlobalSequence == 1 || resumable else {
+            throw ServiceAPIError(code: .quiescing, message: "JSON import requires a new, cleanly stopped, or resumable import store")
+        }
+        if !resumable, !completed {
+            try await transaction { try await recordImportAudit(kind: "legacy.import.started", digest: sourceDigest) }
+        }
+    }
+
+    public func completeLegacyImport(sourceDigest: String) async throws {
+        guard !(try await importAuditExists(kind: "legacy.import.completed", digest: sourceDigest)) else { return }
+        try await transaction { try await recordImportAudit(kind: "legacy.import.completed", digest: sourceDigest) }
     }
 
     public func project(id: UUID) async throws -> ProjectSnapshot? {
@@ -273,6 +369,51 @@ public actor SQLiteServiceStore {
         }
     }
 
+    public func persistProcessFamily(runID: UUID, leader: PersistedProcessIdentity, connectionGeneration: Int64 = 1, containmentMode: String = "process-group", state: String = "running") async throws {
+        try await transaction {
+            let executableDigest = CanonicalSigning.bodyDigest(Data(leader.executablePath.utf8))
+            _ = try await connection.query(
+                "INSERT INTO process_families(run_id,schema_version,leader_pid,pgid,process_start_time,boot_id,executable_digest,executable_path,helper_token_digest,connection_generation,containment_mode,state) VALUES(?,1,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET leader_pid=excluded.leader_pid,pgid=excluded.pgid,process_start_time=excluded.process_start_time,boot_id=excluded.boot_id,executable_digest=excluded.executable_digest,executable_path=excluded.executable_path,helper_token_digest=excluded.helper_token_digest,connection_generation=excluded.connection_generation,containment_mode=excluded.containment_mode,state=excluded.state",
+                [.text(runID.uuidString), .integer(Int(leader.pid)), .integer(Int(leader.processGroupID)), .integer(Int(leader.startTimeTicks)), .text(leader.bootID), .text(executableDigest), .text(leader.executablePath), .text(leader.helperTokenDigest), .integer(Int(connectionGeneration)), .text(containmentMode), .text(state)]
+            )
+            try await persistProcessMembersWithoutTransaction(runID: runID, members: [leader], terminalState: nil)
+        }
+    }
+
+    public func persistProcessMembers(runID: UUID, members: [PersistedProcessIdentity], terminalState: String? = nil) async throws {
+        try await transaction {
+            try await persistProcessMembersWithoutTransaction(runID: runID, members: members, terminalState: terminalState)
+        }
+    }
+
+    public func activeProcessFamilies() async throws -> [PersistedProcessFamily] {
+        try await connection.query("SELECT f.*,m.parent_pid AS leader_parent_pid,m.session_id AS leader_session_id FROM process_families f LEFT JOIN process_members m ON m.run_id=f.run_id AND m.pid=f.leader_pid AND m.start_time=f.process_start_time WHERE f.state IN ('running','terminating') ORDER BY f.run_id").map { row in
+            guard let runID = UUID(uuidString: row.column("run_id")?.string ?? "") else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Persisted process family run ID is invalid")
+            }
+            let leader = PersistedProcessIdentity(
+                pid: Int32(row.column("leader_pid")?.integer ?? 0),
+                parentPID: Int32(row.column("leader_parent_pid")?.integer ?? 0),
+                processGroupID: Int32(row.column("pgid")?.integer ?? 0),
+                sessionID: Int32(row.column("leader_session_id")?.integer ?? 0),
+                startTimeTicks: UInt64(row.column("process_start_time")?.integer ?? 0),
+                bootID: row.column("boot_id")?.string ?? "",
+                executablePath: row.column("executable_path")?.string ?? "",
+                helperTokenDigest: row.column("helper_token_digest")?.string ?? ""
+            )
+            return PersistedProcessFamily(runID: runID, leader: leader, connectionGeneration: Int64(row.column("connection_generation")?.integer ?? 1), containmentMode: row.column("containment_mode")?.string ?? "process-group", state: row.column("state")?.string ?? "running")
+        }
+    }
+
+    public func updateProcessFamilyState(runID: UUID, state: String, members: [PersistedProcessIdentity] = []) async throws {
+        try await transaction {
+            _ = try await connection.query("UPDATE process_families SET state=? WHERE run_id=?", [.text(state), .text(runID.uuidString)])
+            if !members.isEmpty {
+                try await persistProcessMembersWithoutTransaction(runID: runID, members: members, terminalState: state)
+            }
+        }
+    }
+
     public func consumeNonce(direction: String, keyID: String, nonce: String, observedAt: Date, expiresAt: Date) async throws {
         do {
             _ = try await connection.query("INSERT INTO request_nonces(direction,key_id,nonce,observed_at,expires_at) VALUES(?,?,?,?,?)", [.text(direction), .text(keyID), .text(nonce), .float(observedAt.timeIntervalSince1970), .float(expiresAt.timeIntervalSince1970)])
@@ -356,6 +497,24 @@ public actor SQLiteServiceStore {
         _ = try await connection.query("INSERT INTO events(global_sequence,event_id,project_id,session_id,root_session_id,run_id,session_sequence,event_type,payload_version,generation,turn_epoch,actor_json,payload_json,digest,timestamp,envelope_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", bindings)
         _ = try await connection.query("UPDATE service_metadata SET next_global_sequence = next_global_sequence + 1, last_clean_shutdown = 0 WHERE fixed_id = 1")
         return envelope
+    }
+
+    private func persistProcessMembersWithoutTransaction(runID: UUID, members: [PersistedProcessIdentity], terminalState: String?) async throws {
+        for member in members {
+            let executableIdentity = CanonicalSigning.bodyDigest(Data(member.executablePath.utf8))
+            _ = try await connection.query(
+                "INSERT INTO process_members(run_id,pid,schema_version,parent_pid,pgid,session_id,start_time,executable_identity,first_observed_at,last_observed_at,terminal_state) VALUES(?,?,1,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?) ON CONFLICT(run_id,pid,start_time) DO UPDATE SET parent_pid=excluded.parent_pid,pgid=excluded.pgid,session_id=excluded.session_id,executable_identity=excluded.executable_identity,last_observed_at=CURRENT_TIMESTAMP,terminal_state=excluded.terminal_state",
+                [.text(runID.uuidString), .integer(Int(member.pid)), .integer(Int(member.parentPID)), .integer(Int(member.processGroupID)), .integer(Int(member.sessionID)), .integer(Int(member.startTimeTicks)), .text(executableIdentity), terminalState.map(SQLiteData.text) ?? .null]
+            )
+        }
+    }
+
+    private func importAuditExists(kind: String, digest: String) async throws -> Bool {
+        try await connection.query("SELECT 1 FROM audit_events WHERE event_type=? AND payload_json=? LIMIT 1", [.text(kind), .text(digest)]).first != nil
+    }
+
+    private func recordImportAudit(kind: String, digest: String) async throws {
+        _ = try await connection.query("INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,1,?,?,CURRENT_TIMESTAMP)", [.text(UUID().uuidString), .text(kind), .text(digest)])
     }
 
     private func migrate() async throws {

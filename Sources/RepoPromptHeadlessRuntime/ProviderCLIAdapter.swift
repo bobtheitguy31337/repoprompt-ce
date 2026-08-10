@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptAgentRuntimeCore
+import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 import RepoPromptWorkspaceRuntimeCore
 
@@ -20,12 +21,16 @@ public actor ProviderCLIAdapter {
     private let processSupervisor: ProviderProcessSupervisor?
     private let outputDirectory: String
 
-    public init(configurations: [ProviderCLIConfiguration], runner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(), processPort: PortableProcessSupervisionPort? = nil, outputDirectory: String = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-provider-output").path) {
+    public init(configurations: [ProviderCLIConfiguration], runner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(), processPort: PortableProcessSupervisionPort? = nil, processStore: SQLiteServiceStore? = nil, outputDirectory: String = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-provider-output").path) {
         self.configurations = Dictionary(uniqueKeysWithValues: configurations.map { ($0.kind, $0) })
         self.runner = runner
         self.processPort = processPort
-        processSupervisor = processPort.map { ProviderProcessSupervisor(processPort: $0) }
+        processSupervisor = processPort.map { ProviderProcessSupervisor(processPort: $0, store: processStore) }
         self.outputDirectory = outputDirectory
+    }
+
+    public func recoverProcessFamilies() async throws {
+        try await processSupervisor?.recoverPersistedFamilies()
     }
 
     public func capabilities() -> [ProviderCapability] {
@@ -85,7 +90,7 @@ public actor ProviderCLIAdapter {
         let runID = UUID()
         let helperToken = runID.uuidString
         let captured = try await processPort.launchCaptured(executable: configuration.executable, arguments: arguments, environment: [:], workingDirectory: workingDirectory, helperToken: helperToken, outputDirectory: outputDirectory)
-        await processSupervisor.register(runID: runID, leader: captured.identity)
+        try await processSupervisor.register(runID: runID, leader: captured.identity)
         do {
             let output = try await withTaskCancellationHandler {
                 try await processPort.waitForCapturedProcess(captured, maximumBytes: maximumBytes)

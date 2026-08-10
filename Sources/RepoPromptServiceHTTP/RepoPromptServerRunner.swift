@@ -68,7 +68,7 @@ public enum RepoPromptServerRunner {
         let artifacts = try ArtifactRuntimeService(baseDirectory: configuration.artifactDirectory)
         let processPort = try PortableProcessSupervisionPort()
         let processOutput = URL(fileURLWithPath: configuration.stateDatabasePath).deletingLastPathComponent().appendingPathComponent("provider-output").path
-        let providers = ProviderCLIAdapter(configurations: configuration.providerExecutables.map { ProviderCLIConfiguration(kind: $0.key, executable: $0.value) }, processPort: processPort, outputDirectory: processOutput)
+        let providers = ProviderCLIAdapter(configurations: configuration.providerExecutables.map { ProviderCLIConfiguration(kind: $0.key, executable: $0.value) }, processPort: processPort, processStore: store, outputDirectory: processOutput)
         let authority = RepoPromptHeadlessAuthority(store: store, worktreeService: worktrees, artifactService: artifacts, providerAdapter: providers)
         try await authority.recover()
         let authenticator = InternalRequestAuthenticator(keys: configuration.signingKeys, store: store)

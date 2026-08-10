@@ -44,6 +44,7 @@ public actor RepoPromptHeadlessAuthority {
 
     public func recover() async throws {
         let unclean = !(try await store.metadata().lastCleanShutdown)
+        try await providerAdapter?.recoverProcessFamilies()
         for snapshot in try await store.allProjects() {
             let roots = snapshot.roots.map { CanonicalRoot(snapshot: $0, filesystemIdentity: "persisted") }
             let project = ProjectAuthority(snapshot: snapshot, roots: roots)

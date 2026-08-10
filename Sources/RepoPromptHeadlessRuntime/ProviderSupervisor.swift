@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptAgentRuntimeCore
+import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 
 public actor ProviderRegistry {
@@ -37,36 +38,91 @@ public enum ProcStatParser {
 public actor ProviderProcessSupervisor {
     private let processPort: any ProcessSupervisionPort
     private let clock: any RuntimeClock
+    private let store: SQLiteServiceStore?
     private var families: [UUID: [ProcessIdentity]] = [:]
-    public init(processPort: any ProcessSupervisionPort, clock: any RuntimeClock = SystemRuntimeClock()) {
+    public init(processPort: any ProcessSupervisionPort, clock: any RuntimeClock = SystemRuntimeClock(), store: SQLiteServiceStore? = nil) {
         self.processPort = processPort
         self.clock = clock
+        self.store = store
     }
 
-    public func register(runID: UUID, leader: ProcessIdentity) {
+    public func register(runID: UUID, leader: ProcessIdentity, connectionGeneration: Int64 = 1) async throws {
         families[runID] = [leader]
+        try await store?.persistProcessFamily(runID: runID, leader: leader.persisted, connectionGeneration: connectionGeneration)
     }
 
-    public func forget(runID: UUID) {
+    public func forget(runID: UUID) async {
         families[runID] = nil
+        try? await store?.updateProcessFamilyState(runID: runID, state: "exited")
+    }
+
+    public func recoverPersistedFamilies() async throws {
+        guard let store else { return }
+        for persisted in try await store.activeProcessFamilies() {
+            let leader = ProcessIdentity(persisted.leader)
+            guard try await processPort.inspect(pid: leader.pid) == leader else {
+                try await store.updateProcessFamilyState(runID: persisted.runID, state: "identity-mismatch")
+                continue
+            }
+            families[persisted.runID] = [leader]
+            try await cancel(runID: persisted.runID)
+        }
     }
 
     public func cancel(runID: UUID, termSignal: Int32 = 15, killSignal: Int32 = 9) async throws {
         guard let recorded = families[runID], let leader = recorded.first else { return }
-        guard let current = try await processPort.inspect(pid: leader.pid), current == leader else { families[runID] = nil
+        guard let current = try await processPort.inspect(pid: leader.pid), current == leader else {
+            families[runID] = nil
+            try await store?.updateProcessFamilyState(runID: runID, state: "identity-mismatch")
             return
         }
-        let descendants = try await processPort.descendants(of: leader.pid).filter { observed in recorded.contains(observed) || observed.bootID == leader.bootID }
-        try await processPort.signal(termSignal, processGroupID: leader.processGroupID, verifiedMembers: [leader] + descendants)
-        try await clock.sleep(for: .seconds(10))
+        try await store?.updateProcessFamilyState(runID: runID, state: "terminating")
+        var discovered = Set(recorded)
+        let initialDescendants = try await verifiedDescendants(of: leader)
+        discovered.formUnion(initialDescendants)
+        try await persistMembers(runID: runID, members: Array(discovered))
+        try await processPort.signal(termSignal, processGroupID: leader.processGroupID, verifiedMembers: Array(discovered))
+
+        // Re-scan for the entire grace window. Providers commonly fork cleanup helpers
+        // after TERM; a single ancestry snapshot lets those late children escape.
+        for _ in 0 ..< 100 {
+            try await clock.sleep(for: .milliseconds(100))
+            let descendants = try await verifiedDescendants(of: leader)
+            let previousCount = discovered.count
+            discovered.formUnion(descendants)
+            if discovered.count != previousCount {
+                try await persistMembers(runID: runID, members: Array(discovered))
+            }
+        }
         var survivors: [ProcessIdentity] = []
-        for member in [leader] + descendants where try await processPort.inspect(pid: member.pid) == member {
+        for member in discovered where try await processPort.inspect(pid: member.pid) == member {
             survivors.append(member)
         }
         if !survivors.isEmpty { try await processPort.signal(killSignal, processGroupID: leader.processGroupID, verifiedMembers: survivors) }
-        for member in survivors {
+        for member in discovered {
             try await processPort.reap(pid: member.pid)
         }
         families[runID] = nil
+        try await store?.updateProcessFamilyState(runID: runID, state: "reaped", members: discovered.map(\.persisted))
+    }
+
+    private func verifiedDescendants(of leader: ProcessIdentity) async throws -> [ProcessIdentity] {
+        try await processPort.descendants(of: leader.pid).filter {
+            $0.bootID == leader.bootID && $0.processGroupID == leader.processGroupID && $0.helperTokenDigest == leader.helperTokenDigest
+        }
+    }
+
+    private func persistMembers(runID: UUID, members: [ProcessIdentity]) async throws {
+        try await store?.persistProcessMembers(runID: runID, members: members.map(\.persisted))
+    }
+}
+
+private extension ProcessIdentity {
+    var persisted: PersistedProcessIdentity {
+        PersistedProcessIdentity(pid: pid, parentPID: parentPID, processGroupID: processGroupID, sessionID: sessionID, startTimeTicks: startTimeTicks, bootID: bootID, executablePath: executablePath, helperTokenDigest: helperTokenDigest)
+    }
+
+    init(_ persisted: PersistedProcessIdentity) {
+        self.init(pid: persisted.pid, parentPID: persisted.parentPID, processGroupID: persisted.processGroupID, sessionID: persisted.sessionID, startTimeTicks: persisted.startTimeTicks, bootID: persisted.bootID, executablePath: persisted.executablePath, helperTokenDigest: persisted.helperTokenDigest)
     }
 }
