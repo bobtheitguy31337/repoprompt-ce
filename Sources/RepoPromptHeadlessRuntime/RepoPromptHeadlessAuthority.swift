@@ -12,7 +12,7 @@ public actor RepoPromptHeadlessAuthority {
     private let commandRunner: any WorkspaceCommandRunning
     private let worktreeService: WorktreeRuntimeService?
     private let artifactService: ArtifactRuntimeService?
-    private let providerAdapter: ProviderCLIAdapter?
+    private let providerAdapter: (any AgentProviderDispatcher)?
     private let interactionDelivery: (any InteractionDeliveryPort)?
     private let workflowCatalog = BuiltinWorkflowCatalog()
     private let projects = ProjectRuntimeSupervisor()
@@ -33,7 +33,7 @@ public actor RepoPromptHeadlessAuthority {
         commandRunner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(),
         worktreeService: WorktreeRuntimeService? = nil,
         artifactService: ArtifactRuntimeService? = nil,
-        providerAdapter: ProviderCLIAdapter? = nil,
+        providerAdapter: (any AgentProviderDispatcher)? = nil,
         interactionDelivery: (any InteractionDeliveryPort)? = nil
     ) {
         self.store = store
@@ -1172,6 +1172,7 @@ public actor RepoPromptHeadlessAuthority {
                 model: initial.model,
                 prompt: prompt,
                 workingDirectory: workingDirectory,
+                maximumBytes: 8_388_608,
                 runID: binding.runID,
                 resumeProviderSessionID: run.providerSessionID
             ) { providerSessionID in

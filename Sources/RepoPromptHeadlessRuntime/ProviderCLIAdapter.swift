@@ -20,12 +20,7 @@ public struct ProviderCLIConfiguration: Codable, Hashable, Sendable {
     }
 }
 
-public struct ProviderExecutionResult: Sendable {
-    public let output: String
-    public let providerSessionID: String?
-}
-
-public actor ProviderCLIAdapter {
+public actor ProviderCLIAdapter: AgentProviderDispatcher {
     private let configurations: [ProviderKind: ProviderCLIConfiguration]
     private let runner: any WorkspaceCommandRunning
     private let processPort: PortableProcessSupervisionPort?
@@ -161,6 +156,18 @@ public actor ProviderCLIAdapter {
             if !(error is CancellationError) { await processSupervisor.forget(runID: runID) }
             throw error
         }
+    }
+
+    public func execute(
+        kind: ProviderKind,
+        model: String?,
+        prompt: String,
+        workingDirectory: String,
+        maximumBytes: Int = 8_388_608,
+        runID requestedRunID: UUID? = nil,
+        resumeProviderSessionID: String? = nil
+    ) async throws -> ProviderExecutionResult {
+        try await execute(kind: kind, model: model, prompt: prompt, workingDirectory: workingDirectory, maximumBytes: maximumBytes, runID: requestedRunID, resumeProviderSessionID: resumeProviderSessionID) { _ in }
     }
 
     private nonisolated static func parseOutput(_ output: String, kind: ProviderKind) -> ProviderExecutionResult {
