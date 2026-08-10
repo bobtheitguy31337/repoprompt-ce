@@ -1006,14 +1006,26 @@ public actor SQLiteServiceStore {
             releaseTransactionSlot()
             return result
         } catch let existing as ExistingIdempotency {
-            _ = try? await connection.query("ROLLBACK")
+            await rollbackIgnoringTaskCancellation()
             releaseTransactionSlot()
             throw existing
         } catch {
-            _ = try? await connection.query("ROLLBACK")
+            await rollbackIgnoringTaskCancellation()
             releaseTransactionSlot()
             throw error
         }
+    }
+
+    /// A provider cancellation may enter this catch path with the current task
+    /// already canceled. Running ROLLBACK on that task can itself be canceled
+    /// before SQLite observes it, leaving the connection inside BEGIN while the
+    /// transaction gate is released. Finalize on an uncanceled task and wait for
+    /// it before handing the slot to the next mutation.
+    private func rollbackIgnoringTaskCancellation() async {
+        let connection = connection
+        _ = try? await Task.detached {
+            try await connection.query("ROLLBACK")
+        }.value
     }
 
     private func acquireTransactionSlot() async {
