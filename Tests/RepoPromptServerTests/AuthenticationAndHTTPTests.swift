@@ -8,6 +8,31 @@ import RepoPromptServiceProtocol
 import XCTest
 
 final class AuthenticationAndHTTPTests: XCTestCase {
+    func testConfigurationAcceptsOverlappingRoleKeysAndRejectsDuplicateIdentity() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        func secret(_ name: String) throws -> String {
+            let path = directory.appendingPathComponent(name).path
+            try Data("secret-\(name)".utf8).write(to: URL(fileURLWithPath: path))
+            return path
+        }
+        var environment = try [
+            "REPOPROMPT_TLS_CERT_FILE": "/cert", "REPOPROMPT_TLS_KEY_FILE": "/key", "REPOPROMPT_TLS_CLIENT_CA_FILE": "/ca",
+            "REPOPROMPT_GOBLIN_APP_HMAC_FILE": secret("app"), "REPOPROMPT_GOBLIN_SYNC_HMAC_FILE": secret("sync"),
+            "REPOPROMPT_OPERATOR_HMAC_FILE": secret("operator"), "REPOPROMPT_EVENT_HMAC_FILE": secret("event"),
+            "REPOPROMPT_GOBLIN_APP_PREVIOUS_KEY_ID": "app-v0", "REPOPROMPT_GOBLIN_APP_PREVIOUS_HMAC_FILE": secret("app-v0")
+        ]
+        let configuration = try RepoPromptServerConfiguration.environment(environment)
+        XCTAssertEqual(configuration.signingKeys.count, 4)
+        XCTAssertEqual(configuration.signingKeys.first(where: { $0.keyID == "app-v0" })?.active, false)
+        XCTAssertEqual(configuration.signingKeys.first(where: { $0.keyID == "app-v0" })?.role, .goblinApp)
+
+        environment["REPOPROMPT_GOBLIN_SYNC_PREVIOUS_KEY_ID"] = "app-v0"
+        environment["REPOPROMPT_GOBLIN_SYNC_PREVIOUS_HMAC_FILE"] = try secret("sync-v0")
+        XCTAssertThrowsError(try RepoPromptServerConfiguration.environment(environment))
+    }
+
     func testSignedRequestRejectsNonceReplayAndRoleMismatch() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let instant = Date(timeIntervalSince1970: 1000)

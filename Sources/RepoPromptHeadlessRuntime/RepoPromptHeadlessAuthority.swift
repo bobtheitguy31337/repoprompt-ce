@@ -651,6 +651,20 @@ public actor RepoPromptHeadlessAuthority {
 
     public func quiesce() async throws {
         quiescing = true
+        let roots = await sessionSnapshots().filter { $0.parentSessionID == nil && [.preparing, .running, .waiting].contains($0.state) }
+        for snapshot in roots {
+            cancellationBarriers.insert(snapshot.rootSessionID)
+            try await cancelDescendants(rootSessionID: snapshot.rootSessionID, excluding: snapshot.sessionID, actor: nil)
+            guard let session = sessions[snapshot.sessionID], let binding = await session.activeBinding() else { continue }
+            providerTasks[binding.runID]?.cancel()
+            providerTasks[binding.runID] = nil
+            try await providerAdapter?.cancel(runID: binding.runID)
+            guard await session.settle(binding: binding, terminal: .sessionInterrupted, lifecycle: .interrupted) == .accepted else { continue }
+            let cursor = try await store.nextCursor()
+            let event = try await store.persistSession(replacingCursor(session.snapshot(), cursor: cursor), eventType: .sessionInterrupted, actor: nil, correlationID: ids.next(), idempotency: nil)
+            await eventHub.publish(event)
+            try await updateAgentLifecycle(sessionID: snapshot.sessionID, state: .interrupted, eventType: .agentFailed, actor: nil)
+        }
         try await store.checkpoint()
     }
 
@@ -781,7 +795,7 @@ public actor RepoPromptHeadlessAuthority {
         return receipt
     }
 
-    private func cancelDescendants(rootSessionID: UUID, excluding rootID: UUID, actor: ExternalActor) async throws {
+    private func cancelDescendants(rootSessionID: UUID, excluding rootID: UUID, actor: ExternalActor?) async throws {
         let snapshots = await sessionSnapshots().filter { $0.rootSessionID == rootSessionID && $0.sessionID != rootID }
         let byID = Dictionary(uniqueKeysWithValues: snapshots.map { ($0.sessionID, $0) })
         func depth(_ snapshot: SessionSnapshot) -> Int {

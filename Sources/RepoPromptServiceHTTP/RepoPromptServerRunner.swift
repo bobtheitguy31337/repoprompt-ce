@@ -40,10 +40,24 @@ public struct RepoPromptServerConfiguration: Sendable {
             let data = try Data(contentsOf: URL(fileURLWithPath: path))
             return Data(String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines).utf8)
         }
+        func previousKey(prefix: String, role: InternalRouteRole, direction: String) throws -> InternalSigningKey? {
+            let id = environment["\(prefix)_PREVIOUS_KEY_ID"]
+            let file = environment["\(prefix)_PREVIOUS_HMAC_FILE"]
+            guard id != nil || file != nil else { return nil }
+            guard let id, !id.isEmpty, file != nil else { throw ConfigurationError.invalid("\(prefix) previous key ID and HMAC file must be configured together") }
+            return try InternalSigningKey(keyID: id, role: role, direction: direction, secret: secret("\(prefix)_PREVIOUS_HMAC_FILE"), active: false)
+        }
         let app = try InternalSigningKey(keyID: environment["REPOPROMPT_GOBLIN_APP_KEY_ID"] ?? "goblin-app-v1", role: .goblinApp, direction: "goblin-app-to-repoprompt-v1", secret: secret("REPOPROMPT_GOBLIN_APP_HMAC_FILE"))
         let sync = try InternalSigningKey(keyID: environment["REPOPROMPT_GOBLIN_SYNC_KEY_ID"] ?? "goblin-sync-v1", role: .goblinSync, direction: "goblin-sync-to-repoprompt-v1", secret: secret("REPOPROMPT_GOBLIN_SYNC_HMAC_FILE"))
         let operatorKey = try InternalSigningKey(keyID: environment["REPOPROMPT_OPERATOR_KEY_ID"] ?? "repoprompt-operator-v1", role: .operatorRole, direction: "repoprompt-operator-to-repoprompt-v1", secret: secret("REPOPROMPT_OPERATOR_HMAC_FILE"))
         let event = try InternalSigningKey(keyID: environment["REPOPROMPT_EVENT_KEY_ID"] ?? "repoprompt-event-v1", role: .goblinSync, direction: "repoprompt-to-goblin-v1", secret: secret("REPOPROMPT_EVENT_HMAC_FILE"))
+        let signingKeys = try [
+            app, sync, operatorKey,
+            previousKey(prefix: "REPOPROMPT_GOBLIN_APP", role: .goblinApp, direction: app.direction),
+            previousKey(prefix: "REPOPROMPT_GOBLIN_SYNC", role: .goblinSync, direction: sync.direction),
+            previousKey(prefix: "REPOPROMPT_OPERATOR", role: .operatorRole, direction: operatorKey.direction)
+        ].compactMap(\.self)
+        guard Set(signingKeys.map(\.keyID)).count == signingKeys.count else { throw ConfigurationError.invalid("Internal signing key IDs must be unique across roles and rotations") }
         var providers: [ProviderKind: String] = [
             .codex: environment["REPOPROMPT_CODEX_EXECUTABLE"] ?? "/opt/repoprompt/providers/codex",
             .claudeCompatible: environment["REPOPROMPT_CLAUDE_EXECUTABLE"] ?? "/opt/repoprompt/providers/claude",
@@ -71,7 +85,7 @@ public struct RepoPromptServerConfiguration: Sendable {
             bindHost: environment["REPOPROMPT_BIND_HOST"] ?? "0.0.0.0", bindPort: Int(environment["REPOPROMPT_BIND_PORT"] ?? "9443") ?? 9443,
             healthHost: "127.0.0.1", healthPort: Int(environment["REPOPROMPT_HEALTH_PORT"] ?? "9080") ?? 9080,
             certificatePath: required("REPOPROMPT_TLS_CERT_FILE"), privateKeyPath: required("REPOPROMPT_TLS_KEY_FILE"), clientCAPath: required("REPOPROMPT_TLS_CLIENT_CA_FILE"),
-            signingKeys: [app, sync, operatorKey], eventSigningKey: event,
+            signingKeys: signingKeys, eventSigningKey: event,
             providerExecutables: providers,
             providerVersions: versions,
             providerProtocols: protocols,
@@ -84,8 +98,12 @@ public struct RepoPromptServerConfiguration: Sendable {
 }
 
 public enum ConfigurationError: Error, CustomStringConvertible { case missing(String)
+    case invalid(String)
     public var description: String {
-        switch self { case let .missing(name): "Required configuration \(name) is missing" }
+        switch self {
+        case let .missing(name): "Required configuration \(name) is missing"
+        case let .invalid(message): message
+        }
     }
 }
 

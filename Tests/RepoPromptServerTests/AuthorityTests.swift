@@ -119,6 +119,31 @@ final class AuthorityTests: XCTestCase {
         try await store.close()
     }
 
+    func testQuiesceInterruptsActiveProviderTreeBeforeCheckpoint() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let runner = DelayedProviderRunner()
+        await runner.setDelay(.seconds(10))
+        let provider = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: "/usr/bin/true")], runner: runner)
+        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-drain", requestDigest: "p-drain")
+        let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "run"), externalActor: actor, idempotencyKey: "s-drain", requestDigest: "s-drain")
+        _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "resume-drain", requestDigest: "resume-drain")
+
+        try await authority.quiesce()
+
+        let ready = await authority.isReady()
+        let interrupted = try await authority.sessionSnapshot(sessionID: session.sessionID)
+        let interruptedAgent = try await authority.agentSnapshots(rootSessionID: session.sessionID).first
+        XCTAssertFalse(ready)
+        XCTAssertEqual(interrupted.state, .interrupted)
+        XCTAssertEqual(interruptedAgent?.state, .interrupted)
+        try await store.close()
+    }
+
     func testIdempotencyKeyDigestConflictFailsClosed() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
