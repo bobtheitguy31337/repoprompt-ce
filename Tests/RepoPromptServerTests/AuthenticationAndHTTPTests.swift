@@ -49,6 +49,33 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         try await store.close()
     }
 
+    func testAuthorizationDecisionRevisionsAreDurablyMonotonicAndSingleUse() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let instant = Date(timeIntervalSince1970: 1000)
+        let key = InternalSigningKey(keyID: "app-v1", role: .goblinApp, direction: "goblin-app-to-repoprompt-v1", secret: Data("secret".utf8))
+        let auth = InternalRequestAuthenticator(keys: [key], store: store, now: { instant })
+
+        func request(revision: Int64, nonce: String, decisionID: UUID = UUID()) throws -> SignedInternalRequest {
+            let unsignedDecision = GoblinAuthorizationDecision(decisionID: decisionID, actor: .init(goblinUserID: "u1", username: "alice", displayName: "Alice"), operation: "listProjects", requestDigest: CanonicalSigning.bodyDigest(Data()), policyRevision: revision, controllerRevision: revision, membershipRevision: revision, issuedAt: instant, expiresAt: instant.addingTimeInterval(10), requestID: UUID(), correlationID: UUID(), keyID: key.keyID, signature: "")
+            let decision = GoblinAuthorizationDecision(decisionID: unsignedDecision.decisionID, actor: unsignedDecision.actor, operation: unsignedDecision.operation, requestDigest: unsignedDecision.requestDigest, policyRevision: unsignedDecision.policyRevision, controllerRevision: unsignedDecision.controllerRevision, membershipRevision: unsignedDecision.membershipRevision, issuedAt: unsignedDecision.issuedAt, expiresAt: unsignedDecision.expiresAt, requestID: unsignedDecision.requestID, correlationID: unsignedDecision.correlationID, keyID: key.keyID, signature: CanonicalSigning.hmacSHA256(message: auth.decisionCanonicalString(unsignedDecision), key: key.secret))
+            let decisionData = try JSONEncoder.serviceEncoder.encode(decision)
+            let timestamp = String(instant.timeIntervalSince1970)
+            let path = "/internal/v1/projects"
+            let canonical = CanonicalSigning.requestString(method: "GET", pathAndQuery: path, timestamp: timestamp, nonce: nonce, bodyDigest: CanonicalSigning.bodyDigest(Data()), authorizationDecisionDigest: CanonicalSigning.bodyDigest(decisionData), keyID: key.keyID)
+            return SignedInternalRequest(method: "GET", pathAndQuery: path, timestamp: timestamp, nonce: nonce, body: Data(), authorizationDecisionData: decisionData, keyID: key.keyID, signature: CanonicalSigning.hmacSHA256(message: canonical, key: key.secret))
+        }
+
+        let accepted = try request(revision: 2, nonce: "decisionrevision2")
+        _ = try await auth.verify(accepted, allowedRoles: [.goblinApp], operation: "listProjects")
+        do {
+            _ = try await auth.verify(request(revision: 1, nonce: "decisionrevision1"), allowedRoles: [.goblinApp], operation: "listProjects")
+            XCTFail("expected revision regression rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .authorizationDecisionRejected)
+        }
+        try await store.close()
+    }
+
     func testLoopbackHealthRoutesAreContentFree() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)

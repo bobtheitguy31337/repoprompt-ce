@@ -78,6 +78,7 @@ public actor InternalRequestAuthenticator {
             let unsigned = decisionCanonicalString(decision)
             let decisionSignature = CanonicalSigning.hmacSHA256(message: unsigned, key: key.secret)
             guard decision.keyID == key.keyID, CanonicalSigning.secureEquals(decisionSignature, decision.signature) else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision signature is invalid") }
+            try await store.consumeAuthorizationDecision(decision)
             return AuthenticatedInternalRequest(role: key.role, decision: decision)
         }
         return AuthenticatedInternalRequest(role: key.role, decision: nil)

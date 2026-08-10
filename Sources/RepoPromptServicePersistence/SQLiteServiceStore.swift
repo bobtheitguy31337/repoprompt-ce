@@ -620,6 +620,31 @@ public actor SQLiteServiceStore {
         } catch { throw ServiceAPIError(code: .internalAuthFailed, message: "Nonce has already been used") }
     }
 
+    public func consumeAuthorizationDecision(_ decision: GoblinAuthorizationDecision) async throws {
+        try await transaction {
+            let scope = decision.sessionID.map { "session:\($0.uuidString)" }
+                ?? decision.projectID.map { "project:\($0.uuidString)" }
+                ?? "global"
+            if try await connection.query("SELECT 1 FROM consumed_authorization_decisions WHERE decision_id=?", [.text(decision.decisionID.uuidString)]).first != nil {
+                throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision was already consumed")
+            }
+            if let sessionID = decision.sessionID, let collaboration = try await collaboration(sessionID: sessionID) {
+                guard decision.policyRevision == collaboration.policyRevision,
+                      decision.controllerRevision == collaboration.controllerRevision,
+                      decision.membershipRevision == collaboration.membershipRevision
+                else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision revisions do not match durable session policy") }
+            }
+            if let row = try await connection.query("SELECT policy_revision,controller_revision,membership_revision FROM authorization_revision_fences WHERE scope_key=?", [.text(scope)]).first {
+                guard decision.policyRevision >= Int64(row.column("policy_revision")?.integer ?? 0),
+                      decision.controllerRevision >= Int64(row.column("controller_revision")?.integer ?? 0),
+                      decision.membershipRevision >= Int64(row.column("membership_revision")?.integer ?? 0)
+                else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision revision regressed") }
+            }
+            _ = try await connection.query("INSERT INTO consumed_authorization_decisions(decision_id,scope_key,actor_id,policy_revision,controller_revision,membership_revision,consumed_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP)", [.text(decision.decisionID.uuidString), .text(scope), .text(decision.actor.goblinUserID), .integer(Int(decision.policyRevision)), .integer(Int(decision.controllerRevision)), .integer(Int(decision.membershipRevision))])
+            _ = try await connection.query("INSERT INTO authorization_revision_fences(scope_key,policy_revision,controller_revision,membership_revision,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(scope_key) DO UPDATE SET policy_revision=MAX(policy_revision,excluded.policy_revision),controller_revision=MAX(controller_revision,excluded.controller_revision),membership_revision=MAX(membership_revision,excluded.membership_revision),updated_at=CURRENT_TIMESTAMP", [.text(scope), .integer(Int(decision.policyRevision)), .integer(Int(decision.controllerRevision)), .integer(Int(decision.membershipRevision))])
+        }
+    }
+
     public func checkpoint() async throws {
         _ = try await connection.query("PRAGMA wal_checkpoint(TRUNCATE)")
     }
