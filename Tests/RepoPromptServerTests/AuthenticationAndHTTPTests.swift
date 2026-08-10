@@ -3,7 +3,7 @@ import Hummingbird
 import HummingbirdTesting
 import RepoPromptHeadlessRuntime
 import RepoPromptServiceHTTP
-import RepoPromptServicePersistence
+@testable import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 import XCTest
 
@@ -31,6 +31,14 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         environment["REPOPROMPT_GOBLIN_SYNC_PREVIOUS_KEY_ID"] = "app-v0"
         environment["REPOPROMPT_GOBLIN_SYNC_PREVIOUS_HMAC_FILE"] = try secret("sync-v0")
         XCTAssertThrowsError(try RepoPromptServerConfiguration.environment(environment))
+    }
+
+    func testCertificateTrustConfigurationRejectsOverlappingRoleIdentities() throws {
+        XCTAssertThrowsError(try CertificateIdentityRoleResolver.environment([
+            "REPOPROMPT_GOBLIN_APP_CERT_IDENTITY": "shared.internal",
+            "REPOPROMPT_GOBLIN_SYNC_CERT_IDENTITY": "shared.internal",
+            "REPOPROMPT_OPERATOR_CERT_IDENTITY": "operator.internal"
+        ]))
     }
 
     func testSignedRequestRejectsNonceReplayAndRoleMismatch() async throws {
@@ -147,10 +155,22 @@ final class AuthenticationAndHTTPTests: XCTestCase {
 
     func testReadinessFailsClosedForMissingVolumeAndCapacity() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let provider = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: "/usr/bin/true")])
+        let provider = ProviderCLIAdapter(configurations: [
+            .init(kind: .codex, executable: "/usr/bin/true", protocolVersion: "unexpected-v1")
+        ])
         let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
         let missing = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
-        let readiness = RepoPromptReadinessService(authority: authority, store: store, volumes: [.init(name: "missing", path: missing)], requiredProviders: [.codex], minimumFreeBytes: 0, minimumFreeNodes: 0, maximumActiveSessions: 0, cacheDuration: 0)
+        let readiness = RepoPromptReadinessService(
+            authority: authority,
+            store: store,
+            volumes: [.init(name: "missing", path: missing)],
+            requiredProviders: [.codex],
+            expectedProviderProtocols: [.codex: "app-server-v2"],
+            minimumFreeBytes: 0,
+            minimumFreeNodes: 0,
+            maximumActiveSessions: 0,
+            cacheDuration: 0
+        )
         let auth = InternalRequestAuthenticator(keys: [], store: store)
         let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth, readiness: readiness)
         let app = Application(router: service.healthRouter())
@@ -163,7 +183,8 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         }
         let snapshot = await readiness.snapshot(forceRefresh: true)
         XCTAssertFalse(snapshot.ready)
-        XCTAssertEqual(snapshot.providers.first { $0.kind == .codex }?.ready, true)
+        XCTAssertEqual(snapshot.providers.first { $0.kind == .codex }?.ready, false)
+        XCTAssertEqual(snapshot.providers.first { $0.kind == .codex }?.detail, "protocol-mismatch")
         XCTAssertEqual(snapshot.checks.first { $0.name == "volume:missing" }?.detail, "missing")
         XCTAssertEqual(snapshot.checks.first { $0.name == "session-capacity" }?.ready, false)
         try await store.close()

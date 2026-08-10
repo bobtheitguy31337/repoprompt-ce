@@ -1,6 +1,6 @@
 import Foundation
 import RepoPromptHeadlessRuntime
-import RepoPromptServicePersistence
+@testable import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 import XCTest
 
@@ -44,7 +44,14 @@ final class PersistenceTests: XCTestCase {
         let project = ProjectSnapshot(projectID: UUID(), name: "P", creator: actor, state: .active, roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)], revision: 1, cursor: priorCursor)
         _ = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: nil)
 
-        let fresh = try await store.markRestored(from: prior, backupSequence: 1, digest: "digest")
+        let activationToken = Data("restore-activation".utf8)
+        let fresh = try await store.prepareRestoredStore(
+            from: prior,
+            backupSequence: 1,
+            digest: "digest",
+            activationToken: activationToken
+        )
+        _ = try await store.activateRestoredStore(activationToken: activationToken, instanceID: UUID())
         XCTAssertNotEqual(prior, fresh)
         let restored = try await store.metadata()
         XCTAssertEqual(restored.storeID, fresh)
