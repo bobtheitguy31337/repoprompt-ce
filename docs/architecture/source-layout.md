@@ -51,6 +51,14 @@ Sources/
   RepoPromptRegexCore/          # internal reusable PCRE2 wrapper/JIT runtime
   RepoPromptWorkspaceCore/      # internal Foundation-only workspace path values and deterministic policies
   RepoPromptDomainRuntime/      # internal AppKit-free MCP runtime, workspace/context persistence, routing, and launch-token authority
+  RepoPromptAgentRuntimeCore/   # portable provider-neutral session, lifecycle, interaction, transcript, and supervision contracts
+  RepoPromptWorkspaceRuntimeCore/ # portable multi-project root, logical selection, Context Builder, Oracle, and worktree authority contracts
+  RepoPromptHeadlessRuntime/    # actor-isolated server composition and exact project/session routing
+  RepoPromptServiceProtocol/    # versioned server DTOs, event/command/error unions, and canonical signing
+  RepoPromptServicePersistence/ # SQLiteNIO migrations, repositories, ordered events, idempotency, and nonce replay state
+  RepoPromptServiceHTTP/        # Hummingbird/NIOSSL authenticated REST, SSE, health, readiness, diagnostics, and metrics
+  RepoPromptServerExecutable/   # thin RepoPromptServer process entry
+  RepoPromptMCPAdapter/         # compatibility adapter over RepoPromptHeadlessAuthority
   RepoPromptShared/
     MCP/                         # shared app/CLI MCP control protocol definitions
   RepoPromptMCP/                 # MCP CLI implementation

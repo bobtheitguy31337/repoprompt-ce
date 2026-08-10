@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1.7
+FROM swift:6.2.4-noble AS build
+WORKDIR /src
+COPY Package.swift Package.resolved ./
+COPY Sources/RepoPromptServiceProtocol Sources/RepoPromptServiceProtocol
+COPY Sources/RepoPromptAgentRuntimeCore Sources/RepoPromptAgentRuntimeCore
+COPY Sources/RepoPromptWorkspaceRuntimeCore Sources/RepoPromptWorkspaceRuntimeCore
+COPY Sources/RepoPromptServicePersistence Sources/RepoPromptServicePersistence
+COPY Sources/RepoPromptHeadlessRuntime Sources/RepoPromptHeadlessRuntime
+COPY Sources/RepoPromptServiceHTTP Sources/RepoPromptServiceHTTP
+COPY Sources/RepoPromptMCPAdapter Sources/RepoPromptMCPAdapter
+COPY Sources/RepoPromptServerExecutable Sources/RepoPromptServerExecutable
+RUN --mount=type=cache,target=/root/.cache/org.swift.swiftpm \
+    --mount=type=cache,target=/src/.build \
+    REPOPROMPT_SERVER_ONLY=1 swift build --disable-automatic-resolution -c release --product RepoPromptServer && \
+    install -D -m 0755 "$(swift build -c release --show-bin-path)/RepoPromptServer" /out/usr/local/bin/RepoPromptServer
+
+FROM swift:6.2.4-noble-slim
+ARG REPOPROMPT_COMMIT=unknown
+ARG SOURCE_DATE_EPOCH=0
+LABEL org.opencontainers.image.title="RepoPromptServer" \
+      org.opencontainers.image.revision="$REPOPROMPT_COMMIT" \
+      org.opencontainers.image.created="$SOURCE_DATE_EPOCH"
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl tini && rm -rf /var/lib/apt/lists/* && \
+    groupadd --gid 65532 repoprompt && useradd --uid 65532 --gid 65532 --home-dir /var/lib/repoprompt --create-home --shell /usr/sbin/nologin repoprompt && \
+    install -d -o 65532 -g 65532 /var/lib/repoprompt/state /srv/repoprompt/projects /srv/repoprompt/worktrees /var/cache/repoprompt
+COPY --from=build /out/usr/local/bin/RepoPromptServer /usr/local/bin/RepoPromptServer
+USER 65532:65532
+EXPOSE 9443
+VOLUME ["/var/lib/repoprompt/state", "/srv/repoprompt/projects", "/srv/repoprompt/worktrees", "/var/cache/repoprompt"]
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=6 CMD ["curl", "-fsS", "--max-time", "3", "http://127.0.0.1:9080/health/ready"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/RepoPromptServer"]

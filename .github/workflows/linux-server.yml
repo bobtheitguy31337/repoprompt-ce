@@ -1,0 +1,56 @@
+name: Linux RepoPrompt Server
+
+on:
+  pull_request:
+    paths:
+      - Package.swift
+      - Package.resolved
+      - Dockerfile.server
+      - Sources/RepoPromptAgentRuntimeCore/**
+      - Sources/RepoPromptWorkspaceRuntimeCore/**
+      - Sources/RepoPromptHeadlessRuntime/**
+      - Sources/RepoPromptServiceProtocol/**
+      - Sources/RepoPromptServicePersistence/**
+      - Sources/RepoPromptServiceHTTP/**
+      - Sources/RepoPromptServerExecutable/**
+      - Sources/RepoPromptMCPAdapter/**
+      - Tests/RepoPromptServerTests/**
+      - .github/workflows/linux-server.yml
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  swift:
+    name: Ubuntu 24.04 build, migration, auth, SSE, and runtime tests
+    runs-on: ubuntu-24.04
+    container: swift:6.2.4-noble
+    timeout-minutes: 35
+    env:
+      REPOPROMPT_SERVER_ONLY: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build RepoPromptServer
+        run: swift build --disable-automatic-resolution --product RepoPromptServer
+      - name: Run focused server tests
+        run: swift test --disable-automatic-resolution --filter RepoPromptServerTests
+      - name: Verify server graph excludes UI frameworks
+        run: |
+          test "$(find Sources/RepoPromptServerExecutable -type f | wc -l)" -eq 1
+          ! grep -R -E '^import (AppKit|SwiftUI|Sparkle|Combine)$'             Sources/RepoPromptAgentRuntimeCore             Sources/RepoPromptWorkspaceRuntimeCore             Sources/RepoPromptHeadlessRuntime             Sources/RepoPromptServiceProtocol             Sources/RepoPromptServicePersistence             Sources/RepoPromptServiceHTTP             Sources/RepoPromptServerExecutable             Sources/RepoPromptMCPAdapter
+
+  image:
+    name: Canonical non-root image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        run: docker build --build-arg REPOPROMPT_COMMIT="$GITHUB_SHA" --build-arg SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" -f Dockerfile.server -t repoprompt-server:test .
+      - name: Verify image user and entrypoint
+        run: |
+          test "$(docker image inspect repoprompt-server:test --format '{{.Config.User}}')" = "65532:65532"
+          docker image inspect repoprompt-server:test --format '{{json .Config.Entrypoint}}' | grep -F 'RepoPromptServer'
