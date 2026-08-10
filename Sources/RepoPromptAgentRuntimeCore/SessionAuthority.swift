@@ -60,6 +60,16 @@ public actor SessionAuthority {
         replaceSnapshot(transcript: transcript)
     }
 
+    public func appendExternalEntry(kind: TranscriptEntry.Kind, text: String, actor: ExternalActor, expectedRevision: Int64) throws {
+        guard expectedRevision == state.snapshot.revision else { throw ServiceAPIError(code: .staleRevision, message: "Session revision is stale", currentRevision: state.snapshot.revision) }
+        guard [.human, .progress, .system, .tool].contains(kind) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "External transcript entry kind is not publishable")
+        }
+        var transcript = state.snapshot.transcript
+        transcript.append(TranscriptEntry(entryID: ids.next(), sessionSequence: Int64(transcript.count + 1), kind: kind, content: text, actor: actor, timestamp: clock.now()))
+        replaceSnapshot(transcript: transcript)
+    }
+
     public func activeBinding() -> RunBindingIdentity? {
         state.gate?.binding
     }

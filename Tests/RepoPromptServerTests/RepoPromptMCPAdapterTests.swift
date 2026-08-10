@@ -1,0 +1,193 @@
+import Foundation
+import RepoPromptHeadlessRuntime
+import RepoPromptMCPAdapter
+import RepoPromptServicePersistence
+import RepoPromptServiceProtocol
+import RepoPromptWorkspaceRuntimeCore
+import XCTest
+
+final class RepoPromptMCPAdapterTests: XCTestCase {
+    func testCanonicalCatalogDispatchesWorkspaceStateThroughDurableAuthority() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try "hello adapter".write(
+            to: root.appendingPathComponent("README.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let actor = ExternalActor(goblinUserID: "mcp", username: "mcp", displayName: "MCP")
+        let project = try await authority.createProject(
+            input: .init(name: "Adapter", roots: [
+                .init(logicalName: "source", path: root.path, writable: true)
+            ]),
+            externalActor: actor,
+            idempotencyKey: "adapter-project",
+            requestDigest: "adapter-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(
+                projectID: project.projectID,
+                provider: .codex,
+                visibility: .privateSession
+            ),
+            externalActor: actor,
+            idempotencyKey: "adapter-session",
+            requestDigest: "adapter-session"
+        )
+        let adapter = RepoPromptMCPAdapter(authority: authority)
+        let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
+
+        XCTAssertEqual(RepoPromptMCPAdapter.canonicalToolNames.count, 27)
+        XCTAssertEqual(Set(RepoPromptMCPAdapter.canonicalToolNames).count, 27)
+        XCTAssertEqual(Set(RepoPromptMCPAdapter.canonicalToolNames), Set([
+            "app_settings", "bind_context", "manage_workspaces", "manage_selection",
+            "file_actions", "get_code_structure", "get_file_tree", "read_file",
+            "file_search", "workspace_context", "prompt", "apply_edits", "oracle_utils",
+            "ask_oracle", "oracle_send", "oracle_chat_log", "git", "manage_worktree",
+            "context_builder", "ask_user", "agent_explore", "agent_run", "agent_manage",
+            "history", "share_thoughts", "set_status", "wait_for_next_user_instruction"
+        ]))
+
+        _ = try await adapter.invoke(
+            toolName: "manage_selection",
+            argumentsJSON: json(["op": "set", "paths": ["README.md"]]),
+            binding: binding
+        )
+        let selection = try await authority.selectionSnapshot(sessionID: session.sessionID)
+        XCTAssertEqual(selection.entries.map(\.logicalPath), ["README.md"])
+
+        let readData = try await adapter.invoke(
+            toolName: "read_file",
+            argumentsJSON: json(["path": "README.md"]),
+            binding: binding
+        )
+        let read = try JSONSerialization.jsonObject(with: readData) as? [String: Any]
+        XCTAssertEqual(read?["content"] as? String, "hello adapter")
+
+        _ = try await adapter.invoke(
+            toolName: "prompt",
+            argumentsJSON: json(["op": "set", "text": "durable prompt"]),
+            binding: binding
+        )
+        let context = try await authority.sessionContext(sessionID: session.sessionID)
+        XCTAssertEqual(context.prompt, "durable prompt")
+        XCTAssertEqual(context.contextRevision, 2)
+
+        let historyData = try await adapter.invoke(
+            toolName: "history",
+            argumentsJSON: json(["op": "get_session", "session_id": session.sessionID.uuidString]),
+            binding: binding
+        )
+        let history = try JSONDecoder.serviceDecoder.decode(SessionSnapshot.self, from: historyData)
+        XCTAssertEqual(history.sessionID, session.sessionID)
+
+        let eventTypes = try await authority.events(after: nil, limit: 20).events.map(\.eventType)
+        XCTAssertTrue(eventTypes.contains(.selectionUpdated))
+        XCTAssertTrue(eventTypes.contains(.contextUpdated))
+        XCTAssertGreaterThanOrEqual(eventTypes.count(where: { $0 == .toolStarted }), 4)
+        XCTAssertGreaterThanOrEqual(eventTypes.count(where: { $0 == .toolCompleted }), 4)
+
+        _ = try await adapter.invoke(
+            toolName: "share_thoughts",
+            argumentsJSON: json(["text": "durable progress"]),
+            binding: binding
+        )
+        _ = try await adapter.invoke(
+            toolName: "set_status",
+            argumentsJSON: json(["session_name": "Adapter Agent"]),
+            binding: binding
+        )
+        let updated = try await authority.sessionSnapshot(sessionID: session.sessionID)
+        XCTAssertEqual(updated.transcript.last?.kind, .progress)
+        XCTAssertEqual(updated.transcript.last?.content, "durable progress")
+        let agents = try await authority.agentSnapshots(rootSessionID: session.sessionID)
+        let agent = try XCTUnwrap(agents.first)
+        XCTAssertEqual(agent.label, "Adapter Agent")
+        let finalEventTypes = try await authority.events(after: nil, limit: 100).events.map(\.eventType)
+        XCTAssertTrue(finalEventTypes.contains(.transcriptProgress))
+        XCTAssertTrue(finalEventTypes.contains(.agentUpdated))
+        try await store.close()
+    }
+
+    func testOracleUsesProviderNativeContinuationIdentity() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let artifacts = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: artifacts)
+        }
+        let runner = NativeOracleRunner()
+        let provider = ProviderCLIAdapter(
+            configurations: [.init(kind: .codex, executable: "/usr/bin/true")],
+            runner: runner
+        )
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = try RepoPromptHeadlessAuthority(
+            store: store,
+            artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path),
+            providerAdapter: provider
+        )
+        let actor = ExternalActor(goblinUserID: "oracle", username: "oracle", displayName: "Oracle")
+        let project = try await authority.createProject(
+            input: .init(name: "Oracle", roots: [.init(logicalName: "source", path: root.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "oracle-project",
+            requestDigest: "oracle-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "oracle-session",
+            requestDigest: "oracle-session"
+        )
+
+        let first = try await authority.askOracle(
+            sessionID: session.sessionID,
+            input: .init(chatID: nil, prompt: "first", contextMode: "selected"),
+            actor: actor
+        )
+        let second = try await authority.askOracle(
+            sessionID: session.sessionID,
+            input: .init(chatID: first.chatID, prompt: "second", contextMode: "selected"),
+            actor: actor
+        )
+
+        XCTAssertEqual(second.revision, 2)
+        let calls = await runner.calls()
+        XCTAssertEqual(Array(calls[1].prefix(4)), ["exec", "resume", "--json", "--skip-git-repo-check"])
+        XCTAssertTrue(calls[1].contains("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
+        let chat = try await authority.oracleChatState(sessionID: session.sessionID, chatID: first.chatID)
+        XCTAssertEqual(chat.providerSessionID, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        try await store.close()
+    }
+
+    private func json(_ object: Any) throws -> Data {
+        try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    }
+}
+
+private actor NativeOracleRunner: WorkspaceCommandRunning {
+    private var recorded: [[String]] = []
+
+    func run(
+        executable _: String,
+        arguments: [String],
+        workingDirectory _: String,
+        maximumBytes _: Int
+    ) async throws -> String {
+        recorded.append(arguments)
+        return """
+        {"type":"thread.started","thread_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}
+        {"type":"item.completed","item":{"type":"agent_message","text":"oracle response"}}
+        """
+    }
+
+    func calls() -> [[String]] {
+        recorded
+    }
+}

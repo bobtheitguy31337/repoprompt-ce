@@ -220,6 +220,71 @@ public actor RepoPromptHeadlessAuthority {
         return child
     }
 
+    /// Starts a provider run for an authority-created child without weakening the public
+    /// root-only command contract. MCP/Agent Mode adapters call this only after the parent
+    /// session has created and durably bound the child through `spawnChildSession`.
+    public func startChildAgentRun(sessionID: UUID) async throws -> CommandReceipt {
+        try ensureWritable()
+        guard let session = sessions[sessionID] else {
+            throw ServiceAPIError(code: .notFound, message: "Child session not found")
+        }
+        let snapshot = await session.snapshot()
+        guard snapshot.parentSessionID != nil else {
+            throw ServiceAPIError(
+                code: .authorizationDecisionRejected,
+                message: "Managed child entry point may not target a root session"
+            )
+        }
+        let command = SessionCommand.resumeSession(expectedRunID: nil, providerResumeMode: "new")
+        let idempotency = IdempotencyInput(
+            actorID: snapshot.creator.goblinUserID,
+            operation: "agentRun",
+            key: "agent-run:\(ids.next().uuidString)",
+            requestDigest: CanonicalSigning.bodyDigest(Data(sessionID.uuidString.utf8))
+        )
+        return try await startProviderRun(
+            command: command,
+            sessionID: sessionID,
+            session: session,
+            actor: snapshot.creator,
+            idempotency: idempotency
+        )
+    }
+
+    public func cancelChildAgentRun(sessionID: UUID) async throws -> CommandReceipt {
+        try ensureWritable()
+        guard let session = sessions[sessionID] else {
+            throw ServiceAPIError(code: .notFound, message: "Child session not found")
+        }
+        let snapshot = await session.snapshot()
+        guard snapshot.parentSessionID != nil else {
+            throw ServiceAPIError(
+                code: .authorizationDecisionRejected,
+                message: "Managed child entry point may not target a root session"
+            )
+        }
+        let run = try await store.latestRun(sessionID: sessionID)
+        let command = SessionCommand.cancelSession(
+            expectedRunID: run?.runID,
+            expectedGeneration: snapshot.runGeneration
+        )
+        let idempotency = IdempotencyInput(
+            actorID: snapshot.creator.goblinUserID,
+            operation: "agentCancel",
+            key: "agent-cancel:\(ids.next().uuidString)",
+            requestDigest: CanonicalSigning.bodyDigest(Data(sessionID.uuidString.utf8))
+        )
+        return try await cancelProviderRun(
+            command: command,
+            sessionID: sessionID,
+            session: session,
+            expectedRunID: run?.runID,
+            generation: snapshot.runGeneration,
+            actor: snapshot.creator,
+            idempotency: idempotency
+        )
+    }
+
     public func agentSnapshots(rootSessionID: UUID) async throws -> [AgentSnapshot] {
         guard sessions[rootSessionID] != nil else { throw ServiceAPIError(code: .notFound, message: "Root session not found") }
         return try await store.agents(rootSessionID: rootSessionID)
@@ -332,6 +397,26 @@ public actor RepoPromptHeadlessAuthority {
         return try await tool.diff(request)
     }
 
+    public func projectGit(
+        projectID: UUID,
+        rootID: UUID,
+        arguments: [String],
+        maximumBytes: Int = 2_097_152
+    ) async throws -> String {
+        let project = try await projects.authority(projectID: projectID)
+        let root = try await project.root(rootID: rootID)
+        let forbidden = Set(["push", "fetch", "pull", "clone", "remote", "credential"])
+        guard let operation = arguments.first, !forbidden.contains(operation.lowercased()) else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Network or credential Git operations are unavailable")
+        }
+        return try await commandRunner.run(
+            executable: "/usr/bin/git",
+            arguments: arguments,
+            workingDirectory: root.snapshot.canonicalPath,
+            maximumBytes: maximumBytes
+        )
+    }
+
     public func refreshProject(projectID: UUID, expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> ProjectSnapshot {
         try ensureWritable()
         let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "refreshProject", key: idempotencyKey, requestDigest: requestDigest)
@@ -378,6 +463,91 @@ public actor RepoPromptHeadlessAuthority {
     public func selectionSnapshot(sessionID: UUID) async throws -> SelectionSnapshot {
         guard let selection = selections[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
         return await selection.snapshot()
+    }
+
+    public func sessionContext(sessionID: UUID) async throws -> SessionContextSnapshot {
+        let selection = try await selectionSnapshot(sessionID: sessionID)
+        return try await store.sessionContext(sessionID: sessionID)
+            ?? SessionContextSnapshot(
+                sessionID: sessionID,
+                prompt: "",
+                selectionRevision: selection.revision,
+                contextRevision: 1
+            )
+    }
+
+    public func beginToolInvocation(sessionID: UUID, toolName: String, argumentDigest: String, actor: ExternalActor) async throws -> ToolInvocationSnapshot {
+        try ensureWritable()
+        let snapshot = try await sessionSnapshot(sessionID: sessionID)
+        let invocation = ToolInvocationSnapshot(invocationID: ids.next(), toolName: toolName, state: "running", argumentDigest: argumentDigest)
+        let event = try await store.persistToolInvocation(invocation, session: snapshot, actor: actor, correlationID: invocation.invocationID, eventType: .toolStarted)
+        await eventHub.publish(event)
+        return invocation
+    }
+
+    public func finishToolInvocation(sessionID: UUID, invocation: ToolInvocationSnapshot, resultDigest: String?, errorCode: ServiceErrorCode?, actor: ExternalActor) async throws {
+        let snapshot = try await sessionSnapshot(sessionID: sessionID)
+        let failed = errorCode != nil
+        let terminal = ToolInvocationSnapshot(invocationID: invocation.invocationID, toolName: invocation.toolName, state: failed ? "failed" : "completed", argumentDigest: invocation.argumentDigest, resultDigest: resultDigest, errorCode: errorCode)
+        let event = try await store.persistToolInvocation(terminal, session: snapshot, actor: actor, correlationID: invocation.invocationID, eventType: failed ? .toolFailed : .toolCompleted)
+        await eventHub.publish(event)
+    }
+
+    public func publishProgress(sessionID: UUID, text: String, actor: ExternalActor, expectedRevision: Int64) async throws -> SessionSnapshot {
+        try ensureWritable()
+        guard let session = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
+        try await session.appendExternalEntry(kind: .progress, text: text, actor: actor, expectedRevision: expectedRevision)
+        let cursor = try await store.nextCursor()
+        let snapshot = await replacingCursor(session.snapshot(), cursor: cursor)
+        let event = try await store.persistSession(snapshot, eventType: .transcriptProgress, actor: actor, correlationID: ids.next(), idempotency: nil)
+        await eventHub.publish(event)
+        return snapshot
+    }
+
+    public func updateAgentLabel(sessionID: UUID, label: String?, actor: ExternalActor, expectedRevision: Int64) async throws -> AgentSnapshot {
+        try ensureWritable()
+        guard let current = agents[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Agent not found") }
+        guard current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Agent revision is stale", currentRevision: current.revision) }
+        let normalized = label?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let updated = AgentSnapshot(agentID: current.agentID, sessionID: current.sessionID, rootSessionID: current.rootSessionID, parentAgentID: current.parentAgentID, providerNativeIdentity: current.providerNativeIdentity, role: current.role, label: normalized?.isEmpty == true ? nil : normalized, state: current.state, revision: current.revision + 1)
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        let event = try await store.persistAgent(updated, projectID: session.projectID, actor: actor, correlationID: ids.next(), eventType: .agentUpdated)
+        agents[sessionID] = updated
+        await eventHub.publish(event)
+        return updated
+    }
+
+    public func updateSessionPrompt(
+        sessionID: UUID,
+        prompt: String,
+        expectedContextRevision: Int64,
+        actor: ExternalActor
+    ) async throws -> SessionContextSnapshot {
+        try ensureWritable()
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        let current = try await sessionContext(sessionID: sessionID)
+        guard current.contextRevision == expectedContextRevision else {
+            throw ServiceAPIError(
+                code: .staleRevision,
+                message: "Context revision is stale",
+                currentRevision: current.contextRevision
+            )
+        }
+        let selection = try await selectionSnapshot(sessionID: sessionID)
+        let updated = SessionContextSnapshot(
+            sessionID: sessionID,
+            prompt: prompt,
+            selectionRevision: selection.revision,
+            contextRevision: current.contextRevision + 1
+        )
+        let event = try await store.persistSessionContext(
+            updated,
+            session: session,
+            actor: actor,
+            correlationID: ids.next()
+        )
+        await eventHub.publish(event)
+        return updated
     }
 
     public func projectSelectionTemplate(projectID: UUID) async throws -> ProjectSelectionTemplateSnapshot {
@@ -612,7 +782,13 @@ public actor RepoPromptHeadlessAuthority {
             guard let stored = try await store.oracleChat(chatID: inputChatID), stored.sessionID == sessionID else { throw ServiceAPIError(code: .notFound, message: "Oracle chat not found for this session") }
             priorChat = stored
         } else {
-            priorChat = OracleChatState(chatID: chatID, sessionID: sessionID, turns: [], revision: 0)
+            priorChat = OracleChatState(
+                chatID: chatID,
+                sessionID: sessionID,
+                providerSessionID: nil,
+                turns: [],
+                revision: 0
+            )
         }
         let history = priorChat.turns.suffix(20).map { "Human: \($0.prompt)\nOracle: \($0.response)" }.joined(separator: "\n\n")
         let prompt = """
@@ -625,11 +801,33 @@ public actor RepoPromptHeadlessAuthority {
 
         \(context)
         """
-        let response = try await providerAdapter.complete(kind: session.provider, model: session.model, prompt: prompt, workingDirectory: workingDirectory)
-        let nextChat = OracleChatState(chatID: chatID, sessionID: sessionID, turns: priorChat.turns + [OracleChatTurn(prompt: input.prompt, response: response, timestamp: clock.now())], revision: priorChat.revision + 1)
+        let execution = try await providerAdapter.execute(
+            kind: session.provider,
+            model: session.model,
+            prompt: prompt,
+            workingDirectory: workingDirectory,
+            resumeProviderSessionID: priorChat.providerSessionID
+        )
+        let response = execution.output
+        let nextChat = OracleChatState(
+            chatID: chatID,
+            sessionID: sessionID,
+            providerSessionID: execution.providerSessionID ?? priorChat.providerSessionID,
+            turns: priorChat.turns + [
+                OracleChatTurn(prompt: input.prompt, response: response, timestamp: clock.now())
+            ],
+            revision: priorChat.revision + 1
+        )
         try await store.persistOracleChat(nextChat)
         let artifact = try await createArtifact(projectID: project.projectID, sessionID: sessionID, kind: "oracle", logicalName: "oracle-\(chatID.uuidString)-r\(nextChat.revision).md", content: Data(response.utf8), actor: actor)
         return OracleSnapshot(chatID: chatID, response: response, artifactID: artifact.artifactID, revision: nextChat.revision)
+    }
+
+    public func oracleChatState(sessionID: UUID, chatID: UUID) async throws -> OracleChatState {
+        guard let state = try await store.oracleChat(chatID: chatID), state.sessionID == sessionID else {
+            throw ServiceAPIError(code: .notFound, message: "Oracle chat not found for this session")
+        }
+        return state
     }
 
     public func sessionSnapshot(sessionID: UUID) async throws -> SessionSnapshot {

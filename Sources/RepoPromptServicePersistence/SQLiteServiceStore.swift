@@ -231,6 +231,36 @@ public actor SQLiteServiceStore {
         }
     }
 
+    public func persistToolInvocation(
+        _ snapshot: ToolInvocationSnapshot,
+        session: SessionSnapshot,
+        actor: ExternalActor?,
+        correlationID: UUID,
+        eventType: EventType
+    ) async throws -> EventEnvelope {
+        guard [.toolStarted, .toolUpdated, .toolCompleted, .toolFailed].contains(eventType) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Tool invocation requires a tool event type")
+        }
+        let run = try await latestRun(sessionID: session.sessionID)
+        return try await transaction {
+            try await appendEvent(
+                projectID: session.projectID,
+                sessionID: session.sessionID,
+                agentID: session.sessionID,
+                parentAgentID: session.parentSessionID,
+                rootSessionID: session.rootSessionID,
+                runID: run?.runID,
+                sessionSequence: Int64(session.transcript.count),
+                type: eventType,
+                generation: session.runGeneration,
+                turnEpoch: session.turnEpoch,
+                actor: actor,
+                correlationID: correlationID,
+                payload: encoder.encode(snapshot)
+            )
+        }
+    }
+
     public func agents(rootSessionID: UUID? = nil) async throws -> [AgentSnapshot] {
         let rows = if let rootSessionID {
             try await connection.query("SELECT * FROM agents WHERE root_session_id=? ORDER BY created_at", [.text(rootSessionID.uuidString)])
@@ -300,6 +330,51 @@ public actor SQLiteServiceStore {
     public func selection(sessionID: UUID) async throws -> SelectionSnapshot? {
         guard let text = try await connection.query("SELECT selection_json FROM session_selections WHERE session_id=?", [.text(sessionID.uuidString)]).first?.column("selection_json")?.string else { return nil }
         return try decoder.decode(SelectionSnapshot.self, from: Data(text.utf8))
+    }
+
+    public func sessionContext(sessionID: UUID) async throws -> SessionContextSnapshot? {
+        guard let row = try await connection.query(
+            "SELECT prompt_text,selection_revision,context_revision FROM session_contexts WHERE session_id=?",
+            [.text(sessionID.uuidString)]
+        ).first else { return nil }
+        return SessionContextSnapshot(
+            sessionID: sessionID,
+            prompt: row.column("prompt_text")?.string ?? "",
+            selectionRevision: Int64(row.column("selection_revision")?.integer ?? 1),
+            contextRevision: Int64(row.column("context_revision")?.integer ?? 1)
+        )
+    }
+
+    public func persistSessionContext(
+        _ snapshot: SessionContextSnapshot,
+        session: SessionSnapshot,
+        actor: ExternalActor,
+        correlationID: UUID
+    ) async throws -> EventEnvelope {
+        try await transaction {
+            _ = try await connection.query(
+                "INSERT INTO session_contexts(session_id,schema_version,prompt_text,selection_revision,context_revision,frozen_context_json,updated_at) VALUES(?,1,?,?,?,'{}',CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET prompt_text=excluded.prompt_text,selection_revision=excluded.selection_revision,context_revision=excluded.context_revision,updated_at=CURRENT_TIMESTAMP",
+                [
+                    .text(snapshot.sessionID.uuidString),
+                    .text(snapshot.prompt),
+                    .integer(Int(snapshot.selectionRevision)),
+                    .integer(Int(snapshot.contextRevision))
+                ]
+            )
+            return try await appendEvent(
+                projectID: session.projectID,
+                sessionID: session.sessionID,
+                rootSessionID: session.rootSessionID,
+                runID: nil,
+                sessionSequence: nil,
+                type: .contextUpdated,
+                generation: session.runGeneration,
+                turnEpoch: session.turnEpoch,
+                actor: actor,
+                correlationID: correlationID,
+                payload: encoder.encode(snapshot)
+            )
+        }
     }
 
     public func selectionTemplate(projectID: UUID) async throws -> ProjectSelectionTemplateSnapshot? {

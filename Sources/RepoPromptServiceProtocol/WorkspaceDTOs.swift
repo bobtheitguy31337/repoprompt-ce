@@ -29,6 +29,43 @@ public struct SelectionSnapshot: Codable, Hashable, Sendable {
     }
 }
 
+public struct SessionContextSnapshot: Codable, Hashable, Sendable {
+    public let sessionID: UUID
+    public let prompt: String
+    public let selectionRevision: Int64
+    public let contextRevision: Int64
+
+    public init(
+        sessionID: UUID,
+        prompt: String,
+        selectionRevision: Int64,
+        contextRevision: Int64
+    ) {
+        self.sessionID = sessionID
+        self.prompt = prompt
+        self.selectionRevision = selectionRevision
+        self.contextRevision = contextRevision
+    }
+}
+
+public struct ToolInvocationSnapshot: Codable, Hashable, Sendable {
+    public let invocationID: UUID
+    public let toolName: String
+    public let state: String
+    public let argumentDigest: String
+    public let resultDigest: String?
+    public let errorCode: ServiceErrorCode?
+
+    public init(invocationID: UUID, toolName: String, state: String, argumentDigest: String, resultDigest: String? = nil, errorCode: ServiceErrorCode? = nil) {
+        self.invocationID = invocationID
+        self.toolName = toolName
+        self.state = state
+        self.argumentDigest = argumentDigest
+        self.resultDigest = resultDigest
+        self.errorCode = errorCode
+    }
+}
+
 public struct ProjectSelectionTemplateSnapshot: Codable, Hashable, Sendable {
     public let projectID: UUID
     public let entries: [LogicalSelectionEntry]
@@ -456,12 +493,20 @@ public struct OracleChatTurn: Codable, Hashable, Sendable {
 public struct OracleChatState: Codable, Hashable, Sendable {
     public let chatID: UUID
     public let sessionID: UUID
+    public let providerSessionID: String?
     public let turns: [OracleChatTurn]
     public let revision: Int64
 
-    public init(chatID: UUID, sessionID: UUID, turns: [OracleChatTurn], revision: Int64) {
+    public init(
+        chatID: UUID,
+        sessionID: UUID,
+        providerSessionID: String? = nil,
+        turns: [OracleChatTurn],
+        revision: Int64
+    ) {
         self.chatID = chatID
         self.sessionID = sessionID
+        self.providerSessionID = providerSessionID
         self.turns = turns
         self.revision = revision
     }
