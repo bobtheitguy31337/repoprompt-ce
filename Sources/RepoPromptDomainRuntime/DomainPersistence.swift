@@ -1,6 +1,9 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
-import os
 
 struct DomainPendingSave: Codable {
     let operationID: UUID
@@ -184,15 +187,21 @@ package struct DomainPersistenceDataSnapshot: Sendable {
     }
 }
 
-private final class DomainBlockingCancellation: Sendable {
-    private let state = OSAllocatedUnfairLock(initialState: false)
+private final class DomainBlockingCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
 
     func cancel() {
-        state.withLock { $0 = true }
+        lock.lock()
+        cancelled = true
+        lock.unlock()
     }
 
     func check() throws {
-        if state.withLock({ $0 }) {
+        lock.lock()
+        let isCancelled = cancelled
+        lock.unlock()
+        if isCancelled {
             throw DomainPersistenceError.cancelled
         }
     }
@@ -349,51 +358,88 @@ package struct DomainPersistenceCoordinator {
             .appendingPathComponent("\(safe)-\(digest)", isDirectory: true)
     }
 
-    private var journalDirectory: URL { runtimeRoot.appendingPathComponent("working-journals", isDirectory: true) }
-    private var revisionDirectory: URL { runtimeRoot.appendingPathComponent("revisions", isDirectory: true) }
-    private var deletionDirectory: URL { runtimeRoot.appendingPathComponent("deletion-tombstones", isDirectory: true) }
-    private var lockDirectory: URL { runtimeRoot.appendingPathComponent("locks", isDirectory: true) }
-    private var settingsDirectory: URL { runtimeRoot.appendingPathComponent("settings", isDirectory: true) }
-    private var rollbackRoot: URL { runtimeRoot.appendingPathComponent("rollback", isDirectory: true) }
-    private var policyURL: URL { settingsDirectory.appendingPathComponent("runtime-policy.json") }
+    private var journalDirectory: URL {
+        runtimeRoot.appendingPathComponent("working-journals", isDirectory: true)
+    }
+
+    private var revisionDirectory: URL {
+        runtimeRoot.appendingPathComponent("revisions", isDirectory: true)
+    }
+
+    private var deletionDirectory: URL {
+        runtimeRoot.appendingPathComponent("deletion-tombstones", isDirectory: true)
+    }
+
+    private var lockDirectory: URL {
+        runtimeRoot.appendingPathComponent("locks", isDirectory: true)
+    }
+
+    private var settingsDirectory: URL {
+        runtimeRoot.appendingPathComponent("settings", isDirectory: true)
+    }
+
+    private var rollbackRoot: URL {
+        runtimeRoot.appendingPathComponent("rollback", isDirectory: true)
+    }
+
+    private var policyURL: URL {
+        settingsDirectory.appendingPathComponent("runtime-policy.json")
+    }
+
     private var protectedMutationPolicyURL: URL {
         settingsDirectory.appendingPathComponent("protected-mutations.json")
     }
+
     private var protectedMutationPolicyLockURL: URL {
         lockDirectory.appendingPathComponent("protected-mutations.lock")
     }
+
     private var protectedMutationJournalURL: URL {
         settingsDirectory.appendingPathComponent("protected-mutation-journal.json")
     }
+
     private var protectedMutationJournalLockURL: URL {
         lockDirectory.appendingPathComponent("protected-mutation-journal.lock")
     }
+
     private var agentSessionMetadataURL: URL {
         settingsDirectory.appendingPathComponent("agent-sessions.json")
     }
+
     private var agentSessionMetadataLockURL: URL {
         lockDirectory.appendingPathComponent("agent-sessions.lock")
     }
+
     private var directSettingsURL: URL {
         settingsDirectory.appendingPathComponent("direct-settings.json")
     }
+
     private var directSettingsLockURL: URL {
         lockDirectory.appendingPathComponent("direct-settings.lock")
     }
+
     private var agentWorktreeBindingsURL: URL {
         settingsDirectory.appendingPathComponent("agent-worktree-bindings.json")
     }
+
     private var agentWorktreeBindingsLockURL: URL {
         lockDirectory.appendingPathComponent("agent-worktree-bindings.lock")
     }
+
     private var legacyAgentSessionMetadataURL: URL {
         configuration.storageDirectory
             .appendingPathComponent("DomainRuntime", isDirectory: true)
             .appendingPathComponent("v1", isDirectory: true)
             .appendingPathComponent("agent-sessions.json")
     }
-    private var catalogURL: URL { runtimeRoot.appendingPathComponent("workspace-catalog.json") }
-    private var indexURL: URL { workspaceRoot.appendingPathComponent("workspacesIndex.json") }
+
+    private var catalogURL: URL {
+        runtimeRoot.appendingPathComponent("workspace-catalog.json")
+    }
+
+    private var indexURL: URL {
+        workspaceRoot.appendingPathComponent("workspacesIndex.json")
+    }
 
     private func journalURL(_ workspaceID: UUID) -> URL {
         journalDirectory.appendingPathComponent("\(workspaceID.uuidString).json")
@@ -2008,7 +2054,7 @@ private enum DomainPersistenceLock {
                 guard let baseAddress = rawBuffer.baseAddress else { return }
                 var written = 0
                 while written < rawBuffer.count {
-                    let count = Darwin.write(
+                    let count = platformWrite(
                         descriptor,
                         baseAddress.advanced(by: written),
                         rawBuffer.count - written
@@ -2039,5 +2085,17 @@ private enum DomainPersistenceLock {
             unlink(temporary.path)
             throw error
         }
+    }
+
+    private static func platformWrite(
+        _ descriptor: Int32,
+        _ buffer: UnsafeRawPointer,
+        _ count: Int
+    ) -> Int {
+        #if canImport(Darwin)
+            Darwin.write(descriptor, buffer, count)
+        #else
+            Glibc.write(descriptor, buffer, count)
+        #endif
     }
 }

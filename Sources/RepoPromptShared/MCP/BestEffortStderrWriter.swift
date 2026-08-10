@@ -1,5 +1,9 @@
-import Darwin
-import Darwin.POSIX.fcntl
+#if canImport(Darwin)
+    import Darwin
+    import Darwin.POSIX.fcntl
+#else
+    import Glibc
+#endif
 import Foundation
 
 /// Best-effort raw file-descriptor writer for diagnostic output on MCP stdio
@@ -32,7 +36,7 @@ public enum BestEffortStderrWriter {
             guard let baseAddress = rawBuffer.baseAddress else { return false }
             var offset = 0
             while offset < rawBuffer.count {
-                let written = Darwin.write(descriptor, baseAddress + offset, rawBuffer.count - offset)
+                let written = platformWrite(descriptor, baseAddress + offset, rawBuffer.count - offset)
                 if written > 0 {
                     offset += written
                     continue
@@ -72,14 +76,19 @@ public enum BestEffortStderrWriter {
 
         let originalFlags = fcntl(descriptor, F_GETFL)
         guard originalFlags >= 0 else { return false }
-        let rawNoSIGPIPE = fcntl(descriptor, F_GETNOSIGPIPE)
-        let originalNoSIGPIPE = rawNoSIGPIPE >= 0 ? rawNoSIGPIPE : nil
-        let needsNoSIGPIPE = originalNoSIGPIPE == 0
-        if needsNoSIGPIPE,
-           fcntl(descriptor, F_SETNOSIGPIPE, 1) < 0
-        {
-            return false
-        }
+        #if canImport(Darwin)
+            let rawNoSIGPIPE = fcntl(descriptor, F_GETNOSIGPIPE)
+            let originalNoSIGPIPE: Int32? = rawNoSIGPIPE >= 0 ? rawNoSIGPIPE : nil
+            let needsNoSIGPIPE = originalNoSIGPIPE == 0
+            if needsNoSIGPIPE,
+               fcntl(descriptor, F_SETNOSIGPIPE, 1) < 0
+            {
+                return false
+            }
+        #else
+            let originalNoSIGPIPE: Int32? = nil
+            let needsNoSIGPIPE = false
+        #endif
 
         let needsNonBlocking = originalFlags & O_NONBLOCK == 0
         if needsNonBlocking,
@@ -96,7 +105,7 @@ public enum BestEffortStderrWriter {
 
         let writeSucceeded = data.withUnsafeBytes { rawBuffer in
             guard let baseAddress = rawBuffer.baseAddress else { return false }
-            let written = Darwin.write(descriptor, baseAddress, rawBuffer.count)
+            let written = platformWrite(descriptor, baseAddress, rawBuffer.count)
             return written == rawBuffer.count
         }
 
@@ -135,13 +144,33 @@ public enum BestEffortStderrWriter {
         }
 
         guard let noSIGPIPE else { return restoredFlags }
-        let restoredSIGPIPE = fcntl(descriptor, F_SETNOSIGPIPE, noSIGPIPE) >= 0
-        return restoredFlags && restoredSIGPIPE
+        #if canImport(Darwin)
+            let restoredSIGPIPE = fcntl(descriptor, F_SETNOSIGPIPE, noSIGPIPE) >= 0
+            return restoredFlags && restoredSIGPIPE
+        #else
+            return restoredFlags
+        #endif
     }
 
     private static func suppressSIGPIPE(on descriptor: Int32) {
         // Failure is acceptable: callers also ignore SIGPIPE process-wide, and
         // the write still fails softly when descriptor configuration is unavailable.
-        _ = fcntl(descriptor, F_SETNOSIGPIPE, 1)
+        #if canImport(Darwin)
+            _ = fcntl(descriptor, F_SETNOSIGPIPE, 1)
+        #else
+            _ = signal(SIGPIPE, SIG_IGN)
+        #endif
+    }
+
+    private static func platformWrite(
+        _ descriptor: Int32,
+        _ buffer: UnsafeRawPointer,
+        _ count: Int
+    ) -> Int {
+        #if canImport(Darwin)
+            Darwin.write(descriptor, buffer, count)
+        #else
+            Glibc.write(descriptor, buffer, count)
+        #endif
     }
 }

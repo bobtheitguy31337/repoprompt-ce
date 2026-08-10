@@ -7,6 +7,9 @@ on:
       - Package.resolved
       - Dockerfile.server
       - Sources/RepoPromptAgentRuntimeCore/**
+      - Sources/RepoPromptDomainRuntime/**
+      - Sources/RepoPromptShared/**
+      - Sources/RepoPromptC/**
       - Sources/RepoPromptWorkspaceRuntimeCore/**
       - Sources/RepoPromptHeadlessRuntime/**
       - Sources/RepoPromptServiceProtocol/**
@@ -15,6 +18,7 @@ on:
       - Sources/RepoPromptServerExecutable/**
       - Sources/RepoPromptMCPAdapter/**
       - Tests/RepoPromptServerTests/**
+      - Tests/RepoPromptDomainRuntimeTests/**
       - .github/workflows/linux-server.yml
   push:
     branches: [main]
@@ -36,10 +40,13 @@ jobs:
         run: swift build --disable-automatic-resolution --product RepoPromptServer
       - name: Run focused server tests
         run: swift test --disable-automatic-resolution --filter RepoPromptServerTests
+      - name: Run canonical portable-domain tests
+        run: swift test --disable-automatic-resolution --filter RepoPromptDomainRuntimeTests
       - name: Verify server graph excludes UI frameworks
         run: |
           test "$(find Sources/RepoPromptServerExecutable -type f | wc -l)" -eq 1
           ! grep -R -E '^import (AppKit|SwiftUI|Sparkle|Combine)$'             Sources/RepoPromptAgentRuntimeCore             Sources/RepoPromptWorkspaceRuntimeCore             Sources/RepoPromptHeadlessRuntime             Sources/RepoPromptServiceProtocol             Sources/RepoPromptServicePersistence             Sources/RepoPromptServiceHTTP             Sources/RepoPromptServerExecutable             Sources/RepoPromptMCPAdapter
+          ! grep -R -E '^import (AppKit|SwiftUI|Sparkle|Combine)$'             Sources/RepoPromptDomainRuntime             Sources/RepoPromptShared
 
   image:
     name: Canonical non-root image

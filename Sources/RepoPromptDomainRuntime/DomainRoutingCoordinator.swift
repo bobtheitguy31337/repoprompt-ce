@@ -1,5 +1,7 @@
 import Foundation
-import Security
+#if canImport(Security)
+    import Security
+#endif
 
 package struct DomainWindowDescriptor: Codable, Equatable {
     package let windowID: Int
@@ -52,7 +54,7 @@ package extension DomainBinding {
     }
 }
 
-package struct DomainConnectionBindingSnapshot: Codable, Equatable, Sendable {
+package struct DomainConnectionBindingSnapshot: Codable, Equatable {
     package let registration: DomainConnectionRegistration
     package let binding: DomainBinding
 }
@@ -125,7 +127,7 @@ package struct DomainRunLaunchReservationRequest {
     }
 }
 
-package struct DomainRunLaunchRedemption: Equatable, Sendable {
+package struct DomainRunLaunchRedemption: Equatable {
     package let binding: DomainConnectionBindingSnapshot
     package let restrictedTools: Set<String>
     package let additionalTools: Set<String>
@@ -141,7 +143,7 @@ package struct DomainRunLaunchRedemption: Equatable, Sendable {
     }
 }
 
-package enum DomainRunLaunchRedemptionResult: Equatable, Sendable {
+package enum DomainRunLaunchRedemptionResult: Equatable {
     case accepted(DomainRunLaunchRedemption)
     case unknown
     case expired
@@ -506,9 +508,16 @@ package actor DomainRoutingCoordinator {
             )
         }
         var bytes = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
-            throw DomainRunLaunchTokenError.randomGenerationFailed
-        }
+        #if canImport(Security)
+            guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+                throw DomainRunLaunchTokenError.randomGenerationFailed
+            }
+        #else
+            var generator = SystemRandomNumberGenerator()
+            for index in bytes.indices {
+                bytes[index] = UInt8.random(in: .min ... .max, using: &generator)
+            }
+        #endif
         let material = Data(bytes).base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")

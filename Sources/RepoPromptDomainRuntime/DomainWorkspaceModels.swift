@@ -1,4 +1,8 @@
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 
 package enum DomainWorkspaceStoragePath {
@@ -61,12 +65,12 @@ package enum DomainAuthorityHealth: Codable, Equatable {
     }
 }
 
-package enum DomainWorkspaceTabLocation: String, Codable, Equatable, Hashable, Sendable {
+package enum DomainWorkspaceTabLocation: String, Codable, Equatable, Hashable {
     case composed
     case stashed
 }
 
-package struct DomainProtectedAgentIdentity: Codable, Equatable, Hashable, Sendable {
+package struct DomainProtectedAgentIdentity: Codable, Equatable, Hashable {
     package let tabID: UUID
     package let location: DomainWorkspaceTabLocation
     package let activeAgentSessionID: UUID?

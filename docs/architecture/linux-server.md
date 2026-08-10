@@ -15,12 +15,13 @@ RepoPromptServerExecutable
   -> RepoPromptHeadlessRuntime
        -> RepoPromptAgentRuntimeCore
        -> RepoPromptWorkspaceRuntimeCore
+       -> RepoPromptDomainRuntime
        -> RepoPromptServicePersistence
 
-RepoPromptMCPAdapter -> RepoPromptHeadlessRuntime
+RepoPromptMCPAdapter -> RepoPromptHeadlessRuntime + RepoPromptDomainRuntime
 ```
 
-Linux, and macOS builds with `REPOPROMPT_SERVER_ONLY=1`, resolve only this graph. AppKit, SwiftUI, Sparkle, Combine UI, the Objective-C bridging header, and the macOS binary target are absent. The normal macOS graph remains available when that switch is unset.
+Linux, and macOS builds with `REPOPROMPT_SERVER_ONLY=1`, resolve only this graph. The same canonical `RepoPromptDomainRuntime` and `RepoPromptShared` sources used by the app and MCP product are below the server boundary; their crypto, random, locking, and POSIX edges select Crypto/Glibc implementations on Linux. AppKit, SwiftUI, Sparkle, Combine UI, the Objective-C bridging header, and the macOS binary target are absent. The normal macOS graph remains available when that switch is unset.
 
 ## Authority and isolation
 

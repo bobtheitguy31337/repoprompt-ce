@@ -1,4 +1,8 @@
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 import MCP
 import RepoPromptC
@@ -20,7 +24,7 @@ package extension DomainPhysicalToolResult {
     }
 }
 
-package struct DomainCanonicalWorkspaceSnapshot: Sendable {
+package struct DomainCanonicalWorkspaceSnapshot {
     package let identity: DomainContextIdentity
     package let roots: [URL]
     package let prompt: String
@@ -39,12 +43,12 @@ package struct DomainCanonicalWorkspaceSnapshot: Sendable {
     }
 }
 
-package enum DomainCanonicalWorkspaceMutation: Sendable {
+package enum DomainCanonicalWorkspaceMutation {
     case setPrompt(String)
     case setSelection([String])
 }
 
-package struct DomainCanonicalWorkspaceAdapter: Sendable {
+package struct DomainCanonicalWorkspaceAdapter {
     package typealias ToolSnapshot = @Sendable (DomainPhysicalToolRequest) async throws -> DomainCanonicalWorkspaceSnapshot
     package typealias ReadSnapshot = @Sendable (DomainPhysicalReadRequest) async throws -> DomainCanonicalWorkspaceSnapshot
     package typealias Mutate = @Sendable (
@@ -79,7 +83,7 @@ package struct DomainCanonicalWorkspaceAdapter: Sendable {
 /// The executable supplies only authoritative snapshot/mutation/path adapters; argument parsing,
 /// selection semantics, file reads, search, tree rendering, codemaps, prompt/context projection,
 /// mutation admission, and response shapes are owned here.
-package struct MCPDomainCanonicalWorkspaceService: Sendable {
+package struct MCPDomainCanonicalWorkspaceService {
     private let adapter: DomainCanonicalWorkspaceAdapter
 
     package init(adapter: DomainCanonicalWorkspaceAdapter) {
