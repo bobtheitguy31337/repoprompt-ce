@@ -281,6 +281,87 @@ final class ProjectSourceProvisioningTests: XCTestCase {
     }
 
     #if os(Linux)
+    func testLinuxSupervisorAnchorsFinalValidationThenSuccessReleasesWithoutLaterSignal() async throws {
+        let fixture = try RealRunnerFixture(script: "#!/bin/sh\nexit 23\n")
+        defer { fixture.cleanup() }
+        let invocation = fixture.invocation(timeoutSeconds: 5)
+        XCTAssertTrue(FileManager.default.createFile(atPath: invocation.outputPath, contents: nil))
+        let output = try FileHandle(forWritingTo: URL(fileURLWithPath: invocation.outputPath))
+        defer { try? output.close() }
+        let lifecycle = ManagedProjectSourceProcess()
+        try LocalProjectSourceGitRunner.spawnLinuxSupervisor(
+            invocation,
+            outputDescriptor: output.fileDescriptor,
+            lifecycle: lifecycle
+        )
+
+        XCTAssertEqual(await waitForGitStatus(lifecycle), 23)
+        let anchorPID = lifecycle.testSupervisorProcessID
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(kill(anchorPID, 0), 0, "The anchor must outlive Git through final validation")
+
+        XCTAssertTrue(lifecycle.releaseSupervisor())
+        let commandsAfterRelease = lifecycle.testControlCommandsSent
+        XCTAssertTrue(await waitForSupervisorExit(lifecycle))
+        lifecycle.signal(SIGTERM)
+        XCTAssertEqual(lifecycle.testControlCommandsSent, commandsAfterRelease, "No signal command may be sent after release")
+        XCTAssertNotEqual(kill(anchorPID, 0), 0, "The released supervisor must be reaped")
+    }
+
+    func testLinuxStoppedSupervisorConsumesKillEscalationBeforeReap() async throws {
+        let fixture = try RealRunnerFixture(script: "#!/bin/sh\nexit 0\n")
+        defer { fixture.cleanup() }
+        let invocation = fixture.invocation(timeoutSeconds: 5)
+        XCTAssertTrue(FileManager.default.createFile(atPath: invocation.outputPath, contents: nil))
+        let output = try FileHandle(forWritingTo: URL(fileURLWithPath: invocation.outputPath))
+        defer { try? output.close() }
+        let lifecycle = ManagedProjectSourceProcess()
+        try LocalProjectSourceGitRunner.spawnLinuxSupervisor(
+            invocation,
+            outputDescriptor: output.fileDescriptor,
+            lifecycle: lifecycle
+        )
+
+        XCTAssertEqual(await waitForGitStatus(lifecycle), 0)
+        let anchorPID = lifecycle.testSupervisorProcessID
+        XCTAssertEqual(kill(anchorPID, SIGSTOP), 0)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertTrue(lifecycle.releaseSupervisor())
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(kill(anchorPID, 0), 0, "A stopped anchor cannot consume release yet")
+
+        lifecycle.signal(SIGKILL)
+        XCTAssertTrue(await waitForSupervisorExit(lifecycle))
+        XCTAssertNotEqual(kill(anchorPID, 0), 0)
+    }
+
+    func testLinuxSupervisorFailureSignalsFamilyWhileAnchorIsOwned() async throws {
+        let fixture = try RealRunnerFixture(
+            script: "#!/bin/sh\nsh -c 'trap \"echo terminated > term.marker; exit 0\" TERM; while :; do sleep 1; done' &\necho $! > child.pid\nexit 7\n"
+        )
+        defer { fixture.cleanup() }
+        let invocation = fixture.invocation(timeoutSeconds: 5)
+        XCTAssertTrue(FileManager.default.createFile(atPath: invocation.outputPath, contents: nil))
+        let output = try FileHandle(forWritingTo: URL(fileURLWithPath: invocation.outputPath))
+        defer { try? output.close() }
+        let lifecycle = ManagedProjectSourceProcess()
+        try LocalProjectSourceGitRunner.spawnLinuxSupervisor(
+            invocation,
+            outputDescriptor: output.fileDescriptor,
+            lifecycle: lifecycle
+        )
+
+        XCTAssertEqual(await waitForGitStatus(lifecycle), 7)
+        let anchorPID = lifecycle.testSupervisorProcessID
+        XCTAssertEqual(kill(anchorPID, 0), 0)
+        lifecycle.signal(SIGTERM)
+        try await fixture.waitForFile(named: "term.marker")
+        XCTAssertEqual(kill(anchorPID, 0), 0, "TERM must run while the anchor still owns the group")
+        lifecycle.signal(SIGKILL)
+        XCTAssertTrue(await waitForSupervisorExit(lifecycle))
+        XCTAssertTrue(await processIsGone(try fixture.processID(named: "child.pid")))
+    }
+
     func testRealGitRunnerPostExitOutputFailureTerminatesDescendantProcessGroup() async throws {
         let fixture = try RealRunnerFixture(
             script: "#!/bin/sh\nsleep 30 &\necho $! > child.pid\nexec dd if=/dev/zero bs=65536 count=1 2>/dev/null\n"
@@ -652,6 +733,24 @@ private struct RealRunnerFixture {
         try? FileManager.default.removeItem(at: directory)
     }
 }
+
+#if os(Linux)
+private func waitForGitStatus(_ lifecycle: ManagedProjectSourceProcess) async -> Int32? {
+    for _ in 0 ..< 100 {
+        if let status = lifecycle.terminationStatus() { return status }
+        try? await Task.sleep(for: .milliseconds(20))
+    }
+    return nil
+}
+
+private func waitForSupervisorExit(_ lifecycle: ManagedProjectSourceProcess) async -> Bool {
+    for _ in 0 ..< 100 {
+        if !lifecycle.terminationTargetExists() { return true }
+        try? await Task.sleep(for: .milliseconds(20))
+    }
+    return false
+}
+#endif
 
 private func processIsGone(_ processID: pid_t) async -> Bool {
     for _ in 0 ..< 100 {

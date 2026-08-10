@@ -286,19 +286,39 @@ public protocol ProjectSourceGitRunning: Sendable {
     func run(_ invocation: ProjectSourceGitInvocation) async throws -> String
 }
 
-private final class ManagedProjectSourceProcess: @unchecked Sendable {
-    private struct State {
-        let processID: pid_t
-        let processGroup: pid_t?
-        let leaderRunning: Bool
-        let leaderReaped: Bool
-    }
-
+final class ManagedProjectSourceProcess: @unchecked Sendable {
     private let lock = NSLock()
+
+    #if os(Linux)
+    private var supervisorPID: pid_t = 0
+    private var statusDescriptor: Int32 = -1
+    private var controlDescriptor: Int32 = -1
+    private var gitStatus: Int32?
+    private var releaseRequested = false
+    private var supervisorReaped = false
+    private var controlCommandsSent = 0
+    #else
     private var process: Process?
     private var processGroup: pid_t?
     private var leaderReaped = false
+    #endif
 
+    deinit {
+        #if os(Linux)
+        if statusDescriptor >= 0 { close(statusDescriptor) }
+        if controlDescriptor >= 0 { close(controlDescriptor) }
+        #endif
+    }
+
+    #if os(Linux)
+    func activateSupervisor(pid: pid_t, statusDescriptor: Int32, controlDescriptor: Int32) {
+        lock.lock()
+        supervisorPID = pid
+        self.statusDescriptor = statusDescriptor
+        self.controlDescriptor = controlDescriptor
+        lock.unlock()
+    }
+    #else
     func prepare(_ process: Process) {
         lock.lock()
         self.process = process
@@ -310,39 +330,81 @@ private final class ManagedProjectSourceProcess: @unchecked Sendable {
         self.processGroup = processGroup
         lock.unlock()
     }
+    #endif
 
     func signal(_ signal: Int32) {
-        let state = currentState()
         #if os(Linux)
-        if let processGroup = ownedLinuxProcessGroup(in: state) {
-            if kill(-processGroup, signal) == 0 || errno == EPERM { return }
-            if errno == ESRCH, state.leaderReaped { forgetProcessGroup(processGroup) }
+        let isKill = signal == SIGKILL
+        let command: UInt8 = isKill
+            ? UInt8(RP_ANCHORED_COMMAND_KILL)
+            : UInt8(RP_ANCHORED_COMMAND_TERM)
+        lock.lock()
+        if !supervisorReaped, controlDescriptor >= 0, !releaseRequested || isKill {
+            if isKill, supervisorPID > 1 {
+                // The unreaped direct child PID cannot be reused. SIGCONT makes
+                // a stopped anchor consume the queued group-KILL command; Swift
+                // never sends a signal to a numeric Linux process group.
+                _ = kill(supervisorPID, SIGCONT)
+            }
+            if rp_anchored_process_send_command(controlDescriptor, command) == 0 {
+                controlCommandsSent += 1
+            }
         }
+        lock.unlock()
         #else
-        if state.leaderRunning, let processGroup = state.processGroup, processGroup > 1,
+        lock.lock()
+        let process = self.process
+        let processGroup = self.processGroup
+        let processID = process?.processIdentifier ?? 0
+        let leaderRunning = process?.isRunning == true
+        lock.unlock()
+        if leaderRunning, let processGroup, processGroup > 1,
            kill(-processGroup, signal) == 0 || errno == EPERM
         {
             return
         }
+        if leaderRunning, processID > 1 { _ = kill(processID, signal) }
         #endif
-        if state.leaderRunning, state.processID > 1 {
-            _ = kill(state.processID, signal)
-        }
     }
 
     func isRunning() -> Bool {
-        currentState().leaderRunning
+        terminationStatus() == nil
     }
 
     func terminationTargetExists() -> Bool {
-        let state = currentState()
         #if os(Linux)
-        if let processGroup = ownedLinuxProcessGroup(in: state) { return processGroup > 1 }
+        return pollSupervisorReap() == false
+        #else
+        lock.lock()
+        let running = process?.isRunning == true
+        lock.unlock()
+        return running
         #endif
-        return state.leaderRunning
     }
 
     func terminationStatus() -> Int32? {
+        #if os(Linux)
+        lock.lock()
+        if let gitStatus {
+            lock.unlock()
+            return gitStatus
+        }
+        let descriptor = statusDescriptor
+        lock.unlock()
+        guard descriptor >= 0 else { return nil }
+        var status: Int32 = 0
+        let result = rp_anchored_process_poll_status(descriptor, &status)
+        guard result != 0 else { return nil }
+        lock.lock()
+        if result == 1 {
+            gitStatus = status
+        } else {
+            gitStatus = 127
+        }
+        let resolved = gitStatus
+        lock.unlock()
+        return resolved
+        #else
         lock.lock()
         guard let process, !process.isRunning else {
             lock.unlock()
@@ -355,57 +417,63 @@ private final class ManagedProjectSourceProcess: @unchecked Sendable {
         let status = process.terminationStatus
         lock.unlock()
         return status
+        #endif
     }
 
-    private func currentState() -> State {
+    func releaseSupervisor() -> Bool {
+        #if os(Linux)
         lock.lock()
-        let processID = process?.processIdentifier ?? 0
-        let leaderRunning = process?.isRunning == true
-        if let process, !leaderRunning, !leaderReaped {
-            process.waitUntilExit()
-            leaderReaped = true
+        guard !releaseRequested, !supervisorReaped, controlDescriptor >= 0 else {
+            let released = releaseRequested
+            lock.unlock()
+            return released
         }
-        let state = State(
-            processID: processID,
-            processGroup: processGroup,
-            leaderRunning: leaderRunning,
-            leaderReaped: leaderReaped
+        let result = rp_anchored_process_send_command(
+            controlDescriptor,
+            UInt8(RP_ANCHORED_COMMAND_RELEASE)
         )
+        if result == 0 {
+            releaseRequested = true
+            controlCommandsSent += 1
+        }
         lock.unlock()
-        return state
+        return result == 0
+        #else
+        return true
+        #endif
     }
 
     #if os(Linux)
-    private func ownedLinuxProcessGroup(in state: State) -> pid_t? {
-        guard let processGroup = state.processGroup, processGroup > 1 else { return nil }
-        guard Self.processGroupExists(processGroup) else {
-            if state.leaderReaped { forgetProcessGroup(processGroup) }
-            return nil
-        }
-        // Once the original leader is reaped its numeric PID must remain unused
-        // while the orphaned session still owns this group ID. A positive-PID
-        // match therefore means the ID was reused and must never be signaled.
-        if state.leaderReaped, Self.processExists(processGroup) {
-            forgetProcessGroup(processGroup)
-            return nil
-        }
-        return processGroup
+    var testSupervisorProcessID: pid_t {
+        lock.lock(); defer { lock.unlock() }
+        return supervisorPID
     }
 
-    private func forgetProcessGroup(_ expected: pid_t) {
+    var testControlCommandsSent: Int {
+        lock.lock(); defer { lock.unlock() }
+        return controlCommandsSent
+    }
+
+    private func pollSupervisorReap() -> Bool {
         lock.lock()
-        if processGroup == expected { processGroup = nil }
+        if supervisorReaped {
+            lock.unlock()
+            return true
+        }
+        let pid = supervisorPID
         lock.unlock()
-    }
-
-    private static func processGroupExists(_ processGroup: pid_t) -> Bool {
-        if kill(-processGroup, 0) == 0 { return true }
-        return errno == EPERM
-    }
-
-    private static func processExists(_ processID: pid_t) -> Bool {
-        if kill(processID, 0) == 0 { return true }
-        return errno == EPERM
+        guard pid > 1 else { return true }
+        var status: Int32 = 0
+        let result = rp_anchored_process_poll_reap(pid, &status)
+        guard result != 0 else { return false }
+        lock.lock()
+        if !supervisorReaped {
+            supervisorReaped = true
+            if statusDescriptor >= 0 { close(statusDescriptor); statusDescriptor = -1 }
+            if controlDescriptor >= 0 { close(controlDescriptor); controlDescriptor = -1 }
+        }
+        lock.unlock()
+        return true
     }
     #endif
 }
@@ -442,18 +510,16 @@ public struct LocalProjectSourceGitRunner: ProjectSourceGitRunning {
             let output = try FileHandle(forWritingTo: URL(fileURLWithPath: invocation.outputPath))
             defer { try? output.close() }
 
-            let process = Process()
             #if os(Linux)
-            let sessionLauncher = "/usr/bin/setsid"
-            guard manager.isExecutableFile(atPath: sessionLauncher) else {
-                throw ServiceAPIError(code: .capabilityMissing, message: "Git process isolation is unavailable")
-            }
-            process.executableURL = URL(fileURLWithPath: sessionLauncher)
-            process.arguments = [invocation.executable] + invocation.arguments
+            try spawnLinuxSupervisor(
+                invocation,
+                outputDescriptor: output.fileDescriptor,
+                lifecycle: lifecycle
+            )
             #else
+            let process = Process()
             process.executableURL = URL(fileURLWithPath: invocation.executable)
             process.arguments = invocation.arguments
-            #endif
             process.environment = invocation.environment
             process.currentDirectoryURL = URL(fileURLWithPath: invocation.workingDirectory)
             process.standardOutput = output
@@ -463,9 +529,6 @@ public struct LocalProjectSourceGitRunner: ProjectSourceGitRunning {
             do { try process.run() } catch {
                 throw ServiceAPIError(code: .dependencyUnavailable, message: "Git source operation could not start")
             }
-            #if os(Linux)
-            lifecycle.activateProcessGroup(process.processIdentifier)
-            #else
             let processID = process.processIdentifier
             lifecycle.activateProcessGroup(setpgid(processID, processID) == 0 ? processID : nil)
             #endif
@@ -496,6 +559,11 @@ public struct LocalProjectSourceGitRunner: ProjectSourceGitRunning {
                 throw ServiceAPIError(code: .dependencyUnavailable, message: "Git source operation failed")
             }
             let data = try Data(contentsOf: URL(fileURLWithPath: invocation.outputPath), options: [.mappedIfSafe])
+            guard lifecycle.releaseSupervisor(),
+                  await waitForTerminationTargetExit(lifecycle, timeout: .seconds(2))
+            else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "Git process supervisor could not be released")
+            }
             return String(decoding: data, as: UTF8.self)
     }
 
@@ -518,6 +586,62 @@ public struct LocalProjectSourceGitRunner: ProjectSourceGitRunning {
             try? await Task.sleep(for: .milliseconds(25))
         }
         return !lifecycle.terminationTargetExists()
+    }
+
+    #if os(Linux)
+    static func spawnLinuxSupervisor(
+        _ invocation: ProjectSourceGitInvocation,
+        outputDescriptor: Int32,
+        lifecycle: ManagedProjectSourceProcess
+    ) throws {
+        let argumentBlob = try nullTerminatedBlob(invocation.arguments)
+        let environmentBlob = try nullTerminatedBlob(
+            invocation.environment.keys.sorted().map { "\($0)=\(invocation.environment[$0] ?? "")" }
+        )
+        var supervisorPID: pid_t = 0
+        var statusDescriptor: Int32 = -1
+        var controlDescriptor: Int32 = -1
+        let spawnResult = invocation.executable.withCString { executable in
+            invocation.workingDirectory.withCString { workingDirectory in
+                argumentBlob.withUnsafeBytes { arguments in
+                    environmentBlob.withUnsafeBytes { environment in
+                        rp_anchored_process_spawn(
+                            executable,
+                            arguments.bindMemory(to: CChar.self).baseAddress,
+                            arguments.count,
+                            environment.bindMemory(to: CChar.self).baseAddress,
+                            environment.count,
+                            workingDirectory,
+                            outputDescriptor,
+                            &supervisorPID,
+                            &statusDescriptor,
+                            &controlDescriptor
+                        )
+                    }
+                }
+            }
+        }
+        guard spawnResult == 0 else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Git source operation could not start")
+        }
+        lifecycle.activateSupervisor(
+            pid: supervisorPID,
+            statusDescriptor: statusDescriptor,
+            controlDescriptor: controlDescriptor
+        )
+    }
+    #endif
+
+    private static func nullTerminatedBlob(_ values: [String]) throws -> Data {
+        var data = Data()
+        for value in values {
+            guard !value.utf8.contains(0) else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Git invocation contains an invalid value")
+            }
+            data.append(contentsOf: value.utf8)
+            data.append(0)
+        }
+        return data
     }
 
     private static func fileSize(_ path: String) -> Int64 {
