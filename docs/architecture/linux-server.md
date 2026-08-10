@@ -53,7 +53,7 @@ Provider and Git credentials are not accepted through HTTP and are never stored 
 
 ## Image contract
 
-`Dockerfile.server` builds only `RepoPromptServer`, runs it as fixed UID/GID 65532, includes `tini` and `curl`, exposes 9443 only as service metadata, and probes readiness over loopback. Compose must still set read-only root, dropped capabilities, no-new-privileges, resource/PID/log bounds, persistent state/project/worktree/cache volumes, internal networks, and runtime secret mounts.
+`Dockerfile.server` builds only `RepoPromptServer`, runs it as fixed UID/GID 65532, includes `tini` and `curl`, and retains image metadata for both fixed ports: `9443/tcp` is the mTLS internal API and `9080/tcp` is the loopback-only health listener used by the image probe. The `io.degentlemen.repoprompt.port.*` OCI labels make those scopes explicit; deployments must not publish 9080. Compose must still set read-only root, dropped capabilities, no-new-privileges, resource/PID/log bounds, persistent state/project/worktree/cache volumes, internal networks, and runtime secret mounts.
 
 ## Validation
 

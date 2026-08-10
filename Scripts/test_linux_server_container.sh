@@ -47,10 +47,10 @@ openssl req -newkey rsa:2048 -nodes -subj '/CN=repoprompt' -keyout "$temporary/s
 openssl x509 -req -days 1 -in "$temporary/server.csr" -CA "$temporary/ca.crt" -CAkey "$temporary/ca.key" -CAcreateserial -extfile "$temporary/server.ext" -out "$temporary/server.crt" >/dev/null 2>&1
 openssl req -newkey rsa:2048 -nodes -subj '/CN=operator' -keyout "$temporary/operator.key" -out "$temporary/operator.csr" >/dev/null 2>&1
 openssl x509 -req -days 1 -in "$temporary/operator.csr" -CA "$temporary/ca.crt" -CAkey "$temporary/ca.key" -CAcreateserial -extfile "$temporary/operator.ext" -out "$temporary/operator.crt" >/dev/null 2>&1
-printf '%s' 'app-test-secret' >"$temporary/app.hmac"
-printf '%s' 'sync-test-secret' >"$temporary/sync.hmac"
-printf '%s' 'operator-test-secret' >"$temporary/operator.hmac"
-printf '%s' 'event-test-secret' >"$temporary/event.hmac"
+printf '%s' 'app-test-secret-0000000000000000' >"$temporary/app.hmac"
+printf '%s' 'sync-test-secret-000000000000000' >"$temporary/sync.hmac"
+printf '%s' 'operator-test-secret-00000000000' >"$temporary/operator.hmac"
+printf '%s' 'event-test-secret-00000000000000' >"$temporary/event.hmac"
 chmod 0755 "$temporary"
 chmod 0644 "$temporary"/*.crt "$temporary"/*.key "$temporary"/*.hmac
 
@@ -99,6 +99,15 @@ wait_ready() {
 test "$(docker image inspect "$image" --format '{{.Config.User}}')" = '65532:65532'
 test "$(docker image inspect "$image" --format '{{index .Config.Labels "io.degentlemen.repoprompt.schema-version"}}')" = '2'
 test "$(docker image inspect "$image" --format '{{json .Config.ExposedPorts}}')" = '{"9080/tcp":{},"9443/tcp":{}}'
+test "$(docker image inspect "$image" --format '{{index .Config.Labels "io.degentlemen.repoprompt.port.internal-api"}}')" = '9443/tcp;mtls'
+test "$(docker image inspect "$image" --format '{{index .Config.Labels "io.degentlemen.repoprompt.port.health"}}')" = '9080/tcp;loopback-only'
+
+# Exercise the shipped provider binaries as the runtime UID, then prove that a
+# persisted family with an escaped descendant is reconstructed and reaped by a
+# fresh Linux supervision port.
+docker run --rm --entrypoint /bin/sh "$image" -c \
+  'codex --version | grep -F "0.147.0" && claude --version | grep -F "2.1.226" && opencode --version | grep -F "1.15.11" && cursor-agent --version | grep -F "2026.08.04-aaa8809"' >/dev/null
+docker run --rm --init --entrypoint /usr/local/bin/RepoPromptServer "$image" process-family-smoke | grep -F 'process-family smoke passed' >/dev/null
 
 run_container
 wait_ready
@@ -106,6 +115,31 @@ wait_ready
 test "$(docker exec "$container" id -u)" = '65532'
 test "$(docker exec "$container" curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --resolve repoprompt:9443:127.0.0.1 --cacert /run/repoprompt/trust/ca.crt https://repoprompt:9443/internal/v1/diagnostics || true)" = '000'
 test "$(docker exec "$container" curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --resolve repoprompt:9443:127.0.0.1 --cacert /run/repoprompt/trust/ca.crt --cert /run/repoprompt/trust/operator.crt --key /run/repoprompt/trust/operator.key https://repoprompt:9443/internal/v1/diagnostics)" = '401'
+
+# Canonical x-internal request authentication and exact-byte response signing
+# are exercised through the real mTLS listener, not only by unit tests.
+request_path='/internal/v1/diagnostics'
+request_timestamp="$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))')"
+request_nonce='Y29udGFpbmVyLWF1ZGl0LTE'
+empty_digest="$(printf '' | openssl dgst -sha256 | awk '{print $2}')"
+request_key_id='repoprompt-operator-v1'
+request_canonical="$(printf 'GET\n%s\n%s\n%s\n%s\n%s\n%s' "$request_path" "$request_timestamp" "$request_nonce" "$empty_digest" "$empty_digest" "$request_key_id")"
+request_signature="$(printf '%s' "$request_canonical" | openssl dgst -sha256 -hmac 'operator-test-secret-00000000000' | awk '{print $2}')"
+response_wire="$(docker exec "$container" curl --noproxy '*' -sS -o /tmp/diagnostics.json \
+  -w '%{http_code}|%header{x-internal-body-digest}|%header{x-internal-timestamp}|%header{x-internal-nonce}|%header{x-internal-key-id}|%header{x-internal-signature}' \
+  --resolve repoprompt:9443:127.0.0.1 --cacert /run/repoprompt/trust/ca.crt \
+  --cert /run/repoprompt/trust/operator.crt --key /run/repoprompt/trust/operator.key \
+  -H "x-internal-key-id: $request_key_id" -H "x-internal-timestamp: $request_timestamp" \
+  -H "x-internal-nonce: $request_nonce" -H "x-internal-body-digest: $empty_digest" \
+  -H "x-internal-authorization-digest: $empty_digest" -H "x-internal-signature: $request_signature" \
+  "https://repoprompt:9443$request_path")"
+IFS='|' read -r response_status response_digest response_timestamp response_nonce response_key_id response_signature <<<"$response_wire"
+test "$response_status" = '200'
+test "$response_key_id" = 'repoprompt-event-v1'
+response_body="$(docker exec "$container" cat /tmp/diagnostics.json)"
+test "$response_digest" = "$(printf '%s' "$response_body" | openssl dgst -sha256 | awk '{print $2}')"
+response_canonical="$(printf 'RESPONSE\n%s#200\n%s\n%s\n%s\n%s\n%s' "$request_path" "$response_timestamp" "$response_nonce" "$response_digest" "$empty_digest" "$response_key_id")"
+test "$response_signature" = "$(printf '%s' "$response_canonical" | openssl dgst -sha256 -hmac 'event-test-secret-00000000000000' | awk '{print $2}')"
 
 # An unclean stop must leave a restartable durable store.
 docker kill -s KILL "$container" >/dev/null
