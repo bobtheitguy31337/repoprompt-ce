@@ -20,6 +20,7 @@ on:
       - Tests/RepoPromptServerTests/**
       - Tests/RepoPromptDomainRuntimeTests/**
       - .github/workflows/linux-server.yml
+      - Scripts/test_linux_server_container.sh
   push:
     branches: [main]
 
@@ -64,7 +65,7 @@ jobs:
           test "$(docker image inspect repoprompt-server:test --format '{{index .Config.Labels "org.opencontainers.image.title"}}')" = "RepoPromptServer"
           test "$(docker image inspect repoprompt-server:test --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
           test "$(docker image inspect repoprompt-server:test --format '{{index .Config.Labels "io.degentlemen.repoprompt.protocol-version"}}')" = "1"
-          test "$(docker image inspect repoprompt-server:test --format '{{index .Config.Labels "io.degentlemen.repoprompt.schema-version"}}')" = "1"
+          test "$(docker image inspect repoprompt-server:test --format '{{index .Config.Labels "io.degentlemen.repoprompt.schema-version"}}')" = "2"
           test "$(docker image inspect repoprompt-server:test --format '{{json .Config.ExposedPorts}}')" = '{"9080/tcp":{},"9443/tcp":{}}'
           docker run --rm --entrypoint /bin/sh repoprompt-server:test -c '
             test "$(id -u)" = 65532 &&
@@ -73,3 +74,7 @@ jobs:
             /opt/repoprompt/providers/claude --version | grep -F 2.1.226 &&
             /opt/repoprompt/providers/opencode --version | grep -F 1.15.11 &&
             /opt/repoprompt/providers/cursor-agent --version | grep -F 2026.08.04-aaa8809'
+      - name: Run non-root mTLS, readiness, restart, shutdown, and cleanup checks
+        env:
+          REPOPROMPT_SERVER_IMAGE: repoprompt-server:test
+        run: Scripts/test_linux_server_container.sh
