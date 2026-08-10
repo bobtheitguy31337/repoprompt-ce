@@ -172,6 +172,13 @@ public actor RepoPromptHeadlessAuthority {
     }
 
     public func createSession(input: CreateSessionInput, externalActor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> SessionSnapshot {
+        guard input.parentSessionID == nil else {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Child sessions must be created through the authority-managed agent lifecycle")
+        }
+        return try await createAuthoritySession(input: input, externalActor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
+    }
+
+    private func createAuthoritySession(input: CreateSessionInput, externalActor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> SessionSnapshot {
         try ensureWritable()
         let idempotency = IdempotencyInput(actorID: externalActor.goblinUserID, operation: "startSession", key: idempotencyKey, requestDigest: requestDigest)
         if let existing = try await store.idempotencyResult(idempotency) {
@@ -224,7 +231,7 @@ public actor RepoPromptHeadlessAuthority {
         guard let parentAuthority = sessions[parentSessionID] else { throw ServiceAPIError(code: .notFound, message: "Parent session not found") }
         let parent = await parentAuthority.snapshot()
         guard !cancellationBarriers.contains(parent.rootSessionID) else { throw ServiceAPIError(code: .quiescing, message: "Root session is canceling; new children are fenced") }
-        let child = try await createSession(input: CreateSessionInput(projectID: parent.projectID, parentSessionID: parentSessionID, provider: provider ?? parent.provider, model: model ?? parent.model, visibility: parent.visibility, initialPrompt: initialPrompt), externalActor: parent.creator, idempotencyKey: "agent-manage:\(ids.next().uuidString)", requestDigest: CanonicalSigning.bodyDigest(Data(initialPrompt.utf8)))
+        let child = try await createAuthoritySession(input: CreateSessionInput(projectID: parent.projectID, parentSessionID: parentSessionID, provider: provider ?? parent.provider, model: model ?? parent.model, visibility: parent.visibility, initialPrompt: initialPrompt), externalActor: parent.creator, idempotencyKey: "agent-manage:\(ids.next().uuidString)", requestDigest: CanonicalSigning.bodyDigest(Data(initialPrompt.utf8)))
         if var agent = agents[child.sessionID] {
             agent = AgentSnapshot(agentID: agent.agentID, sessionID: agent.sessionID, rootSessionID: agent.rootSessionID, parentAgentID: agent.parentAgentID, providerNativeIdentity: agent.providerNativeIdentity, role: role, label: label, state: agent.state, revision: agent.revision + 1)
             let agentEvent = try await store.persistAgent(agent, projectID: child.projectID, actor: nil, correlationID: ids.next(), eventType: .agentUpdated)
@@ -364,6 +371,9 @@ public actor RepoPromptHeadlessAuthority {
             return try await commandReceipt(command: command, sessionID: sessionID)
         case let .mergeWorktree(bindingID, strategy, expectedRevision):
             _ = try await mergeWorktree(sessionID: sessionID, bindingID: bindingID, strategy: strategy, expectedRevision: expectedRevision, actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
+            return try await commandReceipt(command: command, sessionID: sessionID)
+        case let .abortConflictedMerge(bindingID, leaseID, expectedRevision):
+            _ = try await abortConflictedMerge(sessionID: sessionID, bindingID: bindingID, leaseID: leaseID, expectedRevision: expectedRevision, actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
             return try await commandReceipt(command: command, sessionID: sessionID)
         case .retrySession:
             return try await startProviderRun(command: command, sessionID: sessionID, session: session, actor: externalActor, idempotency: idempotency)
@@ -782,6 +792,27 @@ public actor RepoPromptHeadlessAuthority {
         let event = try await store.persistWorktree(merged, actor: actor, correlationID: ids.next(), idempotency: idempotency)
         await eventHub.publish(event)
         return merged
+    }
+
+    public func abortConflictedMerge(sessionID: UUID, bindingID: UUID, leaseID: UUID, expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> WorktreeBindingSnapshot {
+        let idempotency = try mutationIdempotency(actor: actor, operation: "abortConflictedMerge", key: idempotencyKey, digest: requestDigest)
+        if let idempotency, let prior: WorktreeBindingSnapshot = try await priorResult(idempotency) { return prior }
+        guard let worktreeService else { throw ServiceAPIError(code: .capabilityMissing, message: "Worktree storage is not configured") }
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        guard let binding = try await store.worktree(bindingID: bindingID), binding.projectID == session.projectID, binding.sessionID == sessionID else {
+            throw ServiceAPIError(code: .notFound, message: "Worktree binding not found")
+        }
+        guard binding.revision == expectedRevision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Worktree revision is stale", currentRevision: binding.revision)
+        }
+        let project = try await projectSnapshot(projectID: session.projectID)
+        guard let root = project.roots.first(where: { $0.rootID == binding.rootID }) else {
+            throw ServiceAPIError(code: .rootUnauthorized, message: "Unknown project root")
+        }
+        let recovered = try await worktreeService.abortConflictedMerge(binding, targetPath: root.canonicalPath, leaseID: leaseID)
+        let event = try await store.persistWorktree(recovered, actor: actor, correlationID: ids.next(), idempotency: idempotency)
+        await eventHub.publish(event)
+        return recovered
     }
 
     public func artifactSnapshots(sessionID: UUID) async throws -> [ArtifactSnapshot] {

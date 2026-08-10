@@ -156,18 +156,20 @@ public enum RepoPromptServerRunner {
             baseDirectory: configuration.artifactDirectory,
             resources: store
         )
+        let processOutput = URL(fileURLWithPath: stateDirectory).appendingPathComponent("provider-output").path
+        try FileManager.default.createDirectory(atPath: processOutput, withIntermediateDirectories: true)
         let reconciler = OwnedResourceReconciliationService(
             repository: store,
             artifactRoot: configuration.artifactDirectory,
             worktreeRoot: configuration.worktreeDirectory,
-            providerHomeRoot: configuration.providerHomeDirectory
+            providerHomeRoot: configuration.providerHomeDirectory,
+            providerOutputRoot: processOutput
         )
         _ = await reconciler.reconcileStartup()
         let durabilityOperations = DurabilityOperationsService(store: store, reconciler: reconciler)
         _ = await durabilityOperations.runOnce()
 
         let processPort = try PortableProcessSupervisionPort()
-        let processOutput = URL(fileURLWithPath: stateDirectory).appendingPathComponent("provider-output").path
         let providerConfigurations = configuration.providerExecutables.map { kind, executable in
             ProviderCLIConfiguration(
                 kind: kind,

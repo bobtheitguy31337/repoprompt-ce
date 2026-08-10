@@ -11,10 +11,12 @@ final class ResourceReconciliationTests: XCTestCase {
         let worktrees = directory.appendingPathComponent("worktrees", isDirectory: true)
         let source = directory.appendingPathComponent("source", isDirectory: true)
         let providerHomes = directory.appendingPathComponent("provider-homes", isDirectory: true)
+        let providerOutput = directory.appendingPathComponent("provider-output", isDirectory: true)
         try FileManager.default.createDirectory(at: artifacts, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: worktrees, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: providerHomes, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: providerOutput, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let artifactPath = artifacts.appendingPathComponent("owned.bin")
@@ -26,6 +28,10 @@ final class ResourceReconciliationTests: XCTestCase {
         try FileManager.default.createDirectory(at: worktreePath, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: providerHomePath, withIntermediateDirectories: true)
         try Data("credential".utf8).write(to: providerHomePath.appendingPathComponent("auth.json"))
+        let providerStdout = providerOutput.appendingPathComponent("expired.stdout")
+        let providerStderr = providerOutput.appendingPathComponent("expired.stderr")
+        try Data("out".utf8).write(to: providerStdout)
+        try Data("err".utf8).write(to: providerStderr)
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let deadline = Date().addingTimeInterval(15 * 60)
@@ -53,23 +59,35 @@ final class ResourceReconciliationTests: XCTestCase {
             lifecycleState: .cleanupPending,
             retentionDeadline: deadline
         )
+        let providerCapture = OwnedResourceRecord(
+            kind: .providerOutput,
+            externalID: UUID(),
+            internalPathIdentity: providerStdout.path,
+            temporaryPathIdentity: providerStderr.path,
+            lifecycleState: .cleanupPending,
+            retentionDeadline: deadline
+        )
         try await store.reserveOwnedResource(artifact)
         try await store.reserveOwnedResource(worktree)
         try await store.reserveOwnedResource(providerHome)
+        try await store.reserveOwnedResource(providerCapture)
         let reconciler = OwnedResourceReconciliationService(
             repository: store,
             artifactRoot: artifacts.path,
             worktreeRoot: worktrees.path,
             providerHomeRoot: providerHomes.path,
+            providerOutputRoot: providerOutput.path,
             runner: DirtyWorktreeRunner()
         )
         let report = await reconciler.reconcileStartup()
-        XCTAssertEqual(report.deleted, 2)
+        XCTAssertEqual(report.deleted, 3)
         XCTAssertFalse(FileManager.default.fileExists(atPath: artifactPath.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: unknownPath.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: worktreePath.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: providerHomePath.path))
-        let persistedWorktree = try await store.ownedResource(externalID: try XCTUnwrap(worktree.externalID), kind: .worktree)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: providerStdout.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: providerStderr.path))
+        let persistedWorktree = try await store.ownedResource(externalID: XCTUnwrap(worktree.externalID), kind: .worktree)
         XCTAssertEqual(persistedWorktree?.lifecycleState, .quarantined)
         try await store.close()
     }

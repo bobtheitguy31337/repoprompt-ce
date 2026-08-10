@@ -43,6 +43,11 @@ enum NativeProviderRuntimeFactory {
 }
 
 private struct NativeProviderProcessSupport {
+    private struct PreparedHome {
+        let url: URL
+        let resources: [OwnedResourceRecord]
+    }
+
     let configuration: ProviderCLIConfiguration
     let processPort: PortableProcessSupervisionPort
     let processStore: SQLiteServiceStore?
@@ -85,20 +90,38 @@ private struct NativeProviderProcessSupport {
     }
 
     func makeSession(runID: UUID, arguments: [String], workingDirectory: String) async throws -> NativeJSONLineProcess {
-        let home = try prepareEphemeralHome(runID: runID)
-        let environment = providerEnvironment(home: home, workingDirectory: workingDirectory)
+        let preparedHome = try await prepareEphemeralHome(runID: runID)
+        let environment = providerEnvironment(home: preparedHome.url, workingDirectory: workingDirectory)
         let supervisor = ProviderProcessSupervisor(processPort: processPort, store: processStore)
-        return try await NativeJSONLineProcess.launch(
-            runID: runID,
-            executable: configuration.executable,
-            arguments: arguments,
-            environment: environment,
-            workingDirectory: workingDirectory,
-            home: home,
-            processPort: processPort,
-            supervisor: supervisor,
-            outputDirectory: outputDirectory
-        )
+        do {
+            return try await NativeJSONLineProcess.launch(
+                runID: runID,
+                executable: configuration.executable,
+                arguments: arguments,
+                environment: environment,
+                workingDirectory: workingDirectory,
+                home: preparedHome.url,
+                processPort: processPort,
+                supervisor: supervisor,
+                outputDirectory: outputDirectory,
+                resourceRepository: processStore,
+                homeResources: preparedHome.resources
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: preparedHome.url)
+            for resource in preparedHome.resources {
+                let remains = FileManager.default.fileExists(atPath: resource.internalPathIdentity)
+                _ = try? await processStore?.transitionOwnedResource(
+                    resourceID: resource.resourceID,
+                    expectedStates: [.active, .prepared, .preparing],
+                    to: remains ? .quarantined : .deleted,
+                    observedBytes: nil,
+                    contentDigest: nil,
+                    cleanupError: remains ? "provider_launch_cleanup_incomplete" : nil
+                )
+            }
+            throw error
+        }
     }
 
     func recover() async throws {
@@ -129,24 +152,73 @@ private struct NativeProviderProcessSupport {
         return environment
     }
 
-    private func prepareEphemeralHome(runID: UUID) throws -> URL {
+    private func prepareEphemeralHome(runID: UUID) async throws -> PreparedHome {
         let root = URL(fileURLWithPath: ephemeralHomeRoot, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let home = root.appendingPathComponent(runID.uuidString, isDirectory: true)
         if FileManager.default.fileExists(atPath: home.path) { try FileManager.default.removeItem(at: home) }
+        var records: [OwnedResourceRecord] = []
+        let homeRecord = OwnedResourceRecord(
+            kind: .providerHome,
+            runID: runID,
+            externalID: UUID(),
+            internalPathIdentity: home.path,
+            lifecycleState: .preparing,
+            metadata: ["provider": configuration.kind.rawValue],
+            retentionDeadline: Date()
+        )
+        try await processStore?.reserveOwnedResource(homeRecord)
+        records.append(homeRecord)
+        do {
+            try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            for child in [".config", ".cache", ".codex", ".claude"] {
+                try FileManager.default.createDirectory(at: home.appendingPathComponent(child, isDirectory: true), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            }
+        } catch {
+            _ = try? await processStore?.transitionOwnedResource(resourceID: homeRecord.resourceID, expectedStates: [.preparing], to: .failed, observedBytes: nil, contentDigest: nil, cleanupError: "provider_home_create_failed")
+            throw error
+        }
+
         if let sourcePath = configuration.credentialSourceDirectory {
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: sourcePath, isDirectory: &isDirectory), isDirectory.boolValue else {
+                try? FileManager.default.removeItem(at: home)
+                _ = try? await processStore?.transitionOwnedResource(resourceID: homeRecord.resourceID, expectedStates: [.preparing], to: .failed, observedBytes: nil, contentDigest: nil, cleanupError: "credential_source_unavailable")
                 throw ServiceAPIError(code: .dependencyUnavailable, message: "Configured provider credential source is unavailable")
             }
-            try FileManager.default.copyItem(at: URL(fileURLWithPath: sourcePath, isDirectory: true), to: home)
-        } else {
-            try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            let credentialDestination: URL = switch configuration.kind {
+            case .codex: home.appendingPathComponent(".codex", isDirectory: true)
+            case .claudeCompatible: home.appendingPathComponent(".claude", isDirectory: true)
+            case .openCodeACP, .cursorACP: home.appendingPathComponent(".config", isDirectory: true)
+            case .headlessAdapter, .mcp: home.appendingPathComponent(".credentials", isDirectory: true)
+            }
+            let credentialRecord = OwnedResourceRecord(
+                kind: .providerCredentialCopy,
+                runID: runID,
+                externalID: UUID(),
+                internalPathIdentity: credentialDestination.path,
+                lifecycleState: .preparing,
+                metadata: ["provider": configuration.kind.rawValue],
+                retentionDeadline: Date()
+            )
+            try await processStore?.reserveOwnedResource(credentialRecord)
+            records.append(credentialRecord)
+            do {
+                try FileManager.default.removeItem(at: credentialDestination)
+                try FileManager.default.copyItem(at: URL(fileURLWithPath: sourcePath, isDirectory: true), to: credentialDestination)
+            } catch {
+                try? FileManager.default.removeItem(at: home)
+                for record in records {
+                    _ = try? await processStore?.transitionOwnedResource(resourceID: record.resourceID, expectedStates: [.preparing], to: .failed, observedBytes: nil, contentDigest: nil, cleanupError: "credential_copy_failed")
+                }
+                throw error
+            }
         }
-        for child in [".config", ".cache", ".codex", ".claude"] {
-            try FileManager.default.createDirectory(at: home.appendingPathComponent(child, isDirectory: true), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        var activated: [OwnedResourceRecord] = []
+        for record in records {
+            try await activated.append(processStore?.transitionOwnedResource(resourceID: record.resourceID, expectedStates: [.preparing], to: .active, observedBytes: nil, contentDigest: nil, cleanupError: nil) ?? record.replacing(lifecycleState: .active))
         }
-        return home
+        return PreparedHome(url: home, resources: activated)
     }
 }
 
@@ -156,30 +228,74 @@ private actor NativeJSONLineProcess {
     private let home: URL
     private let processPort: PortableProcessSupervisionPort
     private let supervisor: ProviderProcessSupervisor
+    private let resourceRepository: (any OwnedResourceRepository)?
+    private let ownedResources: [OwnedResourceRecord]
     private var offset = 0
     private var buffer = Data()
     private var nextRequestID = 1
     private var finished = false
 
-    private init(runID: UUID, captured: PortableProcessSupervisionPort.CapturedProcess, home: URL, processPort: PortableProcessSupervisionPort, supervisor: ProviderProcessSupervisor) {
+    private init(runID: UUID, captured: PortableProcessSupervisionPort.CapturedProcess, home: URL, processPort: PortableProcessSupervisionPort, supervisor: ProviderProcessSupervisor, resourceRepository: (any OwnedResourceRepository)?, ownedResources: [OwnedResourceRecord]) {
         self.runID = runID
         self.captured = captured
         self.home = home
         self.processPort = processPort
         self.supervisor = supervisor
+        self.resourceRepository = resourceRepository
+        self.ownedResources = ownedResources
     }
 
-    static func launch(runID: UUID, executable: String, arguments: [String], environment: [String: String], workingDirectory: String, home: URL, processPort: PortableProcessSupervisionPort, supervisor: ProviderProcessSupervisor, outputDirectory: String) async throws -> NativeJSONLineProcess {
-        let captured = try await processPort.launchInteractiveCaptured(
-            executable: executable,
-            arguments: arguments,
-            environment: environment,
-            workingDirectory: workingDirectory,
-            helperToken: runID.uuidString,
-            outputDirectory: outputDirectory
+    static func launch(runID: UUID, executable: String, arguments: [String], environment: [String: String], workingDirectory: String, home: URL, processPort: PortableProcessSupervisionPort, supervisor: ProviderProcessSupervisor, outputDirectory: String, resourceRepository: (any OwnedResourceRepository)?, homeResources: [OwnedResourceRecord]) async throws -> NativeJSONLineProcess {
+        let captureID = UUID()
+        let outputRoot = URL(fileURLWithPath: outputDirectory, isDirectory: true)
+        let outputRecord = OwnedResourceRecord(
+            kind: .providerOutput,
+            runID: runID,
+            externalID: captureID,
+            internalPathIdentity: outputRoot.appendingPathComponent("\(captureID.uuidString).stdout").path,
+            temporaryPathIdentity: outputRoot.appendingPathComponent("\(captureID.uuidString).stderr").path,
+            lifecycleState: .preparing,
+            metadata: ["transport": "stdio"],
+            retentionDeadline: Date()
         )
-        try await supervisor.register(runID: runID, leader: captured.identity)
-        return NativeJSONLineProcess(runID: runID, captured: captured, home: home, processPort: processPort, supervisor: supervisor)
+        try await resourceRepository?.reserveOwnedResource(outputRecord)
+        var capturedProcess: PortableProcessSupervisionPort.CapturedProcess?
+        do {
+            let captured = try await processPort.launchInteractiveCaptured(
+                executable: executable,
+                arguments: arguments,
+                environment: environment,
+                workingDirectory: workingDirectory,
+                helperToken: runID.uuidString,
+                outputDirectory: outputDirectory,
+                captureID: captureID
+            )
+            capturedProcess = captured
+            try await supervisor.register(runID: runID, leader: captured.identity)
+            let activeOutput = try await resourceRepository?.transitionOwnedResource(resourceID: outputRecord.resourceID, expectedStates: [.preparing], to: .active, observedBytes: 0, contentDigest: nil, cleanupError: nil) ?? outputRecord.replacing(lifecycleState: .active, observedBytes: 0)
+            return NativeJSONLineProcess(runID: runID, captured: captured, home: home, processPort: processPort, supervisor: supervisor, resourceRepository: resourceRepository, ownedResources: homeResources + [activeOutput])
+        } catch {
+            if let capturedProcess {
+                try? await supervisor.cancel(runID: runID, graceScans: 5)
+                await processPort.cleanupCapturedFiles(capturedProcess)
+            } else {
+                for path in [outputRecord.internalPathIdentity, outputRecord.temporaryPathIdentity].compactMap(\.self) {
+                    try? FileManager.default.removeItem(atPath: path)
+                }
+            }
+            let remains = [outputRecord.internalPathIdentity, outputRecord.temporaryPathIdentity].compactMap(\.self).contains {
+                FileManager.default.fileExists(atPath: $0)
+            }
+            _ = try? await resourceRepository?.transitionOwnedResource(
+                resourceID: outputRecord.resourceID,
+                expectedStates: [.preparing, .active],
+                to: remains ? .quarantined : .deleted,
+                observedBytes: nil,
+                contentDigest: nil,
+                cleanupError: remains ? "provider_output_launch_cleanup_incomplete" : nil
+            )
+            throw error
+        }
     }
 
     func notify(method: String, params: [String: Any]? = nil) async throws {
@@ -284,8 +400,40 @@ private actor NativeJSONLineProcess {
     private func cleanup() async {
         guard !finished else { return }
         finished = true
+        for resource in ownedResources {
+            _ = try? await resourceRepository?.transitionOwnedResource(
+                resourceID: resource.resourceID,
+                expectedStates: [.preparing, .prepared, .active, .quarantined],
+                to: .cleanupPending,
+                observedBytes: observedBytes(for: resource),
+                contentDigest: nil,
+                cleanupError: nil
+            )
+        }
         await processPort.cleanupCapturedFiles(captured)
         try? FileManager.default.removeItem(at: home)
+        for resource in ownedResources {
+            let remains = resourcePaths(resource).contains { FileManager.default.fileExists(atPath: $0) }
+            _ = try? await resourceRepository?.transitionOwnedResource(
+                resourceID: resource.resourceID,
+                expectedStates: [.cleanupPending],
+                to: remains ? .quarantined : .deleted,
+                observedBytes: observedBytes(for: resource),
+                contentDigest: nil,
+                cleanupError: remains ? "provider_resource_cleanup_incomplete" : nil
+            )
+        }
+    }
+
+    private func resourcePaths(_ resource: OwnedResourceRecord) -> [String] {
+        [resource.internalPathIdentity, resource.temporaryPathIdentity].compactMap(\.self)
+    }
+
+    private func observedBytes(for resource: OwnedResourceRecord) -> Int64? {
+        let sizes = resourcePaths(resource).compactMap { path in
+            (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value
+        }
+        return sizes.isEmpty ? nil : sizes.reduce(0, +)
     }
 }
 

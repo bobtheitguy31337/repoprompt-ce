@@ -744,6 +744,20 @@ private actor AuthorityToolBackend {
                 expectedRevision: arguments["expected_revision"]?.intValue.map(Int64.init) ?? worktree.revision,
                 actor: binding.actor
             ))
+        case "abort":
+            guard let bindingID = arguments["binding_id"]?.stringValue.flatMap(UUID.init(uuidString:)),
+                  let leaseID = arguments["lease_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+            else {
+                throw ServiceAPIError(code: .invalidRequest, message: "abort requires binding_id and lease_id")
+            }
+            let worktree = try await authority.worktreeSnapshot(projectID: session.projectID, bindingID: bindingID)
+            return try await value(authority.abortConflictedMerge(
+                sessionID: binding.sessionID,
+                bindingID: bindingID,
+                leaseID: leaseID,
+                expectedRevision: arguments["expected_revision"]?.intValue.map(Int64.init) ?? worktree.revision,
+                actor: binding.actor
+            ))
         default:
             throw ServiceAPIError(code: .invalidRequest, message: "Unsupported worktree operation")
         }

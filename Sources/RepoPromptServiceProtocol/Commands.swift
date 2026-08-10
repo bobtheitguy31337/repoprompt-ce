@@ -71,6 +71,7 @@ public enum SessionCommand: Codable, Sendable {
     case createWorktree(rootID: UUID, baseRef: String, branchName: String)
     case bindWorktree(bindingID: UUID, expectedRevision: Int64)
     case mergeWorktree(bindingID: UUID, strategy: String, expectedRevision: Int64)
+    case abortConflictedMerge(bindingID: UUID, leaseID: UUID, expectedRevision: Int64)
     case archiveSession(expectedRevision: Int64)
 
     public var operation: String {
@@ -90,6 +91,7 @@ public enum SessionCommand: Codable, Sendable {
         case .createWorktree: "createWorktree"
         case .bindWorktree: "bindWorktree"
         case .mergeWorktree: "mergeWorktree"
+        case .abortConflictedMerge: "abortConflictedMerge"
         case .archiveSession: "archiveSession"
         }
     }

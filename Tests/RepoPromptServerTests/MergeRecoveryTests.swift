@@ -1,10 +1,79 @@
 import Foundation
+import RepoPromptHeadlessRuntime
 import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 final class MergeRecoveryTests: XCTestCase {
+    func testAuthorityRoutesFencedConflictedMergeAbort() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let target = directory.appendingPathComponent("target", isDirectory: true)
+        let owned = directory.appendingPathComponent("owned", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: owned, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        addTeardownBlock { try await store.close() }
+        let actor = ExternalActor(goblinUserID: "owner", username: "owner", displayName: "Owner")
+        let service = try WorktreeRuntimeService(baseDirectory: owned.path, runner: ConflictingMergeRunner(preMergeHead: "abc123"), resources: store)
+        let authority = RepoPromptHeadlessAuthority(store: store, worktreeService: service)
+        let project = try await authority.createProject(
+            input: .init(name: "Project", roots: [.init(logicalName: "source", path: target.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "project",
+            requestDigest: "project"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "session",
+            requestDigest: "session"
+        )
+        let rootID = try XCTUnwrap(project.roots.first?.rootID)
+        let binding = WorktreeBindingSnapshot(
+            bindingID: UUID(),
+            projectID: project.projectID,
+            rootID: rootID,
+            sessionID: session.sessionID,
+            baseRef: "main",
+            branch: "feature",
+            physicalPath: owned.appendingPathComponent("binding").path,
+            ownershipState: .active,
+            mergeState: .clean,
+            revision: 1
+        )
+        _ = try await store.persistWorktree(binding, actor: actor, correlationID: UUID())
+        do {
+            _ = try await authority.execute(
+                command: .mergeWorktree(bindingID: binding.bindingID, strategy: "merge", expectedRevision: 1),
+                sessionID: session.sessionID,
+                externalActor: actor,
+                idempotencyKey: "merge",
+                requestDigest: "merge"
+            )
+            XCTFail("expected merge conflict")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .worktreeConflict)
+        }
+        let activeLeases = try await store.worktreeMergeLeases(nonterminalOnly: true)
+        let lease = try XCTUnwrap(activeLeases.first)
+        let receipt = try await authority.execute(
+            command: .abortConflictedMerge(bindingID: binding.bindingID, leaseID: lease.leaseID, expectedRevision: 1),
+            sessionID: session.sessionID,
+            externalActor: actor,
+            idempotencyKey: "abort",
+            requestDigest: "abort"
+        )
+        XCTAssertEqual(receipt.operation, "abortConflictedMerge")
+        let recovered = try await authority.worktreeSnapshot(projectID: project.projectID, bindingID: binding.bindingID)
+        XCTAssertEqual(recovered.mergeState, .clean)
+        XCTAssertEqual(recovered.revision, 2)
+        let allLeases = try await store.worktreeMergeLeases(nonterminalOnly: false)
+        XCTAssertEqual(allLeases.first?.state, .aborted)
+    }
+
     func testMergeConflictLeasePublishesArtifactAndSupportsVerifiedAbortRecovery() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let target = directory.appendingPathComponent("target", isDirectory: true)
@@ -65,9 +134,10 @@ private actor ConflictingMergeRunner: WorkspaceCommandRunning {
     func run(
         executable _: String,
         arguments: [String],
-        workingDirectory _: String,
+        workingDirectory: String,
         maximumBytes _: Int
     ) async throws -> String {
+        if arguments.contains("--show-toplevel") { return workingDirectory }
         if arguments.suffix(2) == ["rev-parse", "HEAD"] { return preMergeHead }
         if arguments.contains("--abort") { return "" }
         if arguments.contains("merge") {

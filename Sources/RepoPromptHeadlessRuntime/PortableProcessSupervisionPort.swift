@@ -63,9 +63,9 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
 
     /// Launches a bidirectional provider protocol while retaining the same
     /// subreaper/process-family identity and captured-output guarantees.
-    public func launchInteractiveCaptured(executable: String, arguments: [String], environment: [String: String], workingDirectory: String, helperToken: String, outputDirectory: String) async throws -> CapturedProcess {
+    public func launchInteractiveCaptured(executable: String, arguments: [String], environment: [String: String], workingDirectory: String, helperToken: String, outputDirectory: String, captureID: UUID = UUID()) async throws -> CapturedProcess {
         try FileManager.default.createDirectory(atPath: outputDirectory, withIntermediateDirectories: true)
-        let id = UUID().uuidString
+        let id = captureID.uuidString
         let stdoutPath = URL(fileURLWithPath: outputDirectory).appendingPathComponent("\(id).stdout").path
         let stderrPath = URL(fileURLWithPath: outputDirectory).appendingPathComponent("\(id).stderr").path
         FileManager.default.createFile(atPath: stdoutPath, contents: nil)

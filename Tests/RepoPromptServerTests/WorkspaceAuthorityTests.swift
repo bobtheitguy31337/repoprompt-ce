@@ -143,10 +143,16 @@ final class WorkspaceAuthorityTests: XCTestCase {
         let parent = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "parent", requestDigest: "parent")
         let parentSelection = try await authority.selectionSnapshot(sessionID: parent.sessionID)
         XCTAssertEqual(parentSelection.entries, [entry])
-        let child = try await authority.createSession(input: .init(projectID: project.projectID, parentSessionID: parent.sessionID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "child", requestDigest: "child")
+        let child = try await authority.spawnChildSession(parentSessionID: parent.sessionID, initialPrompt: "child")
         let childSelection = try await authority.selectionSnapshot(sessionID: child.sessionID)
         XCTAssertEqual(childSelection.entries, [entry])
         XCTAssertEqual(child.rootSessionID, parent.sessionID)
+        do {
+            _ = try await authority.createSession(input: .init(projectID: project.projectID, parentSessionID: parent.sessionID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "external-child", requestDigest: "external-child")
+            XCTFail("expected public child-session rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .authorizationDecisionRejected)
+        }
         try await store.close()
     }
 

@@ -24,6 +24,7 @@ public actor OwnedResourceReconciliationService {
     private let artifactRoot: String
     private let worktreeRoot: String
     private let providerHomeRoot: String?
+    private let providerOutputRoot: String?
     private let runner: any WorkspaceCommandRunning
     private let gitExecutable: String
 
@@ -32,6 +33,7 @@ public actor OwnedResourceReconciliationService {
         artifactRoot: String,
         worktreeRoot: String,
         providerHomeRoot: String? = nil,
+        providerOutputRoot: String? = nil,
         runner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(),
         gitExecutable: String = "/usr/bin/git"
     ) {
@@ -39,6 +41,7 @@ public actor OwnedResourceReconciliationService {
         self.artifactRoot = URL(fileURLWithPath: artifactRoot).standardizedFileURL.path
         self.worktreeRoot = URL(fileURLWithPath: worktreeRoot).standardizedFileURL.path
         self.providerHomeRoot = providerHomeRoot.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        self.providerOutputRoot = providerOutputRoot.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
         self.runner = runner
         self.gitExecutable = gitExecutable
     }
@@ -96,7 +99,7 @@ public actor OwnedResourceReconciliationService {
                 )
             }
         }
-        let leases = (try? await repository.worktreeMergeLeases(nonterminalOnly: true)) ?? []
+        let leases = await (try? repository.worktreeMergeLeases(nonterminalOnly: true)) ?? []
         for lease in leases where lease.expiresAt <= now && lease.state != .conflicted {
             do {
                 _ = try await repository.transitionWorktreeMergeLease(
@@ -121,13 +124,13 @@ public actor OwnedResourceReconciliationService {
         recoverInterruptedPreparation: Bool
     ) async throws -> OwnedResourceLifecycleState {
         let manager = FileManager.default
-        let exists = manager.fileExists(atPath: record.internalPathIdentity)
+        let exists = resourcePaths(record).contains { manager.fileExists(atPath: $0) }
         switch record.lifecycleState {
         case .preparing:
             if exists {
                 if record.kind == .artifact, artifactMatches(record) { return .prepared }
                 if record.kind == .worktree, try await worktreeMatches(record) { return .prepared }
-                if isProviderHomeResource(record), providerResourceIsSafe(record) { return .prepared }
+                if isProviderResource(record), providerResourceIsSafe(record) { return .prepared }
                 return .quarantined
             }
             if recoverInterruptedPreparation || record.retentionDeadline.map({ $0 <= now }) == true { return .failed }
@@ -142,13 +145,18 @@ public actor OwnedResourceReconciliationService {
             if record.kind == .worktree {
                 return try await removeAbandonedWorktree(record) ? .deleted : .quarantined
             }
-            if isProviderHomeResource(record) {
+            if isProviderResource(record) {
                 try removeProviderResource(record)
                 return .deleted
             }
             return record.lifecycleState
         case .active:
             guard exists else { return .missing }
+            if record.kind == .providerOutput,
+               !resourcePaths(record).allSatisfy({ manager.fileExists(atPath: $0) })
+            {
+                return .corrupt
+            }
             if record.kind == .artifact, !artifactMatches(record) { return .corrupt }
             if record.kind == .worktree, try await !worktreeMatches(record) { return .corrupt }
             return .active
@@ -186,18 +194,26 @@ public actor OwnedResourceReconciliationService {
         record.kind == .providerHome || record.kind == .providerCredentialCopy
     }
 
+    private func isProviderResource(_ record: OwnedResourceRecord) -> Bool {
+        isProviderHomeResource(record) || record.kind == .providerOutput
+    }
+
     private func providerResourceIsSafe(_ record: OwnedResourceRecord) -> Bool {
-        guard let providerHomeRoot else { return false }
-        return isContained(record.internalPathIdentity, root: providerHomeRoot)
-            && !isSymbolicLink(record.internalPathIdentity)
+        let root = record.kind == .providerOutput ? providerOutputRoot : providerHomeRoot
+        guard let root else { return false }
+        return resourcePaths(record).allSatisfy {
+            isContained($0, root: root) && !isSymbolicLink($0)
+        }
     }
 
     private func removeProviderResource(_ record: OwnedResourceRecord) throws {
         guard providerResourceIsSafe(record) else {
             throw ServiceAPIError(code: .rootUnauthorized, message: "Provider-home cleanup path is unsafe")
         }
-        try FileManager.default.removeItem(atPath: record.internalPathIdentity)
-        try DurableFilesystem.fsyncDirectory(URL(fileURLWithPath: record.internalPathIdentity).deletingLastPathComponent().path)
+        for path in resourcePaths(record) where FileManager.default.fileExists(atPath: path) {
+            try FileManager.default.removeItem(atPath: path)
+            try DurableFilesystem.fsyncDirectory(URL(fileURLWithPath: path).deletingLastPathComponent().path)
+        }
     }
 
     private func removeArtifact(_ record: OwnedResourceRecord) throws {
@@ -247,6 +263,10 @@ public actor OwnedResourceReconciliationService {
 
     private func observedSize(at path: String) -> Int64? {
         (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value
+    }
+
+    private func resourcePaths(_ record: OwnedResourceRecord) -> [String] {
+        [record.internalPathIdentity, record.temporaryPathIdentity].compactMap(\.self)
     }
 
     private func observedDigest(for record: OwnedResourceRecord) -> String? {
