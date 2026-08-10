@@ -116,7 +116,13 @@ public actor RepoPromptHeadlessAuthority {
         try await store.installWorkflows(workflowCatalog.workflows())
     }
 
-    public func createProject(input: CreateProjectInput, externalActor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> ProjectSnapshot {
+    public func createProject(
+        input: CreateProjectInput,
+        externalActor: ExternalActor,
+        idempotencyKey: String,
+        requestDigest: String,
+        correlationID: UUID? = nil
+    ) async throws -> ProjectSnapshot {
         try ensureWritable()
         let idempotency = IdempotencyInput(actorID: externalActor.goblinUserID, operation: "createProject", key: idempotencyKey, requestDigest: requestDigest)
         if let existing = try await store.idempotencyResult(idempotency) {
@@ -136,7 +142,7 @@ public actor RepoPromptHeadlessAuthority {
         }
         let cursor = try await store.nextCursor()
         let snapshot = ProjectSnapshot(projectID: projectID, name: projectName, creator: externalActor, state: .active, roots: canonicalRoots.map(\.snapshot), revision: 1, cursor: cursor)
-        let event = try await store.persistProject(snapshot, rootIdentities: Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.snapshot.rootID, $0.filesystemIdentity) }), eventType: .projectCreated, actor: externalActor, correlationID: ids.next(), idempotency: idempotency)
+        let event = try await store.persistProject(snapshot, rootIdentities: Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.snapshot.rootID, $0.filesystemIdentity) }), eventType: .projectCreated, actor: externalActor, correlationID: correlationID ?? ids.next(), idempotency: idempotency, expectedRevision: 0)
         let project = ProjectAuthority(snapshot: snapshot, roots: canonicalRoots)
         await projects.install(project)
         tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)

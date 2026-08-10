@@ -11,36 +11,36 @@ import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 final class ProjectSourceProvisioningTests: XCTestCase {
-    func testExactGoblinProjectSourceFixtureDecodes() throws {
+    func testExactGoblinProjectCreationFixtureDecodes() throws {
         let fixtureURL = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
-            .appendingPathComponent("Fixtures/goblin-project-source-operations-v1.json")
+            .appendingPathComponent("Fixtures/goblin-project-creation-v1.json")
         let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: fixtureURL)) as? [String: Any])
         XCTAssertEqual(fixture["schemaVersion"] as? Int, 1)
         let vectors = try XCTUnwrap(fixture["vectors"] as? [[String: Any]])
-        XCTAssertEqual(vectors.count, 2)
+        XCTAssertEqual(vectors.count, 1)
         for vector in vectors {
-            let body = try JSONSerialization.data(withJSONObject: XCTUnwrap(vector["publicBody"]))
-            let input = try JSONDecoder.serviceDecoder.decode(AddProjectRepositoryInput.self, from: body)
+            XCTAssertEqual(vector["internalPath"] as? String, "/internal/v1/projects")
+            let body = try JSONSerialization.data(withJSONObject: XCTUnwrap(vector["internalBody"]))
+            let input = try JSONDecoder.serviceDecoder.decode(CreateProjectWireInput.self, from: body)
             XCTAssertEqual(input.schemaVersion, 1)
-            XCTAssertGreaterThanOrEqual(input.expectedRevision, 1)
+            XCTAssertEqual(input.expectedRevision, 0)
+            XCTAssertEqual(input.operationID.uuidString.lowercased(), (vector["operationId"] as? String)?.lowercased())
             XCTAssertEqual(
                 try JSONSerialization.jsonObject(with: JSONEncoder.serviceEncoder.encode(input)) as? NSDictionary,
-                vector["publicBody"] as? NSDictionary
+                vector["internalBody"] as? NSDictionary
             )
         }
-        var unsupported = try XCTUnwrap(vectors.first?["publicBody"] as? [String: Any])
-        unsupported["credentialPath"] = "/run/secret"
+        var unsupported = try XCTUnwrap(vectors.first?["internalBody"] as? [String: Any])
+        unsupported["roots"] = []
         XCTAssertThrowsError(try JSONDecoder.serviceDecoder.decode(
-            AddProjectRepositoryInput.self,
+            CreateProjectWireInput.self,
             from: JSONSerialization.data(withJSONObject: unsupported)
         ))
-        var unsupportedSource = try XCTUnwrap(unsupported["source"] as? [String: Any])
-        unsupported.removeValue(forKey: "credentialPath")
-        unsupportedSource["executable"] = "/usr/bin/git"
-        unsupported["source"] = unsupportedSource
+        unsupported.removeValue(forKey: "roots")
+        unsupported["credentialPath"] = "/run/secret"
         XCTAssertThrowsError(try JSONDecoder.serviceDecoder.decode(
-            AddProjectRepositoryInput.self,
+            CreateProjectWireInput.self,
             from: JSONSerialization.data(withJSONObject: unsupported)
         ))
     }

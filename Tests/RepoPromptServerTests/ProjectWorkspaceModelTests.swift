@@ -9,12 +9,12 @@ final class ProjectWorkspaceModelTests: XCTestCase {
     func testPublicProjectAndRepositoryContractsArePathAndAliasFree() throws {
         let create = try JSONDecoder.serviceDecoder.decode(
             CreateProjectWireInput.self,
-            from: Data(#"{"schemaVersion":1,"name":"Workspace"}"#.utf8)
+            from: Data(#"{"schemaVersion":1,"operationId":"11111111-1111-4111-8111-111111111111","expectedRevision":0,"name":"Workspace"}"#.utf8)
         )
         XCTAssertEqual(create.name, "Workspace")
         XCTAssertThrowsError(try JSONDecoder.serviceDecoder.decode(
             CreateProjectWireInput.self,
-            from: Data(#"{"schemaVersion":1,"name":"Workspace","roots":[]}"#.utf8)
+            from: Data(#"{"schemaVersion":1,"operationId":"11111111-1111-4111-8111-111111111111","expectedRevision":0,"name":"Workspace","roots":[]}"#.utf8)
         ))
 
         let addition = try JSONDecoder.serviceDecoder.decode(

@@ -124,10 +124,18 @@ public struct RepoPromptHTTPService: Sendable {
         router.post("/internal/v1/projects") { request, context in await respond(request) { let data = try await bodyData(request)
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "createProject")
             let input = try JSONDecoder.serviceDecoder.decode(CreateProjectWireInput.self, from: data)
-            guard input.schemaVersion == 1 else { throw ServiceAPIError(code: .invalidRequest, message: "Project creation schema is unsupported") }
+            guard input.schemaVersion == 1, input.expectedRevision == 0 else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Project creation contract is invalid")
+            }
             let actor = try requireActor(auth)
             let key = try requireIdempotency(request)
-            let snapshot = try await authority.createProject(input: .init(name: input.name, roots: []), externalActor: actor, idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data))
+            let snapshot = try await authority.createProject(
+                input: .init(name: input.name, roots: []),
+                externalActor: actor,
+                idempotencyKey: key,
+                requestDigest: CanonicalSigning.bodyDigest(data),
+                correlationID: input.operationID
+            )
             return try HTTPResponses.json(ProjectWireSnapshot(snapshot), status: .created)
         } }
         router.post("/internal/v1/projects/:id/source-operations") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)

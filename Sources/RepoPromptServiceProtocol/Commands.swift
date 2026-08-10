@@ -36,21 +36,27 @@ public struct CreateProjectInput: Codable, Sendable {
 
 public struct CreateProjectWireInput: Codable, Hashable, Sendable {
     public let schemaVersion: Int
+    public let operationID: UUID
+    public let expectedRevision: Int64
     public let name: String
 
-    public init(schemaVersion: Int = 1, name: String) {
+    public init(schemaVersion: Int = 1, operationID: UUID, expectedRevision: Int64 = 0, name: String) {
         self.schemaVersion = schemaVersion
+        self.operationID = operationID
+        self.expectedRevision = expectedRevision
         self.name = name
     }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: ProjectSourceCodingKey.self)
         let marker = ProjectSourceCodingKey("schemaVersion")
-        guard Set(values.allKeys.map(\.stringValue)) == Set(["schemaVersion", "name"]) else {
+        guard Set(values.allKeys.map(\.stringValue)) == Set(["schemaVersion", "operationId", "expectedRevision", "name"]) else {
             throw DecodingError.dataCorruptedError(forKey: marker, in: values, debugDescription: "Project creation contains unsupported fields")
         }
         self.init(
             schemaVersion: try values.decode(Int.self, forKey: marker),
+            operationID: try values.decode(UUID.self, forKey: ProjectSourceCodingKey("operationId")),
+            expectedRevision: try values.decode(Int64.self, forKey: ProjectSourceCodingKey("expectedRevision")),
             name: try values.decode(String.self, forKey: ProjectSourceCodingKey("name"))
         )
     }
@@ -58,6 +64,8 @@ public struct CreateProjectWireInput: Codable, Hashable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: ProjectSourceCodingKey.self)
         try values.encode(schemaVersion, forKey: ProjectSourceCodingKey("schemaVersion"))
+        try values.encode(operationID, forKey: ProjectSourceCodingKey("operationId"))
+        try values.encode(expectedRevision, forKey: ProjectSourceCodingKey("expectedRevision"))
         try values.encode(name, forKey: ProjectSourceCodingKey("name"))
     }
 }
