@@ -72,7 +72,7 @@ run_container() {
     -e REPOPROMPT_GOBLIN_APP_CERT_IDENTITY=app.internal \
     -e REPOPROMPT_GOBLIN_SYNC_CERT_IDENTITY=sync.internal \
     -e REPOPROMPT_OPERATOR_CERT_IDENTITY=operator.internal \
-    -e REPOPROMPT_DISABLED_PROVIDERS=codex,claudeCompatible,openCodeACP,cursorACP \
+    -e REPOPROMPT_ENABLED_PROVIDERS= \
     -e REPOPROMPT_MINIMUM_FREE_BYTES=1 \
     -e REPOPROMPT_MINIMUM_FREE_NODES=1 \
     "$image" >/dev/null
