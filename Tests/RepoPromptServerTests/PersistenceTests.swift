@@ -86,7 +86,7 @@ final class PersistenceTests: XCTestCase {
         let recovered = try await authority.sessionSnapshot(sessionID: session.sessionID)
         XCTAssertEqual(recovered.state, .interrupted)
         let events = try await authority.events(after: nil, limit: 10)
-        XCTAssertEqual(events.events.filter { $0.eventType == .serviceRecovery }.count, 1)
+        XCTAssertEqual(events.events.count(where: { $0.eventType == .serviceRecovery }), 1)
         try await store.close()
     }
 
@@ -107,6 +107,8 @@ final class PersistenceTests: XCTestCase {
         let archiveID = try XCTUnwrap(archivedID)
         let archive = try await store.archivedEvents(archiveID: archiveID)
         XCTAssertEqual(archive.map(\.eventType), [.projectCreated])
+        let preCompaction = try await store.snapshotCheckpoints(scope: "events:\(projectCursor.storeID.uuidString):pre-compaction")
+        XCTAssertEqual(preCompaction.map(\.sequence), [1])
         let metadata = try await store.metadata()
         XCTAssertEqual(metadata.replayFloor, 1)
         do {
@@ -192,7 +194,7 @@ final class PersistenceTests: XCTestCase {
         let resumedSessions = try await store.allSessions()
         XCTAssertEqual(resumedSessions.count, 2)
         let events = try await store.events(after: nil, limit: 20)
-        XCTAssertEqual(events.events.filter { $0.eventType == .sessionCreated }.count, 2)
+        XCTAssertEqual(events.events.count(where: { $0.eventType == .sessionCreated }), 2)
         try await store.close()
     }
 }

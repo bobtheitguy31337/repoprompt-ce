@@ -614,6 +614,7 @@ public actor SQLiteServiceStore {
             let archiveID = UUID()
             let bytes = try encoder.encode(events)
             let digest = CanonicalSigning.bodyDigest(bytes)
+            try await saveCheckpoint(scope: "events:\(meta.storeID.uuidString):pre-compaction", sequence: last.globalSequence, snapshot: bytes)
             _ = try await connection.query("INSERT INTO event_archives(archive_id,first_sequence,last_sequence,event_count,canonical_events_json,digest,created_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP)", [.text(archiveID.uuidString), .integer(Int(first.globalSequence)), .integer(Int(last.globalSequence)), .integer(events.count), .text(String(decoding: bytes, as: UTF8.self)), .text(digest)])
             _ = try await connection.query("DELETE FROM events WHERE global_sequence<=?", [.integer(Int(last.globalSequence))])
             _ = try await connection.query("UPDATE service_metadata SET replay_floor=? WHERE fixed_id=1", [.integer(Int(last.globalSequence))])

@@ -91,3 +91,17 @@ public struct EventPage: Codable, Sendable {
         self.replayFloor = replayFloor
     }
 }
+
+public struct CursorExpiredResponse: Codable, Sendable {
+    public let code: ServiceErrorCode
+    public let storeID: UUID
+    public let replayFloor: Int64
+    public let snapshotURL: String
+
+    public init(storeID: UUID, replayFloor: Int64, snapshotURL: String = "/internal/v1/snapshot") {
+        code = .cursorExpired
+        self.storeID = storeID
+        self.replayFloor = replayFloor
+        self.snapshotURL = snapshotURL
+    }
+}

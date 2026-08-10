@@ -80,6 +80,44 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         try await store.close()
     }
 
+    func testEveryNormativeV1MethodAndPathIsRegistered() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: InternalRequestAuthenticator(keys: [], store: store))
+        let app = Application(router: service.internalRouter())
+        let id = UUID().uuidString
+        let routes: [(HTTPRequest.Method, String)] = [
+            (.get, "/internal/v1/diagnostics"), (.get, "/metrics"), (.get, "/internal/v1/capabilities"),
+            (.get, "/internal/v1/projects"), (.post, "/internal/v1/projects"), (.get, "/internal/v1/projects/\(id)/snapshot"),
+            (.patch, "/internal/v1/projects/\(id)"), (.delete, "/internal/v1/projects/\(id)"), (.post, "/internal/v1/projects/\(id)/refresh"),
+            (.get, "/internal/v1/projects/\(id)/tree"), (.post, "/internal/v1/projects/\(id)/search"), (.post, "/internal/v1/projects/\(id)/file"),
+            (.post, "/internal/v1/projects/\(id)/diff"), (.get, "/internal/v1/catalog/providers"), (.get, "/internal/v1/catalog/models"),
+            (.get, "/internal/v1/catalog/workflows"), (.get, "/internal/v1/catalog/workflows/review"), (.get, "/internal/v1/catalog/execution-modes"),
+            (.get, "/internal/v1/sessions"), (.post, "/internal/v1/sessions"), (.get, "/internal/v1/sessions/\(id)/snapshot"),
+            (.post, "/internal/v1/sessions/\(id)/commands"), (.post, "/internal/v1/sessions/\(id)/interactions/\(id)/answer"),
+            (.patch, "/internal/v1/sessions/\(id)/execution-permissions"), (.patch, "/internal/v1/sessions/\(id)/collaboration-metadata"),
+            (.get, "/internal/v1/sessions/\(id)/children"), (.get, "/internal/v1/sessions/\(id)/transcript"),
+            (.get, "/internal/v1/sessions/\(id)/artifacts"), (.get, "/internal/v1/sessions/\(id)/artifacts/\(id)/content"),
+            (.get, "/internal/v1/projects/\(id)/worktrees"), (.get, "/internal/v1/projects/\(id)/worktrees/\(id)"),
+            (.post, "/internal/v1/sessions/\(id)/worktrees"), (.patch, "/internal/v1/sessions/\(id)/worktree-binding"),
+            (.post, "/internal/v1/sessions/\(id)/worktrees/\(id)/merge"), (.get, "/internal/v1/sessions/\(id)/context/selection"),
+            (.put, "/internal/v1/sessions/\(id)/context/selection"), (.post, "/internal/v1/sessions/\(id)/context/selection/add"),
+            (.post, "/internal/v1/sessions/\(id)/context/selection/remove"), (.post, "/internal/v1/sessions/\(id)/context/build"),
+            (.post, "/internal/v1/sessions/\(id)/context/context-builder"), (.post, "/internal/v1/sessions/\(id)/context/oracle"),
+            (.get, "/internal/v1/events"), (.get, "/internal/v1/events/stream"), (.get, "/internal/v1/snapshot"),
+            (.post, "/internal/v1/admin/checkpoint"), (.post, "/internal/v1/admin/quiesce")
+        ]
+        try await app.test(.router) { client in
+            for (method, path) in routes {
+                try await client.execute(uri: path, method: method) { response in
+                    XCTAssertNotEqual(response.status, .notFound, "Missing route: \(method) \(path)")
+                    XCTAssertNotEqual(response.status, .methodNotAllowed, "Wrong method registration: \(method) \(path)")
+                }
+            }
+        }
+        try await store.close()
+    }
+
     func testReadinessFailsClosedForMissingVolumeAndCapacity() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let provider = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: "/usr/bin/true")])
@@ -159,5 +197,45 @@ final class AuthenticationAndHTTPTests: XCTestCase {
             }
         }
         try await store.close()
+    }
+
+    func testRESTExpiredCursorReturnsSnapshotRecoveryContract() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "project-rest-expired", requestDigest: "project-rest-expired")
+        let metadata = try await store.metadata()
+        _ = try await store.archiveEvents(through: 1)
+        let instant = Date(timeIntervalSince1970: 1000)
+        let key = InternalSigningKey(keyID: "sync-v1", role: .goblinSync, direction: "goblin-sync-to-repoprompt-v1", secret: Data("secret".utf8))
+        let auth = InternalRequestAuthenticator(keys: [key], store: store, now: { instant })
+        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth)
+        let app = Application(router: service.internalRouter())
+        let path = "/internal/v1/events?after=\(metadata.storeID.uuidString):0"
+        let headers = signedHeaders(method: "GET", path: path, key: key, instant: instant, nonce: "expiredcursorrest1")
+        try await app.test(.router) { client in
+            try await client.execute(uri: path, method: .get, headers: headers) { response in
+                XCTAssertEqual(response.status, .gone)
+                let payload = try JSONDecoder.serviceDecoder.decode(CursorExpiredResponse.self, from: Data(response.body.readableBytesView))
+                XCTAssertEqual(payload.storeID, metadata.storeID)
+                XCTAssertEqual(payload.replayFloor, 1)
+                XCTAssertEqual(payload.snapshotURL, "/internal/v1/snapshot")
+            }
+        }
+        try await store.close()
+    }
+
+    private func signedHeaders(method: String, path: String, key: InternalSigningKey, instant: Date, nonce: String) -> HTTPFields {
+        let timestamp = String(instant.timeIntervalSince1970)
+        let canonical = CanonicalSigning.requestString(method: method, pathAndQuery: path, timestamp: timestamp, nonce: nonce, bodyDigest: CanonicalSigning.bodyDigest(Data()), authorizationDecisionDigest: CanonicalSigning.bodyDigest(Data()), keyID: key.keyID)
+        var headers = HTTPFields()
+        headers[.init("X-RepoPrompt-Key-Id")!] = key.keyID
+        headers[.init("X-RepoPrompt-Timestamp")!] = timestamp
+        headers[.init("X-RepoPrompt-Nonce")!] = nonce
+        headers[.init("X-RepoPrompt-Signature")!] = CanonicalSigning.hmacSHA256(message: canonical, key: key.secret)
+        return headers
     }
 }

@@ -13,6 +13,9 @@ enum HTTPResponses {
 
     static func error(_ error: Error) -> Response {
         let apiError = error as? ServiceAPIError ?? ServiceAPIError(code: .dependencyUnavailable, message: "Internal dependency failed", retryable: true)
+        if apiError.code == .cursorExpired, let cursor = apiError.cursor {
+            return (try? json(CursorExpiredResponse(storeID: cursor.storeID, replayFloor: cursor.globalSequence), status: .gone)) ?? Response(status: .internalServerError)
+        }
         let status: HTTPResponse.Status = switch apiError.code {
         case .invalidRequest: .badRequest
         case .internalAuthFailed: .unauthorized

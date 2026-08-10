@@ -61,3 +61,15 @@ jobs:
         run: |
           test "$(docker image inspect repoprompt-server:test --format '{{.Config.User}}')" = "65532:65532"
           docker image inspect repoprompt-server:test --format '{{json .Config.Entrypoint}}' | grep -F 'RepoPromptServer'
+          test "$(docker image inspect repoprompt-server:test --format '{{index .Config.Labels "org.opencontainers.image.title"}}')" = "RepoPromptServer"
+          test "$(docker image inspect repoprompt-server:test --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
+          test "$(docker image inspect repoprompt-server:test --format '{{index .Config.Labels "io.degentlemen.repoprompt.protocol-version"}}')" = "1"
+          test "$(docker image inspect repoprompt-server:test --format '{{index .Config.Labels "io.degentlemen.repoprompt.schema-version"}}')" = "1"
+          test "$(docker image inspect repoprompt-server:test --format '{{json .Config.ExposedPorts}}')" = '{"9080/tcp":{},"9443/tcp":{}}'
+          docker run --rm --entrypoint /bin/sh repoprompt-server:test -c '
+            test "$(id -u)" = 65532 &&
+            test -x /usr/local/bin/RepoPromptServer &&
+            /opt/repoprompt/providers/codex --version | grep -F 0.147.0 &&
+            /opt/repoprompt/providers/claude --version | grep -F 2.1.226 &&
+            /opt/repoprompt/providers/opencode --version | grep -F 1.15.11 &&
+            /opt/repoprompt/providers/cursor-agent --version | grep -F 2026.08.04-aaa8809'
