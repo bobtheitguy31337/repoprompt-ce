@@ -51,6 +51,15 @@ public protocol ProcessSupervisionPort: Sendable {
     func descendants(of pid: Int32) async throws -> [ProcessIdentity]
     func signal(_ signal: Int32, processGroupID: Int32, verifiedMembers: [ProcessIdentity]) async throws
     func reap(pid: Int32) async throws
+    /// Returns true when a delegated outer containment boundary accepted a
+    /// complete-family kill (Linux cgroup v2). False selects ancestry/PGID fallback.
+    func terminateContainedFamily(leader: ProcessIdentity) async throws -> Bool
+}
+
+public extension ProcessSupervisionPort {
+    func terminateContainedFamily(leader _: ProcessIdentity) async throws -> Bool {
+        false
+    }
 }
 
 public protocol RuntimeEventSink: Sendable {

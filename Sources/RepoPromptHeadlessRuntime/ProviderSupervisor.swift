@@ -69,7 +69,7 @@ public actor ProviderProcessSupervisor {
         }
     }
 
-    public func cancel(runID: UUID, termSignal: Int32 = 15, killSignal: Int32 = 9) async throws {
+    public func cancel(runID: UUID, termSignal: Int32 = 15, killSignal: Int32 = 9, graceScans: Int = 100) async throws {
         guard let recorded = families[runID], let leader = recorded.first else { return }
         guard let current = try await processPort.inspect(pid: leader.pid), current == leader else {
             families[runID] = nil
@@ -85,7 +85,7 @@ public actor ProviderProcessSupervisor {
 
         // Re-scan for the entire grace window. Providers commonly fork cleanup helpers
         // after TERM; a single ancestry snapshot lets those late children escape.
-        for _ in 0 ..< 100 {
+        for _ in 0 ..< max(1, graceScans) {
             try await clock.sleep(for: .milliseconds(100))
             let descendants = try await verifiedDescendants(of: leader)
             let previousCount = discovered.count
@@ -98,7 +98,8 @@ public actor ProviderProcessSupervisor {
         for member in discovered where try await processPort.inspect(pid: member.pid) == member {
             survivors.append(member)
         }
-        if !survivors.isEmpty { try await signalGroups(killSignal, members: survivors) }
+        let containedKill = try await processPort.terminateContainedFamily(leader: leader)
+        if !survivors.isEmpty, !containedKill { try await signalGroups(killSignal, members: survivors) }
         for member in discovered {
             try await processPort.reap(pid: member.pid)
         }

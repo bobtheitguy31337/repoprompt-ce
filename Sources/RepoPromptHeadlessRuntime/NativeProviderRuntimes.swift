@@ -1,0 +1,791 @@
+import Foundation
+import RepoPromptAgentRuntimeCore
+import RepoPromptServicePersistence
+import RepoPromptServiceProtocol
+import RepoPromptWorkspaceRuntimeCore
+
+enum NativeProviderRuntimeFactory {
+    static func make(
+        configuration: ProviderCLIConfiguration,
+        processPort: PortableProcessSupervisionPort,
+        processStore: SQLiteServiceStore?,
+        outputDirectory: String,
+        ephemeralHomeRoot: String
+    ) -> any AgentProviderRuntime {
+        let support = NativeProviderProcessSupport(
+            configuration: configuration,
+            processPort: processPort,
+            processStore: processStore,
+            outputDirectory: outputDirectory,
+            ephemeralHomeRoot: ephemeralHomeRoot
+        )
+        switch configuration.kind {
+        case .codex:
+            return CodexAppServerProviderRuntime(support: support)
+        case .claudeCompatible:
+            return ClaudeNativeProviderRuntime(support: support)
+        case .openCodeACP:
+            return ACPProviderRuntime(kind: .openCodeACP, arguments: ["acp"], support: support)
+        case .cursorACP:
+            return ACPProviderRuntime(kind: .cursorACP, arguments: ["--approve-mcps", "acp"], support: support)
+        case .headlessAdapter:
+            return NormalizedHeadlessProviderRuntime(kind: .headlessAdapter, support: support)
+        case .mcp:
+            return MCPStdioProviderRuntime(support: support)
+        }
+    }
+}
+
+private struct NativeProviderProcessSupport {
+    let configuration: ProviderCLIConfiguration
+    let processPort: PortableProcessSupervisionPort
+    let processStore: SQLiteServiceStore?
+    let outputDirectory: String
+    let ephemeralHomeRoot: String
+
+    func capability(supportsResume: Bool, supportsSteering: Bool) -> ProviderCapability {
+        let executable = FileManager.default.isExecutableFile(atPath: configuration.executable)
+        return .init(
+            kind: configuration.kind,
+            enabled: executable,
+            executable: executable ? configuration.executable : nil,
+            supportsResume: supportsResume,
+            supportsSteering: supportsSteering,
+            version: configuration.expectedVersion,
+            protocolVersion: configuration.protocolVersion,
+            reasonUnavailable: executable ? nil : "configured binary is not executable"
+        )
+    }
+
+    func preflight(supportsResume: Bool, supportsSteering: Bool, protocolName: String) async -> ProviderCapability {
+        let base = capability(supportsResume: supportsResume, supportsSteering: supportsSteering)
+        guard base.enabled else { return base }
+        do {
+            let runner = LocalWorkspaceCommandRunner()
+            let output = try await runner.run(
+                executable: configuration.executable,
+                arguments: ["--version"],
+                workingDirectory: FileManager.default.currentDirectoryPath,
+                maximumBytes: 65536
+            )
+            let reported = output.split(whereSeparator: \.isNewline).first.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let expected = configuration.expectedVersion, reported?.contains(expected) != true {
+                return .init(kind: configuration.kind, enabled: false, executable: configuration.executable, supportsResume: supportsResume, supportsSteering: supportsSteering, version: reported, protocolVersion: configuration.protocolVersion, reasonUnavailable: "provider version does not match the pinned image contract")
+            }
+            return .init(kind: configuration.kind, enabled: true, executable: configuration.executable, supportsResume: supportsResume, supportsSteering: supportsSteering, version: reported ?? configuration.expectedVersion, protocolVersion: configuration.protocolVersion ?? protocolName)
+        } catch {
+            return .init(kind: configuration.kind, enabled: false, executable: configuration.executable, supportsResume: supportsResume, supportsSteering: supportsSteering, version: configuration.expectedVersion, protocolVersion: configuration.protocolVersion, reasonUnavailable: "provider preflight failed: \(protocolName) executable probe")
+        }
+    }
+
+    func makeSession(runID: UUID, arguments: [String], workingDirectory: String) async throws -> NativeJSONLineProcess {
+        let home = try prepareEphemeralHome(runID: runID)
+        let environment = providerEnvironment(home: home)
+        let supervisor = ProviderProcessSupervisor(processPort: processPort, store: processStore)
+        return try await NativeJSONLineProcess.launch(
+            runID: runID,
+            executable: configuration.executable,
+            arguments: arguments,
+            environment: environment,
+            workingDirectory: workingDirectory,
+            home: home,
+            processPort: processPort,
+            supervisor: supervisor,
+            outputDirectory: outputDirectory
+        )
+    }
+
+    func recover() async throws {
+        try await ProviderProcessSupervisor(processPort: processPort, store: processStore).recoverPersistedFamilies()
+    }
+
+    private func providerEnvironment(home: URL) -> [String: String] {
+        let source = ProcessInfo.processInfo.environment
+        let inheritedKeys = ["PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]
+        var environment = Dictionary(uniqueKeysWithValues: inheritedKeys.compactMap { key in source[key].map { (key, $0) } })
+        environment["HOME"] = home.path
+        environment["XDG_CONFIG_HOME"] = home.appendingPathComponent(".config", isDirectory: true).path
+        environment["XDG_CACHE_HOME"] = home.appendingPathComponent(".cache", isDirectory: true).path
+        environment["CODEX_HOME"] = home.appendingPathComponent(".codex", isDirectory: true).path
+        environment["CLAUDE_CONFIG_DIR"] = home.appendingPathComponent(".claude", isDirectory: true).path
+        environment["DISABLE_AUTOUPDATER"] = "1"
+        environment["CURSOR_AGENT_DISABLE_AUTO_UPDATE"] = "1"
+        return environment
+    }
+
+    private func prepareEphemeralHome(runID: UUID) throws -> URL {
+        let root = URL(fileURLWithPath: ephemeralHomeRoot, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let home = root.appendingPathComponent(runID.uuidString, isDirectory: true)
+        if FileManager.default.fileExists(atPath: home.path) { try FileManager.default.removeItem(at: home) }
+        if let sourcePath = configuration.credentialSourceDirectory {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: sourcePath, isDirectory: &isDirectory), isDirectory.boolValue else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "Configured provider credential source is unavailable")
+            }
+            try FileManager.default.copyItem(at: URL(fileURLWithPath: sourcePath, isDirectory: true), to: home)
+        } else {
+            try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        }
+        for child in [".config", ".cache", ".codex", ".claude"] {
+            try FileManager.default.createDirectory(at: home.appendingPathComponent(child, isDirectory: true), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        }
+        return home
+    }
+}
+
+private actor NativeJSONLineProcess {
+    private let runID: UUID
+    private let captured: PortableProcessSupervisionPort.CapturedProcess
+    private let home: URL
+    private let processPort: PortableProcessSupervisionPort
+    private let supervisor: ProviderProcessSupervisor
+    private var offset = 0
+    private var buffer = Data()
+    private var nextRequestID = 1
+    private var finished = false
+
+    private init(runID: UUID, captured: PortableProcessSupervisionPort.CapturedProcess, home: URL, processPort: PortableProcessSupervisionPort, supervisor: ProviderProcessSupervisor) {
+        self.runID = runID
+        self.captured = captured
+        self.home = home
+        self.processPort = processPort
+        self.supervisor = supervisor
+    }
+
+    static func launch(runID: UUID, executable: String, arguments: [String], environment: [String: String], workingDirectory: String, home: URL, processPort: PortableProcessSupervisionPort, supervisor: ProviderProcessSupervisor, outputDirectory: String) async throws -> NativeJSONLineProcess {
+        let captured = try await processPort.launchInteractiveCaptured(
+            executable: executable,
+            arguments: arguments,
+            environment: environment,
+            workingDirectory: workingDirectory,
+            helperToken: runID.uuidString,
+            outputDirectory: outputDirectory
+        )
+        try await supervisor.register(runID: runID, leader: captured.identity)
+        return NativeJSONLineProcess(runID: runID, captured: captured, home: home, processPort: processPort, supervisor: supervisor)
+    }
+
+    func notify(method: String, params: [String: Any]? = nil) async throws {
+        var object: [String: Any] = ["jsonrpc": "2.0", "method": method]
+        if let params { object["params"] = params }
+        try await send(object)
+    }
+
+    func request(method: String, params: [String: Any]? = nil, onFrame: @escaping @Sendable (Data) async throws -> Void) async throws -> Data {
+        let id = nextRequestID
+        nextRequestID += 1
+        var object: [String: Any] = ["jsonrpc": "2.0", "id": id, "method": method]
+        if let params { object["params"] = params }
+        try await send(object)
+        while true {
+            let line = try await nextLine()
+            guard let frame = try JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+            if (frame["id"] as? Int) == id {
+                if let error = frame["error"] as? [String: Any] {
+                    throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider protocol request \(method) failed: \(error["message"] as? String ?? "unknown error")")
+                }
+                return try JSONSerialization.data(withJSONObject: frame["result"] ?? [:])
+            }
+            try await onFrame(line)
+        }
+    }
+
+    func sendResponse(id: Any, result: Any) async throws {
+        try await send(["jsonrpc": "2.0", "id": id, "result": result])
+    }
+
+    func sendRaw(_ data: Data) async throws {
+        var line = data
+        line.append(0x0A)
+        try await processPort.write(line, to: captured)
+    }
+
+    func nextLine() async throws -> Data {
+        while true {
+            if let newline = buffer.firstIndex(of: 0x0A) {
+                let line = Data(buffer[..<newline])
+                buffer.removeSubrange(...newline)
+                if !line.isEmpty { return line }
+                continue
+            }
+            let chunk = try await processPort.capturedOutput(captured, after: offset, maximumBytes: 262_144)
+            offset = chunk.nextOffset
+            buffer.append(chunk.data)
+            if chunk.data.isEmpty {
+                if !chunk.running {
+                    if !buffer.isEmpty { defer { buffer.removeAll() }
+                        return buffer
+                    }
+                    throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider protocol transport closed")
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+        }
+    }
+
+    func interrupt(protocolAction: @Sendable (NativeJSONLineProcess) async -> Void) async {
+        guard !finished else { return }
+        await protocolAction(self)
+        try? await supervisor.cancel(runID: runID, graceScans: 20)
+        await cleanup()
+    }
+
+    func finish() async {
+        guard !finished else { return }
+        await processPort.closeInput(captured)
+        for _ in 0 ..< 25 {
+            if await (try? processPort.capturedOutput(captured, after: offset, maximumBytes: 1).running) != true { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        if await (try? processPort.capturedOutput(captured, after: offset, maximumBytes: 1).running) == true {
+            try? await supervisor.cancel(runID: runID, graceScans: 5)
+        } else {
+            _ = try? await processPort.waitForCapturedProcess(captured, maximumBytes: 1)
+            await supervisor.forget(runID: runID)
+        }
+        await cleanup()
+    }
+
+    private func send(_ object: [String: Any]) async throws {
+        try await sendRaw(JSONSerialization.data(withJSONObject: object))
+    }
+
+    private func cleanup() async {
+        guard !finished else { return }
+        finished = true
+        await processPort.cleanupCapturedFiles(captured)
+        try? FileManager.default.removeItem(at: home)
+    }
+}
+
+private actor CodexAppServerProviderRuntime: AgentProviderRuntime {
+    let kind = ProviderKind.codex
+    private let support: NativeProviderProcessSupport
+    private var sessions: [UUID: NativeJSONLineProcess] = [:]
+    private var threadIDs: [UUID: String] = [:]
+    private var turnIDs: [UUID: String] = [:]
+
+    init(support: NativeProviderProcessSupport) {
+        self.support = support
+    }
+
+    func capability() -> ProviderCapability {
+        support.capability(supportsResume: true, supportsSteering: true)
+    }
+
+    func preflight() async -> ProviderCapability {
+        await support.preflight(supportsResume: true, supportsSteering: true, protocolName: "app-server-v2")
+    }
+
+    func recoverProcessFamilies() async throws {
+        try await support.recover()
+    }
+
+    func hasActiveRun(_ runID: UUID) -> Bool {
+        sessions[runID] != nil
+    }
+
+    func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
+        let process = try await support.makeSession(runID: request.runID, arguments: ["app-server"], workingDirectory: request.workingDirectory)
+        sessions[request.runID] = process
+        defer { sessions[request.runID] = nil
+            threadIDs[request.runID] = nil
+            turnIDs[request.runID] = nil
+        }
+        do {
+            _ = try await process.request(method: "initialize", params: ["clientInfo": ["name": "repoprompt-server", "title": "RepoPrompt Server", "version": "1"], "capabilities": ["experimentalApi": true]], onFrame: { _ in })
+            try await process.notify(method: "initialized")
+            var threadParams: [String: Any] = ["cwd": request.workingDirectory, "approvalPolicy": "on-request", "sandbox": "workspace-write"]
+            if let model = request.model { threadParams["model"] = model }
+            let threadMethod: String
+            if let existing = request.resumeProviderSessionID {
+                threadMethod = "thread/resume"
+                threadParams["threadId"] = existing
+            } else {
+                threadMethod = "thread/start"
+            }
+            let threadData = try await process.request(method: threadMethod, params: threadParams, onFrame: { line in try await Self.forward(line, output: onEvent) })
+            let threadResult = try Self.object(threadData)
+            guard let threadID = Self.string(in: threadResult, paths: [["thread", "id"], ["threadId"], ["id"]]) ?? request.resumeProviderSessionID else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "Codex app-server did not return a thread identity")
+            }
+            threadIDs[request.runID] = threadID
+            await onEvent(.providerIdentity(threadID))
+            let turnData = try await process.request(method: "turn/start", params: ["threadId": threadID, "input": [["type": "text", "text": request.prompt]], "cwd": request.workingDirectory, "approvalPolicy": "on-request", "sandboxPolicy": ["type": "workspaceWrite", "writableRoots": [request.workingDirectory]]], onFrame: { line in try await Self.forward(line, output: onEvent) })
+            let turnResult = try Self.object(turnData)
+            turnIDs[request.runID] = Self.string(in: turnResult, paths: [["turn", "id"], ["turnId"], ["id"]])
+            var output = ""
+            while true {
+                let line = try await process.nextLine()
+                let normalized = try Self.normalize(line)
+                for event in normalized.events {
+                    switch event {
+                    case let .assistantDelta(text): output += text
+                    case let .assistantFinal(text): output = text
+                    default: break
+                    }
+                    await onEvent(event)
+                }
+                if normalized.completed { break }
+            }
+            await onEvent(.completed(providerSessionID: threadID))
+            await process.finish()
+            return .init(output: output, providerSessionID: threadID)
+        } catch {
+            await process.interrupt { session in try? await session.notify(method: "turn/interrupt", params: [:]) }
+            throw error
+        }
+    }
+
+    func steer(runID: UUID, text: String, targetTurnEpoch _: Int64) async throws {
+        guard let process = sessions[runID], let threadID = threadIDs[runID], let turnID = turnIDs[runID] else { throw ServiceAPIError(code: .notFound, message: "Codex turn is not active") }
+        _ = try await process.request(method: "turn/steer", params: ["threadId": threadID, "expectedTurnId": turnID, "input": [["type": "text", "text": text]]], onFrame: { _ in })
+    }
+
+    func interrupt(runID: UUID) async throws {
+        guard let process = sessions[runID] else { return }
+        let threadID = threadIDs[runID]
+        let turnID = turnIDs[runID]
+        await process.interrupt { session in
+            guard let threadID, let turnID else { return }
+            _ = try? await session.request(method: "turn/interrupt", params: ["threadId": threadID, "turnId": turnID], onFrame: { _ in })
+        }
+    }
+
+    func deliverInteraction(runID: UUID, providerRequestID: String, answer: Data) async throws {
+        guard let process = sessions[runID] else { throw ServiceAPIError(code: .notFound, message: "Codex run is not active") }
+        let id: Any = Int(providerRequestID) ?? providerRequestID
+        let payload = (try? JSONSerialization.jsonObject(with: answer)) ?? ["decision": "decline"]
+        try await process.sendResponse(id: id, result: payload)
+    }
+
+    private nonisolated static func forward(_ line: Data, output: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws {
+        for event in try normalize(line).events {
+            await output(event)
+        }
+    }
+
+    private nonisolated static func normalize(_ data: Data) throws -> (events: [ProviderRuntimeEvent], completed: Bool) {
+        guard let frame = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return ([], false) }
+        let method = frame["method"] as? String ?? ""
+        let params = frame["params"] as? [String: Any] ?? [:]
+        if frame["id"] != nil, !method.isEmpty {
+            let id = String(describing: frame["id"]!)
+            let prompt = string(in: params, paths: [["reason"], ["message"], ["question"], ["item", "command"], ["item", "path"]]) ?? method
+            let kind: ProviderInteractionKind = method == "item/tool/requestUserInput" || method == "mcpServer/elicitation/request" ? .question : .approval
+            return ([.interactionRequested(providerRequestID: id, kind: kind, prompt: prompt, choices: kind == .approval ? ["accept", "decline"] : [])], false)
+        }
+        switch method {
+        case "item/agentMessage/delta", "codex/event/agent_message_delta":
+            return ([.assistantDelta(string(in: params, paths: [["delta"], ["text"]]) ?? "")], false)
+        case "item/reasoning/summaryTextDelta", "item/reasoning/textDelta":
+            return ([.reasoning(string(in: params, paths: [["delta"], ["text"]]) ?? "")], false)
+        case "turn/started", "codex/event/turn_started":
+            return ([.progress("turn started")], false)
+        case "item/started":
+            let item = params["item"] as? [String: Any] ?? params
+            let id = item["id"] as? String ?? UUID().uuidString
+            let name = item["type"] as? String ?? "tool"
+            let arguments = try? JSONSerialization.data(withJSONObject: item)
+            return ([.toolStarted(providerToolID: id, name: name, arguments: arguments)], false)
+        case "item/commandExecution/outputDelta", "item/mcpToolCall/progress", "item/fileChange/outputDelta":
+            let id = string(in: params, paths: [["itemId"], ["id"]]) ?? "tool"
+            return ([.toolUpdated(providerToolID: id, output: string(in: params, paths: [["delta"], ["output"], ["message"]]) ?? "")], false)
+        case "item/completed":
+            let item = params["item"] as? [String: Any] ?? params
+            if item["type"] as? String == "agentMessage" || item["type"] as? String == "agent_message" {
+                return ([.assistantFinal(string(in: item, paths: [["text"], ["content"]]) ?? "")], false)
+            }
+            return ([.toolCompleted(providerToolID: item["id"] as? String ?? "tool", name: item["type"] as? String ?? "tool", output: string(in: item, paths: [["output"], ["aggregatedOutput"]]), failed: false)], false)
+        case "turn/completed", "codex/event/turn_completed":
+            return ([], true)
+        default:
+            return ([], false)
+        }
+    }
+
+    fileprivate nonisolated static func object(_ data: Data) throws -> [String: Any] {
+        try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+    }
+
+    fileprivate nonisolated static func string(in object: [String: Any], paths: [[String]]) -> String? {
+        for path in paths {
+            var value: Any = object
+            for key in path {
+                guard let dictionary = value as? [String: Any], let next = dictionary[key] else { value = NSNull()
+                    break
+                }
+                value = next
+            }
+            if let string = value as? String, !string.isEmpty { return string }
+        }
+        return nil
+    }
+}
+
+private actor ACPProviderRuntime: AgentProviderRuntime {
+    let kind: ProviderKind
+    private let arguments: [String]
+    private let support: NativeProviderProcessSupport
+    private var sessions: [UUID: NativeJSONLineProcess] = [:]
+    private var providerSessionIDs: [UUID: String] = [:]
+
+    init(kind: ProviderKind, arguments: [String], support: NativeProviderProcessSupport) {
+        self.kind = kind
+        self.arguments = arguments
+        self.support = support
+    }
+
+    func capability() -> ProviderCapability {
+        support.capability(supportsResume: true, supportsSteering: true)
+    }
+
+    func preflight() async -> ProviderCapability {
+        await support.preflight(supportsResume: true, supportsSteering: true, protocolName: "acp-v1")
+    }
+
+    func recoverProcessFamilies() async throws {
+        try await support.recover()
+    }
+
+    func hasActiveRun(_ runID: UUID) -> Bool {
+        sessions[runID] != nil
+    }
+
+    func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
+        let process = try await support.makeSession(runID: request.runID, arguments: arguments, workingDirectory: request.workingDirectory)
+        sessions[request.runID] = process
+        defer { sessions[request.runID] = nil
+            providerSessionIDs[request.runID] = nil
+        }
+        do {
+            let initialize = try await process.request(method: "initialize", params: ["protocolVersion": 1, "clientInfo": ["name": "RepoPrompt", "version": "1"], "clientCapabilities": ["fs": ["readTextFile": false, "writeTextFile": false], "terminal": false]], onFrame: { line in try await Self.forward(line, output: onEvent) })
+            let capabilities = try CodexAppServerProviderRuntime.object(initialize)["agentCapabilities"] as? [String: Any] ?? [:]
+            let sessionID: String
+            if let resume = request.resumeProviderSessionID {
+                guard capabilities["loadSession"] as? Bool == true else { throw ServiceAPIError(code: .resumeUnsupported, message: "ACP provider did not negotiate session/load") }
+                _ = try await process.request(method: "session/load", params: ["sessionId": resume, "cwd": request.workingDirectory, "mcpServers": []], onFrame: { line in try await Self.forward(line, output: onEvent) })
+                sessionID = resume
+            } else {
+                let opened = try await process.request(method: "session/new", params: ["cwd": request.workingDirectory, "mcpServers": []], onFrame: { line in try await Self.forward(line, output: onEvent) })
+                guard let id = try CodexAppServerProviderRuntime.string(in: CodexAppServerProviderRuntime.object(opened), paths: [["sessionId"]]) else { throw ServiceAPIError(code: .dependencyUnavailable, message: "ACP session/new omitted sessionId") }
+                sessionID = id
+            }
+            providerSessionIDs[request.runID] = sessionID
+            await onEvent(.providerIdentity(sessionID))
+            let output = ProviderOutputAccumulator()
+            _ = try await process.request(method: "session/prompt", params: ["sessionId": sessionID, "prompt": [["type": "text", "text": request.prompt]]], onFrame: { line in
+                for event in try Self.normalize(line) {
+                    await output.record(event)
+                    await onEvent(event)
+                }
+            })
+            await onEvent(.completed(providerSessionID: sessionID))
+            await process.finish()
+            return await .init(output: output.value(), providerSessionID: sessionID)
+        } catch {
+            await process.interrupt { session in try? await session.notify(method: "session/cancel", params: [:]) }
+            throw error
+        }
+    }
+
+    func steer(runID: UUID, text: String, targetTurnEpoch _: Int64) async throws {
+        guard let process = sessions[runID], let sessionID = providerSessionIDs[runID] else { throw ServiceAPIError(code: .notFound, message: "ACP run is not active") }
+        try await process.notify(method: "session/cancel", params: ["sessionId": sessionID])
+        _ = try await process.request(method: "session/prompt", params: ["sessionId": sessionID, "prompt": [["type": "text", "text": text]]], onFrame: { _ in })
+    }
+
+    func interrupt(runID: UUID) async throws {
+        guard let process = sessions[runID] else { return }
+        let sessionID = providerSessionIDs[runID]
+        await process.interrupt { session in
+            if let sessionID { try? await session.notify(method: "session/cancel", params: ["sessionId": sessionID]) }
+        }
+    }
+
+    func deliverInteraction(runID: UUID, providerRequestID: String, answer: Data) async throws {
+        guard let process = sessions[runID] else { throw ServiceAPIError(code: .notFound, message: "ACP run is not active") }
+        let answerObject = (try? JSONSerialization.jsonObject(with: answer)) as? [String: Any]
+        let optionID = answerObject?["optionId"] as? String
+        let outcome: [String: Any] = optionID.map { ["outcome": "selected", "optionId": $0] } ?? ["outcome": "cancelled"]
+        try await process.sendResponse(id: Int(providerRequestID) ?? providerRequestID, result: ["outcome": outcome])
+    }
+
+    private nonisolated static func forward(_ line: Data, output: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws {
+        for event in try normalize(line) {
+            await output(event)
+        }
+    }
+
+    private nonisolated static func normalize(_ data: Data) throws -> [ProviderRuntimeEvent] {
+        guard let frame = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
+        let method = frame["method"] as? String ?? ""
+        let params = frame["params"] as? [String: Any] ?? [:]
+        if frame["id"] != nil, method == "session/request_permission" {
+            let id = String(describing: frame["id"]!)
+            let tool = params["toolCall"] as? [String: Any] ?? [:]
+            let choices = (params["options"] as? [[String: Any]] ?? []).compactMap { $0["optionId"] as? String }
+            return [.interactionRequested(providerRequestID: id, kind: .approval, prompt: tool["title"] as? String ?? "Tool approval", choices: choices)]
+        }
+        guard method == "session/update", let update = params["update"] as? [String: Any] else { return [] }
+        let type = update["sessionUpdate"] as? String ?? ""
+        switch type {
+        case "agent_message_chunk":
+            return [.assistantDelta(CodexAppServerProviderRuntime.string(in: update, paths: [["content", "text"], ["text"]]) ?? "")]
+        case "agent_thought_chunk":
+            return [.reasoning(CodexAppServerProviderRuntime.string(in: update, paths: [["content", "text"], ["text"]]) ?? "")]
+        case "plan":
+            return [.progress(CodexAppServerProviderRuntime.string(in: update, paths: [["text"], ["content", "text"]]) ?? "plan updated")]
+        case "tool_call":
+            let id = update["toolCallId"] as? String ?? UUID().uuidString
+            let name = update["title"] as? String ?? update["kind"] as? String ?? "tool"
+            return [.toolStarted(providerToolID: id, name: name, arguments: try? JSONSerialization.data(withJSONObject: update["rawInput"] ?? [:]))]
+        case "tool_call_update":
+            let id = update["toolCallId"] as? String ?? "tool"
+            let status = update["status"] as? String ?? ""
+            let output = CodexAppServerProviderRuntime.string(in: update, paths: [["content", "text"], ["output"]])
+            if ["completed", "failed"].contains(status) {
+                return [.toolCompleted(providerToolID: id, name: update["title"] as? String ?? "tool", output: output, failed: status == "failed")]
+            }
+            return [.toolUpdated(providerToolID: id, output: output ?? status)]
+        default:
+            return []
+        }
+    }
+}
+
+private actor ClaudeNativeProviderRuntime: AgentProviderRuntime {
+    let kind = ProviderKind.claudeCompatible
+    private let support: NativeProviderProcessSupport
+    private var sessions: [UUID: NativeJSONLineProcess] = [:]
+
+    init(support: NativeProviderProcessSupport) {
+        self.support = support
+    }
+
+    func capability() -> ProviderCapability {
+        support.capability(supportsResume: true, supportsSteering: true)
+    }
+
+    func preflight() async -> ProviderCapability {
+        await support.preflight(supportsResume: true, supportsSteering: true, protocolName: "bidirectional-stream-json")
+    }
+
+    func recoverProcessFamilies() async throws {
+        try await support.recover()
+    }
+
+    func hasActiveRun(_ runID: UUID) -> Bool {
+        sessions[runID] != nil
+    }
+
+    func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
+        var arguments = ["-p", "--verbose", "--output-format", "stream-json", "--input-format", "stream-json", "--permission-prompt-tool", "stdio"]
+        if let resume = request.resumeProviderSessionID { arguments += ["--resume", resume] }
+        if let model = request.model { arguments += ["--model", model] }
+        let process = try await support.makeSession(runID: request.runID, arguments: arguments, workingDirectory: request.workingDirectory)
+        sessions[request.runID] = process
+        defer { sessions[request.runID] = nil }
+        do {
+            try await process.sendRaw(JSONSerialization.data(withJSONObject: ["type": "user", "message": ["role": "user", "content": [["type": "text", "text": request.prompt]]], "parent_tool_use_id": NSNull()]))
+            var output = ""
+            var identity = request.resumeProviderSessionID
+            while true {
+                let line = try await process.nextLine()
+                guard let frame = try JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+                if frame["type"] as? String == "control_request", let requestID = frame["request_id"] as? String, let payload = frame["request"] as? [String: Any] {
+                    await onEvent(.interactionRequested(providerRequestID: requestID, kind: .approval, prompt: payload["description"] as? String ?? payload["tool_name"] as? String ?? "Tool approval", choices: ["accept", "decline"]))
+                    continue
+                }
+                identity = identity ?? frame["session_id"] as? String
+                if let identity { await onEvent(.providerIdentity(identity)) }
+                let type = frame["type"] as? String ?? ""
+                if type == "assistant", let message = frame["message"] as? [String: Any], let content = message["content"] as? [[String: Any]] {
+                    for block in content {
+                        if block["type"] as? String == "text", let text = block["text"] as? String { output += text
+                            await onEvent(.assistantDelta(text))
+                        }
+                        if block["type"] as? String == "thinking", let text = block["thinking"] as? String { await onEvent(.reasoning(text)) }
+                        if block["type"] as? String == "tool_use" {
+                            await onEvent(.toolStarted(providerToolID: block["id"] as? String ?? UUID().uuidString, name: block["name"] as? String ?? "tool", arguments: try? JSONSerialization.data(withJSONObject: block["input"] ?? [:])))
+                        }
+                    }
+                }
+                if type == "result" {
+                    if let final = frame["result"] as? String, !final.isEmpty { output = final
+                        await onEvent(.assistantFinal(final))
+                    }
+                    await onEvent(.completed(providerSessionID: identity))
+                    break
+                }
+            }
+            await process.finish()
+            return .init(output: output, providerSessionID: identity)
+        } catch {
+            await process.interrupt { session in try? await Self.sendInterrupt(to: session) }
+            throw error
+        }
+    }
+
+    func steer(runID: UUID, text: String, targetTurnEpoch _: Int64) async throws {
+        guard let process = sessions[runID] else { throw ServiceAPIError(code: .notFound, message: "Claude run is not active") }
+        try await Self.sendInterrupt(to: process)
+        try await process.sendRaw(JSONSerialization.data(withJSONObject: ["type": "user", "message": ["role": "user", "content": [["type": "text", "text": text]]], "parent_tool_use_id": NSNull()]))
+    }
+
+    func interrupt(runID: UUID) async throws {
+        guard let process = sessions[runID] else { return }
+        await process.interrupt { session in try? await Self.sendInterrupt(to: session) }
+    }
+
+    func deliverInteraction(runID: UUID, providerRequestID: String, answer: Data) async throws {
+        guard let process = sessions[runID] else { throw ServiceAPIError(code: .notFound, message: "Claude run is not active") }
+        let answerObject = (try? JSONSerialization.jsonObject(with: answer)) as? [String: Any] ?? [:]
+        let accepted = answerObject["decision"] as? String == "accept" || answerObject["accepted"] as? Bool == true
+        let response: [String: Any] = accepted ? ["behavior": "allow"] : ["behavior": "deny", "message": "Declined by controller"]
+        try await process.sendRaw(JSONSerialization.data(withJSONObject: ["type": "control_response", "response": ["subtype": "success", "request_id": providerRequestID, "response": response]]))
+    }
+
+    private nonisolated static func sendInterrupt(to process: NativeJSONLineProcess) async throws {
+        try await process.sendRaw(JSONSerialization.data(withJSONObject: ["type": "control_request", "request_id": UUID().uuidString, "request": ["subtype": "interrupt", "reason": "authority control"]]))
+    }
+}
+
+/// Portable normalized HeadlessAgentProvider wire. The helper emits the same
+/// event vocabulary as AgentStreamEvent as NDJSON and accepts control NDJSON.
+private actor NormalizedHeadlessProviderRuntime: AgentProviderRuntime {
+    let kind: ProviderKind
+    private let support: NativeProviderProcessSupport
+    private var sessions: [UUID: NativeJSONLineProcess] = [:]
+    init(kind: ProviderKind, support: NativeProviderProcessSupport) {
+        self.kind = kind
+        self.support = support
+    }
+
+    func capability() -> ProviderCapability {
+        support.capability(supportsResume: true, supportsSteering: true)
+    }
+
+    func preflight() async -> ProviderCapability {
+        await support.preflight(supportsResume: true, supportsSteering: true, protocolName: "repoprompt-headless-v1")
+    }
+
+    func recoverProcessFamilies() async throws {
+        try await support.recover()
+    }
+
+    func hasActiveRun(_ runID: UUID) -> Bool {
+        sessions[runID] != nil
+    }
+
+    func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
+        let process = try await support.makeSession(runID: request.runID, arguments: ["--headless-provider-json"], workingDirectory: request.workingDirectory)
+        sessions[request.runID] = process
+        defer { sessions[request.runID] = nil }
+        try await process.sendRaw(JSONSerialization.data(withJSONObject: ["operation": "start", "runID": request.runID.uuidString, "prompt": request.prompt, "model": request.model as Any, "resumeSessionID": request.resumeProviderSessionID as Any]))
+        var output = ""
+        var identity = request.resumeProviderSessionID
+        while true {
+            let line = try await process.nextLine()
+            guard let frame = try JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+            switch frame["type"] as? String {
+            case "message": let text = frame["content"] as? String ?? ""
+                output += text
+                await onEvent(.assistantDelta(text))
+            case "finalMessage": let text = frame["content"] as? String ?? ""
+                output = text
+                await onEvent(.assistantFinal(text))
+            case "reasoning": await onEvent(.reasoning(frame["content"] as? String ?? ""))
+            case "progress", "system": await onEvent(.progress(frame["message"] as? String ?? ""))
+            case "toolCall": await onEvent(.toolStarted(providerToolID: frame["id"] as? String ?? UUID().uuidString, name: frame["name"] as? String ?? "tool", arguments: try? JSONSerialization.data(withJSONObject: frame["args"] ?? [:])))
+            case "toolResult": await onEvent(.toolCompleted(providerToolID: frame["id"] as? String ?? "tool", name: frame["name"] as? String ?? "tool", output: frame["result"] as? String, failed: frame["failed"] as? Bool ?? false))
+            case "interaction": await onEvent(.interactionRequested(providerRequestID: frame["requestID"] as? String ?? UUID().uuidString, kind: (frame["kind"] as? String) == "question" ? .question : .approval, prompt: frame["prompt"] as? String ?? "Provider input required", choices: frame["choices"] as? [String] ?? []))
+            case "completion": identity = frame["providerSessionID"] as? String ?? identity
+                await onEvent(.completed(providerSessionID: identity))
+                await process.finish()
+                return .init(output: output, providerSessionID: identity)
+            default: break
+            }
+        }
+    }
+
+    func steer(runID: UUID, text: String, targetTurnEpoch: Int64) async throws {
+        guard let process = sessions[runID] else { throw ServiceAPIError(code: .notFound, message: "Headless run is not active") }
+        try await process.sendRaw(JSONSerialization.data(withJSONObject: ["operation": "steer", "text": text, "targetTurnEpoch": targetTurnEpoch]))
+    }
+
+    func interrupt(runID: UUID) async throws {
+        guard let process = sessions[runID] else { return }
+        await process.interrupt { session in try? await session.sendRaw(try JSONSerialization.data(withJSONObject: ["operation": "interrupt"])) }
+    }
+
+    func deliverInteraction(runID: UUID, providerRequestID: String, answer: Data) async throws {
+        guard let process = sessions[runID] else { throw ServiceAPIError(code: .notFound, message: "Headless run is not active") }
+        try await process.sendRaw(JSONSerialization.data(withJSONObject: ["operation": "respond", "requestID": providerRequestID, "answer": (try? JSONSerialization.jsonObject(with: answer)) ?? NSNull()]))
+    }
+}
+
+private actor ProviderOutputAccumulator {
+    private var output = ""
+    func record(_ event: ProviderRuntimeEvent) {
+        switch event {
+        case let .assistantDelta(text): output += text
+        case let .assistantFinal(text): output = text
+        default: break
+        }
+    }
+
+    func value() -> String {
+        output
+    }
+}
+
+/// Executable MCP compatibility path: initialize and tools/list are real stdio
+/// JSON-RPC exchanges. It is intentionally not a second session authority.
+private actor MCPStdioProviderRuntime: AgentProviderRuntime {
+    let kind = ProviderKind.mcp
+    private let support: NativeProviderProcessSupport
+    private var sessions: [UUID: NativeJSONLineProcess] = [:]
+    init(support: NativeProviderProcessSupport) {
+        self.support = support
+    }
+
+    func capability() -> ProviderCapability {
+        support.capability(supportsResume: false, supportsSteering: false)
+    }
+
+    func preflight() async -> ProviderCapability {
+        await support.preflight(supportsResume: false, supportsSteering: false, protocolName: "mcp-stdio-2025-03-26")
+    }
+
+    func recoverProcessFamilies() async throws {
+        try await support.recover()
+    }
+
+    func hasActiveRun(_ runID: UUID) -> Bool {
+        sessions[runID] != nil
+    }
+
+    func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
+        let process = try await support.makeSession(runID: request.runID, arguments: [], workingDirectory: request.workingDirectory)
+        sessions[request.runID] = process
+        defer { sessions[request.runID] = nil }
+        _ = try await process.request(method: "initialize", params: ["protocolVersion": "2025-03-26", "capabilities": [:], "clientInfo": ["name": "RepoPromptServer", "version": "1"]], onFrame: { _ in })
+        try await process.notify(method: "notifications/initialized")
+        let tools = try await process.request(method: "tools/list", params: [:], onFrame: { _ in })
+        let object = try CodexAppServerProviderRuntime.object(tools)
+        let names = (object["tools"] as? [[String: Any]] ?? []).compactMap { $0["name"] as? String }.sorted()
+        let output = names.joined(separator: "\n")
+        await onEvent(.progress("MCP initialized with \(names.count) tools"))
+        await onEvent(.assistantFinal(output))
+        await onEvent(.completed(providerSessionID: nil))
+        await process.finish()
+        return .init(output: output, providerSessionID: nil)
+    }
+
+    func interrupt(runID: UUID) async throws {
+        guard let process = sessions[runID] else { return }
+        await process.interrupt { _ in }
+    }
+}

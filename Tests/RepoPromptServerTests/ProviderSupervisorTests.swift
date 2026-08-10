@@ -76,7 +76,7 @@ final class ProviderSupervisorTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let executable = directory.appendingPathComponent("provider")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try Data("#!/bin/sh\necho '{\"type\":\"thread.started\",\"thread_id\":\"22222222-2222-2222-2222-222222222222\"}'\nsleep 2\necho '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"done\"}}'\n".utf8).write(to: executable)
+        try Data(Self.fakeCodexAppServerScript(finalTextShell: "done", delayBeforeCompletion: true).utf8).write(to: executable)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         defer { try? FileManager.default.removeItem(at: directory) }
         let port = try PortableProcessSupervisionPort()
@@ -103,7 +103,7 @@ final class ProviderSupervisorTests: XCTestCase {
         let executable = directory.appendingPathComponent("provider")
         let homes = directory.appendingPathComponent("homes", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try Data("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'provider 1.0'; exit 0; fi\ntouch \"$HOME/provider-wrote\"\nexec /bin/echo \"$HOME\"\n".utf8).write(to: executable)
+        try Data(Self.fakeCodexAppServerScript(finalTextShell: "$HOME", version: "provider 1.0").utf8).write(to: executable)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = try await SQLiteServiceStore.open(storage: .memory)
@@ -211,6 +211,26 @@ final class ProviderSupervisorTests: XCTestCase {
         let result = await port.result()
         XCTAssertEqual(result.reaped.sorted(), [300, 301])
         try await store.close()
+    }
+
+    private static func fakeCodexAppServerScript(finalTextShell: String, version: String = "provider 1.0", delayBeforeCompletion: Bool = false) -> String {
+        let delay = delayBeforeCompletion ? "sleep 1" : ":"
+        return """
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then echo '\(version)'; exit 0; fi
+        while IFS= read -r line; do
+          case "$line" in
+            *'"method":"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+            *method*thread*start*|*method*thread*resume*) echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"22222222-2222-2222-2222-222222222222"}}}' ;;
+            *method*turn*start*)
+              echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+              \(delay)
+              printf '{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"message-1","type":"agentMessage","text":"%s"}}}\n' "\(finalTextShell)"
+              echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"turn-1"}}}'
+              ;;
+          esac
+        done
+        """
     }
 }
 

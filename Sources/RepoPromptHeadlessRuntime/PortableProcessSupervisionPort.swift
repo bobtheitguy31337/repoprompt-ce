@@ -18,21 +18,26 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
 
     private var processes: [Int32: Process] = [:]
     private var identities: [Int32: ProcessIdentity] = [:]
+    private var standardInputs: [Int32: FileHandle] = [:]
+    private var cgroupPaths: [Int32: String] = [:]
     private let bootID: String
+    private let delegatedCgroupRoot: String?
 
-    public init() throws {
+    public init(cgroupRoot: String? = ProcessInfo.processInfo.environment["REPOPROMPT_PROVIDER_CGROUP_ROOT"]) throws {
         #if os(Linux)
             guard rp_enable_child_subreaper() == 0 else {
                 throw ServiceAPIError(code: .dependencyUnavailable, message: "Unable to enable Linux child subreaper")
             }
             bootID = (try? String(contentsOfFile: "/proc/sys/kernel/random/boot_id", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) ?? "unknown-linux-boot"
+            delegatedCgroupRoot = Self.validatedCgroupV2Root(cgroupRoot)
         #else
             bootID = "darwin-\(ProcessInfo.processInfo.systemUptime)"
+            delegatedCgroupRoot = nil
         #endif
     }
 
     public func launch(executable: String, arguments: [String], environment: [String: String], workingDirectory: String, helperToken: String) async throws -> ProcessIdentity {
-        try await launchProcess(executable: executable, arguments: arguments, environment: environment, workingDirectory: workingDirectory, helperToken: helperToken, stdout: FileHandle.nullDevice, stderr: FileHandle.nullDevice)
+        try await launchProcess(executable: executable, arguments: arguments, environment: environment, workingDirectory: workingDirectory, helperToken: helperToken, stdin: FileHandle.nullDevice, stdout: FileHandle.nullDevice, stderr: FileHandle.nullDevice)
     }
 
     public func launchCaptured(executable: String, arguments: [String], environment: [String: String], workingDirectory: String, helperToken: String, outputDirectory: String) async throws -> CapturedProcess {
@@ -45,7 +50,7 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         let stdout = try FileHandle(forWritingTo: URL(fileURLWithPath: stdoutPath))
         let stderr = try FileHandle(forWritingTo: URL(fileURLWithPath: stderrPath))
         do {
-            let identity = try await launchProcess(executable: executable, arguments: arguments, environment: environment, workingDirectory: workingDirectory, helperToken: helperToken, stdout: stdout, stderr: stderr)
+            let identity = try await launchProcess(executable: executable, arguments: arguments, environment: environment, workingDirectory: workingDirectory, helperToken: helperToken, stdin: FileHandle.nullDevice, stdout: stdout, stderr: stderr)
             return CapturedProcess(identity: identity, stdoutPath: stdoutPath, stderrPath: stderrPath)
         } catch {
             try? stdout.close()
@@ -54,6 +59,57 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
             try? FileManager.default.removeItem(atPath: stderrPath)
             throw error
         }
+    }
+
+    /// Launches a bidirectional provider protocol while retaining the same
+    /// subreaper/process-family identity and captured-output guarantees.
+    public func launchInteractiveCaptured(executable: String, arguments: [String], environment: [String: String], workingDirectory: String, helperToken: String, outputDirectory: String) async throws -> CapturedProcess {
+        try FileManager.default.createDirectory(atPath: outputDirectory, withIntermediateDirectories: true)
+        let id = UUID().uuidString
+        let stdoutPath = URL(fileURLWithPath: outputDirectory).appendingPathComponent("\(id).stdout").path
+        let stderrPath = URL(fileURLWithPath: outputDirectory).appendingPathComponent("\(id).stderr").path
+        FileManager.default.createFile(atPath: stdoutPath, contents: nil)
+        FileManager.default.createFile(atPath: stderrPath, contents: nil)
+        let stdout = try FileHandle(forWritingTo: URL(fileURLWithPath: stdoutPath))
+        let stderr = try FileHandle(forWritingTo: URL(fileURLWithPath: stderrPath))
+        let input = Pipe()
+        do {
+            let identity = try await launchProcess(executable: executable, arguments: arguments, environment: environment, workingDirectory: workingDirectory, helperToken: helperToken, stdin: input, stdout: stdout, stderr: stderr)
+            standardInputs[identity.pid] = input.fileHandleForWriting
+            return CapturedProcess(identity: identity, stdoutPath: stdoutPath, stderrPath: stderrPath)
+        } catch {
+            try? input.fileHandleForWriting.close()
+            try? stdout.close()
+            try? stderr.close()
+            try? FileManager.default.removeItem(atPath: stdoutPath)
+            try? FileManager.default.removeItem(atPath: stderrPath)
+            throw error
+        }
+    }
+
+    public func write(_ data: Data, to captured: CapturedProcess) throws {
+        guard let input = standardInputs[captured.identity.pid] else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider protocol input is closed")
+        }
+        try input.write(contentsOf: data)
+    }
+
+    public func capturedOutput(_ captured: CapturedProcess, after offset: Int, maximumBytes: Int) throws -> (data: Data, nextOffset: Int, running: Bool) {
+        let contents = try Data(contentsOf: URL(fileURLWithPath: captured.stdoutPath))
+        guard offset <= contents.count else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider output stream was truncated")
+        }
+        let end = min(contents.count, offset + max(1, maximumBytes))
+        return (Data(contents[offset ..< end]), end, processes[captured.identity.pid]?.isRunning == true)
+    }
+
+    public func closeInput(_ captured: CapturedProcess) {
+        try? standardInputs.removeValue(forKey: captured.identity.pid)?.close()
+    }
+
+    public func cleanupCapturedFiles(_ captured: CapturedProcess) {
+        try? FileManager.default.removeItem(atPath: captured.stdoutPath)
+        try? FileManager.default.removeItem(atPath: captured.stderrPath)
     }
 
     public func waitForCapturedProcess(
@@ -89,7 +145,7 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         return String(decoding: stdout.prefix(max(1, maximumBytes)), as: UTF8.self)
     }
 
-    private func launchProcess(executable: String, arguments: [String], environment: [String: String], workingDirectory: String, helperToken: String, stdout: FileHandle, stderr: FileHandle) async throws -> ProcessIdentity {
+    private func launchProcess(executable: String, arguments: [String], environment: [String: String], workingDirectory: String, helperToken: String, stdin: Any, stdout: FileHandle, stderr: FileHandle) async throws -> ProcessIdentity {
         guard FileManager.default.isExecutableFile(atPath: executable) else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider executable is unavailable") }
         let process = Process()
         #if os(Linux)
@@ -104,15 +160,19 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
             process.arguments = arguments
         #endif
         process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
-        var launchEnvironment = ProcessInfo.processInfo.environment.merging(environment) { _, configured in configured }
+        // Provider processes receive an explicit allowlist assembled by the
+        // runtime. Never inherit service signing keys, database credentials,
+        // Docker endpoints, or unrelated host secrets.
+        var launchEnvironment = environment
         launchEnvironment["REPOPROMPT_HELPER_TOKEN"] = helperToken
         process.environment = launchEnvironment
-        process.standardInput = FileHandle.nullDevice
+        process.standardInput = stdin
         process.standardOutput = stdout
         process.standardError = stderr
         try process.run()
         let pid = process.processIdentifier
         processes[pid] = process
+        try attachToDelegatedCgroupIfAvailable(pid: pid, helperToken: helperToken)
         let digest = CanonicalSigning.bodyDigest(Data(helperToken.utf8))
         #if !os(Linux)
             let observed = ProcessIdentity(pid: pid, parentPID: getpid(), processGroupID: getpgid(pid), sessionID: getsid(pid), startTimeTicks: UInt64(ProcessInfo.processInfo.systemUptime * 100), bootID: bootID, executablePath: executable, helperTokenDigest: digest)
@@ -159,12 +219,26 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         guard systemKill(-processGroupID, signal) == 0 || errno == ESRCH else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Unable to signal provider process group") }
     }
 
+    public func terminateContainedFamily(leader: ProcessIdentity) async throws -> Bool {
+        #if os(Linux)
+            guard let path = cgroupPaths[leader.pid] else { return false }
+            let killFile = URL(fileURLWithPath: path).appendingPathComponent("cgroup.kill").path
+            guard FileManager.default.isWritableFile(atPath: killFile) else { return false }
+            try Data("1\n".utf8).write(to: URL(fileURLWithPath: killFile))
+            return true
+        #else
+            return false
+        #endif
+    }
+
     public func reap(pid: Int32) async throws {
         var status: Int32 = 0
         _ = rp_waitpid_nohang(pid, &status)
         if let process = processes[pid], !process.isRunning { process.waitUntilExit() }
         processes[pid] = nil
         identities[pid] = nil
+        try? standardInputs.removeValue(forKey: pid)?.close()
+        if let cgroup = cgroupPaths.removeValue(forKey: pid) { try? FileManager.default.removeItem(atPath: cgroup) }
         try reapAdoptedChildren()
     }
 
@@ -204,6 +278,36 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
             Glibc.kill(pid, signal)
         #else
             Darwin.kill(pid, signal)
+        #endif
+    }
+
+    private func attachToDelegatedCgroupIfAvailable(pid: Int32, helperToken: String) throws {
+        #if os(Linux)
+            guard let delegatedCgroupRoot else { return }
+            let safeToken = helperToken.replacingOccurrences(of: "[^A-Za-z0-9_.-]", with: "-", options: .regularExpression)
+            let path = URL(fileURLWithPath: delegatedCgroupRoot, isDirectory: true).appendingPathComponent("run-\(safeToken)", isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(at: path, withIntermediateDirectories: false)
+                try Data("\(pid)\n".utf8).write(to: path.appendingPathComponent("cgroup.procs"))
+                cgroupPaths[pid] = path.path
+            } catch {
+                try? FileManager.default.removeItem(at: path)
+                // Lack of delegation is an expected deployment mode. The
+                // subreaper + verified ancestry/PGID path remains authoritative.
+            }
+        #endif
+    }
+
+    private static func validatedCgroupV2Root(_ configured: String?) -> String? {
+        #if os(Linux)
+            guard let configured, !configured.isEmpty else { return nil }
+            let root = URL(fileURLWithPath: configured, isDirectory: true).standardizedFileURL.path
+            guard FileManager.default.fileExists(atPath: URL(fileURLWithPath: root).appendingPathComponent("cgroup.controllers").path),
+                  FileManager.default.isWritableFile(atPath: root)
+            else { return nil }
+            return root
+        #else
+            return nil
         #endif
     }
 }

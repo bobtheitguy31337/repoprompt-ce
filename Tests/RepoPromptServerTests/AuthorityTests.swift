@@ -52,26 +52,97 @@ final class AuthorityTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let runner = DelayedProviderRunner()
-        let provider = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: "/usr/bin/true")], runner: runner)
+        let runtime = SteeringProviderRuntime()
+        let provider = ProviderCLIAdapter(runtimes: [runtime])
         let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
         let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-run", requestDigest: "p-run")
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "first"), externalActor: actor, idempotencyKey: "s-run", requestDigest: "s-run")
 
-        _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "resume", requestDigest: "resume")
-        _ = try await authority.execute(command: .steerSession(text: "second", targetTurnEpoch: 1), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "steer", requestDigest: "steer")
+        do {
+            _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "resume", requestDigest: "resume")
+        } catch {
+            print("NATIVE RESUME ERROR: \(error)")
+            XCTFail("native resume failed: \(error)")
+            try? await store.close()
+            return
+        }
+        do {
+            _ = try await authority.execute(command: .steerSession(text: "second", targetTurnEpoch: 1), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "steer", requestDigest: "steer")
+        } catch {
+            print("NATIVE STEER ERROR: \(error)")
+            XCTFail("native steer failed: \(error)")
+            try? await store.close()
+            return
+        }
         try await Task.sleep(for: .milliseconds(150))
         let completed = try await authority.sessionSnapshot(sessionID: session.sessionID)
         XCTAssertEqual(completed.state, .completed)
         XCTAssertEqual(completed.transcript.suffix(2).map(\.content), ["second", "provider:second"])
 
-        let cancelSession = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "cancel"), externalActor: actor, idempotencyKey: "s-cancel", requestDigest: "s-cancel")
-        await runner.setDelay(.seconds(10))
-        _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: cancelSession.sessionID, externalActor: actor, idempotencyKey: "resume-cancel", requestDigest: "resume-cancel")
-        _ = try await authority.execute(command: .cancelSession(expectedRunID: nil, expectedGeneration: 1), sessionID: cancelSession.sessionID, externalActor: actor, idempotencyKey: "cancel", requestDigest: "cancel")
+        let cancelSession: SessionSnapshot
+        do {
+            cancelSession = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "cancel"), externalActor: actor, idempotencyKey: "s-cancel", requestDigest: "s-cancel")
+            await runtime.holdNextRun()
+            _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: cancelSession.sessionID, externalActor: actor, idempotencyKey: "resume-cancel", requestDigest: "resume-cancel")
+            _ = try await authority.execute(command: .cancelSession(expectedRunID: nil, expectedGeneration: 1), sessionID: cancelSession.sessionID, externalActor: actor, idempotencyKey: "cancel", requestDigest: "cancel")
+        } catch {
+            print("NATIVE CANCEL ERROR: \(error)")
+            XCTFail("native cancel phase failed: \(error)")
+            try? await store.close()
+            return
+        }
         let canceled = try await authority.sessionSnapshot(sessionID: cancelSession.sessionID)
         XCTAssertEqual(canceled.state, .canceled)
+        await authority.waitForProviderRunsToSettle()
+        try await authority.quiesce()
+        do { try await store.close() } catch {
+            XCTFail("store close after provider controls failed: \(error)")
+            return
+        }
+    }
+
+    func testProviderEventsAndInteractionDeliveryUseDurableAuthority() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let runtime = InteractiveEventProviderRuntime()
+        let provider = ProviderCLIAdapter(runtimes: [runtime])
+        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-events", requestDigest: "p-events")
+        let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "run"), externalActor: actor, idempotencyKey: "s-events", requestDigest: "s-events")
+        _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "run-events", requestDigest: "run-events")
+
+        var interaction: InteractionSnapshot?
+        for _ in 0 ..< 100 {
+            interaction = try await authority.interactionSnapshots(sessionID: session.sessionID).first
+            if interaction != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let pending = try XCTUnwrap(interaction)
+        let answer = try JSONSerialization.data(withJSONObject: ["decision": "accept"])
+        _ = try await authority.answerInteraction(sessionID: session.sessionID, interactionID: pending.interactionID, expectedRevision: pending.revision, payload: answer, actor: actor, idempotencyKey: "answer-events", requestDigest: "answer-events")
+
+        var completed = try await authority.sessionSnapshot(sessionID: session.sessionID)
+        for _ in 0 ..< 100 where completed.state != .completed {
+            try await Task.sleep(for: .milliseconds(10))
+            completed = try await authority.sessionSnapshot(sessionID: session.sessionID)
+        }
+        XCTAssertEqual(completed.state, .completed)
+        XCTAssertTrue(completed.transcript.contains { $0.kind == .reasoning && $0.content == "thinking" })
+        XCTAssertTrue(completed.transcript.contains { $0.kind == .assistant && $0.content == "finished" })
+        let events = try await authority.events(after: nil, limit: 100)
+        XCTAssertTrue(events.events.contains { $0.eventType == .toolStarted })
+        XCTAssertTrue(events.events.contains { $0.eventType == .toolUpdated })
+        XCTAssertTrue(events.events.contains { $0.eventType == .toolCompleted })
+        XCTAssertTrue(events.events.contains { $0.eventType == .interactionRequested })
+        XCTAssertTrue(events.events.contains { $0.eventType == .interactionResolved })
+        let deliveredRequestID = await runtime.deliveredRequestID()
+        XCTAssertEqual(deliveredRequestID, "approval-1")
+        await authority.waitForProviderRunsToSettle()
+        try await authority.quiesce()
         try await store.close()
     }
 
@@ -314,6 +385,112 @@ private actor DelayedProviderRunner: WorkspaceCommandRunning {
     func run(executable _: String, arguments: [String], workingDirectory _: String, maximumBytes _: Int) async throws -> String {
         try await Task.sleep(for: delay)
         return "provider:\(arguments.last ?? "")"
+    }
+}
+
+private actor SteeringProviderRuntime: AgentProviderRuntime {
+    let kind = ProviderKind.codex
+    private var active: Set<UUID> = []
+    private var steeredText: [UUID: String] = [:]
+    private var hold = false
+
+    func capability() -> ProviderCapability {
+        .init(kind: kind, enabled: true, executable: "/test/codex", supportsResume: true, supportsSteering: true, protocolVersion: "app-server-v2")
+    }
+
+    func preflight() -> ProviderCapability {
+        capability()
+    }
+
+    func hasActiveRun(_ runID: UUID) -> Bool {
+        active.contains(runID)
+    }
+
+    func holdNextRun() {
+        hold = true
+    }
+
+    func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
+        active.insert(request.runID)
+        defer { active.remove(request.runID)
+            steeredText[request.runID] = nil
+        }
+        await onEvent(.providerIdentity("thread-\(request.runID.uuidString)"))
+        while steeredText[request.runID] == nil, !hold {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        if hold {
+            while active.contains(request.runID) {
+                try await Task.sleep(for: .seconds(1))
+            }
+            throw CancellationError()
+        }
+        let text = steeredText[request.runID] ?? request.prompt
+        let output = "provider:\(text)"
+        await onEvent(.assistantFinal(output))
+        await onEvent(.completed(providerSessionID: "thread-\(request.runID.uuidString)"))
+        return .init(output: output, providerSessionID: "thread-\(request.runID.uuidString)")
+    }
+
+    func steer(runID: UUID, text: String, targetTurnEpoch _: Int64) throws {
+        guard active.contains(runID) else { throw ServiceAPIError(code: .notFound, message: "run missing") }
+        steeredText[runID] = text
+    }
+
+    func interrupt(runID: UUID) {
+        active.remove(runID)
+    }
+}
+
+private actor InteractiveEventProviderRuntime: AgentProviderRuntime {
+    let kind = ProviderKind.codex
+    private var activeRunID: UUID?
+    private var deliveredID: String?
+    private var answered = false
+
+    func capability() -> ProviderCapability {
+        .init(kind: kind, enabled: true, executable: "/test/codex", supportsResume: true, supportsSteering: true, protocolVersion: "app-server-v2")
+    }
+
+    func preflight() -> ProviderCapability {
+        capability()
+    }
+
+    func hasActiveRun(_ runID: UUID) -> Bool {
+        activeRunID == runID
+    }
+
+    func deliveredRequestID() -> String? {
+        deliveredID
+    }
+
+    func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
+        activeRunID = request.runID
+        defer { activeRunID = nil }
+        await onEvent(.providerIdentity("event-thread"))
+        await onEvent(.reasoning("thinking"))
+        await onEvent(.progress("working"))
+        await onEvent(.toolStarted(providerToolID: "tool-1", name: "read_file", arguments: Data("{}".utf8)))
+        await onEvent(.toolUpdated(providerToolID: "tool-1", output: "partial"))
+        await onEvent(.toolCompleted(providerToolID: "tool-1", name: "read_file", output: "done", failed: false))
+        await onEvent(.interactionRequested(providerRequestID: "approval-1", kind: .approval, prompt: "Approve tool", choices: ["accept", "decline"]))
+        while !answered {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        await onEvent(.assistantFinal("finished"))
+        await onEvent(.completed(providerSessionID: "event-thread"))
+        return .init(output: "finished", providerSessionID: "event-thread")
+    }
+
+    func steer(runID _: UUID, text _: String, targetTurnEpoch _: Int64) {}
+    func interrupt(runID _: UUID) {
+        answered = true
+    }
+
+    func deliverInteraction(runID: UUID, providerRequestID: String, answer _: Data) throws {
+        guard activeRunID == runID else { throw ServiceAPIError(code: .notFound, message: "run missing") }
+        deliveredID = providerRequestID
+        answered = true
     }
 }
 
