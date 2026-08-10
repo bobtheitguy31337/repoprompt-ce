@@ -86,6 +86,7 @@ var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptApp",
     "RepoPromptDomainRuntime",
     "RepoPromptCodeMapCore",
+    "RepoPromptWorkspaceRuntimeCore",
     "RepoPromptMCP",
     "RepoPromptShared",
     .product(name: "Markdown", package: "swift-markdown")
@@ -193,7 +194,7 @@ let package: Package = if serverOnly {
                 path: "Sources/RepoPromptCodeMapCore",
                 swiftSettings: swift6LanguageMode
             ),
-            .target(name: "RepoPromptWorkspaceRuntimeCore", dependencies: ["RepoPromptServiceProtocol", "RepoPromptCodeMapCore"], path: "Sources/RepoPromptWorkspaceRuntimeCore", swiftSettings: swift6LanguageMode),
+            .target(name: "RepoPromptWorkspaceRuntimeCore", dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptCodeMapCore"], path: "Sources/RepoPromptWorkspaceRuntimeCore", resources: [.copy("Resources")], swiftSettings: swift6LanguageMode),
             .target(name: "RepoPromptServicePersistence", dependencies: ["RepoPromptServiceProtocol", .product(name: "SQLiteNIO", package: "sqlite-nio")], path: "Sources/RepoPromptServicePersistence", swiftSettings: swift6LanguageMode),
             .target(name: "RepoPromptHeadlessRuntime", dependencies: ["RepoPromptServiceProtocol", "RepoPromptServicePersistence", "RepoPromptAgentRuntimeCore", "RepoPromptWorkspaceRuntimeCore", "RepoPromptDomainRuntime", "RepoPromptLinuxSupport"], path: "Sources/RepoPromptHeadlessRuntime", swiftSettings: swift6LanguageMode),
             .target(name: "RepoPromptServiceHTTP", dependencies: ["RepoPromptServiceProtocol", "RepoPromptServicePersistence", "RepoPromptHeadlessRuntime", "RepoPromptAgentRuntimeCore", .product(name: "Crypto", package: "swift-crypto"), .product(name: "Hummingbird", package: "hummingbird"), .product(name: "HummingbirdTLS", package: "hummingbird"), .product(name: "NIOSSL", package: "swift-nio-ssl"), .product(name: "X509", package: "swift-certificates")], path: "Sources/RepoPromptServiceHTTP", swiftSettings: swift6LanguageMode),
@@ -309,8 +310,9 @@ let package: Package = if serverOnly {
             ),
             .target(
                 name: "RepoPromptWorkspaceRuntimeCore",
-                dependencies: ["RepoPromptServiceProtocol", "RepoPromptCodeMapCore"],
+                dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptCodeMapCore"],
                 path: "Sources/RepoPromptWorkspaceRuntimeCore",
+                resources: [.copy("Resources")],
                 swiftSettings: swift6LanguageMode
             ),
             .target(

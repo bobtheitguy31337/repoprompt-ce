@@ -46,11 +46,3 @@ public actor SessionSelectionAuthority {
         }
     }
 }
-
-public protocol ContextBuilderRuntimeService: Sendable {
-    func propose(sessionID: UUID, expectedSelectionRevision: Int64, instructions: String, budget: Int) async throws -> [LogicalSelectionEntry]
-}
-
-public protocol OracleRuntimeService: Sendable {
-    func ask(sessionID: UUID, chatID: UUID?, prompt: String, contextMode: String) async throws -> String
-}

@@ -84,6 +84,28 @@ final class WorkspaceAuthorityTests: XCTestCase {
         try await store.close()
     }
 
+    func testAuthorizedRootIdentityReplacementIsRejected() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try "original".write(to: root.appendingPathComponent("value.txt"), atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-root-identity", requestDigest: "p-root-identity")
+        let rootID = try XCTUnwrap(project.roots.first?.rootID)
+        try FileManager.default.removeItem(at: root)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try "replacement".write(to: root.appendingPathComponent("value.txt"), atomically: true, encoding: .utf8)
+        do {
+            _ = try await authority.projectFile(projectID: project.projectID, request: .init(rootID: rootID, logicalPath: "value.txt"))
+            XCTFail("expected root identity rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .rootUnauthorized)
+        }
+        try await store.close()
+    }
+
     func testWorktreeServiceUsesValidatedGitArguments() async throws {
         let runner = RecordingWorkspaceRunner()
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -146,25 +168,117 @@ final class WorkspaceAuthorityTests: XCTestCase {
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p", requestDigest: "p")
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "s", requestDigest: "s")
         let rootID = try XCTUnwrap(project.roots.first?.rootID)
-        await runner.setContextBuilderResponse("[{\"rootID\":\"\(rootID.uuidString)\",\"path\":\"important.txt\"}]")
+        await runner.setContextBuilderResponse("{\"tool\":\"manage_selection\",\"args\":{\"op\":\"set\",\"entries\":[{\"rootID\":\"\(rootID.uuidString)\",\"path\":\"important.txt\"}]}}")
 
         let selection = try await authority.runContextBuilder(sessionID: session.sessionID, input: .init(expectedSelectionRevision: 1, instructions: "find important context", budget: 100), actor: actor)
         XCTAssertEqual(selection.entries.map(\.logicalPath), ["important.txt"])
+        XCTAssertEqual(selection.response, "builder plan")
+        XCTAssertNotNil(selection.chatID)
+        let builderContext = try await authority.sessionContext(sessionID: session.sessionID)
+        XCTAssertEqual(builderContext.prompt, "Use the selected important context.")
         let context = try await authority.buildContext(sessionID: session.sessionID, expectedSelectionRevision: selection.revision, include: ["files"], actor: actor)
         let contextData = try await authority.artifactContent(artifactID: context.artifactID, maximumBytes: 1_048_576)
         XCTAssertTrue(String(decoding: contextData, as: UTF8.self).contains("important context"))
 
-        let oracle = try await authority.askOracle(sessionID: session.sessionID, input: .init(chatID: nil, prompt: "explain", contextMode: "selected"), actor: actor)
+        let oracle = try await authority.askOracle(sessionID: session.sessionID, input: .init(chatID: selection.chatID, prompt: "explain", contextMode: "selected"), actor: actor)
         XCTAssertEqual(oracle.response, "oracle response")
         XCTAssertNotNil(oracle.artifactID)
-        XCTAssertEqual(oracle.revision, 1)
+        XCTAssertEqual(oracle.revision, 2)
         let continuedOracle = try await authority.askOracle(sessionID: session.sessionID, input: .init(chatID: oracle.chatID, prompt: "continue", contextMode: "selected"), actor: actor)
         XCTAssertEqual(continuedOracle.chatID, oracle.chatID)
-        XCTAssertEqual(continuedOracle.revision, 2)
+        XCTAssertEqual(continuedOracle.revision, 3)
         let oraclePrompts = await runner.oraclePrompts()
-        XCTAssertTrue(oraclePrompts.last?.contains("Human: explain") == true)
+        XCTAssertTrue(oraclePrompts.last?.contains("<user>explain</user>") == true)
         let enabledProviders = await authority.providerCapabilities().filter(\.enabled).map(\.kind)
         XCTAssertEqual(enabledProviders, [.codex])
+        try await store.close()
+    }
+
+    func testContextBuilderStaleCommitRetainsInspectableProposalArtifact() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let artifacts = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try "context".write(to: root.appendingPathComponent("Context.swift"), atomically: true, encoding: .utf8)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: artifacts)
+        }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let runtime = BlockingContextBuilderRuntime()
+        let authority = try RepoPromptHeadlessAuthority(store: store, artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path), contextBuilderRuntime: runtime)
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-cb-race", requestDigest: "p-cb-race")
+        let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "s-cb-race", requestDigest: "s-cb-race")
+        let rootID = try XCTUnwrap(project.roots.first?.rootID)
+        await runtime.setProposal(.init(selection: [.init(rootID: rootID, logicalPath: "Context.swift", mode: .full)], response: "proposal", providerSessionID: "builder", rawProviderOutput: "fixture"))
+
+        let builder = Task {
+            try await authority.runContextBuilder(sessionID: session.sessionID, input: .init(expectedSelectionRevision: 1, instructions: "select", budget: 100), actor: actor)
+        }
+        for _ in 0 ..< 100 {
+            if await runtime.hasStarted() { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let didStart = await runtime.hasStarted()
+        XCTAssertTrue(didStart)
+        _ = try await authority.replaceSelection(sessionID: session.sessionID, entries: [], expectedRevision: 1, actor: actor)
+        await runtime.release()
+        do {
+            _ = try await builder.value
+            XCTFail("expected stale selection commit")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .staleRevision)
+            XCTAssertEqual(error.currentRevision, 2)
+        }
+        let retained = try await store.artifacts(sessionID: session.sessionID)
+        XCTAssertEqual(retained.map(\.snapshot.kind), ["context-builder-proposal"])
+        let data = try await authority.artifactContent(artifactID: XCTUnwrap(retained.first?.snapshot.artifactID), maximumBytes: 1_048_576)
+        XCTAssertTrue(String(decoding: data, as: UTF8.self).contains("Context.swift"))
+        try await store.close()
+    }
+
+    func testContextBuilderClarifyingQuestionUsesDurableAuthorityInteraction() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let artifacts = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: artifacts)
+        }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let runner = QuestionWorkspaceRunner()
+        let provider = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: "/usr/bin/true")], runner: runner)
+        let authority = try RepoPromptHeadlessAuthority(store: store, artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path), providerAdapter: provider)
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-question", requestDigest: "p-question")
+        let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "s-question", requestDigest: "s-question")
+
+        let builder = Task {
+            try await authority.runContextBuilder(
+                sessionID: session.sessionID,
+                input: .init(expectedSelectionRevision: 1, instructions: "clarify", budget: 100, allowClarifyingQuestions: true),
+                actor: actor
+            )
+        }
+        var pending: InteractionSnapshot?
+        for _ in 0 ..< 100 {
+            pending = try await authority.interactionSnapshots(sessionID: session.sessionID).first(where: { $0.state == .pending })
+            if pending != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let interaction = try XCTUnwrap(pending)
+        XCTAssertEqual(interaction.kind, .question)
+        _ = try await authority.answerInteraction(
+            sessionID: session.sessionID,
+            interactionID: interaction.interactionID,
+            expectedRevision: interaction.revision,
+            payload: Data(#"{"answer":"Use the service target"}"#.utf8),
+            actor: actor
+        )
+        let result = try await builder.value
+        XCTAssertEqual(result.revision, 2)
+        let receivedAnswer = await runner.receivedAnswer
+        XCTAssertTrue(receivedAnswer)
         try await store.close()
     }
 
@@ -225,6 +339,7 @@ private actor RecordingWorkspaceRunner: WorkspaceCommandRunning {
 
 private actor WorkflowWorkspaceRunner: WorkspaceCommandRunning {
     private var contextBuilderResponse = "[]"
+    private var contextBuilderTurn = 0
     private var recordedOraclePrompts: [String] = []
 
     func setContextBuilderResponse(_ value: String) {
@@ -233,7 +348,17 @@ private actor WorkflowWorkspaceRunner: WorkspaceCommandRunning {
 
     func run(executable _: String, arguments: [String], workingDirectory _: String, maximumBytes _: Int) async throws -> String {
         let prompt = arguments.last ?? ""
-        if prompt.contains("Context Builder") { return contextBuilderResponse }
+        if prompt.contains("Context Builder") {
+            contextBuilderTurn = 1
+            return contextBuilderResponse
+        }
+        if prompt.contains("<tool_result>") {
+            contextBuilderTurn += 1
+            if contextBuilderTurn == 2 {
+                return "{\"tool\":\"prompt\",\"args\":{\"op\":\"set\",\"text\":\"Use the selected important context.\"}}"
+            }
+            return "{\"tool\":\"finish\",\"args\":{\"response\":\"builder plan\"}}"
+        }
         if prompt.contains("RepoPrompt Oracle") {
             recordedOraclePrompts.append(prompt)
             return "oracle response"
@@ -243,5 +368,46 @@ private actor WorkflowWorkspaceRunner: WorkspaceCommandRunning {
 
     func oraclePrompts() -> [String] {
         recordedOraclePrompts
+    }
+}
+
+private actor QuestionWorkspaceRunner: WorkspaceCommandRunning {
+    private(set) var receivedAnswer = false
+
+    func run(executable _: String, arguments: [String], workingDirectory _: String, maximumBytes _: Int) async throws -> String {
+        let prompt = arguments.last ?? ""
+        if prompt.contains("Context Builder") {
+            return #"{"tool":"ask_user","args":{"question":"Which target?","choices":["service","app"]}}"#
+        }
+        if prompt.contains("Use the service target") {
+            receivedAnswer = true
+            return #"{"tool":"finish","args":{}}"#
+        }
+        throw ServiceAPIError(code: .dependencyUnavailable, message: "unexpected Context Builder prompt")
+    }
+}
+
+private actor BlockingContextBuilderRuntime: ContextBuilderRuntimeService {
+    private var started = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var proposal = ContextBuilderRuntimeProposal(selection: [], response: nil, providerSessionID: nil, rawProviderOutput: "")
+
+    func setProposal(_ proposal: ContextBuilderRuntimeProposal) {
+        self.proposal = proposal
+    }
+
+    func propose(_: ContextBuilderRuntimeRequest) async -> ContextBuilderRuntimeProposal {
+        started = true
+        await withCheckedContinuation { continuation = $0 }
+        return proposal
+    }
+
+    func hasStarted() -> Bool {
+        started
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
     }
 }

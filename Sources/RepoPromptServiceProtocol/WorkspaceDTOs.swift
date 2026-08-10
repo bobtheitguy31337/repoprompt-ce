@@ -468,11 +468,54 @@ public struct ContextBuilderInput: Codable, Sendable {
     public let expectedSelectionRevision: Int64
     public let instructions: String
     public let budget: Int
+    public let responseType: String?
+    public let allowClarifyingQuestions: Bool
 
-    public init(expectedSelectionRevision: Int64, instructions: String, budget: Int) {
+    public init(expectedSelectionRevision: Int64, instructions: String, budget: Int, responseType: String? = nil, allowClarifyingQuestions: Bool = false) {
         self.expectedSelectionRevision = expectedSelectionRevision
         self.instructions = instructions
         self.budget = budget
+        self.responseType = responseType
+        self.allowClarifyingQuestions = allowClarifyingQuestions
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case expectedSelectionRevision, instructions, budget, responseType, allowClarifyingQuestions
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        expectedSelectionRevision = try values.decode(Int64.self, forKey: .expectedSelectionRevision)
+        instructions = try values.decode(String.self, forKey: .instructions)
+        budget = try values.decode(Int.self, forKey: .budget)
+        responseType = try values.decodeIfPresent(String.self, forKey: .responseType)
+        allowClarifyingQuestions = try values.decodeIfPresent(Bool.self, forKey: .allowClarifyingQuestions) ?? false
+    }
+}
+
+/// Additive v1 Context Builder result. Selection fields remain flat for
+/// compatibility with clients that previously decoded SelectionSnapshot.
+public struct ContextBuilderSnapshot: Codable, Hashable, Sendable {
+    public let sessionID: UUID
+    public let entries: [LogicalSelectionEntry]
+    public let revision: Int64
+    public let bindingRevision: Int64
+    public let proposalArtifactID: UUID
+    public let response: String?
+    public let chatID: UUID?
+
+    public init(selection: SelectionSnapshot, proposalArtifactID: UUID, response: String?, chatID: UUID?) {
+        sessionID = selection.sessionID
+        entries = selection.entries
+        revision = selection.revision
+        bindingRevision = selection.bindingRevision
+        self.proposalArtifactID = proposalArtifactID
+        self.response = response
+        self.chatID = chatID
+    }
+
+    public var selection: SelectionSnapshot {
+        SelectionSnapshot(sessionID: sessionID, entries: entries, revision: revision, bindingRevision: bindingRevision)
     }
 }
 

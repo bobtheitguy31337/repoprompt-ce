@@ -64,6 +64,10 @@ public actor ProjectAuthority {
     public func authorize(rootID: UUID, logicalPath: String, filesystem: any FilesystemAuthorityPort) throws -> String {
         guard let root = rootsByID[rootID] else { throw ServiceAPIError(code: .rootUnauthorized, message: "Unknown project root") }
         guard !logicalPath.hasPrefix("/") else { throw ServiceAPIError(code: .rootUnauthorized, message: "Logical paths must be relative") }
+        let currentRoot = try filesystem.canonicalizeRoot(root.snapshot.canonicalPath)
+        guard currentRoot.path == root.snapshot.canonicalPath, currentRoot.identity == root.filesystemIdentity else {
+            throw ServiceAPIError(code: .rootUnauthorized, message: "Authorized project root identity changed")
+        }
         let candidate = logicalPath.isEmpty
             ? root.snapshot.canonicalPath
             : URL(fileURLWithPath: root.snapshot.canonicalPath).appendingPathComponent(logicalPath).path

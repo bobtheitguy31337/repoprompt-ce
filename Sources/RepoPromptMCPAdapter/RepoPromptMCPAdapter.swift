@@ -655,7 +655,9 @@ private actor AuthorityToolBackend {
             input: ContextBuilderInput(
                 expectedSelectionRevision: selection.revision,
                 instructions: instructions,
-                budget: arguments["budget"]?.intValue ?? 4000
+                budget: arguments["budget"]?.intValue ?? 4000,
+                responseType: arguments["response_type"]?.stringValue,
+                allowClarifyingQuestions: arguments["allow_clarifying_questions"]?.boolValue ?? false
             ),
             actor: binding.actor
         ))

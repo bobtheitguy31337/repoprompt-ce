@@ -70,6 +70,15 @@ public actor SessionAuthority {
         replaceSnapshot(transcript: transcript)
     }
 
+    /// Appends output from another authority-owned runtime (for example Oracle
+    /// or Context Builder). This is not an externally publishable operation;
+    /// the headless authority serializes it with durable session publication.
+    public func appendAuthorityEntry(kind: TranscriptEntry.Kind, text: String, actor: ExternalActor?) {
+        var transcript = state.snapshot.transcript
+        transcript.append(TranscriptEntry(entryID: ids.next(), sessionSequence: Int64(transcript.count + 1), kind: kind, content: text, actor: actor, timestamp: clock.now()))
+        replaceSnapshot(transcript: transcript)
+    }
+
     public func activeBinding() -> RunBindingIdentity? {
         state.gate?.binding
     }

@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 final class WorkflowPromptCatalogTests: XCTestCase {
@@ -80,5 +81,14 @@ final class WorkflowPromptCatalogTests: XCTestCase {
             XCTAssertFalse(rendered.isEmpty, workflow.rawValue)
             XCTAssertEqual(workflow.template, rendered, workflow.rawValue)
         }
+    }
+
+    func testPortableServerCatalogMatchesCanonicalRenderedMCPPrompts() throws {
+        let portable = try BuiltinWorkflowCatalog().workflows()
+        let canonical = RepoPromptWorkflowID.installOrder.map { id in
+            (id.commandName, RepoPromptWorkflowPrompts.render(id: id, variant: .mcp))
+        }
+        XCTAssertEqual(portable.map(\.workflowID), canonical.map(\.0))
+        XCTAssertEqual(portable.map(\.definition), canonical.map(\.1))
     }
 }

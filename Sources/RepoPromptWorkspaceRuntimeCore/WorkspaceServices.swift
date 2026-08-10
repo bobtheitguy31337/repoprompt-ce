@@ -252,14 +252,36 @@ public actor ArtifactRuntimeService {
 
 public struct BuiltinWorkflowCatalog: Sendable {
     public init() {}
-    public func workflows() -> [WorkflowSnapshot] {
-        let definitions = [
-            ("review", "Code Review", "Review the selected changes for correctness, security, and regressions."),
-            ("plan", "Implementation Plan", "Create an implementation plan grounded in the selected repository context."),
-            ("chat", "Repository Chat", "Answer a repository question using the frozen selected context.")
-        ]
-        return definitions.map { id, name, definition in
-            WorkflowSnapshot(workflowID: id, source: "builtin", name: name, definition: definition, contentDigest: CanonicalSigning.bodyDigest(Data(definition.utf8)), enabled: true)
+    public func workflows() throws -> [WorkflowSnapshot] {
+        let rootURL = Bundle.module.url(forResource: "canonical-workflows-v62", withExtension: "json")
+        let nestedURL = Bundle.module.url(forResource: "canonical-workflows-v62", withExtension: "json", subdirectory: "Resources")
+        guard let url = rootURL ?? nestedURL else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Canonical workflow catalog resource is missing")
         }
+        let definitions = try JSONDecoder().decode([BundledWorkflowDefinition].self, from: Data(contentsOf: url))
+        let expectedIDs = Set(["rp-build", "rp-investigate", "rp-deep-plan", "rp-reminder", "rp-oracle-export", "rp-review", "rp-refactor", "rp-orchestrate", "rp-optimize"])
+        guard definitions.count == expectedIDs.count, Set(definitions.map(\.id)) == expectedIDs else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Canonical workflow catalog is incomplete or contains duplicate IDs")
+        }
+        return try definitions.map { definition in
+            guard definition.definition.contains("repoprompt_skills_version: 62"), definition.definition.contains("repoprompt_variant: mcp") else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "Canonical workflow catalog version is invalid")
+            }
+            return WorkflowSnapshot(
+                workflowID: definition.id,
+                source: "builtin",
+                name: definition.name,
+                definition: definition.definition,
+                contentDigest: CanonicalSigning.bodyDigest(Data(definition.definition.utf8)),
+                enabled: true
+            )
+        }
+    }
+
+    private struct BundledWorkflowDefinition: Decodable {
+        let id: String
+        let name: String
+        let description: String
+        let definition: String
     }
 }

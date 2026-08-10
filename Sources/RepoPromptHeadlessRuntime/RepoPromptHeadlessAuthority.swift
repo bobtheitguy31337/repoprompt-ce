@@ -14,6 +14,8 @@ public actor RepoPromptHeadlessAuthority {
     private let artifactService: ArtifactRuntimeService?
     private let providerAdapter: (any AgentProviderDispatcher)?
     private let interactionDelivery: (any InteractionDeliveryPort)?
+    private let contextBuilderRuntime: (any ContextBuilderRuntimeService)?
+    private let oracleRuntime: (any OracleRuntimeService)?
     private let workflowCatalog = BuiltinWorkflowCatalog()
     private let projects = ProjectRuntimeSupervisor()
     private let eventHub = ServiceEventHub()
@@ -36,7 +38,9 @@ public actor RepoPromptHeadlessAuthority {
         worktreeService: WorktreeRuntimeService? = nil,
         artifactService: ArtifactRuntimeService? = nil,
         providerAdapter: (any AgentProviderDispatcher)? = nil,
-        interactionDelivery: (any InteractionDeliveryPort)? = nil
+        interactionDelivery: (any InteractionDeliveryPort)? = nil,
+        contextBuilderRuntime: (any ContextBuilderRuntimeService)? = nil,
+        oracleRuntime: (any OracleRuntimeService)? = nil
     ) {
         self.store = store
         self.clock = clock
@@ -47,6 +51,8 @@ public actor RepoPromptHeadlessAuthority {
         self.artifactService = artifactService
         self.providerAdapter = providerAdapter
         self.interactionDelivery = interactionDelivery ?? (providerAdapter as? any InteractionDeliveryPort)
+        self.contextBuilderRuntime = contextBuilderRuntime ?? providerAdapter.map { ProviderContextBuilderRuntimeService(providers: $0) }
+        self.oracleRuntime = oracleRuntime ?? providerAdapter.map { ProviderOracleRuntimeService(providers: $0) }
     }
 
     public func recover() async throws {
@@ -677,6 +683,24 @@ public actor RepoPromptHeadlessAuthority {
         guard let current = try await store.interactions(sessionID: sessionID).first(where: { $0.interactionID == interactionID }) else { throw ServiceAPIError(code: .notFound, message: "Interaction not found") }
         guard current.state == .pending, current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Interaction revision is stale", currentRevision: current.revision) }
         if let expiresAt = current.expiresAt, expiresAt <= clock.now() { throw ServiceAPIError(code: .interactionSettled, message: "Interaction expired") }
+        if current.runID == nil,
+           let question = try? JSONDecoder.serviceDecoder.decode(ContextBuilderQuestionPayload.self, from: current.payload),
+           question.authorityOperation == "context_builder.ask_user"
+        {
+            let resolved = InteractionSnapshot(
+                interactionID: current.interactionID,
+                runID: nil,
+                agentID: current.agentID,
+                kind: current.kind,
+                state: .resolved,
+                payload: payload,
+                revision: current.revision + 1,
+                expiresAt: current.expiresAt
+            )
+            let event = try await store.persistInteraction(resolved, session: session, actor: actor, correlationID: ids.next(), idempotency: idempotency)
+            await eventHub.publish(event)
+            return resolved
+        }
         guard let interactionDelivery else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider interaction delivery is unavailable") }
         // Retain the authority-created provider delivery token in the durable
         // interaction snapshot. The human answer is passed separately and is
@@ -792,34 +816,110 @@ public actor RepoPromptHeadlessAuthority {
         return try await createArtifact(projectID: session.projectID, sessionID: sessionID, kind: "context", logicalName: "context-r\(selection.revision).md", content: Data(content.utf8), actor: actor)
     }
 
-    public func runContextBuilder(sessionID: UUID, input: ContextBuilderInput, actor: ExternalActor) async throws -> SelectionSnapshot {
-        guard let providerAdapter else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider runtime is not configured") }
+    public func runContextBuilder(sessionID: UUID, input: ContextBuilderInput, actor: ExternalActor) async throws -> ContextBuilderSnapshot {
+        guard let contextBuilderRuntime else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Context Builder runtime is not configured") }
+        guard artifactService != nil else { throw ServiceAPIError(code: .capabilityMissing, message: "Context Builder requires durable artifact storage") }
         let session = try await sessionSnapshot(sessionID: sessionID)
         let current = try await selectionSnapshot(sessionID: sessionID)
         guard current.revision == input.expectedSelectionRevision else { throw ServiceAPIError(code: .staleRevision, message: "Selection revision is stale", currentRevision: current.revision) }
         let project = try await projectSnapshot(projectID: session.projectID)
+        let frozenContext = try await sessionContext(sessionID: sessionID)
+        let frozenBinding = try await sessionWorktreeBinding(session: session)
         let tool = try await sessionToolAuthority(session: session)
         let workingDirectory = try await workingDirectory(session: session)
-        var inventory: [String] = []
+        var candidates: [ContextBuilderFileCandidate] = []
         for root in project.roots {
-            let entries = try await tool.tree(.init(rootID: root.rootID, maximumDepth: 12, maximumEntries: min(max(input.budget, 100), 10000)))
-            inventory.append(contentsOf: entries.filter { !$0.isDirectory }.map { "\(root.rootID.uuidString)\t\($0.logicalPath)" })
+            let entries = try await tool.tree(.init(rootID: root.rootID, maximumDepth: 32, maximumEntries: 20000))
+            candidates.append(contentsOf: entries.filter { !$0.isDirectory }.map {
+                ContextBuilderFileCandidate(rootID: root.rootID, logicalPath: $0.logicalPath, byteCount: $0.size ?? 0)
+            })
         }
-        let prompt = """
-        You are RepoPrompt Context Builder. Select the smallest set of repository files that satisfies the instructions.
-        Return only a JSON array of objects with string fields rootID and path. Do not return markdown.
-        Instructions: \(input.instructions)
-        Repository inventory:
-        \(inventory.joined(separator: "\n"))
-        """
-        let output = try await providerAdapter.complete(kind: session.provider, model: session.model, prompt: prompt, workingDirectory: workingDirectory)
-        let proposals = try decodeContextBuilderOutput(output)
-        let entries = proposals.map { LogicalSelectionEntry(rootID: $0.rootID, logicalPath: $0.path, mode: .full) }
-        return try await replaceSelection(sessionID: sessionID, entries: entries, expectedRevision: input.expectedSelectionRevision, actor: actor)
+        let runID = ids.next()
+        let proposal = try await contextBuilderRuntime.propose(.init(
+            workspace: .init(
+                sessionID: sessionID,
+                projectID: session.projectID,
+                workingDirectory: workingDirectory,
+                prompt: frozenContext.prompt,
+                selection: current,
+                candidates: candidates,
+                tools: ContextBuilderWorkspaceTools { call in
+                    switch call {
+                    case let .tree(rootID, logicalPath, maximumDepth, maximumEntries):
+                        try await .tree(tool.tree(.init(rootID: rootID, logicalPath: logicalPath, maximumDepth: maximumDepth, maximumEntries: maximumEntries)))
+                    case let .search(rootID, logicalPath, query, useRegex, maximumResults):
+                        try await .search(tool.search(.init(rootID: rootID, query: query, logicalPath: logicalPath, useRegex: useRegex, maximumResults: maximumResults)))
+                    case let .read(rootID, logicalPath, startLine, lineCount):
+                        try await .file(tool.readFile(.init(rootID: rootID, logicalPath: logicalPath, startLine: startLine, lineCount: lineCount)))
+                    case let .codeMap(rootID, logicalPath):
+                        try await .codeMap(tool.codeMap(.init(rootID: rootID, logicalPath: logicalPath)))
+                    case let .diff(rootID, comparison, logicalPaths):
+                        try await .diff(tool.diff(.init(rootID: rootID, comparison: comparison, logicalPaths: logicalPaths)))
+                    case let .askUser(prompt, choices):
+                        try await .answer(self.askContextBuilderQuestion(sessionID: sessionID, prompt: prompt, choices: choices))
+                    }
+                }
+            ),
+            instructions: input.instructions,
+            tokenBudget: input.budget,
+            responseType: input.responseType,
+            allowClarifyingQuestions: input.allowClarifyingQuestions,
+            provider: session.provider,
+            model: session.model,
+            runID: runID
+        ))
+        let proposalData = try JSONEncoder.serviceEncoder.encode(proposal)
+        let proposalArtifact = try await createArtifact(
+            projectID: project.projectID,
+            sessionID: sessionID,
+            kind: "context-builder-proposal",
+            logicalName: "context-builder-r\(input.expectedSelectionRevision)-\(runID.uuidString).json",
+            content: proposalData,
+            actor: actor
+        )
+        let latestProject = try await projectSnapshot(projectID: session.projectID)
+        let latestSelection = try await selectionSnapshot(sessionID: sessionID)
+        let latestContext = try await sessionContext(sessionID: sessionID)
+        let latestBinding = try await sessionWorktreeBinding(session: session)
+        guard latestProject.revision == project.revision,
+              latestSelection.revision == current.revision,
+              latestSelection.bindingRevision == current.bindingRevision,
+              latestContext.contextRevision == frozenContext.contextRevision,
+              latestContext.prompt == frozenContext.prompt,
+              latestBinding == frozenBinding
+        else {
+            throw ServiceAPIError(code: .staleRevision, message: "Context Builder frozen workspace changed before commit", currentRevision: latestSelection.revision)
+        }
+        let selection = try await replaceSelection(sessionID: sessionID, entries: proposal.selection, expectedRevision: input.expectedSelectionRevision, actor: actor)
+        if let handoffPrompt = proposal.handoffPrompt {
+            _ = try await updateSessionPrompt(
+                sessionID: sessionID,
+                prompt: handoffPrompt,
+                expectedContextRevision: frozenContext.contextRevision,
+                actor: actor
+            )
+        }
+        var continuationChatID: UUID?
+        if let response = proposal.response, !response.isEmpty, let authority = sessions[sessionID] {
+            let chatID = ids.next()
+            try await store.persistOracleChat(OracleChatState(
+                chatID: chatID,
+                sessionID: sessionID,
+                providerSessionID: proposal.providerSessionID,
+                turns: [.init(prompt: input.instructions, response: response, timestamp: clock.now())],
+                revision: 1
+            ))
+            continuationChatID = chatID
+            await authority.appendAuthorityEntry(kind: .assistant, text: response, actor: nil)
+            let cursor = try await store.nextCursor()
+            let event = try await store.persistSession(replacingCursor(authority.snapshot(), cursor: cursor), eventType: .transcriptMessage, actor: nil, correlationID: runID, idempotency: nil)
+            await eventHub.publish(event)
+        }
+        return ContextBuilderSnapshot(selection: selection, proposalArtifactID: proposalArtifact.artifactID, response: proposal.response, chatID: continuationChatID)
     }
 
     public func askOracle(sessionID: UUID, input: OracleInput, actor: ExternalActor) async throws -> OracleSnapshot {
-        guard let providerAdapter else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider runtime is not configured") }
+        guard let oracleRuntime else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Oracle runtime is not configured") }
         let session = try await sessionSnapshot(sessionID: sessionID)
         let project = try await projectSnapshot(projectID: session.projectID)
         let workingDirectory = try await workingDirectory(session: session)
@@ -839,35 +939,37 @@ public actor RepoPromptHeadlessAuthority {
                 revision: 0
             )
         }
-        let history = priorChat.turns.suffix(20).map { "Human: \($0.prompt)\nOracle: \($0.response)" }.joined(separator: "\n\n")
-        let prompt = """
-        You are the RepoPrompt Oracle. Answer the request using the authoritative selected context. Clearly identify uncertainty.
-        Request: \(input.prompt)
-        Context mode: \(input.contextMode)
-
-        Prior Oracle conversation:
-        \(history.isEmpty ? "(new chat)" : history)
-
-        \(context)
-        """
-        let execution = try await providerAdapter.execute(
-            kind: session.provider,
+        let execution = try await oracleRuntime.ask(.init(
+            sessionID: sessionID,
+            prompt: input.prompt,
+            mode: input.contextMode,
+            selectedContext: context,
+            priorTurns: priorChat.turns,
+            providerSessionID: priorChat.providerSessionID,
+            provider: session.provider,
             model: session.model,
-            prompt: prompt,
             workingDirectory: workingDirectory,
-            resumeProviderSessionID: priorChat.providerSessionID
-        )
-        let response = execution.output
+            runID: ids.next()
+        ))
+        let response = execution.response
         let nextChat = OracleChatState(
             chatID: chatID,
             sessionID: sessionID,
-            providerSessionID: execution.providerSessionID ?? priorChat.providerSessionID,
+            providerSessionID: execution.providerSessionID,
             turns: priorChat.turns + [
                 OracleChatTurn(prompt: input.prompt, response: response, timestamp: clock.now())
             ],
             revision: priorChat.revision + 1
         )
         try await store.persistOracleChat(nextChat)
+        if let authority = sessions[sessionID] {
+            for entry in execution.transcriptEntries {
+                await authority.appendAuthorityEntry(kind: entry.role == .user ? .human : .assistant, text: entry.content, actor: entry.role == .user ? actor : nil)
+            }
+            let cursor = try await store.nextCursor()
+            let event = try await store.persistSession(replacingCursor(authority.snapshot(), cursor: cursor), eventType: .transcriptMessage, actor: actor, correlationID: chatID, idempotency: nil)
+            await eventHub.publish(event)
+        }
         let artifact = try await createArtifact(projectID: project.projectID, sessionID: sessionID, kind: "oracle", logicalName: "oracle-\(chatID.uuidString)-r\(nextChat.revision).md", content: Data(response.utf8), actor: actor)
         return OracleSnapshot(chatID: chatID, response: response, artifactID: artifact.artifactID, revision: nextChat.revision)
     }
@@ -1020,16 +1122,65 @@ public actor RepoPromptHeadlessAuthority {
         return try JSONDecoder.serviceDecoder.decode(T.self, from: existing.response)
     }
 
-    private struct ContextBuilderProposal: Decodable {
-        let rootID: UUID
-        let path: String
+    private func askContextBuilderQuestion(sessionID: UUID, prompt: String, choices: [String]) async throws -> String? {
+        let expiresAt = clock.now().addingTimeInterval(120)
+        let payload = try JSONEncoder.serviceEncoder.encode(ContextBuilderQuestionPayload(prompt: prompt, choices: choices))
+        let interaction = try await requestInteraction(sessionID: sessionID, kind: .question, payload: payload, expiresAt: expiresAt)
+        do {
+            for _ in 0 ..< 1200 {
+                try Task.checkCancellation()
+                guard let current = try await store.interactions(sessionID: sessionID).first(where: { $0.interactionID == interaction.interactionID }) else {
+                    throw ServiceAPIError(code: .notFound, message: "Context Builder interaction disappeared")
+                }
+                switch current.state {
+                case .resolved:
+                    return Self.contextBuilderAnswer(from: current.payload)
+                case .expired:
+                    throw ServiceAPIError(code: .interactionSettled, message: "Context Builder question expired")
+                case .interrupted:
+                    throw CancellationError()
+                case .pending, .deliveryIntent:
+                    break
+                }
+                if clock.now() >= expiresAt { break }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+        } catch {
+            try? await settleContextBuilderQuestion(interaction, sessionID: sessionID, state: .interrupted)
+            throw error
+        }
+        try await settleContextBuilderQuestion(interaction, sessionID: sessionID, state: .expired)
+        throw ServiceAPIError(code: .interactionSettled, message: "Context Builder question expired")
     }
 
-    private func decodeContextBuilderOutput(_ output: String) throws -> [ContextBuilderProposal] {
-        guard let start = output.firstIndex(of: "["), let end = output.lastIndex(of: "]"), start <= end else {
-            throw ServiceAPIError(code: .dependencyUnavailable, message: "Context Builder provider did not return a JSON selection")
+    private func settleContextBuilderQuestion(_ interaction: InteractionSnapshot, sessionID: UUID, state: InteractionSnapshot.State) async throws {
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        guard let current = try await store.interactions(sessionID: sessionID).first(where: { $0.interactionID == interaction.interactionID }), current.state == .pending else { return }
+        let settled = InteractionSnapshot(
+            interactionID: current.interactionID,
+            runID: nil,
+            agentID: current.agentID,
+            kind: current.kind,
+            state: state,
+            payload: current.payload,
+            revision: current.revision + 1,
+            expiresAt: current.expiresAt
+        )
+        let event = try await store.persistInteraction(settled, session: session, actor: nil, correlationID: ids.next(), idempotency: nil)
+        await eventHub.publish(event)
+    }
+
+    private nonisolated static func contextBuilderAnswer(from payload: Data) -> String? {
+        if let value = try? JSONSerialization.jsonObject(with: payload) {
+            if let string = value as? String { return string }
+            if let object = value as? [String: Any] {
+                if let answer = object["answer"] as? String { return answer }
+                if let custom = object["custom_response"] as? String { return custom }
+                if let answers = object["answers"] as? [String] { return answers.joined(separator: "\n") }
+            }
         }
-        return try JSONDecoder.serviceDecoder.decode([ContextBuilderProposal].self, from: Data(output[start ... end].utf8))
+        let text = String(decoding: payload, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
     }
 
     private func materializedContext(projectID: UUID, selection: SelectionSnapshot, include: [String]) async throws -> String {
@@ -1376,6 +1527,18 @@ public actor RepoPromptHeadlessAuthority {
 
     private func replacingLifecycle(_ value: SessionSnapshot, state: SessionLifecycleState, cursor: ServiceCursor) -> SessionSnapshot {
         SessionSnapshot(sessionID: value.sessionID, projectID: value.projectID, parentSessionID: value.parentSessionID, rootSessionID: value.rootSessionID, creator: value.creator, provider: value.provider, model: value.model, visibility: value.visibility, state: state, runGeneration: value.runGeneration, turnEpoch: value.turnEpoch, revision: value.revision + 1, transcript: value.transcript, interactions: value.interactions, cursor: cursor)
+    }
+}
+
+private struct ContextBuilderQuestionPayload: Codable {
+    let authorityOperation: String
+    let prompt: String
+    let choices: [String]
+
+    init(prompt: String, choices: [String]) {
+        authorityOperation = "context_builder.ask_user"
+        self.prompt = prompt
+        self.choices = choices
     }
 }
 

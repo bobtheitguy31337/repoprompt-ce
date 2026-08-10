@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptAgentRuntimeCore
 import RepoPromptHeadlessRuntime
 import RepoPromptServicePersistence
+import RepoPromptServiceProtocol
 import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
@@ -123,6 +124,54 @@ final class ProviderSupervisorTests: XCTestCase {
         try await store.close()
     }
 
+    func testNativePortableProviderMatrixExecutesProtocolContracts() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixtures: [(ProviderKind, String)] = [
+            (.claudeCompatible, Self.fakeClaudeScript()),
+            (.openCodeACP, Self.fakeACPScript(requiredArguments: "acp")),
+            (.cursorACP, Self.fakeACPScript(requiredArguments: "--approve-mcps acp")),
+            (.headlessAdapter, Self.fakeHeadlessAdapterScript()),
+            (.mcp, Self.fakeMCPServerScript())
+        ]
+        let port = try PortableProcessSupervisionPort()
+        var configurations: [ProviderCLIConfiguration] = []
+        for (kind, script) in fixtures {
+            let executable = directory.appendingPathComponent(kind.rawValue)
+            try Data(script.utf8).write(to: executable)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+            configurations.append(.init(kind: kind, executable: executable.path, expectedVersion: "fixture 1.0"))
+        }
+        let adapter = ProviderCLIAdapter(
+            configurations: configurations,
+            processPort: port,
+            outputDirectory: directory.appendingPathComponent("output").path,
+            ephemeralHomeRoot: directory.appendingPathComponent("homes").path
+        )
+        let preflight = await adapter.preflight().filter(\.enabled)
+        XCTAssertEqual(Set(preflight.map(\.kind)), Set(fixtures.map(\.0)))
+
+        let expected: [(ProviderKind, String, String?)] = [
+            (.claudeCompatible, "claude done", "claude-session"),
+            (.openCodeACP, "acp done", "acp-session"),
+            (.cursorACP, "acp done", "acp-session"),
+            (.headlessAdapter, "headless done", "headless-session"),
+            (.mcp, "file_search\nread_file", nil)
+        ]
+        for (kind, output, identity) in expected {
+            let events = ProviderEventRecorder()
+            let result = try await adapter.executeStreaming(.init(kind: kind, model: nil, prompt: "contract prompt", workingDirectory: directory.path, runID: UUID())) { event in
+                await events.record(event)
+            }
+            XCTAssertEqual(result.output, output, kind.rawValue)
+            XCTAssertEqual(result.providerSessionID, identity, kind.rawValue)
+            let observed = await events.values()
+            XCTAssertTrue(observed.contains { if case .assistantFinal = $0 { true } else { false } } || observed.contains { if case .assistantDelta = $0 { true } else { false } }, kind.rawValue)
+            XCTAssertTrue(observed.contains { if case .completed = $0 { true } else { false } }, kind.rawValue)
+        }
+    }
+
     func testPortablePortCapturesAndReapsProviderOutput() async throws {
         let executable = ["/bin/echo", "/usr/bin/echo"].first { FileManager.default.isExecutableFile(atPath: $0) }
         let echo = try XCTUnwrap(executable)
@@ -232,6 +281,67 @@ final class ProviderSupervisorTests: XCTestCase {
         done
         """
     }
+
+    private static func fakeClaudeScript() -> String {
+        """
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then echo 'fixture 1.0'; exit 0; fi
+        while IFS= read -r line; do
+          echo '{"type":"assistant","session_id":"claude-session","message":{"content":[{"type":"thinking","thinking":"reason"},{"type":"text","text":"claude done"}]}}'
+          echo '{"type":"result","session_id":"claude-session","result":"claude done"}'
+          break
+        done
+        """
+    }
+
+    private static func fakeACPScript(requiredArguments: String) -> String {
+        """
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then echo 'fixture 1.0'; exit 0; fi
+        if [ "$*" != "\(requiredArguments)" ]; then exit 64; fi
+        while IFS= read -r line; do
+          case "$line" in
+            *initialize*) echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}' ;;
+            *session*new*) echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"acp-session"}}' ;;
+            *session*prompt*)
+              echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"reason"}}}}'
+              echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"acp done"}}}}'
+              echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+              ;;
+          esac
+        done
+        """
+    }
+
+    private static func fakeHeadlessAdapterScript() -> String {
+        """
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then echo 'fixture 1.0'; exit 0; fi
+        if [ "$1" != "--headless-provider-json" ]; then exit 64; fi
+        while IFS= read -r line; do
+          echo '{"type":"reasoning","content":"reason"}'
+          echo '{"type":"toolCall","id":"tool-1","name":"read_file","args":{"path":"A.swift"}}'
+          echo '{"type":"toolResult","id":"tool-1","name":"read_file","result":"ok","failed":false}'
+          echo '{"type":"finalMessage","content":"headless done"}'
+          echo '{"type":"completion","providerSessionID":"headless-session"}'
+          break
+        done
+        """
+    }
+
+    private static func fakeMCPServerScript() -> String {
+        """
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then echo 'fixture 1.0'; exit 0; fi
+        if [ "$#" -ne 0 ]; then exit 64; fi
+        while IFS= read -r line; do
+          case "$line" in
+            *initialize*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}' ;;
+            *tools*list*) echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"read_file"},{"name":"file_search"}]}}' ;;
+          esac
+        done
+        """
+    }
 }
 
 private actor RecordingProviderRunner: WorkspaceCommandRunning {
@@ -259,5 +369,17 @@ private actor ProviderIdentityObserver {
 
     func value() -> String? {
         identity
+    }
+}
+
+private actor ProviderEventRecorder {
+    private var events: [ProviderRuntimeEvent] = []
+
+    func record(_ event: ProviderRuntimeEvent) {
+        events.append(event)
+    }
+
+    func values() -> [ProviderRuntimeEvent] {
+        events
     }
 }
