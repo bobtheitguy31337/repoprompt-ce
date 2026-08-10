@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptHeadlessRuntime
 import RepoPromptServicePersistence
+import RepoPromptServiceProtocol
 import RepoPromptWorkspaceRuntimeCore
 
 private enum AppDomainRuntimeMetrics {
@@ -118,6 +119,8 @@ actor AppAgentAuthorityComposition {
                 .appendingPathComponent("RepoPrompt CE", isDirectory: true)
                 .appendingPathComponent("AgentAuthority", isDirectory: true)
             let artifacts = root.appendingPathComponent("Artifacts", isDirectory: true)
+            let providerOutput = root.appendingPathComponent("ProviderOutput", isDirectory: true)
+            let providerHomes = root.appendingPathComponent("ProviderHomes", isDirectory: true)
             try FileManager.default.createDirectory(
                 at: root,
                 withIntermediateDirectories: true,
@@ -126,9 +129,18 @@ actor AppAgentAuthorityComposition {
             let store = try await SQLiteServiceStore.open(
                 storage: .file(root.appendingPathComponent("repoprompt.sqlite").path)
             )
+            let processPort = try PortableProcessSupervisionPort()
+            let providers = try ProviderCLIAdapter(
+                configurations: Self.providerConfigurations(),
+                processPort: processPort,
+                processStore: store,
+                outputDirectory: providerOutput.path,
+                ephemeralHomeRoot: providerHomes.path
+            )
             let authority = try RepoPromptHeadlessAuthority(
                 store: store,
-                artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path)
+                artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path),
+                providerAdapter: providers
             )
             try await authority.recover()
             return Prepared(store: store, authority: authority)
@@ -152,6 +164,94 @@ actor AppAgentAuthorityComposition {
         self.prepared = nil
         try? await prepared.authority.quiesce()
         try? await prepared.store.close(clean: true)
+    }
+
+    private static func providerConfigurations() throws -> [ProviderCLIConfiguration] {
+        var result: [ProviderCLIConfiguration] = []
+        if case let .success(runtime) = CodexRuntimeAuthority.resolve() {
+            try runtime.prepareState()
+            result.append(ProviderCLIConfiguration(
+                kind: .codex,
+                executable: runtime.executableURL.path,
+                expectedVersion: runtime.version.description,
+                protocolVersion: "codex-app-server",
+                credentialSourceDirectory: existingDirectory(runtime.statePaths.codexHome.path)
+            ))
+        }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let definitions: [(ProviderKind, String, String, [String], String?)] = [
+            (
+                .claudeCompatible,
+                "REPOPROMPT_CLAUDE_EXECUTABLE",
+                "claude",
+                CLIPathHints.claudeCode,
+                existingDirectory(home.appendingPathComponent(".claude", isDirectory: true).path)
+            ),
+            (
+                .openCodeACP,
+                "REPOPROMPT_OPENCODE_EXECUTABLE",
+                "opencode",
+                CLIPathHints.openCode,
+                existingDirectory(home.appendingPathComponent(".config/opencode", isDirectory: true).path)
+            ),
+            (
+                .cursorACP,
+                "REPOPROMPT_CURSOR_EXECUTABLE",
+                "cursor-agent",
+                CLIPathHints.cursor,
+                existingDirectory(home.appendingPathComponent(".cursor", isDirectory: true).path)
+            )
+        ]
+        for (kind, environmentKey, command, hints, credentials) in definitions {
+            guard let executable = resolveExecutable(
+                environmentKey: environmentKey,
+                command: command,
+                hints: hints
+            ) else { continue }
+            result.append(ProviderCLIConfiguration(
+                kind: kind,
+                executable: executable,
+                credentialSourceDirectory: credentials
+            ))
+        }
+        return result
+    }
+
+    private static func resolveExecutable(
+        environmentKey: String,
+        command: String,
+        hints: [String]
+    ) -> String? {
+        let environment = ProcessInfo.processInfo.environment
+        if let explicit = environment[environmentKey],
+           explicit.hasPrefix("/"),
+           FileManager.default.isExecutableFile(atPath: explicit)
+        {
+            return URL(fileURLWithPath: explicit).standardizedFileURL.resolvingSymlinksInPath().path
+        }
+        let searchDirectories = (environment["PATH"] ?? "")
+            .split(separator: ":")
+            .map(String.init)
+            + hints
+        for directory in searchDirectories {
+            let candidate = URL(fileURLWithPath: directory, isDirectory: true)
+                .appendingPathComponent(command)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+                .path
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private static func existingDirectory(_ path: String) -> String? {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else { return nil }
+        return path
     }
 }
 

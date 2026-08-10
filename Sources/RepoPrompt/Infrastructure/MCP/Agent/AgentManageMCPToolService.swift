@@ -62,7 +62,7 @@ struct AgentManageMCPToolService {
     let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
     let restrictDiscoveryToRoleLabels: @MainActor (_ workspaceID: UUID?) -> Bool
     let cleanupDependencies: CleanupDependencies
-    let loadAuthoritySnapshot: @Sendable (UUID) async -> AuthoritySessionSnapshot?
+    let loadAuthoritySnapshot: @Sendable (UUID) async throws -> AuthoritySessionSnapshot?
 
     init(
         toolName: String,
@@ -75,7 +75,7 @@ struct AgentManageMCPToolService {
             GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID).restrictMCPAgentDiscoveryToRoleLabels
         },
         cleanupDependencies: CleanupDependencies = .live,
-        loadAuthoritySnapshot: @escaping @Sendable (UUID) async -> AuthoritySessionSnapshot? = { _ in nil }
+        loadAuthoritySnapshot: @escaping @Sendable (UUID) async throws -> AuthoritySessionSnapshot? = { _ in nil }
     ) {
         self.toolName = toolName
         self.captureRequestMetadata = captureRequestMetadata
@@ -1102,7 +1102,7 @@ struct AgentManageMCPToolService {
         let normalizedReference = reference.trimmingCharacters(in: .whitespacesAndNewlines)
         let referenceUUID = UUID(uuidString: normalizedReference)
         if let referenceUUID,
-           let snapshot = await loadAuthoritySnapshot(referenceUUID)
+           let snapshot = try await loadAuthoritySnapshot(referenceUUID)
         {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601

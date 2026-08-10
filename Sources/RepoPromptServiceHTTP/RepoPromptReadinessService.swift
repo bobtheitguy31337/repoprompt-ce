@@ -163,7 +163,13 @@ public actor RepoPromptReadinessService {
         }
         let completeProviders = (providers + missingProviders).sorted { $0.kind.rawValue < $1.kind.rawValue }
 
-        let sessions = await authority.sessionSnapshots()
+        let sessions: [SessionSnapshot]
+        do {
+            sessions = try await authority.sessionSnapshots()
+        } catch {
+            sessions = []
+            checks.append(.init(name: "session-authority", ready: false, detail: "persistence-unavailable"))
+        }
         let activeStates: Set<SessionLifecycleState> = [.preparing, .running, .waiting]
         let activeSessionCount = sessions.count(where: { activeStates.contains($0.state) })
         let capacityReady = activeSessionCount < maximumActiveSessions

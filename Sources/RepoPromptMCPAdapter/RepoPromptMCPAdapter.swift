@@ -311,7 +311,7 @@ private actor AuthorityToolBackend {
     private func manageWorkspaces(_ arguments: [String: Value]) async throws -> Value {
         let operation = arguments["op"]?.stringValue ?? "list"
         let projects = await authority.projectSnapshots()
-        let sessions = await authority.sessionSnapshots()
+        let sessions = try await authority.sessionSnapshots()
         return try value(WorkspaceResult(operation: operation, projects: projects, sessions: sessions))
     }
 
@@ -814,7 +814,7 @@ private actor AuthorityToolBackend {
 
     private func history(_ arguments: [String: Value]) async throws -> Value {
         let operation = arguments["op"]?.stringValue ?? "list_sessions"
-        let all = await authority.sessionSnapshots()
+        let all = try await authority.sessionSnapshots()
         let limit = min(max(arguments["limit"]?.intValue ?? 30, 1), 100)
         switch operation {
         case "list_sessions": return try value(Array(all.suffix(limit)))

@@ -428,7 +428,7 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         await AgentRunSessionStore.cleanup(registration: registration)
     }
 
-    func testUnexpectedCurrentEpochTerminalRejectionWakesMatchingWaiter() async throws {
+    func testAuthorityTerminalObservationWakesMatchingWaiterWithoutVeto() async throws {
         let sessionID = UUID()
         let registration = await AgentRunSessionStore.register(sessionID: sessionID)
         let epoch = try await beginEpoch(
@@ -450,11 +450,12 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
             commitID: UUID(),
             successorKind: nil
         )
-        guard case let .rejected(reason) = result else {
-            return XCTFail("Expected rejected terminal publication")
-        }
+        XCTAssertEqual(result, .accepted(successorEpoch: nil))
         let disposition = await waiter.value
-        XCTAssertEqual(disposition, .terminalPublicationRejected(epoch: epoch, reason: reason))
+        guard case let .snapshotReady(snapshot) = disposition else {
+            return XCTFail("Expected authority terminal snapshot wake")
+        }
+        XCTAssertEqual(snapshot.status, .completed)
         await AgentRunSessionStore.cleanup(registration: registration)
     }
 

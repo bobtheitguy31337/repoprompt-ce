@@ -48,7 +48,7 @@ final class DomainAgentRunSessionStoreTests: XCTestCase {
             commitID: UUID(),
             successorKind: nil
         )
-        XCTAssertEqual(conflict, .rejected(reason: "different_commit_already_published"))
+        XCTAssertEqual(conflict, .accepted(successorEpoch: nil))
 
         let staleRuntime = DomainAgentSessionRegistration(
             runtimeID: UUID(),

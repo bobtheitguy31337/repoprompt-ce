@@ -128,6 +128,26 @@ enum AgentRunSessionStore {
         await shared.noteSnapshot(snapshot, cursor: cursor)
     }
 
+    /// One-way projection from the durable provider/session authority. No
+    /// lifecycle decision is returned to the caller.
+    static func observeAuthoritySnapshot(
+        _ snapshot: AgentRunMCPSnapshot,
+        registration: Registration,
+        activationID: UUID,
+        binding: RunBindingSnapshot?,
+        transitionKind: AgentRunEpochTransitionKind
+    ) async -> WaitCursor? {
+        await shared.observeAuthoritySnapshot(
+            snapshot,
+            registration: registration,
+            activationID: activationID,
+            bindingID: binding.map(AgentModeAuthorityAdapter.epochID),
+            ordinal: binding.map { UInt64(clamping: $0.turnEpoch) },
+            continuityGeneration: binding.map { UInt64(clamping: $0.generation) },
+            transitionKind: transitionKind
+        )
+    }
+
     static func publishTerminal(
         _ envelope: AgentRunTerminalPublicationEnvelope,
         registration: Registration,

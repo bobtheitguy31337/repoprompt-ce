@@ -97,7 +97,7 @@ public actor RepoPromptHeadlessAuthority {
         for agent in try await store.agents() {
             agents[agent.sessionID] = agent
         }
-        for snapshot in await sessionSnapshots() where agents[snapshot.sessionID] == nil {
+        for snapshot in try await sessionSnapshots() where agents[snapshot.sessionID] == nil {
             let synthesized = AgentSnapshot(agentID: snapshot.sessionID, sessionID: snapshot.sessionID, rootSessionID: snapshot.rootSessionID, parentAgentID: snapshot.parentSessionID, role: snapshot.parentSessionID == nil ? "root" : "child", state: snapshot.state, revision: 1)
             let event = try await store.persistAgent(synthesized, projectID: snapshot.projectID, actor: nil, correlationID: ids.next(), eventType: .agentStarted)
             agents[snapshot.sessionID] = synthesized
@@ -138,7 +138,7 @@ public actor RepoPromptHeadlessAuthority {
         let current = try await projectSnapshot(projectID: projectID)
         guard current.revision == input.expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Project revision is stale", currentRevision: current.revision) }
         guard !input.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !input.roots.isEmpty else { throw ServiceAPIError(code: .invalidRequest, message: "Project name and at least one root are required") }
-        let activeSessions = await sessionSnapshots().filter { $0.projectID == projectID && ![SessionLifecycleState.completed, .failed, .canceled, .archived].contains($0.state) }
+        let activeSessions = try await sessionSnapshots().filter { $0.projectID == projectID && ![SessionLifecycleState.completed, .failed, .canceled, .archived].contains($0.state) }
         let requestedPaths = Set(input.roots.map { URL(fileURLWithPath: $0.path).standardizedFileURL.resolvingSymlinksInPath().path })
         let currentPaths = Set(current.roots.map(\.canonicalPath))
         let worktrees = try await store.worktrees(projectID: projectID)
@@ -169,7 +169,7 @@ public actor RepoPromptHeadlessAuthority {
         if try await store.idempotencyResult(idempotency) != nil { return }
         let current = try await projectSnapshot(projectID: projectID)
         guard current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Project revision is stale", currentRevision: current.revision) }
-        let activeSessions = await sessionSnapshots().filter { $0.projectID == projectID && ![SessionLifecycleState.completed, .failed, .canceled, .archived].contains($0.state) }
+        let activeSessions = try await sessionSnapshots().filter { $0.projectID == projectID && ![SessionLifecycleState.completed, .failed, .canceled, .archived].contains($0.state) }
         let worktrees = try await store.worktrees(projectID: projectID)
         guard activeSessions.isEmpty, worktrees.isEmpty else { throw ServiceAPIError(code: .worktreeConflict, message: "Project must have no active sessions or worktrees before removal") }
         let cursor = try await store.nextCursor()
@@ -194,11 +194,11 @@ public actor RepoPromptHeadlessAuthority {
     @discardableResult
     public func ensureEmbeddedSession(_ seed: EmbeddedSessionSeed) async throws -> AuthoritySessionSnapshot {
         try ensureWritable()
-        guard !seed.roots.isEmpty else {
-            throw ServiceAPIError(code: .invalidRequest, message: "An embedded session requires at least one project root")
-        }
-
-        if sessions[seed.sessionID] == nil {
+        let isInitialImport = sessions[seed.sessionID] == nil
+        if isInitialImport {
+            guard !seed.roots.isEmpty else {
+                throw ServiceAPIError(code: .invalidRequest, message: "An embedded session requires at least one project root")
+            }
             if let existingProject = await projectSnapshots().first(where: { $0.projectID == seed.projectID }) {
                 guard Set(existingProject.roots.map(\.canonicalPath)) == Set(seed.roots.map(\.canonicalPath)) else {
                     throw ServiceAPIError(code: .worktreeConflict, message: "Embedded project identity is already bound to different roots")
@@ -320,52 +320,137 @@ public actor RepoPromptHeadlessAuthority {
             await eventHub.publish(events.agent)
         }
 
-        try await synchronizeEmbeddedPermissions(
-            sessionID: seed.sessionID,
-            mode: seed.permissionMode,
-            providerSettings: seed.providerSettings,
-            actor: seed.creator
-        )
-        let existingWorktrees = try await store.worktrees(projectID: seed.projectID)
-        for requested in seed.worktrees {
-            let current = existingWorktrees.first { $0.bindingID == requested.bindingID }
-            let isUnchanged = current.map {
-                $0.projectID == requested.projectID
-                    && $0.rootID == requested.rootID
-                    && $0.sessionID == requested.sessionID
-                    && $0.baseRef == requested.baseRef
-                    && $0.branch == requested.branch
-                    && $0.physicalPath == requested.physicalPath
-                    && $0.ownershipState == requested.ownershipState
-                    && $0.mergeState == requested.mergeState
-            } ?? false
-            let binding = WorktreeBindingSnapshot(
-                bindingID: requested.bindingID,
-                projectID: requested.projectID,
-                rootID: requested.rootID,
-                sessionID: requested.sessionID,
-                baseRef: requested.baseRef,
-                branch: requested.branch,
-                physicalPath: requested.physicalPath,
-                ownershipState: requested.ownershipState,
-                mergeState: requested.mergeState,
-                revision: current.map { isUnchanged ? $0.revision : $0.revision + 1 } ?? 1
-            )
-            guard binding.projectID == seed.projectID, binding.sessionID == seed.sessionID else {
-                throw ServiceAPIError(code: .worktreeConflict, message: "Embedded worktree binding does not belong to the admitted session")
+        // Legacy JSON is imported exactly once. Existing durable sessions are
+        // never refreshed from UI-owned transcript, permission, interaction,
+        // or worktree properties.
+        if isInitialImport {
+            for binding in seed.worktrees {
+                guard binding.projectID == seed.projectID, binding.sessionID == seed.sessionID else {
+                    throw ServiceAPIError(code: .worktreeConflict, message: "Embedded worktree binding does not belong to the admitted session")
+                }
+                let event = try await store.persistWorktree(binding, actor: seed.creator, correlationID: ids.next())
+                await eventHub.publish(event)
             }
-            guard !isUnchanged else { continue }
-            let event = try await store.persistWorktree(binding, actor: seed.creator, correlationID: ids.next())
-            await eventHub.publish(event)
         }
         return try await authoritySessionSnapshot(sessionID: seed.sessionID)
+    }
+
+    /// Appends one human turn and launches it through the same provider
+    /// dispatcher used by the Linux service. The authority assigns the run,
+    /// generation, turn epoch, transcript ID, and terminal fence.
+    public func startEmbeddedProviderRun(
+        sessionID: UUID,
+        actor: ExternalActor,
+        userMessage: String,
+        providerPrompt: String,
+        presentationPayload: Data? = nil,
+        resumeMode: String = "auto",
+        idempotencyKey: String,
+        requestDigest: String
+    ) async throws -> AuthoritySessionSnapshot {
+        try ensureWritable()
+        guard let session = sessions[sessionID] else {
+            throw ServiceAPIError(code: .notFound, message: "Session not found")
+        }
+        let before = await session.snapshot()
+        try await session.appendHumanMessage(
+            userMessage,
+            actor: actor,
+            expectedRevision: before.revision,
+            presentationPayload: presentationPayload
+        )
+        let cursor = try await store.nextCursor()
+        let transcriptEvent = try await store.persistSession(
+            replacingCursor(await session.snapshot(), cursor: cursor),
+            eventType: .transcriptMessage,
+            actor: actor,
+            correlationID: ids.next(),
+            idempotency: nil
+        )
+        await eventHub.publish(transcriptEvent)
+        let command = SessionCommand.resumeSession(expectedRunID: nil, providerResumeMode: resumeMode)
+        let idempotency = IdempotencyInput(
+            actorID: actor.goblinUserID,
+            operation: "embeddedProviderRun",
+            key: idempotencyKey,
+            requestDigest: requestDigest
+        )
+        _ = try await startProviderRun(
+            command: command,
+            sessionID: sessionID,
+            session: session,
+            actor: actor,
+            idempotency: idempotency,
+            providerPrompt: providerPrompt
+        )
+        return try await authoritySessionSnapshot(sessionID: sessionID)
+    }
+
+    public func steerEmbeddedProviderRun(
+        sessionID: UUID,
+        text: String,
+        targetTurnEpoch: Int64,
+        actor: ExternalActor,
+        idempotencyKey: String,
+        requestDigest: String
+    ) async throws -> AuthoritySessionSnapshot {
+        guard let session = sessions[sessionID] else {
+            throw ServiceAPIError(code: .notFound, message: "Session not found")
+        }
+        let command = SessionCommand.steerSession(text: text, targetTurnEpoch: targetTurnEpoch)
+        _ = try await steerProviderRun(
+            command: command,
+            sessionID: sessionID,
+            session: session,
+            text: text,
+            targetTurnEpoch: targetTurnEpoch,
+            actor: actor,
+            idempotency: .init(
+                actorID: actor.goblinUserID,
+                operation: command.operation,
+                key: idempotencyKey,
+                requestDigest: requestDigest
+            )
+        )
+        return try await authoritySessionSnapshot(sessionID: sessionID)
+    }
+
+    public func cancelEmbeddedProviderRun(
+        sessionID: UUID,
+        binding: RunBindingSnapshot,
+        actor: ExternalActor,
+        idempotencyKey: String,
+        requestDigest: String
+    ) async throws -> AuthoritySessionSnapshot {
+        guard let session = sessions[sessionID] else {
+            throw ServiceAPIError(code: .notFound, message: "Session not found")
+        }
+        let command = SessionCommand.cancelSession(
+            expectedRunID: binding.runID,
+            expectedGeneration: binding.generation
+        )
+        _ = try await cancelProviderRun(
+            command: command,
+            sessionID: sessionID,
+            session: session,
+            expectedRunID: binding.runID,
+            generation: binding.generation,
+            actor: actor,
+            idempotency: .init(
+                actorID: actor.goblinUserID,
+                operation: command.operation,
+                key: idempotencyKey,
+                requestDigest: requestDigest
+            )
+        )
+        return try await authoritySessionSnapshot(sessionID: sessionID)
     }
 
     public func authoritySessionSnapshot(sessionID: UUID) async throws -> AuthoritySessionSnapshot {
         guard let sessionAuthority = sessions[sessionID] else {
             throw ServiceAPIError(code: .notFound, message: "Session not found")
         }
-        let session = await sessionAuthority.snapshot()
+        let session = try await sessionSnapshot(sessionID: sessionID)
         guard let permissions = try await store.permissions(sessionID: sessionID) else {
             throw ServiceAPIError(code: .persistenceUnavailable, message: "Session permissions are missing")
         }
@@ -380,258 +465,6 @@ public actor RepoPromptHeadlessAuthority {
             interactions: try await store.interactions(sessionID: sessionID),
             worktrees: worktrees
         )
-    }
-
-    /// Begins a run executed by an embedded provider dispatcher. The durable
-    /// authority still issues the run identity and owns terminal fencing.
-    public func beginEmbeddedRun(
-        sessionID: UUID,
-        actor: ExternalActor,
-        connectionGeneration: Int64,
-        providerSessionID: String? = nil,
-        preferredRunID: UUID? = nil
-    ) async throws -> AuthoritySessionSnapshot {
-        try ensureWritable()
-        guard let sessionAuthority = sessions[sessionID] else {
-            throw ServiceAPIError(code: .notFound, message: "Session not found")
-        }
-        let session = await sessionAuthority.snapshot()
-        guard let permissions = try await store.permissions(sessionID: sessionID),
-              permissions.mode != "disabled"
-        else {
-            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Provider execution is disabled by session policy")
-        }
-        let binding = try await sessionAuthority.beginRun(
-            connectionGeneration: connectionGeneration,
-            runID: preferredRunID
-        )
-        let cursor = try await store.nextCursor()
-        let event = try await store.persistSession(
-            replacingCursor(await sessionAuthority.snapshot(), cursor: cursor),
-            eventType: .sessionResumed,
-            actor: actor,
-            correlationID: ids.next(),
-            idempotency: nil
-        )
-        await eventHub.publish(event)
-        try await updateAgentLifecycle(sessionID: sessionID, state: .running, eventType: .agentUpdated, actor: actor)
-        try await store.persistRun(ProviderRunSnapshot(
-            runID: binding.runID,
-            sessionID: sessionID,
-            provider: session.provider,
-            providerSessionID: providerSessionID,
-            state: "running",
-            generation: binding.generation,
-            turnEpoch: binding.turnEpoch,
-            startReason: providerSessionID == nil ? "embedded-fresh" : "embedded-resume",
-            startedAt: clock.now()
-        ))
-        return try await authoritySessionSnapshot(sessionID: sessionID)
-    }
-
-    @discardableResult
-    public func synchronizeEmbeddedTranscript(
-        sessionID: UUID,
-        binding expected: RunBindingSnapshot,
-        entries: [TranscriptEntry]
-    ) async throws -> AuthoritySessionSnapshot {
-        guard let sessionAuthority = sessions[sessionID] else {
-            throw ServiceAPIError(code: .notFound, message: "Session not found")
-        }
-        let binding = Self.runtimeBinding(expected)
-        let before = await (sessionAuthority.snapshot()).revision
-        let acceptance = await sessionAuthority.acceptTranscriptProjection(binding: binding, entries: entries)
-        guard acceptance == .accepted else {
-            throw ServiceAPIError(code: .staleRevision, message: "Transcript projection belongs to a stale run", currentRevision: before)
-        }
-        let current = await sessionAuthority.snapshot()
-        if current.revision != before {
-            let cursor = try await store.nextCursor()
-            let event = try await store.persistSession(
-                replacingCursor(current, cursor: cursor),
-                eventType: .transcriptMessage,
-                actor: nil,
-                correlationID: ids.next(),
-                idempotency: nil
-            )
-            await eventHub.publish(event)
-        }
-        return try await authoritySessionSnapshot(sessionID: sessionID)
-    }
-
-    @discardableResult
-    public func settleEmbeddedRun(
-        sessionID: UUID,
-        binding expected: RunBindingSnapshot,
-        outcome: EmbeddedRunTerminalOutcome,
-        providerSessionID: String? = nil
-    ) async throws -> AuthoritySessionSnapshot {
-        guard let sessionAuthority = sessions[sessionID] else {
-            throw ServiceAPIError(code: .notFound, message: "Session not found")
-        }
-        let binding = Self.runtimeBinding(expected)
-        let terminal: EventType
-        let lifecycle: SessionLifecycleState
-        let runState: String
-        let agentEvent: EventType
-        switch outcome {
-        case .completed:
-            terminal = .sessionCompleted
-            lifecycle = .completed
-            runState = "completed"
-            agentEvent = .agentCompleted
-        case .failed:
-            terminal = .sessionFailed
-            lifecycle = .failed
-            runState = "failed"
-            agentEvent = .agentFailed
-        case .canceled:
-            terminal = .sessionCanceled
-            lifecycle = .canceled
-            runState = "canceled"
-            agentEvent = .agentFailed
-        case .interrupted:
-            terminal = .sessionInterrupted
-            lifecycle = .interrupted
-            runState = "interrupted"
-            agentEvent = .agentFailed
-        }
-        if await sessionAuthority.activeBinding() == nil,
-           let settled = try await store.latestRun(sessionID: sessionID),
-           settled.runID == binding.runID,
-           settled.state == runState
-        {
-            return try await authoritySessionSnapshot(sessionID: sessionID)
-        }
-        guard await sessionAuthority.settle(binding: binding, terminal: terminal, lifecycle: lifecycle) == .accepted else {
-            throw ServiceAPIError(code: .staleRevision, message: "Run terminal was already settled or belongs to a stale binding")
-        }
-        let sessionAfterSettlement = await sessionAuthority.snapshot()
-        for interaction in try await store.interactions(sessionID: sessionID)
-            where interaction.state == .pending || interaction.state == .deliveryIntent
-        {
-            let interrupted = InteractionSnapshot(
-                interactionID: interaction.interactionID,
-                runID: interaction.runID,
-                agentID: interaction.agentID,
-                kind: interaction.kind,
-                state: .interrupted,
-                payload: interaction.payload,
-                revision: interaction.revision + 1,
-                expiresAt: interaction.expiresAt
-            )
-            let interactionEvent = try await store.persistInteraction(
-                interrupted,
-                session: sessionAfterSettlement,
-                actor: nil,
-                correlationID: ids.next()
-            )
-            await eventHub.publish(interactionEvent)
-        }
-        let prior = try await store.latestRun(sessionID: sessionID)
-        try await store.persistRun(ProviderRunSnapshot(
-            runID: binding.runID,
-            sessionID: sessionID,
-            provider: (await sessionAuthority.snapshot()).provider,
-            providerSessionID: providerSessionID ?? prior?.providerSessionID,
-            state: runState,
-            generation: binding.generation,
-            turnEpoch: binding.turnEpoch,
-            startReason: prior?.startReason ?? "embedded",
-            endReason: runState,
-            startedAt: prior?.startedAt ?? clock.now(),
-            endedAt: clock.now()
-        ))
-        try await updateAgentLifecycle(sessionID: sessionID, state: lifecycle, eventType: agentEvent, actor: nil)
-        let cursor = try await store.nextCursor()
-        let event = try await store.persistSession(
-            replacingCursor(await sessionAuthority.snapshot(), cursor: cursor),
-            eventType: terminal,
-            actor: nil,
-            correlationID: ids.next(),
-            idempotency: nil
-        )
-        await eventHub.publish(event)
-        return try await authoritySessionSnapshot(sessionID: sessionID)
-    }
-
-    public func synchronizeEmbeddedPermissions(
-        sessionID: UUID,
-        mode: String,
-        providerSettings: [String: String],
-        actor: ExternalActor
-    ) async throws {
-        let session = try await sessionSnapshot(sessionID: sessionID)
-        let current = try await store.permissions(sessionID: sessionID)
-        guard current?.mode != mode || current?.providerSettings != providerSettings else { return }
-        let snapshot = ExecutionPermissionSnapshot(
-            sessionID: sessionID,
-            mode: mode,
-            providerSettings: providerSettings,
-            revision: (current?.revision ?? 0) + 1,
-            updatedActor: actor
-        )
-        let event = try await store.persistPermissions(
-            snapshot,
-            projectID: session.projectID,
-            rootSessionID: session.rootSessionID,
-            correlationID: ids.next()
-        )
-        await eventHub.publish(event)
-    }
-
-    /// Reconciles the embedded host's visible interaction adapters into the
-    /// durable broker. Missing pending interactions become interrupted rather
-    /// than disappearing, preserving exactly-once answer semantics.
-    public func synchronizeEmbeddedInteractions(
-        sessionID: UUID,
-        interactions desired: [InteractionSnapshot],
-        actor: ExternalActor
-    ) async throws -> [InteractionSnapshot] {
-        let session = try await sessionSnapshot(sessionID: sessionID)
-        let current = try await store.interactions(sessionID: sessionID)
-        let desiredIDs = Set(desired.map(\.interactionID))
-        let activeRunID: UUID? = if let sessionAuthority = sessions[sessionID] {
-            await sessionAuthority.activeBinding()?.runID
-        } else {
-            nil
-        }
-        for interaction in desired {
-            guard interaction.runID == nil || interaction.runID == activeRunID else {
-                throw ServiceAPIError(code: .staleRevision, message: "Interaction belongs to a stale run")
-            }
-            if current.first(where: { $0.interactionID == interaction.interactionID }) != interaction {
-                let event = try await store.persistInteraction(
-                    interaction,
-                    session: session,
-                    actor: actor,
-                    correlationID: ids.next()
-                )
-                await eventHub.publish(event)
-            }
-        }
-        for interaction in current
-            where interaction.state == .pending && !desiredIDs.contains(interaction.interactionID)
-        {
-            let interrupted = InteractionSnapshot(
-                interactionID: interaction.interactionID,
-                runID: interaction.runID,
-                agentID: interaction.agentID,
-                kind: interaction.kind,
-                state: .interrupted,
-                payload: interaction.payload,
-                revision: interaction.revision + 1,
-                expiresAt: interaction.expiresAt
-            )
-            let event = try await store.persistInteraction(
-                interrupted,
-                session: session,
-                actor: actor,
-                correlationID: ids.next()
-            )
-            await eventHub.publish(event)
-        }
-        return try await store.interactions(sessionID: sessionID)
     }
 
     private func createAuthoritySession(input: CreateSessionInput, externalActor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> SessionSnapshot {
@@ -1087,11 +920,12 @@ public actor RepoPromptHeadlessAuthority {
             ?? CollaborationMetadataSnapshot(sessionID: sessionID, visibility: session.visibility, collaborativeSteeringEnabled: false, controllerUserID: session.creator.goblinUserID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
     }
 
-    public func updateCollaborationMetadata(sessionID: UUID, input: CollaborationMetadataInput, actor: ExternalActor, idempotencyKey: String, requestDigest: String, idempotencyResponse: Data? = nil) async throws -> CollaborationMetadataSnapshot {
+    public func updateCollaborationMetadata(sessionID: UUID, input: CollaborationMetadataInput, actor: ExternalActor, idempotencyKey: String, requestDigest: String, idempotencyResponse: Data? = nil, authorizationDecision: GoblinAuthorizationDecision? = nil) async throws -> CollaborationMetadataSnapshot {
         try ensureWritable()
         let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "setSessionVisibility", key: idempotencyKey, requestDigest: requestDigest)
         if let prior: CollaborationMetadataSnapshot = try await priorResult(idempotency) { return prior }
         guard let session = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
+        let authoritySession = await session.snapshot()
         let current = try await collaborationMetadata(sessionID: sessionID)
         guard current.policyRevision == input.expectedPolicyRevision else { throw ServiceAPIError(code: .staleRevision, message: "Collaboration policy revision is stale", currentRevision: current.policyRevision) }
         if let expected = input.expectedControllerRevision, expected != current.controllerRevision { throw ServiceAPIError(code: .staleRevision, message: "Controller revision is stale", currentRevision: current.controllerRevision) }
@@ -1099,22 +933,81 @@ public actor RepoPromptHeadlessAuthority {
         guard !input.controllerUserID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw ServiceAPIError(code: .invalidRequest, message: "Controller user ID is required") }
         let controllerChanged = current.controllerUserID != input.controllerUserID
         let membershipChanged = current.visibility != input.visibility
+        if let authorizationDecision {
+            guard authorizationDecision.sessionID == sessionID,
+                  authorizationDecision.projectID == authoritySession.projectID,
+                  authorizationDecision.actor.goblinUserID == actor.goblinUserID,
+                  authorizationDecision.operation == "setSessionVisibility",
+                  authorizationDecision.requestDigest == requestDigest,
+                  authorizationDecision.policyRevision == current.policyRevision,
+                  authorizationDecision.controllerRevision == current.controllerRevision,
+                  authorizationDecision.membershipRevision == current.membershipRevision,
+                  authorizationDecision.issuedAt <= clock.now(),
+                  authorizationDecision.expiresAt > clock.now(),
+                  authorizationDecision.attributionLabels?.creatorUserID == nil
+                    || authorizationDecision.attributionLabels?.creatorUserID == authoritySession.creator.goblinUserID,
+                  authorizationDecision.attributionLabels?.controllerUserID == nil
+                    || authorizationDecision.attributionLabels?.controllerUserID == input.controllerUserID,
+                  authorizationDecision.attributionLabels?.visibility == nil
+                    || authorizationDecision.attributionLabels?.visibility == input.visibility
+            else {
+                throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Goblin collaboration decision does not acknowledge the current authority revisions")
+            }
+        }
+        let resultingPolicyRevision = current.policyRevision + 1
+        let resultingControllerRevision = current.controllerRevision + (controllerChanged ? 1 : 0)
+        let resultingMembershipRevision = current.membershipRevision + (membershipChanged ? 1 : 0)
+        let acknowledgement = authorizationDecision.map {
+            GoblinCollaborationAcknowledgement(
+                decisionID: $0.decisionID,
+                acknowledgedPolicyRevision: $0.policyRevision,
+                acknowledgedControllerRevision: $0.controllerRevision,
+                acknowledgedMembershipRevision: $0.membershipRevision,
+                resultingPolicyRevision: resultingPolicyRevision,
+                resultingControllerRevision: resultingControllerRevision,
+                resultingMembershipRevision: resultingMembershipRevision,
+                requestID: $0.requestID,
+                correlationID: $0.correlationID
+            )
+        }
         let next = CollaborationMetadataSnapshot(
             sessionID: sessionID,
             visibility: input.visibility,
             collaborativeSteeringEnabled: input.collaborativeSteeringEnabled,
             controllerUserID: input.controllerUserID,
-            policyRevision: current.policyRevision + 1,
-            controllerRevision: current.controllerRevision + (controllerChanged ? 1 : 0),
-            membershipRevision: current.membershipRevision + (membershipChanged ? 1 : 0)
+            policyRevision: resultingPolicyRevision,
+            controllerRevision: resultingControllerRevision,
+            membershipRevision: resultingMembershipRevision,
+            goblinAcknowledgement: acknowledgement
         )
-        try await session.updateVisibility(input.visibility, expectedRevision: (session.snapshot()).revision)
-        let snapshot = await session.snapshot()
+        let currentSession = authoritySession
         let cursor = try await store.nextCursor()
-        let event = try await store.persistCollaboration(next, session: replacingCursor(snapshot, cursor: cursor), actor: actor, correlationID: ids.next(), idempotency: idempotency, idempotencyResponse: idempotencyResponse)
-        await eventHub.publish(event)
+        let persistedSession = SessionSnapshot(
+            sessionID: currentSession.sessionID,
+            projectID: currentSession.projectID,
+            parentSessionID: currentSession.parentSessionID,
+            rootSessionID: currentSession.rootSessionID,
+            creator: currentSession.creator,
+            provider: currentSession.provider,
+            model: currentSession.model,
+            visibility: input.visibility,
+            state: currentSession.state,
+            runGeneration: currentSession.runGeneration,
+            turnEpoch: currentSession.turnEpoch,
+            revision: currentSession.revision + 1,
+            transcript: currentSession.transcript,
+            interactions: currentSession.interactions,
+            cursor: cursor
+        )
+        // Commit durable collaboration/session state first. A persistence failure
+        // therefore cannot leave the in-memory provider authority ahead of the
+        // events and snapshots observed by macOS or direct MCP.
+        let events = try await store.persistCollaboration(next, session: persistedSession, actor: actor, correlationID: authorizationDecision?.correlationID ?? ids.next(), idempotency: idempotency, idempotencyResponse: idempotencyResponse)
+        try await session.updateVisibility(input.visibility, expectedRevision: currentSession.revision)
+        for event in events { await eventHub.publish(event) }
         return next
     }
+
 
     public func updatePermissions(sessionID: UUID, expectedRevision: Int64, mode: String, providerSettings: [String: String], actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> ExecutionPermissionSnapshot {
         let idempotency = try mutationIdempotency(actor: actor, operation: "updateExecutionPermissions", key: idempotencyKey, digest: requestDigest)
@@ -1199,6 +1092,79 @@ public actor RepoPromptHeadlessAuthority {
             throw ServiceAPIError(code: .notFound, message: "Worktree binding not found")
         }
         return binding
+    }
+
+    /// Adopts a macOS-created worktree set as an explicit authority mutation.
+    /// This is not a property mirror: revision checks, active-run fencing and
+    /// all ownership changes are committed atomically before the UI projects
+    /// the returned snapshot.
+    public func replaceEmbeddedWorktrees(
+        sessionID: UUID,
+        desired: [WorktreeBindingSnapshot],
+        actor: ExternalActor
+    ) async throws -> AuthoritySessionSnapshot {
+        guard let sessionAuthority = sessions[sessionID] else {
+            throw ServiceAPIError(code: .notFound, message: "Session not found")
+        }
+        guard await sessionAuthority.activeBinding() == nil else {
+            throw ServiceAPIError(code: .runAlreadyActive, message: "A worktree cannot be changed while a run is active")
+        }
+        let session = await sessionAuthority.snapshot()
+        let project = try await projectSnapshot(projectID: session.projectID)
+        let rootIDs = Set(project.roots.map(\.rootID))
+        guard desired.allSatisfy({
+            $0.projectID == session.projectID
+                && $0.sessionID == sessionID
+                && rootIDs.contains($0.rootID)
+                && !$0.physicalPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) else {
+            throw ServiceAPIError(code: .worktreeConflict, message: "Embedded worktree replacement contains an unauthorized binding")
+        }
+        guard Set(desired.map(\.bindingID)).count == desired.count else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Embedded worktree replacement contains duplicate identities")
+        }
+
+        let current = try await store.worktrees(projectID: session.projectID)
+            .filter { $0.sessionID == sessionID }
+        let currentByID = Dictionary(uniqueKeysWithValues: current.map { ($0.bindingID, $0) })
+        let desiredIDs = Set(desired.map(\.bindingID))
+        var replacement = desired.map { proposed in
+            let prior = currentByID[proposed.bindingID]
+            return WorktreeBindingSnapshot(
+                bindingID: proposed.bindingID,
+                projectID: session.projectID,
+                rootID: proposed.rootID,
+                sessionID: sessionID,
+                baseRef: proposed.baseRef,
+                branch: proposed.branch,
+                physicalPath: proposed.physicalPath,
+                ownershipState: .active,
+                mergeState: proposed.mergeState,
+                revision: (prior?.revision ?? 0) + 1
+            )
+        }
+        replacement.append(contentsOf: current.filter { !desiredIDs.contains($0.bindingID) }.map { prior in
+            WorktreeBindingSnapshot(
+                bindingID: prior.bindingID,
+                projectID: prior.projectID,
+                rootID: prior.rootID,
+                sessionID: nil,
+                baseRef: prior.baseRef,
+                branch: prior.branch,
+                physicalPath: prior.physicalPath,
+                ownershipState: .released,
+                mergeState: prior.mergeState,
+                revision: prior.revision + 1
+            )
+        })
+        let events = try await store.replaceEmbeddedWorktrees(
+            replacement,
+            session: session,
+            actor: actor,
+            correlationID: ids.next()
+        )
+        for event in events { await eventHub.publish(event) }
+        return try await authoritySessionSnapshot(sessionID: sessionID)
     }
 
     public func createWorktree(sessionID: UUID, rootID: UUID, baseRef: String, branch: String, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> WorktreeBindingSnapshot {
@@ -1471,25 +1437,27 @@ public actor RepoPromptHeadlessAuthority {
     }
 
     public func sessionSnapshot(sessionID: UUID) async throws -> SessionSnapshot {
-        guard let session = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
-        return await session.snapshot()
+        guard sessions[sessionID] != nil,
+              let persisted = try await store.sessionWithInteractions(id: sessionID)
+        else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
+        return persisted
     }
 
     public func projectSnapshots() async -> [ProjectSnapshot] {
         await projects.snapshots()
     }
 
-    public func sessionSnapshots() async -> [SessionSnapshot] {
+    public func sessionSnapshots() async throws -> [SessionSnapshot] {
         var values: [SessionSnapshot] = []
-        for session in sessions.values {
-            await values.append(session.snapshot())
+        for snapshot in try await store.allSessionsWithInteractions() where sessions[snapshot.sessionID] != nil {
+            values.append(snapshot)
         }
         return values.sorted { $0.sessionID.uuidString < $1.sessionID.uuidString }
     }
 
     public func childSessionSnapshots(parentSessionID: UUID) async throws -> [SessionSnapshot] {
         guard sessions[parentSessionID] != nil else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
-        return await sessionSnapshots().filter { $0.parentSessionID == parentSessionID }
+        return try await sessionSnapshots().filter { $0.parentSessionID == parentSessionID }
     }
 
     public func events(after cursor: ServiceCursor?, limit: Int, projectID: UUID? = nil, sessionID: UUID? = nil) async throws -> EventPage {
@@ -1543,12 +1511,12 @@ public actor RepoPromptHeadlessAuthority {
     public func authoritativeSnapshot() async throws -> AuthoritativeSnapshot {
         let meta = try await store.metadata()
         let cursor = ServiceCursor(storeID: meta.storeID, globalSequence: meta.nextGlobalSequence - 1)
-        return await AuthoritativeSnapshot(storeID: meta.storeID, projects: projectSnapshots(), sessions: sessionSnapshots(), cursor: cursor)
+        return try await AuthoritativeSnapshot(storeID: meta.storeID, projects: projectSnapshots(), sessions: sessionSnapshots(), cursor: cursor)
     }
 
     public func quiesce() async throws {
         quiescing = true
-        let roots = await sessionSnapshots().filter { $0.parentSessionID == nil && [.preparing, .running, .waiting].contains($0.state) }
+        let roots = try await sessionSnapshots().filter { $0.parentSessionID == nil && [.preparing, .running, .waiting].contains($0.state) }
         for snapshot in roots {
             cancellationBarriers.insert(snapshot.rootSessionID)
             try await cancelDescendants(rootSessionID: snapshot.rootSessionID, excluding: snapshot.sessionID, actor: nil)
@@ -1706,7 +1674,14 @@ public actor RepoPromptHeadlessAuthority {
         return stored.0
     }
 
-    private func startProviderRun(command: SessionCommand, sessionID: UUID, session: SessionAuthority, actor: ExternalActor, idempotency: IdempotencyInput) async throws -> CommandReceipt {
+    private func startProviderRun(
+        command: SessionCommand,
+        sessionID: UUID,
+        session: SessionAuthority,
+        actor: ExternalActor,
+        idempotency: IdempotencyInput,
+        providerPrompt: String? = nil
+    ) async throws -> CommandReceipt {
         guard let providerAdapter else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider runtime is not configured") }
         let snapshot = await session.snapshot()
         guard let permissions = try await store.permissions(sessionID: sessionID) else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Execution permissions are not configured") }
@@ -1735,7 +1710,9 @@ public actor RepoPromptHeadlessAuthority {
         try await store.persistRun(run)
         await providerAdapter.prepareRun(kind: snapshot.provider, runID: binding.runID)
         let workingDirectory = try await workingDirectory(session: snapshot)
-        let prompt = snapshot.transcript.last(where: { $0.kind == .human })?.content ?? "Continue the repository task."
+        let prompt = providerPrompt
+            ?? snapshot.transcript.last(where: { $0.kind == .human })?.content
+            ?? "Continue the repository task."
         providerTasks[binding.runID] = Task {
             await self.performProviderRun(
                 sessionID: sessionID,
@@ -1814,7 +1791,7 @@ public actor RepoPromptHeadlessAuthority {
     }
 
     private func cancelDescendants(rootSessionID: UUID, excluding rootID: UUID, actor: ExternalActor?) async throws {
-        let snapshots = await sessionSnapshots().filter { $0.rootSessionID == rootSessionID && $0.sessionID != rootID }
+        let snapshots = try await sessionSnapshots().filter { $0.rootSessionID == rootSessionID && $0.sessionID != rootID }
         let byID = Dictionary(uniqueKeysWithValues: snapshots.map { ($0.sessionID, $0) })
         func depth(_ snapshot: SessionSnapshot) -> Int {
             var current = snapshot
@@ -2051,14 +2028,6 @@ public actor RepoPromptHeadlessAuthority {
         )
     }
 
-    private static func runtimeBinding(_ binding: RunBindingSnapshot) -> RunBindingIdentity {
-        RunBindingIdentity(
-            runID: binding.runID,
-            generation: binding.generation,
-            turnEpoch: binding.turnEpoch,
-            connectionGeneration: binding.connectionGeneration
-        )
-    }
 }
 
 private struct ContextBuilderQuestionPayload: Codable {

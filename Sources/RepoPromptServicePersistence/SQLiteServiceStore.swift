@@ -263,12 +263,67 @@ public actor SQLiteServiceStore {
         return try decoder.decode(SessionSnapshot.self, from: Data(text.utf8))
     }
 
+    /// Reads the base session and its interaction authority in one SQLite read
+    /// transaction so adapters never observe an impossible lifecycle/interaction
+    /// combination assembled across two revisions.
+    public func sessionWithInteractions(id: UUID) async throws -> SessionSnapshot? {
+        try await transaction {
+            guard let base = try await session(id: id) else { return nil }
+            let currentInteractions = try await interactions(sessionID: id)
+            return SessionSnapshot(
+                sessionID: base.sessionID,
+                projectID: base.projectID,
+                parentSessionID: base.parentSessionID,
+                rootSessionID: base.rootSessionID,
+                creator: base.creator,
+                provider: base.provider,
+                model: base.model,
+                visibility: base.visibility,
+                state: base.state,
+                runGeneration: base.runGeneration,
+                turnEpoch: base.turnEpoch,
+                revision: base.revision,
+                transcript: base.transcript,
+                interactions: currentInteractions,
+                cursor: base.cursor
+            )
+        }
+    }
+
     public func allProjects() async throws -> [ProjectSnapshot] {
         try await decodeRows("SELECT snapshot_json FROM projects WHERE lifecycle_state != 'archived' ORDER BY created_at", as: ProjectSnapshot.self)
     }
 
     public func allSessions() async throws -> [SessionSnapshot] {
         try await decodeRows("SELECT snapshot_json FROM sessions ORDER BY created_at", as: SessionSnapshot.self)
+    }
+
+    public func allSessionsWithInteractions() async throws -> [SessionSnapshot] {
+        try await transaction {
+            let sessions = try await allSessions()
+            var result: [SessionSnapshot] = []
+            for base in sessions {
+                let currentInteractions = try await interactions(sessionID: base.sessionID)
+                result.append(SessionSnapshot(
+                    sessionID: base.sessionID,
+                    projectID: base.projectID,
+                    parentSessionID: base.parentSessionID,
+                    rootSessionID: base.rootSessionID,
+                    creator: base.creator,
+                    provider: base.provider,
+                    model: base.model,
+                    visibility: base.visibility,
+                    state: base.state,
+                    runGeneration: base.runGeneration,
+                    turnEpoch: base.turnEpoch,
+                    revision: base.revision,
+                    transcript: base.transcript,
+                    interactions: currentInteractions,
+                    cursor: base.cursor
+                ))
+            }
+            return result
+        }
     }
 
     public func persistAgent(_ snapshot: AgentSnapshot, projectID: UUID, actor: ExternalActor?, correlationID: UUID, eventType: EventType) async throws -> EventEnvelope {
@@ -462,11 +517,14 @@ public actor SQLiteServiceStore {
     }
 
     public func collaboration(sessionID: UUID) async throws -> CollaborationMetadataSnapshot? {
-        guard let row = try await connection.query("SELECT visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision FROM collaboration_metadata WHERE session_id=?", [.text(sessionID.uuidString)]).first,
+        guard let row = try await connection.query("SELECT visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision,goblin_acknowledgement_json FROM collaboration_metadata WHERE session_id=?", [.text(sessionID.uuidString)]).first,
               let visibility = Visibility(rawValue: row.column("visibility")?.string ?? ""),
               let controllerUserID = row.column("controller_user_id")?.string
         else { return nil }
-        return CollaborationMetadataSnapshot(sessionID: sessionID, visibility: visibility, collaborativeSteeringEnabled: row.column("collaborative_steering_enabled")?.integer == 1, controllerUserID: controllerUserID, policyRevision: Int64(row.column("policy_revision")?.integer ?? 1), controllerRevision: Int64(row.column("controller_revision")?.integer ?? 1), membershipRevision: Int64(row.column("membership_revision")?.integer ?? 1))
+        let acknowledgement = try row.column("goblin_acknowledgement_json")?.string.map {
+            try decoder.decode(GoblinCollaborationAcknowledgement.self, from: Data($0.utf8))
+        }
+        return CollaborationMetadataSnapshot(sessionID: sessionID, visibility: visibility, collaborativeSteeringEnabled: row.column("collaborative_steering_enabled")?.integer == 1, controllerUserID: controllerUserID, policyRevision: Int64(row.column("policy_revision")?.integer ?? 1), controllerRevision: Int64(row.column("controller_revision")?.integer ?? 1), membershipRevision: Int64(row.column("membership_revision")?.integer ?? 1), goblinAcknowledgement: acknowledgement)
     }
 
     public func installInitialPolicies(permissions: ExecutionPermissionSnapshot, collaboration: CollaborationMetadataSnapshot) async throws {
@@ -476,11 +534,15 @@ public actor SQLiteServiceStore {
         }
     }
 
-    public func persistCollaboration(_ metadata: CollaborationMetadataSnapshot, session: SessionSnapshot, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput, idempotencyResponse: Data? = nil) async throws -> EventEnvelope {
+    public func persistCollaboration(_ metadata: CollaborationMetadataSnapshot, session: SessionSnapshot, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput, idempotencyResponse: Data? = nil) async throws -> [EventEnvelope] {
         try await transaction {
             if let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             try await upsertCollaboration(metadata)
-            return try await persistSessionInTransaction(session, eventType: .controllerUpdated, actor: actor, correlationID: correlationID, idempotency: idempotency, idempotencyResponse: idempotencyResponse ?? encoder.encode(metadata), initialSelection: nil)
+            let payload = try encoder.encode(metadata)
+            let visibility = try await persistSessionInTransaction(session, eventType: .visibilityUpdated, actor: actor, correlationID: correlationID, idempotency: nil, idempotencyResponse: nil, initialSelection: nil, eventPayload: payload)
+            let controller = try await appendEvent(projectID: session.projectID, sessionID: session.sessionID, rootSessionID: session.rootSessionID, runID: nil, sessionSequence: Int64(session.transcript.count), type: .controllerUpdated, generation: session.runGeneration, turnEpoch: session.turnEpoch, actor: actor, correlationID: correlationID, payload: payload)
+            try await saveIdempotency(idempotency, status: 202, response: idempotencyResponse ?? payload)
+            return [visibility, controller]
         }
     }
 
@@ -548,6 +610,40 @@ public actor SQLiteServiceStore {
             let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.sessionID, runID: nil, sessionSequence: nil, type: snapshot.revision == 1 ? .worktreeCreated : .worktreeUpdated, generation: nil, turnEpoch: nil, actor: actor, correlationID: correlationID, payload: encoder.encode(snapshot))
             if let idempotency { try await saveIdempotency(idempotency, status: snapshot.revision == 1 ? 201 : 200, response: encoder.encode(snapshot)) }
             return event
+        }
+    }
+
+    /// Atomically replaces an embedded host's authority-owned worktree set.
+    /// The caller supplies already validated active/released snapshots; either
+    /// every ownership transition and event commits or none does.
+    public func replaceEmbeddedWorktrees(
+        _ snapshots: [WorktreeBindingSnapshot],
+        session: SessionSnapshot,
+        actor: ExternalActor,
+        correlationID: UUID
+    ) async throws -> [EventEnvelope] {
+        try await transaction {
+            var events: [EventEnvelope] = []
+            for snapshot in snapshots {
+                _ = try await connection.query(
+                    "INSERT INTO worktree_bindings(binding_id,project_id,root_id,session_id,schema_version,base_ref,branch,physical_path,ownership_state,merge_state,revision) VALUES(?,?,?,?,1,?,?,?,?,?,?) ON CONFLICT(binding_id) DO UPDATE SET session_id=excluded.session_id,base_ref=excluded.base_ref,branch=excluded.branch,physical_path=excluded.physical_path,ownership_state=excluded.ownership_state,merge_state=excluded.merge_state,revision=excluded.revision",
+                    [.text(snapshot.bindingID.uuidString), .text(snapshot.projectID.uuidString), .text(snapshot.rootID.uuidString), snapshot.sessionID.map { .text($0.uuidString) } ?? .null, .text(snapshot.baseRef), .text(snapshot.branch), .text(snapshot.physicalPath), .text(snapshot.ownershipState.rawValue), .text(snapshot.mergeState.rawValue), .integer(Int(snapshot.revision))]
+                )
+                events.append(try await appendEvent(
+                    projectID: session.projectID,
+                    sessionID: session.sessionID,
+                    rootSessionID: session.rootSessionID,
+                    runID: nil,
+                    sessionSequence: nil,
+                    type: snapshot.revision == 1 ? .worktreeCreated : .worktreeUpdated,
+                    generation: session.runGeneration,
+                    turnEpoch: session.turnEpoch,
+                    actor: actor,
+                    correlationID: correlationID,
+                    payload: encoder.encode(snapshot)
+                ))
+            }
+            return events
         }
     }
 
@@ -927,7 +1023,8 @@ public actor SQLiteServiceStore {
         correlationID: UUID,
         idempotency: IdempotencyInput?,
         idempotencyResponse: Data?,
-        initialSelection: SelectionSnapshot?
+        initialSelection: SelectionSnapshot?,
+        eventPayload: Data? = nil
     ) async throws -> EventEnvelope {
         try await validateExpectedCursor(snapshot.cursor)
         if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
@@ -948,7 +1045,7 @@ public actor SQLiteServiceStore {
                 [.text(initialSelection.sessionID.uuidString), .text(encodeText(Array(Set(initialSelection.entries.map(\.rootID))))), .text(encodeText(initialSelection)), .integer(Int(initialSelection.revision)), .integer(Int(initialSelection.bindingRevision)), .text(UUID().uuidString)]
             )
         }
-        let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.rootSessionID, runID: nil, sessionSequence: Int64(snapshot.transcript.count), type: eventType, generation: snapshot.runGeneration, turnEpoch: snapshot.turnEpoch, actor: actor, correlationID: correlationID, payload: Data(snapshotJSON.utf8))
+        let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.rootSessionID, runID: nil, sessionSequence: Int64(snapshot.transcript.count), type: eventType, generation: snapshot.runGeneration, turnEpoch: snapshot.turnEpoch, actor: actor, correlationID: correlationID, payload: eventPayload ?? Data(snapshotJSON.utf8))
         if [.completed, .failed, .canceled, .interrupted, .archived].contains(snapshot.state) {
             try await saveCheckpoint(scope: "session:\(snapshot.sessionID.uuidString)", sequence: event.globalSequence, snapshot: Data(snapshotJSON.utf8), retentionClass: "terminal")
         }
@@ -974,9 +1071,10 @@ public actor SQLiteServiceStore {
     }
 
     private func upsertCollaboration(_ metadata: CollaborationMetadataSnapshot) async throws {
+        let acknowledgement: SQLiteData = try metadata.goblinAcknowledgement.map { .text(try encodeText($0)) } ?? .null
         _ = try await connection.query(
-            "INSERT INTO collaboration_metadata(session_id,schema_version,visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision,updated_at) VALUES(?,1,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET visibility=excluded.visibility,collaborative_steering_enabled=excluded.collaborative_steering_enabled,controller_user_id=excluded.controller_user_id,policy_revision=excluded.policy_revision,controller_revision=excluded.controller_revision,membership_revision=excluded.membership_revision,updated_at=CURRENT_TIMESTAMP",
-            [.text(metadata.sessionID.uuidString), .text(metadata.visibility.rawValue), .integer(metadata.collaborativeSteeringEnabled ? 1 : 0), .text(metadata.controllerUserID), .integer(Int(metadata.policyRevision)), .integer(Int(metadata.controllerRevision)), .integer(Int(metadata.membershipRevision))]
+            "INSERT INTO collaboration_metadata(session_id,schema_version,visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision,goblin_acknowledgement_json,updated_at) VALUES(?,1,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET visibility=excluded.visibility,collaborative_steering_enabled=excluded.collaborative_steering_enabled,controller_user_id=excluded.controller_user_id,policy_revision=excluded.policy_revision,controller_revision=excluded.controller_revision,membership_revision=excluded.membership_revision,goblin_acknowledgement_json=excluded.goblin_acknowledgement_json,updated_at=CURRENT_TIMESTAMP",
+            [.text(metadata.sessionID.uuidString), .text(metadata.visibility.rawValue), .integer(metadata.collaborativeSteeringEnabled ? 1 : 0), .text(metadata.controllerUserID), .integer(Int(metadata.policyRevision)), .integer(Int(metadata.controllerRevision)), .integer(Int(metadata.membershipRevision)), acknowledgement]
         )
     }
 
@@ -995,6 +1093,7 @@ public actor SQLiteServiceStore {
         try await addColumnIfMissing(table: "service_metadata", column: "activation_generation", definition: "INTEGER NOT NULL DEFAULT 1")
         try await addColumnIfMissing(table: "service_metadata", column: "activation_token_digest", definition: "TEXT")
         try await addColumnIfMissing(table: "service_metadata", column: "activation_instance_id", definition: "TEXT")
+        try await addColumnIfMissing(table: "collaboration_metadata", column: "goblin_acknowledgement_json", definition: "TEXT")
         try await addColumnIfMissing(table: "owned_resources", column: "external_id", definition: "TEXT")
         try await addColumnIfMissing(table: "owned_resources", column: "temporary_path_identity", definition: "TEXT")
         try await addColumnIfMissing(table: "owned_resources", column: "content_digest", definition: "TEXT")

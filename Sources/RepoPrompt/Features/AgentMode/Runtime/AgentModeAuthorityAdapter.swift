@@ -3,11 +3,11 @@ import Foundation
 import RepoPromptHeadlessRuntime
 import RepoPromptServiceProtocol
 
-/// Thin macOS adapter over `RepoPromptHeadlessAuthority`.
+/// Main-actor projection adapter for the process-lifetime durable authority.
 ///
-/// Provider controllers and SwiftUI retain presentation mechanics, but durable
-/// identity, lifecycle fencing, transcript, permissions, interactions and
-/// worktree ownership always cross this boundary before MCP waiters are woken.
+/// The adapter performs a one-time legacy import, submits explicit authority
+/// commands, and projects returned snapshots. It never launches providers or
+/// republishes UI-derived lifecycle/transcript state.
 @MainActor
 final class AgentModeAuthorityAdapter {
     static let shared = AgentModeAuthorityAdapter()
@@ -22,16 +22,17 @@ final class AgentModeAuthorityAdapter {
 
     func ensureSession(
         _ session: AgentModeViewModel.TabSession,
-        workspace: WorkspaceModel
+        workspace: WorkspaceModel,
+        excludingCurrentUserMessage: String? = nil
     ) async throws -> AuthoritySessionSnapshot {
         guard let sessionID = session.activeAgentSessionID else {
             throw ServiceAPIError(code: .invalidRequest, message: "Agent tab has no persistent session identity")
         }
         let authority = try await AppAgentAuthorityComposition.shared.authority()
-        let rootSessionID: UUID = if let parentSessionID = session.parentSessionID,
-                                     let parent = try? await authority.authoritySessionSnapshot(sessionID: parentSessionID)
-        {
-            parent.session.rootSessionID
+        let rootSessionID: UUID = if let parentSessionID = session.parentSessionID {
+            try await authority
+                .authoritySessionSnapshot(sessionID: parentSessionID)
+                .session.rootSessionID
         } else {
             sessionID
         }
@@ -48,18 +49,21 @@ final class AgentModeAuthorityAdapter {
         let rootIDsByPath = Dictionary(uniqueKeysWithValues: roots.map { ($0.canonicalPath, $0.rootID) })
         let worktrees = session.worktreeBindings.compactMap { binding -> WorktreeBindingSnapshot? in
             guard let rootID = rootIDsByPath[binding.logicalRootPath] else { return nil }
-            return WorktreeBindingSnapshot(
-                bindingID: Self.stableUUID(namespace: sessionID, value: binding.id),
+            return Self.worktreeSnapshot(
+                binding,
+                sessionID: sessionID,
                 projectID: workspace.id,
                 rootID: rootID,
-                sessionID: sessionID,
-                baseRef: binding.head ?? "HEAD",
-                branch: binding.branch ?? "detached",
-                physicalPath: binding.worktreeRootPath,
-                ownershipState: .active,
-                mergeState: .clean,
                 revision: 1
             )
+        }
+        var legacyItems = Self.authoritativeItems(session)
+        if let excludingCurrentUserMessage,
+           let lastHumanIndex = legacyItems.lastIndex(where: {
+               $0.kind == .user && $0.text == excludingCurrentUserMessage
+           })
+        {
+            legacyItems.remove(at: lastHumanIndex)
         }
         let snapshot = try await authority.ensureEmbeddedSession(EmbeddedSessionSeed(
             projectID: workspace.id,
@@ -72,187 +76,323 @@ final class AgentModeAuthorityAdapter {
             provider: Self.providerKind(session.selectedAgent),
             model: session.selectedModelRaw == AgentModel.defaultModel.rawValue ? nil : session.selectedModelRaw,
             visibility: .privateSession,
-            transcript: Self.transcriptEntries(Self.authoritativeItems(session), actor: actor),
+            transcript: Self.transcriptEntries(legacyItems, actor: actor),
             permissionMode: "workspaceWrite",
             providerSettings: Self.permissionSettings(session.permissionProfile),
             worktrees: worktrees
         ))
-        session.applyAuthorityTranscript(snapshot.session.transcript)
+        await applyAuthoritySnapshot(snapshot, to: session)
         return snapshot
     }
 
-    func beginRun(
+    func startProviderRun(
         _ session: AgentModeViewModel.TabSession,
-        workspace: WorkspaceModel
+        workspace: WorkspaceModel,
+        userMessage: String,
+        providerPrompt: String
     ) async throws -> RunBindingSnapshot {
-        _ = try await ensureSession(session, workspace: workspace)
+        let admitted = try await ensureSession(
+            session,
+            workspace: workspace,
+            excludingCurrentUserMessage: userMessage
+        )
         guard let sessionID = session.activeAgentSessionID else {
             throw ServiceAPIError(code: .invalidRequest, message: "Agent tab has no persistent session identity")
         }
+        startObserving(session)
         let authority = try await AppAgentAuthorityComposition.shared.authority()
-        let generation = AppDomainRuntimeComposition.shared.runtime.identity.lifecycleGeneration
-        let snapshot = try await authority.beginEmbeddedRun(
+        let payload = Self.presentationPayloadForLatestHumanItem(in: session, matching: userMessage)
+        let digest = CanonicalSigning.bodyDigest(Data(providerPrompt.utf8))
+        let snapshot = try await authority.startEmbeddedProviderRun(
             sessionID: sessionID,
             actor: actor,
-            connectionGeneration: Int64(clamping: generation),
-            providerSessionID: session.providerSessionID,
-            preferredRunID: session.runID
+            userMessage: userMessage,
+            providerPrompt: providerPrompt,
+            presentationPayload: payload,
+            resumeMode: admitted.activeRun?.providerSessionID == nil ? "auto" : "resume",
+            idempotencyKey: "macos-run:\(UUID().uuidString)",
+            requestDigest: digest
         )
+        await applyAuthoritySnapshot(snapshot, to: session)
         guard let binding = snapshot.activeBinding else {
-            throw ServiceAPIError(code: .persistenceUnavailable, message: "Authority did not publish the embedded run binding")
+            throw ServiceAPIError(code: .persistenceUnavailable, message: "Authority did not publish a provider run binding")
         }
         return binding
     }
 
-    func synchronizeTranscript(_ session: AgentModeViewModel.TabSession) async {
+    func steerProviderRun(
+        _ session: AgentModeViewModel.TabSession,
+        text: String
+    ) async throws -> AuthoritySessionSnapshot {
         guard let sessionID = session.activeAgentSessionID,
               let binding = session.authorityRunBinding
-        else { return }
-        do {
-            let authority = try await AppAgentAuthorityComposition.shared.authority()
-            let snapshot = try await authority.synchronizeEmbeddedTranscript(
+        else {
+            throw ServiceAPIError(code: .notFound, message: "No authoritative provider run is active")
+        }
+        let authority = try await AppAgentAuthorityComposition.shared.authority()
+        let snapshot = try await authority.steerEmbeddedProviderRun(
+            sessionID: sessionID,
+            text: text,
+            targetTurnEpoch: binding.turnEpoch,
+            actor: actor,
+            idempotencyKey: "macos-steer:\(UUID().uuidString)",
+            requestDigest: CanonicalSigning.bodyDigest(Data(text.utf8))
+        )
+        await applyAuthoritySnapshot(snapshot, to: session)
+        return snapshot
+    }
+
+    func cancelProviderRun(
+        _ session: AgentModeViewModel.TabSession
+    ) async throws -> AuthoritySessionSnapshot {
+        guard let sessionID = session.activeAgentSessionID,
+              let binding = session.authorityRunBinding
+        else {
+            throw ServiceAPIError(code: .notFound, message: "No authoritative provider run is active")
+        }
+        let authority = try await AppAgentAuthorityComposition.shared.authority()
+        let snapshot = try await authority.cancelEmbeddedProviderRun(
+            sessionID: sessionID,
+            binding: binding,
+            actor: actor,
+            idempotencyKey: "macos-cancel:\(UUID().uuidString)",
+            requestDigest: CanonicalSigning.bodyDigest(Data(binding.runID.uuidString.utf8))
+        )
+        await applyAuthoritySnapshot(snapshot, to: session)
+        return snapshot
+    }
+
+    func updatePermissions(
+        _ session: AgentModeViewModel.TabSession
+    ) async throws -> ExecutionPermissionSnapshot {
+        guard let sessionID = session.activeAgentSessionID else {
+            throw ServiceAPIError(code: .notFound, message: "Session is not bound")
+        }
+        let authority = try await AppAgentAuthorityComposition.shared.authority()
+        let current = try await authority.permissionSnapshot(sessionID: sessionID)
+        let snapshot = try await authority.updatePermissions(
+            sessionID: sessionID,
+            expectedRevision: current?.revision ?? 0,
+            mode: "workspaceWrite",
+            providerSettings: Self.permissionSettings(session.permissionProfile),
+            actor: actor
+        )
+        session.applyAuthorityPermissions(snapshot)
+        return snapshot
+    }
+
+    func answerInteraction(
+        _ session: AgentModeViewModel.TabSession,
+        interaction: InteractionSnapshot,
+        payload: Data
+    ) async throws -> InteractionSnapshot {
+        guard let sessionID = session.activeAgentSessionID else {
+            throw ServiceAPIError(code: .notFound, message: "Session is not bound")
+        }
+        let authority = try await AppAgentAuthorityComposition.shared.authority()
+        let answered = try await authority.answerInteraction(
+            sessionID: sessionID,
+            interactionID: interaction.interactionID,
+            expectedRevision: interaction.revision,
+            payload: payload,
+            actor: actor,
+            idempotencyKey: "macos-interaction:\(interaction.interactionID.uuidString):r\(interaction.revision)",
+            requestDigest: CanonicalSigning.bodyDigest(payload)
+        )
+        try await applyAuthoritySnapshot(
+            authority.authoritySessionSnapshot(sessionID: sessionID),
+            to: session
+        )
+        return answered
+    }
+
+    func replaceWorktrees(
+        _ session: AgentModeViewModel.TabSession,
+        workspace: WorkspaceModel,
+        bindings: [AgentSessionWorktreeBinding]
+    ) async throws -> AuthoritySessionSnapshot {
+        guard let sessionID = session.activeAgentSessionID else {
+            throw ServiceAPIError(code: .notFound, message: "Session is not bound")
+        }
+        let roots = Dictionary(uniqueKeysWithValues: workspace.repoPaths.map { path in
+            (path, Self.stableUUID(namespace: workspace.id, value: path))
+        })
+        let desired = try bindings.map { binding -> WorktreeBindingSnapshot in
+            guard let rootID = roots[binding.logicalRootPath] else {
+                throw ServiceAPIError(code: .rootUnauthorized, message: "Worktree logical root is not in the active workspace")
+            }
+            return Self.worktreeSnapshot(
+                binding,
                 sessionID: sessionID,
-                binding: binding,
-                entries: Self.transcriptEntries(Self.authoritativeItems(session), actor: actor)
+                projectID: workspace.id,
+                rootID: rootID,
+                revision: 0
             )
-            session.applyAuthorityTranscript(snapshot.session.transcript)
-        } catch {
-            // A rejected or stale local mutation is rolled back to the
-            // authority rather than remaining visible as a second truth.
-            if let authority = try? await AppAgentAuthorityComposition.shared.authority(),
-               let snapshot = try? await authority.authoritySessionSnapshot(sessionID: sessionID)
-            {
-                session.applyAuthorityTranscript(snapshot.session.transcript)
+        }
+        let authority = try await AppAgentAuthorityComposition.shared.authority()
+        let snapshot = try await authority.replaceEmbeddedWorktrees(
+            sessionID: sessionID,
+            desired: desired,
+            actor: actor
+        )
+        await applyAuthoritySnapshot(snapshot, to: session)
+        return snapshot
+    }
+
+    func startObserving(_ session: AgentModeViewModel.TabSession) {
+        guard session.authorityProjectionTask == nil,
+              let sessionID = session.activeAgentSessionID
+        else { return }
+        session.authorityProjectionTask = Task { @MainActor [weak session] in
+            guard let session else { return }
+            do {
+                let authority = try await AppAgentAuthorityComposition.shared.authority()
+                var snapshot = try await authority.authoritySessionSnapshot(sessionID: sessionID)
+                await self.applyAuthoritySnapshot(snapshot, to: session)
+                let stream = try await authority.subscribe(after: snapshot.session.cursor)
+                for try await event in stream {
+                    try Task.checkCancellation()
+                    guard event.sessionID == sessionID else { continue }
+                    snapshot = try await authority.authoritySessionSnapshot(sessionID: sessionID)
+                    await self.applyAuthoritySnapshot(snapshot, to: session)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                session.recordAuthorityFailure(error)
             }
         }
     }
 
-    func settle(
+    func reloadAuthoritativeSnapshot(
         _ session: AgentModeViewModel.TabSession,
-        terminalState: AgentSessionRunState,
-        expectedRunID: UUID?
-    ) async throws -> AuthoritySessionSnapshot {
-        guard let sessionID = session.activeAgentSessionID,
-              let binding = session.authorityRunBinding,
-              expectedRunID == nil || expectedRunID == binding.runID
-        else {
-            throw ServiceAPIError(code: .staleRevision, message: "Terminal publication is not bound to the authority run")
-        }
-        let authority = try await AppAgentAuthorityComposition.shared.authority()
-        let transcriptSnapshot = try await authority.synchronizeEmbeddedTranscript(
-            sessionID: sessionID,
-            binding: binding,
-            entries: Self.transcriptEntries(Self.authoritativeItems(session), actor: actor)
-        )
-        session.applyAuthorityTranscript(transcriptSnapshot.session.transcript)
-        let outcome: EmbeddedRunTerminalOutcome = switch terminalState {
-        case .completed: .completed
-        case .cancelled: .canceled
-        case .failed: .failed
-        case .idle, .running, .waitingForUser, .waitingForQuestion, .waitingForApproval: .interrupted
-        }
-        return try await authority.settleEmbeddedRun(
-            sessionID: sessionID,
-            binding: binding,
-            outcome: outcome,
-            providerSessionID: session.providerSessionID
-        )
-    }
-
-    func synchronizePermissions(
-        _ session: AgentModeViewModel.TabSession
+        after error: Error
     ) async {
+        session.recordAuthorityFailure(error)
         guard let sessionID = session.activeAgentSessionID else { return }
         do {
             let authority = try await AppAgentAuthorityComposition.shared.authority()
-            try await authority.synchronizeEmbeddedPermissions(
-                sessionID: sessionID,
-                mode: "workspaceWrite",
-                providerSettings: Self.permissionSettings(session.permissionProfile),
-                actor: actor
+            try await applyAuthoritySnapshot(
+                authority.authoritySessionSnapshot(sessionID: sessionID),
+                to: session
             )
         } catch {
-            // Session admission at run start is the authoritative retry path.
+            session.recordAuthorityFailure(error)
         }
     }
 
-    func synchronizeInteractions(_ session: AgentModeViewModel.TabSession) async {
-        guard let sessionID = session.activeAgentSessionID else { return }
-        let runID = session.authorityRunBinding?.runID
-        var interactions: [InteractionSnapshot] = []
-        if let pending = session.pendingAskUser {
-            interactions.append(Self.interaction(
-                id: pending.id,
-                runID: runID,
-                kind: .question,
-                payload: [
-                    "type": "ask_user",
-                    "title": pending.interaction.title ?? "Question",
-                    "context": pending.interaction.context ?? "",
-                    "question_count": pending.interaction.questions.count
-                ]
-            ))
+    /// Applies the UI projection and independently wakes direct-MCP waiters
+    /// from the exact same durable snapshot. The continuation store receives no
+    /// mutation closure and cannot influence lifecycle settlement.
+    private func applyAuthoritySnapshot(
+        _ snapshot: AuthoritySessionSnapshot,
+        to session: AgentModeViewModel.TabSession
+    ) async {
+        session.applyAuthoritySnapshot(snapshot)
+        guard var context = session.mcpControlContext else { return }
+        let priorEpoch = context.currentEpoch
+        let transition: AgentRunEpochTransitionKind = if priorEpoch == nil {
+            .initial
+        } else if let binding = snapshot.activeBinding,
+                  priorEpoch?.id != Self.epochID(binding)
+        {
+            .relatedFollowUp
+        } else {
+            priorEpoch?.transitionKind ?? .initial
         }
-        if let pending = session.pendingUserInputRequest {
-            interactions.append(Self.interaction(
-                id: pending.id,
-                runID: runID,
-                kind: .question,
-                payload: [
-                    "type": "request_user_input",
-                    "method": pending.method,
-                    "question_count": pending.questions.count
-                ]
-            ))
+        guard let cursor = await AgentRunSessionStore.observeAuthoritySnapshot(
+            Self.mcpSnapshot(snapshot, tabID: session.tabID),
+            registration: context.registration,
+            activationID: context.activationID,
+            binding: snapshot.activeBinding,
+            transitionKind: transition
+        ) else { return }
+        context.currentEpoch = cursor.epoch
+        context.preparedEpoch = cursor.epoch
+        context.pendingEpochTransition = nil
+        session.mcpControlContext = context
+    }
+
+    private static func mcpSnapshot(
+        _ snapshot: AuthoritySessionSnapshot,
+        tabID: UUID
+    ) -> AgentRunMCPSnapshot {
+        let pending = snapshot.interactions.first(where: { $0.state == .pending })
+        let interaction = pending.map(mcpInteraction)
+        let status: AgentRunMCPSnapshot.Status = switch snapshot.session.state {
+        case .waiting: .waitingForInput
+        case .completed: .completed
+        case .failed, .interrupted: .failed
+        case .canceled: .cancelled
+        case .idle, .preparing, .running, .archived: .running
         }
-        if let pending = session.pendingMCPElicitationRequest {
-            interactions.append(Self.interaction(
-                id: pending.id,
-                runID: runID,
-                kind: .question,
-                payload: [
-                    "type": "mcp_elicitation",
-                    "title": pending.title,
-                    "message": pending.message ?? pending.prompt ?? ""
-                ]
-            ))
+        let latestAssistant = snapshot.session.transcript.last(where: {
+            $0.kind == .assistant
+        })?.content
+        let failureReason: AgentRunMCPSnapshot.FailureReason? = switch status {
+        case .cancelled: .cancelled
+        case .failed: .agentError
+        default: nil
         }
-        if let pending = session.pendingApproval {
-            interactions.append(Self.interaction(
-                id: pending.id,
-                runID: runID,
-                kind: .approval,
-                payload: [
-                    "type": "approval",
-                    "method": pending.method,
-                    "reason": pending.reason ?? ""
-                ]
-            ))
-        }
-        if let pending = session.pendingPermissionsRequest {
-            interactions.append(Self.interaction(
-                id: pending.id,
-                runID: runID,
-                kind: .approval,
-                payload: [
-                    "type": "permissions",
-                    "method": pending.method,
-                    "cwd": pending.cwd,
-                    "permissions": pending.permissionsJSON
-                ]
-            ))
-        }
-        do {
-            let authority = try await AppAgentAuthorityComposition.shared.authority()
-            _ = try await authority.synchronizeEmbeddedInteractions(
-                sessionID: sessionID,
-                interactions: interactions,
-                actor: actor
-            )
-        } catch {
-            // The next presentation mutation or terminal drain retries against
-            // the exact authority binding.
-        }
+        return AgentRunMCPSnapshot(
+            sessionID: snapshot.session.sessionID,
+            runID: snapshot.activeRun?.runID ?? snapshot.activeBinding?.runID,
+            tabID: tabID,
+            sessionName: nil,
+            agentRaw: snapshot.session.provider.rawValue,
+            agentDisplayName: snapshot.session.provider.rawValue,
+            modelRaw: snapshot.session.model,
+            reasoningEffortRaw: nil,
+            status: status,
+            statusText: snapshot.activeRun?.endReason,
+            latestAssistantPreview: latestAssistant,
+            interaction: interaction,
+            transcriptItemCount: snapshot.session.transcript.count,
+            updatedAt: snapshot.session.transcript.last?.timestamp
+                ?? snapshot.activeRun?.endedAt
+                ?? snapshot.activeRun?.startedAt
+                ?? Date(),
+            parentSessionID: snapshot.session.parentSessionID,
+            failureReason: failureReason,
+            worktreeBindings: snapshot.worktrees.map { binding in
+                AgentRunMCPSnapshot.WorktreeBinding(
+                    id: binding.bindingID.uuidString,
+                    repositoryID: binding.projectID.uuidString,
+                    repoKey: binding.projectID.uuidString,
+                    logicalRootPath: binding.physicalPath,
+                    logicalRootName: nil,
+                    worktreeID: binding.bindingID.uuidString,
+                    worktreeRootPath: binding.physicalPath,
+                    worktreeName: binding.branch,
+                    branch: binding.branch,
+                    head: binding.baseRef,
+                    visualLabel: nil,
+                    visualColorHex: nil,
+                    boundAt: snapshot.session.transcript.first?.timestamp ?? Date(),
+                    source: "durable_authority",
+                    unavailable: binding.ownershipState != .active
+                )
+            },
+            activeWorktreeMerges: []
+        )
+    }
+
+    private static func mcpInteraction(_ value: InteractionSnapshot) -> AgentRunMCPSnapshot.Interaction {
+        let object = (try? JSONSerialization.jsonObject(with: value.payload)) as? [String: Any]
+        let prompt = object?["prompt"] as? String
+        let choices = object?["choices"] as? [String] ?? []
+        return AgentRunMCPSnapshot.Interaction(
+            id: value.interactionID,
+            kind: value.kind == .question ? .question : .approval,
+            responseType: value.kind == .question ? .text : .decision,
+            title: nil,
+            prompt: prompt,
+            context: nil,
+            allowsMultiple: false,
+            options: choices.map { .init(label: $0) },
+            fields: [],
+            details: []
+        )
     }
 
     private static func providerKind(_ value: AgentProviderKind) -> ProviderKind {
@@ -301,6 +441,18 @@ final class AgentModeAuthorityAdapter {
         }
     }
 
+    private static func presentationPayloadForLatestHumanItem(
+        in session: AgentModeViewModel.TabSession,
+        matching message: String
+    ) -> Data? {
+        guard let item = authoritativeItems(session).last(where: {
+            $0.kind == .user && $0.text == message
+        }) else { return nil }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return try? encoder.encode(item)
+    }
+
     private static func authoritativeItems(
         _ session: AgentModeViewModel.TabSession
     ) -> [AgentChatItem] {
@@ -322,25 +474,28 @@ final class AgentModeAuthorityAdapter {
         }
     }
 
-    private static func interaction(
-        id: UUID,
-        runID: UUID?,
-        kind: InteractionSnapshot.Kind,
-        payload object: [String: Any]
-    ) -> InteractionSnapshot {
-        let payload = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data()
-        return InteractionSnapshot(
-            interactionID: id,
-            runID: runID,
-            kind: kind,
-            state: .pending,
-            payload: payload,
-            revision: 1,
-            expiresAt: nil
+    private static func worktreeSnapshot(
+        _ binding: AgentSessionWorktreeBinding,
+        sessionID: UUID,
+        projectID: UUID,
+        rootID: UUID,
+        revision: Int64
+    ) -> WorktreeBindingSnapshot {
+        WorktreeBindingSnapshot(
+            bindingID: stableUUID(namespace: sessionID, value: binding.id),
+            projectID: projectID,
+            rootID: rootID,
+            sessionID: sessionID,
+            baseRef: binding.head ?? "HEAD",
+            branch: binding.branch ?? "detached",
+            physicalPath: binding.worktreeRootPath,
+            ownershipState: .active,
+            mergeState: .clean,
+            revision: revision
         )
     }
 
-    private static func stableUUID(namespace: UUID, value: String) -> UUID {
+    private nonisolated static func stableUUID(namespace: UUID, value: String) -> UUID {
         let digest = SHA256.hash(data: Data("\(namespace.uuidString):\(value)".utf8))
         var bytes = Array(digest.prefix(16))
         bytes[6] = (bytes[6] & 0x0F) | 0x50
@@ -353,7 +508,7 @@ final class AgentModeAuthorityAdapter {
         ))
     }
 
-    static func epochID(_ binding: RunBindingSnapshot) -> UUID {
+    nonisolated static func epochID(_ binding: RunBindingSnapshot) -> UUID {
         stableUUID(
             namespace: binding.runID,
             value: "generation:\(binding.generation):turn:\(binding.turnEpoch)"

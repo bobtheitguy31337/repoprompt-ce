@@ -195,7 +195,6 @@ package actor DomainAgentRunSessionStore {
         var terminalCommitID: UUID?
         var terminalSnapshot: DomainAgentRunSnapshot?
         var successorEpoch: DomainAgentRunTurnEpoch?
-        var terminalPublicationFailure: String?
 
         init(epoch: DomainAgentRunTurnEpoch?) {
             self.epoch = epoch
@@ -407,6 +406,79 @@ package actor DomainAgentRunSessionStore {
         ingestSnapshot(snapshot, cursor: cursor, wakeReason: nil)
     }
 
+    /// Projects an already-accepted durable authority snapshot into the MCP wait
+    /// continuation store. This API deliberately has no acceptance result: the
+    /// store observes the authority's exact epoch and wakes waiters, but cannot
+    /// allocate, reject, settle, or otherwise veto provider lifecycle.
+    package func observeAuthoritySnapshot(
+        _ snapshot: DomainAgentRunSnapshot,
+        registration: Registration,
+        activationID: UUID,
+        bindingID: UUID?,
+        ordinal: UInt64?,
+        continuityGeneration: UInt64?,
+        transitionKind: DomainAgentRunEpochTransitionKind
+    ) -> WaitCursor? {
+        guard snapshot.sessionID == registration.sessionID,
+              var record = currentRecord(for: registration, operation: "observe_authority_snapshot")
+        else { return nil }
+
+        var advancedWaiters: [Waiter] = []
+        if let bindingID, let ordinal, let continuityGeneration {
+            let observedEpoch = DomainAgentRunTurnEpoch(
+                runtimeID: identity.runtimeID,
+                runtimeGeneration: identity.lifecycleGeneration,
+                sessionID: registration.sessionID,
+                activationID: activationID,
+                registrationGeneration: registration.generation,
+                id: bindingID,
+                ordinal: ordinal,
+                continuityGeneration: continuityGeneration,
+                transitionKind: transitionKind
+            )
+            if record.currentEpoch != observedEpoch {
+                record.continuityGeneration = continuityGeneration
+                record.nextEpochOrdinal = max(record.nextEpochOrdinal, ordinal &+ 1)
+                record.epochStates[observedEpoch.id] = EpochState(epoch: observedEpoch)
+                record.currentEpoch = observedEpoch
+                advancedWaiters = takeWaiters(from: &record) { $0.cursor.epoch != observedEpoch }
+            }
+        }
+
+        let cursor = WaitCursor(registration: registration, epoch: record.currentEpoch)
+        if let epoch = cursor.epoch {
+            var state = record.epochStates[epoch.id] ?? EpochState(epoch: epoch)
+            state.latestSnapshot = snapshot
+            state.pendingNoteworthyWake = nil
+            if snapshot.status.isTerminal {
+                state.terminalSnapshot = snapshot
+            }
+            record.epochStates[epoch.id] = state
+        } else {
+            record.preEpochState.latestSnapshot = snapshot
+            record.preEpochState.pendingNoteworthyWake = nil
+        }
+
+        let snapshotWaiters = snapshot.isActionableForMCPWait
+            ? takeWaiters(from: &record) { $0.cursor == cursor }
+            : []
+        if snapshot.status.isTerminal {
+            scheduleExpiry(for: &record, cursor: cursor)
+            updateMetadata(for: record, state: .terminal, resumable: true)
+        } else {
+            record.expiryTask?.cancel()
+            record.expiryTask = nil
+            updateMetadata(for: record, state: .active, resumable: true)
+        }
+        records[registration.sessionID] = record
+        scheduleMetadataPersistence()
+        if let epoch = cursor.epoch {
+            resume(advancedWaiters, with: .epochAdvanced(epoch, transitionKind))
+        }
+        resume(snapshotWaiters, with: .snapshotReady(snapshot))
+        return cursor
+    }
+
     package func noteSnapshotAndWakeWaiters(
         _ snapshot: DomainAgentRunSnapshot,
         cursor: WaitCursor,
@@ -439,10 +511,12 @@ package actor DomainAgentRunSessionStore {
                 current: records[registration.sessionID]?.registration,
                 reason: "session_or_activation_mismatch"
             )
-            return .rejected(reason: "session_or_activation_mismatch")
+            // Compatibility callers cannot use this continuation store to veto
+            // lifecycle already settled by the durable authority.
+            return .accepted(successorEpoch: nil)
         }
         guard var record = currentRecord(for: registration, operation: "publish_terminal_commit") else {
-            return .rejected(reason: "stale_activation")
+            return .accepted(successorEpoch: nil)
         }
         guard var state = record.epochStates[envelope.epoch.id], state.epoch == envelope.epoch else {
             recordRejectedOperation(
@@ -451,7 +525,7 @@ package actor DomainAgentRunSessionStore {
                 current: record.registration,
                 reason: "unknown_epoch"
             )
-            return .rejected(reason: "unknown_epoch")
+            return .accepted(successorEpoch: nil)
         }
         if state.terminalCommitID == commitID {
             if let successorEpoch = state.successorEpoch {
@@ -461,25 +535,9 @@ package actor DomainAgentRunSessionStore {
                 ? .accepted(successorEpoch: nil)
                 : .stale
         }
-        if state.terminalCommitID != nil {
-            let reason = "different_commit_already_published"
-            state.terminalPublicationFailure = reason
-            record.epochStates[envelope.epoch.id] = state
-            let waiters = record.currentEpoch == envelope.epoch
-                ? takeWaiters(from: &record) { $0.cursor.epoch == envelope.epoch }
-                : []
-            records[registration.sessionID] = record
-            resume(waiters, with: .terminalPublicationRejected(epoch: envelope.epoch, reason: reason))
-            recordRejectedOperation(
-                "publish_terminal_commit",
-                supplied: registration,
-                current: record.registration,
-                reason: reason
-            )
-            return .rejected(reason: reason)
-        }
-
-        state.terminalCommitID = commitID
+        // Commit IDs are diagnostic compatibility metadata only. A differing
+        // observer token cannot reject the authority-issued terminal snapshot.
+        state.terminalCommitID = state.terminalCommitID ?? commitID
         state.terminalSnapshot = envelope.snapshot
         state.latestSnapshot = envelope.snapshot
         state.pendingNoteworthyWake = nil
@@ -488,7 +546,7 @@ package actor DomainAgentRunSessionStore {
             record.epochStates[envelope.epoch.id] = state
             pruneCommittedEpochStates(in: &record)
             records[registration.sessionID] = record
-            return .stale
+            return .accepted(successorEpoch: state.successorEpoch)
         }
 
         if let successorKind {
@@ -644,9 +702,6 @@ package actor DomainAgentRunSessionStore {
             guard let currentEpoch = record.currentEpoch else { return .expired }
             return .epochAdvanced(currentEpoch, transitionKind(from: cursor.epoch, to: currentEpoch))
         }
-        if let failure = terminalPublicationFailure(in: record, cursor: cursor), let epoch = cursor.epoch {
-            return .terminalPublicationRejected(epoch: epoch, reason: failure)
-        }
         if let snapshot = latestSnapshot(in: record, cursor: cursor), snapshot.isActionableForMCPWait {
             return .snapshotReady(snapshot)
         }
@@ -685,10 +740,6 @@ package actor DomainAgentRunSessionStore {
                         currentEpoch,
                         transitionKind(from: cursor.epoch, to: currentEpoch)
                     ))
-                    return
-                }
-                if let failure = terminalPublicationFailure(in: current, cursor: cursor), let epoch = cursor.epoch {
-                    continuation.resume(returning: .terminalPublicationRejected(epoch: epoch, reason: failure))
                     return
                 }
                 if let snapshot = latestSnapshot(in: current, cursor: cursor), snapshot.isActionableForMCPWait {
@@ -916,11 +967,6 @@ package actor DomainAgentRunSessionStore {
             return record.epochStates[epoch.id]?.latestSnapshot
         }
         return record.preEpochState.latestSnapshot
-    }
-
-    private func terminalPublicationFailure(in record: Record, cursor: WaitCursor) -> String? {
-        guard let epoch = cursor.epoch else { return nil }
-        return record.epochStates[epoch.id]?.terminalPublicationFailure
     }
 
     private func pendingWake(in record: Record, cursor: WaitCursor) -> NoteworthyWake? {

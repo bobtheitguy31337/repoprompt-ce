@@ -10,6 +10,7 @@ extension AgentModeViewModel {
     final class TabSession: ObservableObject {
         let tabID: UUID
         private var suppressSourceItemsChanged = false
+        private var suppressAuthorityMutationCallbacks = false
 
         /// Canonical runtime source-item suffix. Coordinators and tests mutate this list,
         /// but it only retains the mutable full-detail working turns; older compacted
@@ -48,6 +49,12 @@ extension AgentModeViewModel {
         var onPermissionProfileChanged: ((TabSession) -> Void)?
         var onWorktreeBindingsChanged: ((TabSession) -> Void)?
         var onInteractionsChanged: ((TabSession) -> Void)?
+        var authorityProjectionTask: Task<Void, Never>?
+        private(set) var authoritySnapshot: AuthoritySessionSnapshot?
+        private(set) var authorityPermissions: ExecutionPermissionSnapshot?
+        private(set) var authorityInteractions: [InteractionSnapshot] = []
+        private(set) var authorityWorktrees: [WorktreeBindingSnapshot] = []
+        @Published private(set) var authorityFailureMessage: String?
         #if DEBUG
             private(set) var test_incrementalRetentionCompactionCount = 0
         #endif
@@ -177,6 +184,7 @@ extension AgentModeViewModel {
         /// Persisted logical-root to worktree bindings for this Agent session.
         var worktreeBindings: [AgentSessionWorktreeBinding] = [] {
             didSet {
+                guard !suppressAuthorityMutationCallbacks else { return }
                 guard worktreeBindings != oldValue else { return }
                 onWorktreeBindingsChanged?(self)
             }
@@ -188,6 +196,7 @@ extension AgentModeViewModel {
         /// when MCP control is active, `.userConfigured` otherwise.
         var permissionProfile: AgentPermissionProfile = .userConfigured {
             didSet {
+                guard !suppressAuthorityMutationCallbacks else { return }
                 guard permissionProfile != oldValue else { return }
                 onPermissionProfileChanged?(self)
             }
@@ -1150,10 +1159,27 @@ extension AgentModeViewModel {
         func applyAuthorityTranscript(_ entries: [TranscriptEntry]) {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
-            let rows = entries.compactMap { entry in
-                entry.presentationPayload.flatMap { try? decoder.decode(AgentChatItem.self, from: $0) }
+            let rows = entries.map { entry in
+                if let payload = entry.presentationPayload,
+                   let decoded = try? decoder.decode(AgentChatItem.self, from: payload)
+                {
+                    return decoded
+                }
+                let kind: AgentChatItemKind = switch entry.kind {
+                case .human: .user
+                case .assistant: .assistant
+                case .reasoning, .progress: .thinking
+                case .tool: .toolResult
+                case .system: .system
+                }
+                return AgentChatItem(
+                    id: entry.entryID,
+                    timestamp: entry.timestamp,
+                    kind: kind,
+                    text: entry.content,
+                    sequenceIndex: Int(clamping: entry.sessionSequence)
+                )
             }
-            guard !rows.isEmpty || entries.isEmpty else { return }
             let imported = AgentTranscriptIO.importLegacyItems(
                 rows,
                 nextSequenceIndex: (rows.map(\.sequenceIndex).max() ?? -1) + 1
@@ -1164,6 +1190,57 @@ extension AgentModeViewModel {
                 dispatch: .silent,
                 diagnosticContext: "durable_authority_projection"
             )
+        }
+
+        /// Installs the complete authority projection without invoking the UI-to-authority
+        /// mutation callbacks. Provider lifecycle and transcript identities originate only
+        /// in this snapshot.
+        func applyAuthoritySnapshot(_ snapshot: AuthoritySessionSnapshot) {
+            authorityFailureMessage = nil
+            authoritySnapshot = snapshot
+            authorityInteractions = snapshot.interactions
+            authorityWorktrees = snapshot.worktrees
+            applyAuthorityPermissions(snapshot.permissions)
+            applyAuthorityTranscript(snapshot.session.transcript)
+
+            if let binding = snapshot.activeBinding {
+                installAuthorityRunBinding(binding)
+            } else if let prior = authorityRunBinding {
+                _ = clearAuthorityRunBinding(ifCurrent: prior.runID)
+                _ = clearRunID(ifCurrent: prior.runID)
+            }
+            if let providerSessionID = snapshot.activeRun?.providerSessionID {
+                self.providerSessionID = providerSessionID
+            }
+            runState = switch snapshot.session.state {
+            case .preparing, .running: .running
+            case .waiting: snapshot.interactions.contains(where: { $0.state == .pending })
+                ? .waitingForQuestion
+                : .waitingForUser
+            case .completed: .completed
+            case .failed, .interrupted: .failed
+            case .canceled: .cancelled
+            case .idle, .archived: .idle
+            }
+        }
+
+        func applyAuthorityPermissions(_ snapshot: ExecutionPermissionSnapshot) {
+            authorityFailureMessage = nil
+            authorityPermissions = snapshot
+            suppressAuthorityMutationCallbacks = true
+            switch snapshot.providerSettings["macos.profile"] {
+            case "mcpSafeDefaults": permissionProfile = .mcpSafeDefaults
+            case "providerOverride":
+                // Concrete provider permission identifiers remain adapter-specific. The
+                // authority snapshot is retained verbatim and is the execution source.
+                break
+            default: permissionProfile = .userConfigured
+            }
+            suppressAuthorityMutationCallbacks = false
+        }
+
+        func recordAuthorityFailure(_ error: Error) {
+            authorityFailureMessage = String(describing: error)
         }
 
         private func repairedSourceItems(

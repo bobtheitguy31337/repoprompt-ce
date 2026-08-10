@@ -43,37 +43,6 @@ public actor SessionAuthority {
         return .accepted
     }
 
-    /// Accepts a complete rich-host transcript through the same live binding
-    /// gate used for provider frames. The caller supplies the complete canonical
-    /// history so optimistic rows that were rolled back cannot survive as
-    /// durable ghost entries.
-    public func acceptTranscriptProjection(
-        binding: RunBindingIdentity,
-        entries: [TranscriptEntry]
-    ) -> LifecycleAcceptance {
-        guard var gate = state.gate else { return .staleGeneration }
-        let result = gate.accept(binding: binding)
-        state.gate = gate
-        guard result == .accepted else { return result }
-
-        var entriesByID: [UUID: TranscriptEntry] = [:]
-        for entry in entries {
-            entriesByID[entry.entryID] = entry
-        }
-        let transcript = entriesByID.values.sorted {
-            if $0.sessionSequence == $1.sessionSequence {
-                if $0.timestamp == $1.timestamp {
-                    return $0.entryID.uuidString < $1.entryID.uuidString
-                }
-                return $0.timestamp < $1.timestamp
-            }
-            return $0.sessionSequence < $1.sessionSequence
-        }
-        guard transcript != state.snapshot.transcript else { return .accepted }
-        replaceSnapshot(transcript: transcript)
-        return .accepted
-    }
-
     public func settle(binding: RunBindingIdentity, terminal: EventType, lifecycle: SessionLifecycleState) -> LifecycleAcceptance {
         guard var gate = state.gate else { return .staleGeneration }
         let result = gate.accept(binding: binding, terminal: terminal)
@@ -84,10 +53,23 @@ public actor SessionAuthority {
         return .accepted
     }
 
-    public func appendHumanMessage(_ text: String, actor: ExternalActor, expectedRevision: Int64) throws {
+    public func appendHumanMessage(
+        _ text: String,
+        actor: ExternalActor,
+        expectedRevision: Int64,
+        presentationPayload: Data? = nil
+    ) throws {
         guard expectedRevision == state.snapshot.revision else { throw ServiceAPIError(code: .staleRevision, message: "Session revision is stale", currentRevision: state.snapshot.revision) }
         var transcript = state.snapshot.transcript
-        transcript.append(TranscriptEntry(entryID: ids.next(), sessionSequence: Int64(transcript.count + 1), kind: .human, content: text, actor: actor, timestamp: clock.now()))
+        transcript.append(TranscriptEntry(
+            entryID: ids.next(),
+            sessionSequence: Int64(transcript.count + 1),
+            kind: .human,
+            content: text,
+            actor: actor,
+            timestamp: clock.now(),
+            presentationPayload: presentationPayload
+        ))
         replaceSnapshot(transcript: transcript)
     }
 

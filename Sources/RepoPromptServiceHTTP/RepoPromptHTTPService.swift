@@ -212,7 +212,7 @@ public struct RepoPromptHTTPService: Sendable {
         } }
 
         router.get("/internal/v1/sessions") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "listSessions")
-            let sessions = await authority.sessionSnapshots()
+            let sessions = try await authority.sessionSnapshots()
             return try await HTTPResponses.json(page(sessions, request: request, defaultLimit: 100, maximumLimit: 500) { $0.sessionID.uuidString })
         } }
         router.post("/internal/v1/sessions") { request, context in await respond(request) { let data = try await bodyData(request)
@@ -285,7 +285,7 @@ public struct RepoPromptHTTPService: Sendable {
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(CollaborationMetadataInput.self, from: data)
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "setSessionVisibility", sessionID: id)
-            return try await HTTPResponses.json(authority.updateCollaborationMetadata(sessionID: id, input: input, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data)))
+            return try await HTTPResponses.json(authority.updateCollaborationMetadata(sessionID: id, input: input, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data), authorizationDecision: auth.decision))
         } }
         router.get("/internal/v1/sessions/:id/interactions") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getInteractions", sessionID: id)

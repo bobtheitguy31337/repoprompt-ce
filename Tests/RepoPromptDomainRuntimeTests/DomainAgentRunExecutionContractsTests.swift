@@ -118,14 +118,14 @@ final class DomainAgentRunExecutionContractsTests: XCTestCase {
         )
         XCTAssertEqual(replay, .accepted(successorEpoch: nil))
 
-        // A different terminal commit for the same epoch must be rejected.
+        // A waiter observer cannot veto a different authority publication token.
         let competing = await store.publishTerminal(
             envelope,
             registration: registration,
             commitID: UUID(),
             successorKind: nil
         )
-        XCTAssertEqual(competing, .rejected(reason: "different_commit_already_published"))
+        XCTAssertEqual(competing, .accepted(successorEpoch: nil))
 
         let settled = await store.snapshot(for: registration)
         XCTAssertEqual(settled?.status, .failed)

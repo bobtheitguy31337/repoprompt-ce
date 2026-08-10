@@ -414,10 +414,3 @@ public struct EmbeddedSessionSeed: Codable, Hashable, Sendable {
         case worktrees
     }
 }
-
-public enum EmbeddedRunTerminalOutcome: String, Codable, Hashable, Sendable {
-    case completed
-    case failed
-    case canceled
-    case interrupted
-}

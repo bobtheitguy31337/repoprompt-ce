@@ -204,6 +204,52 @@ public struct ExecutionPermissionUpdateInput: Codable, Sendable {
     }
 }
 
+public struct GoblinCollaborationAcknowledgement: Codable, Hashable, Sendable {
+    public let decisionID: UUID
+    public let acknowledgedPolicyRevision: Int64
+    public let acknowledgedControllerRevision: Int64
+    public let acknowledgedMembershipRevision: Int64
+    public let resultingPolicyRevision: Int64
+    public let resultingControllerRevision: Int64
+    public let resultingMembershipRevision: Int64
+    public let requestID: UUID
+    public let correlationID: UUID
+
+    public init(
+        decisionID: UUID,
+        acknowledgedPolicyRevision: Int64,
+        acknowledgedControllerRevision: Int64,
+        acknowledgedMembershipRevision: Int64,
+        resultingPolicyRevision: Int64,
+        resultingControllerRevision: Int64,
+        resultingMembershipRevision: Int64,
+        requestID: UUID,
+        correlationID: UUID
+    ) {
+        self.decisionID = decisionID
+        self.acknowledgedPolicyRevision = acknowledgedPolicyRevision
+        self.acknowledgedControllerRevision = acknowledgedControllerRevision
+        self.acknowledgedMembershipRevision = acknowledgedMembershipRevision
+        self.resultingPolicyRevision = resultingPolicyRevision
+        self.resultingControllerRevision = resultingControllerRevision
+        self.resultingMembershipRevision = resultingMembershipRevision
+        self.requestID = requestID
+        self.correlationID = correlationID
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case decisionID = "decisionId"
+        case acknowledgedPolicyRevision
+        case acknowledgedControllerRevision
+        case acknowledgedMembershipRevision
+        case resultingPolicyRevision
+        case resultingControllerRevision
+        case resultingMembershipRevision
+        case requestID = "requestId"
+        case correlationID = "correlationId"
+    }
+}
+
 public struct CollaborationMetadataSnapshot: Codable, Hashable, Sendable {
     public let sessionID: UUID
     public let visibility: Visibility
@@ -212,8 +258,9 @@ public struct CollaborationMetadataSnapshot: Codable, Hashable, Sendable {
     public let policyRevision: Int64
     public let controllerRevision: Int64
     public let membershipRevision: Int64
+    public let goblinAcknowledgement: GoblinCollaborationAcknowledgement?
 
-    public init(sessionID: UUID, visibility: Visibility, collaborativeSteeringEnabled: Bool, controllerUserID: String, policyRevision: Int64, controllerRevision: Int64, membershipRevision: Int64) {
+    public init(sessionID: UUID, visibility: Visibility, collaborativeSteeringEnabled: Bool, controllerUserID: String, policyRevision: Int64, controllerRevision: Int64, membershipRevision: Int64, goblinAcknowledgement: GoblinCollaborationAcknowledgement? = nil) {
         self.sessionID = sessionID
         self.visibility = visibility
         self.collaborativeSteeringEnabled = collaborativeSteeringEnabled
@@ -221,6 +268,7 @@ public struct CollaborationMetadataSnapshot: Codable, Hashable, Sendable {
         self.policyRevision = policyRevision
         self.controllerRevision = controllerRevision
         self.membershipRevision = membershipRevision
+        self.goblinAcknowledgement = goblinAcknowledgement
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -231,6 +279,7 @@ public struct CollaborationMetadataSnapshot: Codable, Hashable, Sendable {
         case policyRevision
         case controllerRevision
         case membershipRevision
+        case goblinAcknowledgement
     }
 }
 

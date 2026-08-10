@@ -13,8 +13,17 @@ final class AgentModeRunService {
         let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
         let mcpServerEnabler: AgentModeViewModel.MCPServerEnabler
         let workspacePathProvider: (AgentModeViewModel.TabSession) throws -> String?
+        /// When present, the durable authority owns provider dispatch as well as
+        /// lifecycle. The macOS host projects the returned identity and must not
+        /// construct a parallel provider controller.
+        var authorityProviderDispatch: ((
+            _ session: AgentModeViewModel.TabSession,
+            _ userMessage: String,
+            _ providerPrompt: String
+        ) async throws -> RunBindingSnapshot)?
         /// Acquires the canonical durable lifecycle identity before any native
-        /// provider controller is allowed to launch.
+        /// provider controller is allowed to launch. This is retained only for
+        /// isolated legacy-runner tests where authorityProviderDispatch is nil.
         let beginAuthorityRun: (AgentModeViewModel.TabSession) async throws -> RunBindingSnapshot
         let settleAuthorityStartFailure: (AgentModeViewModel.TabSession) async -> Void
         let codexCoordinator: CodexAgentModeCoordinator
@@ -127,6 +136,32 @@ final class AgentModeRunService {
             let message = Self.providerStartupFailureMessage(for: error)
             await failBeforeProviderStartup(session: session, message: message)
             return selectedAgent == .codexExec ? .failed(message: message) : nil
+        }
+
+        if let authorityProviderDispatch = dependencies.authorityProviderDispatch {
+            let promptIdentity = session.activeAgentSessionID ?? tabID
+            let message = hooks.providerInput.buildHeadlessAgentMessage(
+                session,
+                initialMessageForRun,
+                promptIdentity,
+                attachments
+            )
+            let providerPrompt = [message.systemPrompt, message.userMessage]
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n\n")
+            do {
+                let binding = try await authorityProviderDispatch(
+                    session,
+                    initialUserMessage,
+                    providerPrompt
+                )
+                session.installAuthorityRunBinding(binding)
+                return selectedAgent == .codexExec ? .sent : nil
+            } catch {
+                let message = Self.providerStartupFailureMessage(for: error)
+                await failBeforeProviderStartup(session: session, message: message)
+                return selectedAgent == .codexExec ? .failed(message: message) : nil
+            }
         }
 
         do {

@@ -914,8 +914,8 @@ final class MCPServerViewModel: ObservableObject {
                 try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: metadata)
             },
             loadAuthoritySnapshot: { [agentAuthorityProvider] sessionID in
-                guard let authority = try? await agentAuthorityProvider() else { return nil }
-                return try? await authority.authoritySessionSnapshot(sessionID: sessionID)
+                let authority = try await agentAuthorityProvider()
+                return try await authority.authoritySessionSnapshot(sessionID: sessionID)
             }
         )
     }

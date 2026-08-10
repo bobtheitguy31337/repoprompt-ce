@@ -2218,46 +2218,28 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 guard let self else { return nil }
                 return try effectiveWorkspacePath(for: session)
             },
-            beginAuthorityRun: { [weak self] session in
+            authorityProviderDispatch: usesDurableAgentAuthority ? { [weak self] session, userMessage, providerPrompt in
                 guard let self else {
                     throw ServiceAPIError(code: .persistenceUnavailable, message: "Agent host was released")
-                }
-                guard usesDurableAgentAuthority else {
-                    let prior = session.authorityRunBinding
-                    let binding = RunBindingSnapshot(
-                        runID: session.runID ?? UUID(),
-                        generation: (prior?.generation ?? 0) + 1,
-                        turnEpoch: (prior?.turnEpoch ?? 0) + 1,
-                        connectionGeneration: 1
-                    )
-                    await prepareMCPWaitTrackingForRunStart(
-                        session: session,
-                        authorityBinding: binding
-                    )
-                    return binding
                 }
                 guard let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot else {
                     throw ServiceAPIError(code: .rootUnauthorized, message: "No workspace is available for the Agent authority")
                 }
-                let binding = try await AgentModeAuthorityAdapter.shared.beginRun(
+                return try await AgentModeAuthorityAdapter.shared.startProviderRun(
                     session,
-                    workspace: workspace
+                    workspace: workspace,
+                    userMessage: userMessage,
+                    providerPrompt: providerPrompt
                 )
-                await prepareMCPWaitTrackingForRunStart(
-                    session: session,
-                    authorityBinding: binding
+            } : nil,
+            beginAuthorityRun: { _ in
+                throw ServiceAPIError(
+                    code: .persistenceUnavailable,
+                    message: "No durable authority dispatcher is installed"
                 )
-                return binding
             },
-            settleAuthorityStartFailure: { [usesDurableAgentAuthority] session in
+            settleAuthorityStartFailure: { session in
                 let runID = session.authorityRunBinding?.runID
-                if usesDurableAgentAuthority {
-                    _ = try? await AgentModeAuthorityAdapter.shared.settle(
-                        session,
-                        terminalState: .failed,
-                        expectedRunID: runID
-                    )
-                }
                 if let runID {
                     session.clearAuthorityRunBinding(ifCurrent: runID)
                 }
@@ -2440,20 +2422,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 },
                 publishTerminalCommit: { [weak self] session, revision, successorKind in
                     guard let self else { return .rejected(reason: "view_model_deallocated") }
-                    let durableRunID = usesDurableAgentAuthority
-                        ? session.authorityRunBinding?.runID
-                        : nil
-                    if durableRunID != nil {
-                        do {
-                            _ = try await AgentModeAuthorityAdapter.shared.settle(
-                                session,
-                                terminalState: revision.terminalState,
-                                expectedRunID: revision.expectedRunID
-                            )
-                        } catch {
-                            return .rejected(reason: "durable_authority_rejected_terminal:\(error)")
-                        }
-                    }
+                    precondition(!usesDurableAgentAuthority, "durable terminal state is authority-issued")
                     let result = await publishTerminalCommit(
                         revision,
                         successorKind: successorKind,
@@ -2464,9 +2433,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                        let runID = revision.expectedRunID
                     {
                         mcpRemoveAgentRunOracleReviewContext(sessionID: sessionID, runID: runID)
-                    }
-                    if let durableRunID {
-                        session.clearAuthorityRunBinding(ifCurrent: durableRunID)
                     }
                     return result
                 }
@@ -3571,35 +3537,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // deferral cannot make durability depend on derived UI refresh work.
             scheduleSave(for: session.tabID)
             scheduleDerivedTranscriptRefresh(for: session, reason: .liveMutation, mutation: mutation)
-            Task { @MainActor [weak session] in
-                guard let session else { return }
-                await AgentModeAuthorityAdapter.shared.synchronizeTranscript(session)
-            }
         }
         newSession.onPermissionProfileChanged = { session in
             Task { @MainActor [weak session] in
                 guard let session else { return }
-                await AgentModeAuthorityAdapter.shared.synchronizePermissions(session)
+                do {
+                    _ = try await AgentModeAuthorityAdapter.shared.updatePermissions(session)
+                } catch {
+                    await AgentModeAuthorityAdapter.shared.reloadAuthoritativeSnapshot(session, after: error)
+                }
             }
         }
-        newSession.onInteractionsChanged = { session in
-            Task { @MainActor [weak session] in
-                guard let session else { return }
-                await AgentModeAuthorityAdapter.shared.synchronizeInteractions(session)
-            }
-        }
-        newSession.onWorktreeBindingsChanged = { [weak self] session in
-            guard let self,
-                  let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot
-            else { return }
-            Task { @MainActor [weak session] in
-                guard let session else { return }
-                _ = try? await AgentModeAuthorityAdapter.shared.ensureSession(
-                    session,
-                    workspace: workspace
-                )
-            }
-        }
+        // Provider interactions and worktree bindings are projected from the durable
+        // authority. Their mutation entry points issue explicit commands instead of
+        // republishing these presentation properties.
+        newSession.onInteractionsChanged = nil
+        newSession.onWorktreeBindingsChanged = nil
         newSession.onRunStateChanged = { [weak self] session in
             guard let self else { return }
             if !session.runState.isActive {
@@ -6757,6 +6710,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 _ = try await materializer.commit(preparation)
                 ownershipCommitted = true
             }
+            if usesDurableAgentAuthority {
+                guard let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot else {
+                    throw ExecutionLocationTransitionError.unavailable("No workspace is available for the Agent authority.")
+                }
+                _ = try await AgentModeAuthorityAdapter.shared.replaceWorktrees(
+                    session,
+                    workspace: workspace,
+                    bindings: desiredBindings
+                )
+            }
             _ = commitWorktreeBindings(desiredBindings, to: session)
             return session.worktreeBindings
         } catch {
@@ -8244,6 +8207,27 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
 
+        if let authoritativeInteraction = session.authorityInteractions.first(where: { $0.state == .pending }) {
+            guard authoritativeInteraction.interactionID == interactionID else {
+                throw MCPError.invalidParams(
+                    "interaction_id \"\(interactionID.uuidString)\" does not match the authority's pending interaction_id \"\(authoritativeInteraction.interactionID.uuidString)\"."
+                )
+            }
+            do {
+                _ = try await AgentModeAuthorityAdapter.shared.answerInteraction(
+                    session,
+                    interaction: authoritativeInteraction,
+                    payload: authorityInteractionAnswerPayload(payload)
+                )
+                return nil
+            } catch let error as MCPError {
+                throw error
+            } catch {
+                await AgentModeAuthorityAdapter.shared.reloadAuthoritativeSnapshot(session, after: error)
+                throw MCPError.invalidParams("The authority did not acknowledge the interaction response: \(error.localizedDescription)")
+            }
+        }
+
         // Infer the interaction kind from the live pending interaction
         guard let currentInteraction = mcpPendingInteraction(for: session) else {
             throw MCPError.invalidParams("No pending interaction found for the active run.")
@@ -8461,6 +8445,32 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             handleObservedMCPStateChange(for: session)
             return nil
         }
+    }
+
+    private func authorityInteractionAnswerPayload(_ payload: MCPInteractionResponsePayload) throws -> Data {
+        var object: [String: Any] = [
+            "skip": payload.skip,
+            "answers": payload.answersByQuestionID,
+            "ask_user_answers": payload.askUserAnswersByQuestionID.reduce(into: [String: Any]()) {
+                $0[$1.key] = $1.value.jsonObject
+            }
+        ]
+        switch payload.responseArgument {
+        case .missing:
+            if let text = payload.text { object["response"] = text }
+        case let .scalar(value): object["response"] = value
+        case .nonScalar:
+            throw MCPError.invalidParams("response must be a scalar string")
+        }
+        if let amendment = payload.amendment { object["amendment"] = amendment }
+        if let action = payload.elicitationActionRaw { object["action"] = action }
+        if !payload.elicitationContent.isEmpty {
+            object["content"] = payload.elicitationContent.mapValues { $0.toAny() }
+        }
+        if !payload.elicitationMeta.isEmpty {
+            object["_meta"] = payload.elicitationMeta.mapValues { $0.toAny() }
+        }
+        return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 
     // MARK: - End MCP Control Plane
@@ -13614,6 +13624,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         updateBindingsFromSession(session)
         scheduleSave(for: tabID)
 
+        if usesDurableAgentAuthority, session.runState.isActive {
+            Task { @MainActor [weak session] in
+                guard let session else { return }
+                do {
+                    _ = try await AgentModeAuthorityAdapter.shared.steerProviderRun(
+                        session,
+                        text: wrappedText
+                    )
+                } catch {
+                    await AgentModeAuthorityAdapter.shared.reloadAuthoritativeSnapshot(session, after: error)
+                }
+            }
+            return .submitted
+        }
+
         let steeringMessage = trimmedText.isEmpty ? nil : trimmedText
         if session.runState == .running,
            !session.isMCPInstructionDispatchInProgress
@@ -15989,6 +16014,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async {
         guard let session = sessions[tabID] else { return }
         cancelPendingInstruction(for: session)
+        if usesDurableAgentAuthority {
+            do {
+                _ = try await AgentModeAuthorityAdapter.shared.cancelProviderRun(session)
+            } catch {
+                await AgentModeAuthorityAdapter.shared.reloadAuthoritativeSnapshot(session, after: error)
+            }
+            return
+        }
         await runService.cancelRun(tabID: tabID, session: session, completion: completion)
     }
 
@@ -16010,6 +16043,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return false
         }
         cancelPendingInstruction(for: session)
+        if usesDurableAgentAuthority {
+            do {
+                _ = try await AgentModeAuthorityAdapter.shared.cancelProviderRun(session)
+            } catch {
+                await AgentModeAuthorityAdapter.shared.reloadAuthoritativeSnapshot(session, after: error)
+            }
+            return true
+        }
         await runService.cancelRun(tabID: target.tabID, session: session, completion: completion)
         return true
     }
@@ -16023,7 +16064,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if session.activeAgentSessionID != target.expectedActiveAgentSessionID {
             return "agent_session_id_mismatch"
         }
-        if session.activeRunAttemptID != target.expectedRunAttemptID {
+        if !usesDurableAgentAuthority,
+           session.activeRunAttemptID != target.expectedRunAttemptID
+        {
             return "run_attempt_id_mismatch"
         }
         if let expectedPendingUserInputRequestID = target.expectedPendingUserInputRequestID,

@@ -107,6 +107,78 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
+    func testDurableAuthorityDispatchNeverConstructsMacOSProviderControllers() async {
+        for agent in [AgentProviderKind.codexExec, .claudeCode, .openCode, .cursor] {
+            let recorder = LifecycleRecorder()
+            let binding = RunBindingSnapshot(
+                runID: UUID(),
+                generation: 7,
+                turnEpoch: 11,
+                connectionGeneration: 3
+            )
+            let harness = makeHarness(
+                recorder: recorder,
+                authorityProviderDispatch: { session, userMessage, providerPrompt in
+                    recorder.record("authority:\(session.selectedAgent.rawValue):\(userMessage)")
+                    XCTAssertTrue(providerPrompt.contains(userMessage))
+                    session.runState = .running
+                    return binding
+                }
+            )
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = agent
+            session.testInstallPersistentSessionBinding(sessionID: UUID())
+
+            _ = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "single authority",
+                initialMessageForRun: "single authority",
+                attachments: []
+            )
+
+            XCTAssertEqual(session.authorityRunBinding, binding, agent.rawValue)
+            XCTAssertTrue(recorder.contains(prefix: "authority:"), agent.rawValue)
+            XCTAssertFalse(recorder.contains("codex:send"), agent.rawValue)
+            XCTAssertFalse(recorder.contains(prefix: "factory:"), agent.rawValue)
+            XCTAssertNil(session.codexController, agent.rawValue)
+            XCTAssertNil(session.claudeController, agent.rawValue)
+            XCTAssertNil(session.acpController, agent.rawValue)
+        }
+    }
+
+    func testDurableAuthorityDispatchFailureFailsClosedWithoutLocalProviderFallback() async {
+        let recorder = LifecycleRecorder()
+        let harness = makeHarness(
+            recorder: recorder,
+            authorityProviderDispatch: { _, _, _ in
+                throw ServiceAPIError(code: .providerUnavailable, message: "authority provider unavailable")
+            }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "must fail closed",
+            initialMessageForRun: "must fail closed",
+            attachments: []
+        )
+
+        guard case let .failed(message)? = outcome else {
+            return XCTFail("Expected authority failure")
+        }
+        XCTAssertFalse(message.isEmpty)
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertFalse(recorder.contains("codex:send"))
+        XCTAssertFalse(recorder.contains(prefix: "factory:"))
+        XCTAssertNil(session.codexController)
+        XCTAssertNil(session.claudeController)
+        XCTAssertNil(session.acpController)
+    }
+
     func testCodexRejectedSendOnlyEndsOwnershipCreatedByInvocation() async {
         let recorder = LifecycleRecorder()
         let codexController = LifecycleNoopCodexController(recorder: recorder, failSend: true)
@@ -1758,6 +1830,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         acpControllerFactory: AgentModeViewModel.ACPControllerFactory? = nil,
         flushPendingAssistantDelta: ((AgentModeViewModel.TabSession) -> Void)? = nil,
         publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil,
+        authorityProviderDispatch: ((AgentModeViewModel.TabSession, String, String) async throws -> RunBindingSnapshot)? = nil,
         autoSignalACPRouting: Bool = false
     ) -> LifecycleHarness {
         let codexController = codexController ?? LifecycleNoopCodexController(recorder: recorder)
@@ -1810,6 +1883,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             expectedPIDPolicyArmer: { _ in true },
             mcpServerEnabler: serverEnabler,
             workspacePathProvider: workspacePathProvider,
+            authorityProviderDispatch: authorityProviderDispatch,
             beginAuthorityRun: { session in
                 RunBindingSnapshot(
                     runID: session.runID ?? UUID(),
