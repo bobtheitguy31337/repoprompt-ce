@@ -30,6 +30,15 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         XCTAssertEqual(configuration.signingKeys.count, 4)
         XCTAssertEqual(configuration.signingKeys.first(where: { $0.keyID == "app-v0" })?.active, false)
         XCTAssertEqual(configuration.signingKeys.first(where: { $0.keyID == "app-v0" })?.role, .goblinApp)
+        XCTAssertEqual(Set(configuration.providerExecutables.keys), [.codex, .claudeCompatible, .openCodeACP, .cursorACP])
+        XCTAssertTrue(configuration.enabledProviders.isEmpty)
+
+        environment["REPOPROMPT_ENABLED_PROVIDERS"] = "codex, claudeCompatible"
+        let enabledConfiguration = try RepoPromptServerConfiguration.environment(environment)
+        XCTAssertEqual(enabledConfiguration.enabledProviders, [.codex, .claudeCompatible])
+        environment["REPOPROMPT_ENABLED_PROVIDERS"] = "unknown-provider"
+        XCTAssertThrowsError(try RepoPromptServerConfiguration.environment(environment))
+        environment["REPOPROMPT_ENABLED_PROVIDERS"] = "codex"
 
         environment["REPOPROMPT_GOBLIN_SYNC_PREVIOUS_KEY_ID"] = "app-v0"
         environment["REPOPROMPT_GOBLIN_SYNC_PREVIOUS_HMAC_FILE"] = try secret("sync-v0")
@@ -192,6 +201,68 @@ final class AuthenticationAndHTTPTests: XCTestCase {
                 }
             }
         }
+        try await store.close()
+    }
+
+    func testCredentialFreeReadinessAllowsZeroEnabledProviders() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let provider = ProviderCLIAdapter(
+            configurations: [
+                .init(kind: .codex, executable: "/usr/bin/true", expectedVersion: "1.0", protocolVersion: "app-server-v2")
+            ],
+            enabledProviders: []
+        )
+        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
+        let readiness = RepoPromptReadinessService(
+            authority: authority,
+            store: store,
+            requiredProviders: [],
+            expectedProviderProtocols: [.codex: "app-server-v2"],
+            minimumFreeBytes: 0,
+            minimumFreeNodes: 0,
+            maximumActiveSessions: 10,
+            cacheDuration: 0
+        )
+
+        let snapshot = await readiness.snapshot(forceRefresh: true)
+
+        XCTAssertTrue(snapshot.ready)
+        let codex = try XCTUnwrap(snapshot.providers.first { $0.kind == .codex })
+        XCTAssertFalse(codex.required)
+        XCTAssertTrue(codex.ready)
+        XCTAssertEqual(codex.version, "1.0")
+        XCTAssertEqual(codex.protocolVersion, "app-server-v2")
+        XCTAssertEqual(codex.detail, "administratively disabled")
+        try await store.close()
+    }
+
+    func testExplicitlyEnabledProviderStillFailsReadinessWhenPreflightFails() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let provider = ProviderCLIAdapter(
+            configurations: [
+                .init(kind: .codex, executable: "/definitely/missing/repoprompt-provider", protocolVersion: "app-server-v2")
+            ],
+            enabledProviders: [.codex]
+        )
+        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
+        let readiness = RepoPromptReadinessService(
+            authority: authority,
+            store: store,
+            requiredProviders: [.codex],
+            expectedProviderProtocols: [.codex: "app-server-v2"],
+            minimumFreeBytes: 0,
+            minimumFreeNodes: 0,
+            maximumActiveSessions: 10,
+            cacheDuration: 0
+        )
+
+        let snapshot = await readiness.snapshot(forceRefresh: true)
+
+        XCTAssertFalse(snapshot.ready)
+        let codex = try XCTUnwrap(snapshot.providers.first { $0.kind == .codex })
+        XCTAssertTrue(codex.required)
+        XCTAssertFalse(codex.ready)
+        XCTAssertEqual(codex.detail, "configured binary is not executable")
         try await store.close()
     }
 

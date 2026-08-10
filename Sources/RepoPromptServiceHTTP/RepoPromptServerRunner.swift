@@ -23,6 +23,7 @@ public struct RepoPromptServerConfiguration: Sendable {
     public let signingKeys: [InternalSigningKey]
     public let eventSigningKey: InternalSigningKey
     public let providerExecutables: [ProviderKind: String]
+    public let enabledProviders: Set<ProviderKind>
     public let providerVersions: [ProviderKind: String]
     public let providerProtocols: [ProviderKind: String]
     public let providerCredentialSources: [ProviderKind: String]
@@ -63,14 +64,22 @@ public struct RepoPromptServerConfiguration: Sendable {
             $0.keyID.range(of: "^[A-Za-z0-9_.:-]{1,128}$", options: .regularExpression) != nil && $0.secret.count >= 32
         }) else { throw ConfigurationError.invalid("Internal signing keys require a valid key ID and at least 256 bits") }
         guard Set(signingKeys.map(\.keyID)).count == signingKeys.count else { throw ConfigurationError.invalid("Internal signing key IDs must be unique across roles and rotations") }
-        var providers: [ProviderKind: String] = [
+        let providers: [ProviderKind: String] = [
             .codex: environment["REPOPROMPT_CODEX_EXECUTABLE"] ?? "/opt/repoprompt/providers/codex",
             .claudeCompatible: environment["REPOPROMPT_CLAUDE_EXECUTABLE"] ?? "/opt/repoprompt/providers/claude",
             .openCodeACP: environment["REPOPROMPT_OPENCODE_EXECUTABLE"] ?? "/opt/repoprompt/providers/opencode",
             .cursorACP: environment["REPOPROMPT_CURSOR_EXECUTABLE"] ?? "/opt/repoprompt/providers/cursor-agent"
         ]
-        let disabled = Set((environment["REPOPROMPT_DISABLED_PROVIDERS"] ?? "").split(separator: ",").map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) })
-        providers = providers.filter { !disabled.contains($0.key.rawValue) }
+        let enabledProviderNames = (environment["REPOPROMPT_ENABLED_PROVIDERS"] ?? "")
+            .split(separator: ",")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        var enabledProviders = Set<ProviderKind>()
+        for name in enabledProviderNames {
+            guard let kind = ProviderKind(rawValue: name), providers[kind] != nil else {
+                throw ConfigurationError.invalid("REPOPROMPT_ENABLED_PROVIDERS contains an unknown or non-catalogued provider: \(name)")
+            }
+            enabledProviders.insert(kind)
+        }
         let versions: [ProviderKind: String] = [.codex: "0.147.0", .claudeCompatible: "2.1.226", .openCodeACP: "1.15.11", .cursorACP: "2026.08.04-aaa8809"]
         let protocols: [ProviderKind: String] = [.codex: "app-server-v2", .claudeCompatible: "stream-json-v1", .openCodeACP: "acp-v1", .cursorACP: "acp-v1-beta"]
         let credentialSources = [
@@ -92,6 +101,7 @@ public struct RepoPromptServerConfiguration: Sendable {
             certificatePath: required("REPOPROMPT_TLS_CERT_FILE"), privateKeyPath: required("REPOPROMPT_TLS_KEY_FILE"), clientCAPath: required("REPOPROMPT_TLS_CLIENT_CA_FILE"),
             signingKeys: signingKeys, eventSigningKey: event,
             providerExecutables: providers,
+            enabledProviders: enabledProviders,
             providerVersions: versions,
             providerProtocols: protocols,
             providerCredentialSources: credentialSources,
@@ -226,6 +236,7 @@ public enum RepoPromptServerRunner {
         }
         let providers = ProviderCLIAdapter(
             configurations: providerConfigurations,
+            enabledProviders: configuration.enabledProviders,
             processPort: processPort,
             processStore: store,
             outputDirectory: processOutput,
@@ -251,7 +262,7 @@ public enum RepoPromptServerRunner {
                 .init(name: "worktrees", path: configuration.worktreeDirectory),
                 .init(name: "cache", path: configuration.cacheDirectory)
             ],
-            requiredProviders: Set(configuration.providerExecutables.keys),
+            requiredProviders: configuration.enabledProviders,
             expectedProviderProtocols: configuration.providerProtocols,
             minimumFreeBytes: configuration.minimumFreeBytes,
             minimumFreeNodes: configuration.minimumFreeNodes,

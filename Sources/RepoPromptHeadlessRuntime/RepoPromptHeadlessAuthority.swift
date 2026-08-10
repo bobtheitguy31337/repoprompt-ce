@@ -1720,7 +1720,7 @@ public actor RepoPromptHeadlessAuthority {
         guard let permissions = try await store.permissions(sessionID: sessionID) else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Execution permissions are not configured") }
         guard permissions.mode != "disabled" else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Provider execution is disabled by session policy") }
         guard ["readOnly", "workspaceWrite", "fullAccess"].contains(permissions.mode) else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Execution permission mode is invalid") }
-        guard let capability = await providerAdapter.capabilities().first(where: { $0.kind == snapshot.provider && $0.enabled }) else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Session provider is unavailable") }
+        guard let capability = await providerAdapter.capabilities().first(where: { $0.kind == snapshot.provider && $0.enabled }) else { throw ServiceAPIError(code: .providerUnavailable, message: "Session provider is unavailable") }
         let resumeMode: ProviderResumeMode = switch command {
         case let .resumeSession(_, mode): mode
         default: .fresh

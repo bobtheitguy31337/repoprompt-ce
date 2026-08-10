@@ -51,6 +51,8 @@ The v1 migration creates the complete E4 table inventory: service metadata, proj
 
 Provider and Git credentials are not accepted through HTTP and are never stored in the service database. Secret values are loaded from files; the executable does not print them.
 
+Provider executable settings define the server-side catalog, not execution enablement. `REPOPROMPT_ENABLED_PROVIDERS` is the closed comma-separated allowlist of catalogued provider IDs (`codex`, `claudeCompatible`, `openCodeACP`, and `cursorACP`); unset or empty means no provider is enabled. Only allowlisted providers are preflighted for readiness and accepted for runs; disabled provider controllers perform startup cleanup only. Credential-home presence or contents never enable a provider implicitly, while catalogued disabled providers remain visible as unavailable and reject execution with `provider_unavailable`.
+
 ## Image contract
 
 `Dockerfile.server` builds only `RepoPromptServer`, runs it as fixed UID/GID 65532, includes `tini` and `curl`, and retains image metadata for both fixed ports: `9443/tcp` is the mTLS internal API and `9080/tcp` is the loopback-only health listener used by the image probe. The `io.degentlemen.repoprompt.port.*` OCI labels make those scopes explicit; deployments must not publish 9080. Compose must still set read-only root, dropped capabilities, no-new-privileges, resource/PID/log bounds, persistent state/project/worktree/cache volumes, internal networks, and runtime secret mounts.

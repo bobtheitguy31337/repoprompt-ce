@@ -82,6 +82,34 @@ final class ProviderSupervisorTests: XCTestCase {
         XCTAssertEqual(capabilities.first { $0.kind == .codex }?.supportsSteering, true)
     }
 
+    func testCataloguedDisabledProviderReportsUnavailableAndRejectsExecutionLocally() async throws {
+        let runner = RecordingProviderRunner()
+        let adapter = ProviderCLIAdapter(
+            configurations: [
+                .init(kind: .codex, executable: "/usr/bin/true", expectedVersion: "1.0", protocolVersion: "app-server-v2")
+            ],
+            enabledProviders: [],
+            runner: runner
+        )
+
+        let capabilities = await adapter.capabilities()
+        let capability = try XCTUnwrap(capabilities.first { $0.kind == .codex })
+        XCTAssertFalse(capability.enabled)
+        XCTAssertEqual(capability.executable, "/usr/bin/true")
+        XCTAssertEqual(capability.version, "1.0")
+        XCTAssertEqual(capability.protocolVersion, "app-server-v2")
+        XCTAssertEqual(capability.reasonUnavailable, "administratively disabled")
+
+        do {
+            _ = try await adapter.execute(kind: .codex, model: nil, prompt: "must not run", workingDirectory: "/tmp")
+            XCTFail("disabled provider unexpectedly executed")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .providerUnavailable)
+        }
+        let calls = await runner.calls()
+        XCTAssertTrue(calls.isEmpty)
+    }
+
     func testProviderPublishesNativeIdentityBeforeProcessCompletion() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let executable = directory.appendingPathComponent("provider")

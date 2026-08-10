@@ -24,19 +24,23 @@ public struct ProviderCLIConfiguration: Codable, Hashable, Sendable {
 /// individual native runtime controllers, never in this dispatcher.
 public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, InteractionDeliveryPort {
     private let runtimes: [ProviderKind: any AgentProviderRuntime]
+    private let cataloguedConfigurations: [ProviderKind: ProviderCLIConfiguration]
+    private let enabledProviders: Set<ProviderKind>
     private var knownRuns: [UUID: ProviderKind] = [:]
 
-    public init(runtimes: [any AgentProviderRuntime]) {
+    public init(runtimes: [any AgentProviderRuntime], cataloguedConfigurations: [ProviderCLIConfiguration] = [], enabledProviders: Set<ProviderKind>? = nil) {
         self.runtimes = Dictionary(uniqueKeysWithValues: runtimes.map { ($0.kind, $0) })
+        self.cataloguedConfigurations = Dictionary(uniqueKeysWithValues: cataloguedConfigurations.map { ($0.kind, $0) })
+        self.enabledProviders = enabledProviders ?? Set(runtimes.map(\.kind))
     }
 
     public func capabilities() async -> [ProviderCapability] {
         var values: [ProviderCapability] = []
         for kind in ProviderKind.allCases {
-            if let runtime = runtimes[kind] {
+            if enabledProviders.contains(kind), let runtime = runtimes[kind] {
                 await values.append(runtime.capability())
             } else {
-                values.append(.init(kind: kind, enabled: false, executable: nil, supportsResume: false, supportsSteering: false, reasonUnavailable: "not configured"))
+                values.append(unavailableCapability(for: kind))
             }
         }
         return values
@@ -45,10 +49,10 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
     public func preflight() async -> [ProviderCapability] {
         var values: [ProviderCapability] = []
         for kind in ProviderKind.allCases {
-            if let runtime = runtimes[kind] {
+            if enabledProviders.contains(kind), let runtime = runtimes[kind] {
                 await values.append(runtime.preflight())
             } else {
-                values.append(.init(kind: kind, enabled: false, executable: nil, supportsResume: false, supportsSteering: false, reasonUnavailable: "not configured"))
+                values.append(unavailableCapability(for: kind))
             }
         }
         return values
@@ -68,8 +72,11 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
     }
 
     public func executeStreaming(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
-        guard let runtime = runtimes[request.kind] else {
-            throw ServiceAPIError(code: .providerUnavailable, message: "Requested provider is not configured")
+        guard enabledProviders.contains(request.kind), let runtime = runtimes[request.kind] else {
+            let message = cataloguedConfigurations[request.kind] == nil
+                ? "Requested provider is not configured"
+                : "Requested provider is administratively disabled"
+            throw ServiceAPIError(code: .providerUnavailable, message: message)
         }
         knownRuns[request.runID] = request.kind
         return try await runtime.execute(request, onEvent: onEvent)
@@ -123,6 +130,22 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
         }
         return nil
     }
+
+    private func unavailableCapability(for kind: ProviderKind) -> ProviderCapability {
+        guard let configuration = cataloguedConfigurations[kind] else {
+            return .init(kind: kind, enabled: false, executable: nil, supportsResume: false, supportsSteering: false, reasonUnavailable: "not configured")
+        }
+        return .init(
+            kind: kind,
+            enabled: false,
+            executable: configuration.executable,
+            supportsResume: false,
+            supportsSteering: false,
+            version: configuration.expectedVersion,
+            protocolVersion: configuration.protocolVersion,
+            reasonUnavailable: "administratively disabled"
+        )
+    }
 }
 
 /// Compatibility name retained for existing callers. Production construction
@@ -130,7 +153,8 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
 public actor ProviderCLIAdapter: AgentProviderDispatcher, InteractionDeliveryPort {
     private let dispatcher: PortableAgentProviderDispatcher
 
-    public init(configurations: [ProviderCLIConfiguration], runner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(), processPort: PortableProcessSupervisionPort? = nil, processStore: SQLiteServiceStore? = nil, outputDirectory: String = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-provider-output").path, ephemeralHomeRoot: String = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-provider-homes").path) {
+    public init(configurations: [ProviderCLIConfiguration], enabledProviders: Set<ProviderKind>? = nil, runner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(), processPort: PortableProcessSupervisionPort? = nil, processStore: SQLiteServiceStore? = nil, outputDirectory: String = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-provider-output").path, ephemeralHomeRoot: String = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-provider-homes").path) {
+        let enabledProviders = enabledProviders ?? Set(configurations.map(\.kind))
         let runtimes: [any AgentProviderRuntime] = if let processPort {
             configurations.map {
                 NativeProviderRuntimeFactory.make(configuration: $0, processPort: processPort, processStore: processStore, outputDirectory: outputDirectory, ephemeralHomeRoot: ephemeralHomeRoot)
@@ -140,7 +164,7 @@ public actor ProviderCLIAdapter: AgentProviderDispatcher, InteractionDeliveryPor
             // that do not provide the process authority required by native protocols.
             configurations.map { CommandCompatibilityProviderRuntime(configuration: $0, runner: runner) }
         }
-        dispatcher = PortableAgentProviderDispatcher(runtimes: runtimes)
+        dispatcher = PortableAgentProviderDispatcher(runtimes: runtimes, cataloguedConfigurations: configurations, enabledProviders: enabledProviders)
     }
 
     public init(runtimes: [any AgentProviderRuntime]) {
