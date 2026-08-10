@@ -281,6 +281,24 @@ final class ProjectSourceProvisioningTests: XCTestCase {
     }
 
     #if os(Linux)
+    func testRealGitRunnerPostExitOutputFailureTerminatesDescendantProcessGroup() async throws {
+        let fixture = try RealRunnerFixture(
+            script: "#!/bin/sh\nsleep 30 &\necho $! > child.pid\nexec dd if=/dev/zero bs=65536 count=1 2>/dev/null\n"
+        )
+        defer { fixture.cleanup() }
+        do {
+            _ = try await LocalProjectSourceGitRunner().run(
+                fixture.invocation(maximumOutputBytes: 4_096, timeoutSeconds: 5)
+            )
+            XCTFail("Expected post-exit output limit rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .dependencyUnavailable)
+        }
+        let childID = try fixture.processID(named: "child.pid")
+        let gone = await processIsGone(childID)
+        XCTAssertTrue(gone, "A descendant outliving the runner leader must be terminated")
+    }
+
     func testRealGitRunnerTimeoutTerminatesDescendantProcessGroup() async throws {
         let fixture = try RealRunnerFixture(script: "#!/bin/sh\nsleep 30 &\necho $! > child.pid\nwait\n")
         defer { fixture.cleanup() }

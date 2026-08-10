@@ -287,9 +287,17 @@ public protocol ProjectSourceGitRunning: Sendable {
 }
 
 private final class ManagedProjectSourceProcess: @unchecked Sendable {
+    private struct State {
+        let processID: pid_t
+        let processGroup: pid_t?
+        let leaderRunning: Bool
+        let leaderReaped: Bool
+    }
+
     private let lock = NSLock()
     private var process: Process?
     private var processGroup: pid_t?
+    private var leaderReaped = false
 
     func prepare(_ process: Process) {
         lock.lock()
@@ -304,34 +312,102 @@ private final class ManagedProjectSourceProcess: @unchecked Sendable {
     }
 
     func signal(_ signal: Int32) {
-        lock.lock()
-        let process = self.process
-        let processGroup = self.processGroup
-        let processID = process?.processIdentifier ?? 0
-        lock.unlock()
-        if let processGroup, processGroup > 1 {
-            _ = kill(-processGroup, signal)
-        } else if processID > 1 {
-            _ = kill(processID, signal)
+        let state = currentState()
+        #if os(Linux)
+        if let processGroup = ownedLinuxProcessGroup(in: state) {
+            if kill(-processGroup, signal) == 0 || errno == EPERM { return }
+            if errno == ESRCH, state.leaderReaped { forgetProcessGroup(processGroup) }
+        }
+        #else
+        if state.leaderRunning, let processGroup = state.processGroup, processGroup > 1,
+           kill(-processGroup, signal) == 0 || errno == EPERM
+        {
+            return
+        }
+        #endif
+        if state.leaderRunning, state.processID > 1 {
+            _ = kill(state.processID, signal)
         }
     }
 
     func isRunning() -> Bool {
-        lock.lock()
-        let running = process?.isRunning == true
-        lock.unlock()
-        return running
+        currentState().leaderRunning
+    }
+
+    func terminationTargetExists() -> Bool {
+        let state = currentState()
+        #if os(Linux)
+        if let processGroup = ownedLinuxProcessGroup(in: state) { return processGroup > 1 }
+        #endif
+        return state.leaderRunning
     }
 
     func terminationStatus() -> Int32? {
         lock.lock()
-        let process = self.process
-        let running = process?.isRunning == true
+        guard let process, !process.isRunning else {
+            lock.unlock()
+            return nil
+        }
+        if !leaderReaped {
+            process.waitUntilExit()
+            leaderReaped = true
+        }
+        let status = process.terminationStatus
         lock.unlock()
-        guard let process, !running else { return nil }
-        process.waitUntilExit()
-        return process.terminationStatus
+        return status
     }
+
+    private func currentState() -> State {
+        lock.lock()
+        let processID = process?.processIdentifier ?? 0
+        let leaderRunning = process?.isRunning == true
+        if let process, !leaderRunning, !leaderReaped {
+            process.waitUntilExit()
+            leaderReaped = true
+        }
+        let state = State(
+            processID: processID,
+            processGroup: processGroup,
+            leaderRunning: leaderRunning,
+            leaderReaped: leaderReaped
+        )
+        lock.unlock()
+        return state
+    }
+
+    #if os(Linux)
+    private func ownedLinuxProcessGroup(in state: State) -> pid_t? {
+        guard let processGroup = state.processGroup, processGroup > 1 else { return nil }
+        guard Self.processGroupExists(processGroup) else {
+            if state.leaderReaped { forgetProcessGroup(processGroup) }
+            return nil
+        }
+        // Once the original leader is reaped its numeric PID must remain unused
+        // while the orphaned session still owns this group ID. A positive-PID
+        // match therefore means the ID was reused and must never be signaled.
+        if state.leaderReaped, Self.processExists(processGroup) {
+            forgetProcessGroup(processGroup)
+            return nil
+        }
+        return processGroup
+    }
+
+    private func forgetProcessGroup(_ expected: pid_t) {
+        lock.lock()
+        if processGroup == expected { processGroup = nil }
+        lock.unlock()
+    }
+
+    private static func processGroupExists(_ processGroup: pid_t) -> Bool {
+        if kill(-processGroup, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    private static func processExists(_ processID: pid_t) -> Bool {
+        if kill(processID, 0) == 0 { return true }
+        return errno == EPERM
+    }
+    #endif
 }
 
 public struct LocalProjectSourceGitRunner: ProjectSourceGitRunning {
@@ -424,27 +500,24 @@ public struct LocalProjectSourceGitRunner: ProjectSourceGitRunning {
     }
 
     private static func terminateAndReap(_ lifecycle: ManagedProjectSourceProcess) async {
-        guard lifecycle.isRunning() else {
-            _ = lifecycle.terminationStatus()
-            return
-        }
         lifecycle.signal(SIGTERM)
-        if await waitForExit(lifecycle, timeout: .milliseconds(500)) {
-            _ = lifecycle.terminationStatus()
-            return
+        if !(await waitForTerminationTargetExit(lifecycle, timeout: .milliseconds(500))) {
+            lifecycle.signal(SIGKILL)
+            _ = await waitForTerminationTargetExit(lifecycle, timeout: .seconds(2))
         }
-        lifecycle.signal(SIGKILL)
-        _ = await waitForExit(lifecycle, timeout: .seconds(2))
         _ = lifecycle.terminationStatus()
     }
 
-    private static func waitForExit(_ lifecycle: ManagedProjectSourceProcess, timeout: Duration) async -> Bool {
+    private static func waitForTerminationTargetExit(
+        _ lifecycle: ManagedProjectSourceProcess,
+        timeout: Duration
+    ) async -> Bool {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
-        while lifecycle.isRunning(), clock.now < deadline {
+        while lifecycle.terminationTargetExists(), clock.now < deadline {
             try? await Task.sleep(for: .milliseconds(25))
         }
-        return !lifecycle.isRunning()
+        return !lifecycle.terminationTargetExists()
     }
 
     private static func fileSize(_ path: String) -> Int64 {
