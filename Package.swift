@@ -284,7 +284,7 @@ let package: Package = if serverOnly {
             ),
             .executableTarget(
                 name: "RepoPromptMCP",
-                dependencies: ["RepoPromptShared", "RepoPromptDomainRuntime", "RepoPromptMCPAdapter", "RepoPromptCodeMapCore", "RepoPromptC", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
+                dependencies: ["RepoPromptShared", "RepoPromptDomainRuntime", "RepoPromptMCPAdapter", "RepoPromptServiceProtocol", "RepoPromptServicePersistence", "RepoPromptHeadlessRuntime", "RepoPromptWorkspaceRuntimeCore", "RepoPromptCodeMapCore", "RepoPromptC", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
                 path: "Sources/RepoPromptMCP",
                 swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
             ),

@@ -67,6 +67,148 @@ public actor RepoPromptMCPAdapter {
             throw error
         }
     }
+
+    package func install(
+        runtime: MCPDomainRuntime,
+        scopeID: DomainStandaloneScopeID,
+        binding: RepoPromptMCPBinding
+    ) async throws -> MCPDomainStandaloneToolInstallation {
+        let backend = AuthorityDomainBackend(adapter: self, binding: binding)
+        return try await MCPDomainStandaloneToolInstaller.install(
+            runtime: runtime,
+            scopeID: scopeID,
+            backends: MCPDomainStandaloneCapabilityBackends(
+                global: backend,
+                workspace: backend,
+                filesystem: backend,
+                conversation: backend,
+                versionControl: backend,
+                agent: backend,
+                history: backend
+            )
+        )
+    }
+}
+
+private struct AuthorityDomainBackend: DomainGlobalControlBackend, DomainWorkspaceCapabilityBackend, DomainFilesystemMutationBackend, DomainConversationCapabilityBackend, DomainVersionControlCapabilityBackend, DomainAgentCapabilityBackend, DomainHistoryCapabilityBackend {
+    let adapter: RepoPromptMCPAdapter
+    let binding: RepoPromptMCPBinding
+
+    private func call(_ toolName: String, _ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await DomainPhysicalToolResult(json: adapter.invoke(toolName: toolName, argumentsJSON: request.argumentsJSON, binding: binding))
+    }
+
+    private func call(_ toolName: String, _ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
+        try await call(toolName, request.request)
+    }
+
+    func accessSettings(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPGlobalToolName.appSettings, request)
+    }
+
+    func routeContext(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPGlobalToolName.bindContext, request)
+    }
+
+    func manageWorkspaceLifecycle(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPGlobalToolName.manageWorkspaces, request)
+    }
+
+    func mutateSelection(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.manageSelection, request)
+    }
+
+    func inspectCodeStructure(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.getCodeStructure, request)
+    }
+
+    func renderFileTree(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.getFileTree, request)
+    }
+
+    func readFile(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.readFile, request)
+    }
+
+    func searchFiles(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.search, request)
+    }
+
+    func renderWorkspaceContext(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.workspaceContext, request)
+    }
+
+    func accessPrompt(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.prompt, request)
+    }
+
+    func manageFiles(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.fileActions, request)
+    }
+
+    func applyFileEdits(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.applyEdits, request)
+    }
+
+    func accessOracleUtilities(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.oracleUtils, request)
+    }
+
+    func startOracleConversation(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.askOracle, request)
+    }
+
+    func continueOracleConversation(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.oracleSend, request)
+    }
+
+    func readOracleLog(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.oracleChatLog, request)
+    }
+
+    func buildContext(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.contextBuilder, request)
+    }
+
+    func requestUserInput(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.askUser, request)
+    }
+
+    func inspectGit(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.git, request)
+    }
+
+    func manageWorktree(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.manageWorktree, request)
+    }
+
+    func explore(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.agentExplore, request)
+    }
+
+    func run(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.agentRun, request)
+    }
+
+    func manage(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.agentManage, request)
+    }
+
+    func shareThoughts(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.shareThoughts, request)
+    }
+
+    func publishStatus(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.setStatus, request)
+    }
+
+    func waitForInstruction(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.waitForNextInstruction, request)
+    }
+
+    func inspectHistory(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
+        try await call(MCPWindowToolName.history, request)
+    }
 }
 
 private actor AuthorityToolBackend {
@@ -702,7 +844,8 @@ private actor AuthorityToolBackend {
     }
 
     private func waitForInstruction(_ arguments: [String: Value]) async throws -> Value {
-        let timeout = min(max(arguments["timeout"]?.doubleValue ?? 120, 0), 3600)
+        let timeoutValue = arguments["timeout_seconds"] ?? arguments["timeout"]
+        let timeout = min(max(timeoutValue?.doubleValue ?? timeoutValue?.intValue.map(Double.init) ?? 120, 0), 3600)
         let current = try await authority.sessionSnapshot(sessionID: binding.sessionID)
         let baseline = arguments["after_sequence"]?.intValue.map(Int64.init) ?? current.transcript.last?.sessionSequence ?? 0
         let deadline = ContinuousClock().now.advanced(by: .seconds(timeout))

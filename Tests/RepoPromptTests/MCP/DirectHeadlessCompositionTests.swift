@@ -326,7 +326,7 @@ final class DirectHeadlessCompositionTests: XCTestCase {
             "agent_manage": ["op": .string("list_agents"), "roles_only": .bool(true)],
             "share_thoughts": ["text": .string("progress")],
             "set_status": ["session_name": .string("composition")],
-            "wait_for_next_user_instruction": [:],
+            "wait_for_next_user_instruction": ["timeout": .double(0)],
             "history": ["op": .string("list_sessions")]
         ]
         XCTAssertEqual(arguments.count, 27)
@@ -370,9 +370,10 @@ final class DirectHeadlessCompositionTests: XCTestCase {
             dispatched.insert(name)
         }
         XCTAssertEqual(dispatched, Set(arguments.keys))
-        let mutated = try await prepared.context.snapshot(connectionID: prepared.connectionID)
-        XCTAssertEqual(mutated.selection, ["Package.swift"])
-        XCTAssertEqual(mutated.prompt, "headless context mutation")
+        let mutatedSelection = try await prepared.authority.selectionSnapshot(sessionID: prepared.authorityBinding.sessionID)
+        XCTAssertEqual(mutatedSelection.entries.map(\.logicalPath), ["Package.swift"])
+        let mutatedContext = try await prepared.authority.sessionContext(sessionID: prepared.authorityBinding.sessionID)
+        XCTAssertEqual(mutatedContext.prompt, "headless context mutation")
 
         let deniedExport = try await prepared.runtime.domainHost.resolve(
             toolName: "prompt",

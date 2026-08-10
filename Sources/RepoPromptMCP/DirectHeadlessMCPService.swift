@@ -4,6 +4,11 @@ import Foundation
 import Logging
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptHeadlessRuntime
+import RepoPromptMCPAdapter
+import RepoPromptServicePersistence
+import RepoPromptServiceProtocol
+import RepoPromptWorkspaceRuntimeCore
 
 actor DirectHeadlessMCPService {
     struct PreparedRuntime {
@@ -17,6 +22,9 @@ actor DirectHeadlessMCPService {
         let childEndpoint: DirectHeadlessChildEndpoint
         let childLaunchCoordinator: DirectHeadlessChildLaunchCoordinator
         let providerCoordinator: DirectHeadlessProviderCoordinator
+        let durableStore: SQLiteServiceStore
+        let authority: RepoPromptHeadlessAuthority
+        let authorityBinding: RepoPromptMCPBinding
     }
 
     struct ConnectionContext {
@@ -167,27 +175,14 @@ actor DirectHeadlessMCPService {
             workingDirectories: workingDirectories
         )
         let context = DirectHeadlessDomainContext(runtime: runtime, scopeID: scopeID)
-        let workspace = DirectHeadlessWorkspaceBackend(context: context)
-        let global = DirectHeadlessGlobalBackend(runtime: runtime, scopeID: scopeID, context: context)
         let providerCoordinator = DirectHeadlessProviderCoordinator(
             runtime: runtime,
             context: context,
             environment: environment
         )
-        let backends = MCPDomainStandaloneCapabilityBackends(
-            global: global,
-            workspace: workspace,
-            filesystem: DirectHeadlessFilesystemBackend(context: context),
-            conversation: DirectHeadlessConversationBackend(coordinator: providerCoordinator),
-            versionControl: DirectHeadlessVersionControlBackend(runtime: runtime, context: context),
-            agent: DirectHeadlessAgentBackend(coordinator: providerCoordinator),
-            history: DirectHeadlessHistoryBackend(runtime: runtime)
-        )
-        let installation = try await MCPDomainStandaloneToolInstaller.install(
-            runtime: runtime,
-            scopeID: scopeID,
-            backends: backends
-        )
+        let durable = try await prepareDurableAuthority(locations: locations)
+        let adapter = RepoPromptMCPAdapter(authority: durable.authority)
+        let installation = try await adapter.install(runtime: runtime, scopeID: scopeID, binding: durable.binding)
         let privateEndpointDirectory = URL(
             fileURLWithPath: "/tmp/rpce-h-\(geteuid())-\(runtime.identity.runtimeID.uuidString.prefix(8))",
             isDirectory: true
@@ -224,8 +219,80 @@ actor DirectHeadlessMCPService {
             principal: principal,
             childEndpoint: childEndpoint,
             childLaunchCoordinator: childLaunchCoordinator,
-            providerCoordinator: providerCoordinator
+            providerCoordinator: providerCoordinator,
+            durableStore: durable.store,
+            authority: durable.authority,
+            authorityBinding: durable.binding
         )
+    }
+
+    private func prepareDurableAuthority(
+        locations: DirectHeadlessRuntimeLocations
+    ) async throws -> (store: SQLiteServiceStore, authority: RepoPromptHeadlessAuthority, binding: RepoPromptMCPBinding) {
+        let root = locations.storageDirectory.appendingPathComponent("HeadlessAuthority", isDirectory: true)
+        let artifacts = root.appendingPathComponent("Artifacts", isDirectory: true)
+        let providerOutput = root.appendingPathComponent("ProviderOutput", isDirectory: true)
+        let providerHomes = root.appendingPathComponent("ProviderHomes", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let store = try await SQLiteServiceStore.open(storage: .file(root.appendingPathComponent("repoprompt.sqlite").path))
+        let processPort = try PortableProcessSupervisionPort()
+        let providers = ProviderCLIAdapter(
+            configurations: providerConfigurations(),
+            processPort: processPort,
+            processStore: store,
+            outputDirectory: providerOutput.path,
+            ephemeralHomeRoot: providerHomes.path
+        )
+        let authority = try RepoPromptHeadlessAuthority(
+            store: store,
+            artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path),
+            providerAdapter: providers
+        )
+        try await authority.recover()
+        let actor = ExternalActor(goblinUserID: "direct-mcp", username: "direct-mcp", displayName: "Direct MCP")
+        let canonicalPaths = Set(locations.workingDirectories.map { $0.standardizedFileURL.resolvingSymlinksInPath().path })
+        let existing = await authority.projectSnapshots().first { Set($0.roots.map(\.canonicalPath)) == canonicalPaths }
+        let project: ProjectSnapshot
+        if let existing {
+            project = existing
+        } else {
+            guard !locations.workingDirectories.isEmpty else {
+                throw ServiceAPIError(code: .invalidRequest, message: "REPOPROMPT_MCP_WORKING_DIRS must bind at least one authorized root")
+            }
+            project = try await authority.createProject(
+                input: CreateProjectInput(
+                    name: "Direct MCP \(locations.profileIdentifier)",
+                    roots: locations.workingDirectories.enumerated().map { index, url in
+                        CreateProjectInput.Root(logicalName: "root-\(index + 1)", path: url.path, writable: true)
+                    }
+                ),
+                externalActor: actor,
+                idempotencyKey: "direct-mcp-project-\(UUID().uuidString)",
+                requestDigest: CanonicalSigning.bodyDigest(Data(canonicalPaths.sorted().joined(separator: "\n").utf8))
+            )
+        }
+        let provider = ProviderKind(rawValue: environment["REPOPROMPT_MCP_PROVIDER"] ?? "codex") ?? .codex
+        let session = try await authority.createSession(
+            input: CreateSessionInput(projectID: project.projectID, provider: provider, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "direct-mcp-session-\(UUID().uuidString)",
+            requestDigest: CanonicalSigning.bodyDigest(Data(project.projectID.uuidString.utf8))
+        )
+        return (store, authority, RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor))
+    }
+
+    private func providerConfigurations() -> [ProviderCLIConfiguration] {
+        let definitions: [(ProviderKind, String, String?)] = [
+            (.codex, "REPOPROMPT_CODEX_EXECUTABLE", environment["REPOPROMPT_CODEX_CREDENTIAL_HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path),
+            (.claudeCompatible, "REPOPROMPT_CLAUDE_EXECUTABLE", environment["REPOPROMPT_CLAUDE_CREDENTIAL_HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude").path),
+            (.openCodeACP, "REPOPROMPT_OPENCODE_EXECUTABLE", environment["REPOPROMPT_OPENCODE_CREDENTIAL_HOME"]),
+            (.cursorACP, "REPOPROMPT_CURSOR_EXECUTABLE", environment["REPOPROMPT_CURSOR_CREDENTIAL_HOME"])
+        ]
+        return definitions.compactMap { kind, variable, credentials in
+            guard let executable = environment[variable], !executable.isEmpty else { return nil }
+            let credentialSource = credentials.flatMap { FileManager.default.fileExists(atPath: $0) ? $0 : nil }
+            return ProviderCLIConfiguration(kind: kind, executable: executable, credentialSourceDirectory: credentialSource)
+        }
     }
 
     private func installHandlers(
@@ -455,6 +522,8 @@ actor DirectHeadlessMCPService {
             connectionGeneration: prepared.connectionGeneration
         )
         await MCPDomainStandaloneToolInstaller.uninstall(prepared.installation, runtime: prepared.runtime)
+        try? await prepared.authority.quiesce()
+        try? await prepared.durableStore.close(clean: true)
         _ = await prepared.runtime.shutdown()
     }
 
