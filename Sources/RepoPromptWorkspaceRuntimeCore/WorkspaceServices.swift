@@ -185,11 +185,21 @@ public actor WorktreeRuntimeService {
     private let baseDirectory: String
     private let runner: any WorkspaceCommandRunning
     private let gitExecutable: String
+    private let resources: (any OwnedResourceRepository)?
+    private let ownerInstanceID: UUID
 
-    public init(baseDirectory: String, runner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(), gitExecutable: String = "/usr/bin/git") throws {
+    public init(
+        baseDirectory: String,
+        runner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(),
+        gitExecutable: String = "/usr/bin/git",
+        resources: (any OwnedResourceRepository)? = nil,
+        ownerInstanceID: UUID = UUID()
+    ) throws {
         self.baseDirectory = URL(fileURLWithPath: baseDirectory).standardizedFileURL.path
         self.runner = runner
         self.gitExecutable = gitExecutable
+        self.resources = resources
+        self.ownerInstanceID = ownerInstanceID
         try FileManager.default.createDirectory(atPath: self.baseDirectory, withIntermediateDirectories: true)
     }
 
@@ -197,19 +207,211 @@ public actor WorktreeRuntimeService {
         guard root.writable else { throw ServiceAPIError(code: .rootUnauthorized, message: "Worktree root is read-only") }
         guard Self.safeRef(baseRef), Self.safeBranch(branch) else { throw ServiceAPIError(code: .invalidRequest, message: "Worktree ref or branch is invalid") }
         let bindingID = UUID()
-        let path = URL(fileURLWithPath: baseDirectory).appendingPathComponent(project.projectID.uuidString).appendingPathComponent(bindingID.uuidString).path
+        let candidate = URL(fileURLWithPath: baseDirectory).appendingPathComponent(project.projectID.uuidString).appendingPathComponent(bindingID.uuidString).path
+        let path = try DurableFilesystem.standardizedContainedPath(root: baseDirectory, candidate: candidate)
+        let reservation = OwnedResourceRecord(
+            kind: .worktree,
+            projectID: project.projectID,
+            sessionID: sessionID,
+            externalID: bindingID,
+            internalPathIdentity: path,
+            lifecycleState: .preparing,
+            metadata: ["sourceRoot": root.canonicalPath, "baseRef": baseRef, "branch": branch],
+            retentionDeadline: Date().addingTimeInterval(15 * 60)
+        )
+        try await resources?.reserveOwnedResource(reservation)
         try FileManager.default.createDirectory(atPath: URL(fileURLWithPath: path).deletingLastPathComponent().path, withIntermediateDirectories: true)
-        _ = try await runner.run(executable: gitExecutable, arguments: ["-C", root.canonicalPath, "worktree", "add", "-b", branch, path, baseRef], workingDirectory: root.canonicalPath, maximumBytes: 65536)
-        return WorktreeBindingSnapshot(bindingID: bindingID, projectID: project.projectID, rootID: root.rootID, sessionID: sessionID, baseRef: baseRef, branch: branch, physicalPath: path, ownershipState: .active, mergeState: .clean, revision: 1)
+        do {
+            _ = try await runner.run(executable: gitExecutable, arguments: ["-C", root.canonicalPath, "worktree", "add", "-b", branch, path, baseRef], workingDirectory: root.canonicalPath, maximumBytes: 65536)
+            let verification = try await runner.run(executable: gitExecutable, arguments: ["-C", path, "rev-parse", "--show-toplevel"], workingDirectory: path, maximumBytes: 65536)
+            guard URL(fileURLWithPath: verification.trimmingCharacters(in: .whitespacesAndNewlines)).standardizedFileURL.path == path else {
+                throw ServiceAPIError(code: .worktreeConflict, message: "Created Git worktree identity did not match its reservation")
+            }
+            _ = try await resources?.transitionOwnedResource(
+                resourceID: reservation.resourceID,
+                expectedStates: [.preparing],
+                to: .prepared,
+                observedBytes: nil,
+                contentDigest: nil,
+                cleanupError: nil
+            )
+            return WorktreeBindingSnapshot(bindingID: bindingID, projectID: project.projectID, rootID: root.rootID, sessionID: sessionID, baseRef: baseRef, branch: branch, physicalPath: path, ownershipState: .active, mergeState: .clean, revision: 1)
+        } catch {
+            let cleanupError = await cleanupFailedWorktree(path: path, sourceRoot: root.canonicalPath)
+            _ = try? await resources?.transitionOwnedResource(
+                resourceID: reservation.resourceID,
+                expectedStates: [.preparing, .prepared],
+                to: cleanupError == nil ? .failed : .quarantined,
+                observedBytes: nil,
+                contentDigest: nil,
+                cleanupError: cleanupError
+            )
+            throw error
+        }
     }
 
     public func merge(_ binding: WorktreeBindingSnapshot, targetPath: String, strategy: String) async throws -> WorktreeBindingSnapshot {
         guard ["merge", "squash"].contains(strategy) else { throw ServiceAPIError(code: .invalidRequest, message: "Unsupported worktree merge strategy") }
-        var arguments = ["-C", targetPath, "merge", "--no-edit"]
-        if strategy == "squash" { arguments.append("--squash") }
-        arguments.append(binding.branch)
-        _ = try await runner.run(executable: gitExecutable, arguments: arguments, workingDirectory: targetPath, maximumBytes: 1_048_576)
-        return WorktreeBindingSnapshot(bindingID: binding.bindingID, projectID: binding.projectID, rootID: binding.rootID, sessionID: binding.sessionID, baseRef: binding.baseRef, branch: binding.branch, physicalPath: binding.physicalPath, ownershipState: binding.ownershipState, mergeState: .merged, revision: binding.revision + 1)
+        guard binding.ownershipState == .active else { throw ServiceAPIError(code: .worktreeConflict, message: "Only an active worktree can be merged") }
+        let preMergeStatus = try await runner.run(
+            executable: gitExecutable,
+            arguments: ["-C", targetPath, "status", "--porcelain"],
+            workingDirectory: targetPath,
+            maximumBytes: 65536
+        )
+        guard preMergeStatus.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ServiceAPIError(code: .worktreeConflict, message: "Merge target must be clean before acquiring a lease")
+        }
+        let preMergeHead = try await runner.run(executable: gitExecutable, arguments: ["-C", targetPath, "rev-parse", "HEAD"], workingDirectory: targetPath, maximumBytes: 4096).trimmingCharacters(in: .whitespacesAndNewlines)
+        let lease = WorktreeMergeLeaseRecord(
+            bindingID: binding.bindingID,
+            expectedBindingRevision: binding.revision,
+            strategy: strategy,
+            targetPath: URL(fileURLWithPath: targetPath).standardizedFileURL.path,
+            preMergeHead: preMergeHead,
+            ownerInstanceID: ownerInstanceID,
+            expiresAt: Date().addingTimeInterval(2 * 60)
+        )
+        try await resources?.acquireWorktreeMergeLease(lease)
+        _ = try await resources?.transitionWorktreeMergeLease(leaseID: lease.leaseID, expectedStates: [.preparing], to: .running, conflictArtifactPath: nil, errorCode: nil)
+        let leaseHeartbeat = resources.map { resources in
+            Task {
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(30))
+                    guard !Task.isCancelled else { break }
+                    try? await resources.renewWorktreeMergeLease(
+                        leaseID: lease.leaseID,
+                        ownerInstanceID: ownerInstanceID,
+                        expiresAt: Date().addingTimeInterval(2 * 60)
+                    )
+                }
+            }
+        }
+        defer { leaseHeartbeat?.cancel() }
+        do {
+            var arguments = ["-C", targetPath, "merge", "--no-edit"]
+            if strategy == "squash" { arguments.append("--squash") }
+            arguments.append(binding.branch)
+            _ = try await runner.run(executable: gitExecutable, arguments: arguments, workingDirectory: targetPath, maximumBytes: 1_048_576)
+            _ = try await resources?.transitionWorktreeMergeLease(leaseID: lease.leaseID, expectedStates: [.running], to: .prepared, conflictArtifactPath: nil, errorCode: nil)
+            return WorktreeBindingSnapshot(bindingID: binding.bindingID, projectID: binding.projectID, rootID: binding.rootID, sessionID: binding.sessionID, baseRef: binding.baseRef, branch: binding.branch, physicalPath: binding.physicalPath, ownershipState: binding.ownershipState, mergeState: .merged, revision: binding.revision + 1)
+        } catch {
+            let conflictPath = try? await publishConflictSnapshot(binding: binding, lease: lease, targetPath: targetPath)
+            _ = try? await resources?.transitionWorktreeMergeLease(
+                leaseID: lease.leaseID,
+                expectedStates: [.running, .preparing],
+                to: .conflicted,
+                conflictArtifactPath: conflictPath,
+                errorCode: "git_merge_failed"
+            )
+            throw ServiceAPIError(code: .worktreeConflict, message: "Worktree merge requires conflict recovery")
+        }
+    }
+
+    public func abortConflictedMerge(
+        _ binding: WorktreeBindingSnapshot,
+        targetPath: String,
+        leaseID: UUID
+    ) async throws -> WorktreeBindingSnapshot {
+        guard let resources else {
+            throw ServiceAPIError(code: .persistenceUnavailable, message: "Durable merge recovery requires an owned-resource repository")
+        }
+        let leases = try await resources.worktreeMergeLeases(nonterminalOnly: true)
+        guard let lease = leases.first(where: { $0.leaseID == leaseID }),
+              lease.bindingID == binding.bindingID,
+              lease.state == .conflicted,
+              lease.targetPath == URL(fileURLWithPath: targetPath).standardizedFileURL.path
+        else {
+            throw ServiceAPIError(code: .worktreeConflict, message: "Conflicted merge lease does not match the requested binding")
+        }
+        do {
+            _ = try await runner.run(
+                executable: gitExecutable,
+                arguments: ["-C", targetPath, "merge", "--abort"],
+                workingDirectory: targetPath,
+                maximumBytes: 65536
+            )
+        } catch {
+            _ = try await runner.run(
+                executable: gitExecutable,
+                arguments: ["-C", targetPath, "reset", "--merge", lease.preMergeHead],
+                workingDirectory: targetPath,
+                maximumBytes: 65536
+            )
+        }
+        let recoveredHead = try await runner.run(
+            executable: gitExecutable,
+            arguments: ["-C", targetPath, "rev-parse", "HEAD"],
+            workingDirectory: targetPath,
+            maximumBytes: 4096
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let recoveredStatus = try await runner.run(
+            executable: gitExecutable,
+            arguments: ["-C", targetPath, "status", "--porcelain"],
+            workingDirectory: targetPath,
+            maximumBytes: 65536
+        )
+        guard recoveredHead == lease.preMergeHead,
+              recoveredStatus.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            throw ServiceAPIError(code: .worktreeConflict, message: "Merge abort did not restore the fenced clean pre-merge state")
+        }
+        _ = try await resources.transitionWorktreeMergeLease(
+            leaseID: leaseID,
+            expectedStates: [.conflicted],
+            to: .aborted,
+            conflictArtifactPath: lease.conflictArtifactPath,
+            errorCode: nil
+        )
+        return WorktreeBindingSnapshot(
+            bindingID: binding.bindingID,
+            projectID: binding.projectID,
+            rootID: binding.rootID,
+            sessionID: binding.sessionID,
+            baseRef: binding.baseRef,
+            branch: binding.branch,
+            physicalPath: binding.physicalPath,
+            ownershipState: binding.ownershipState,
+            mergeState: .clean,
+            revision: binding.revision + 1
+        )
+    }
+
+    private func cleanupFailedWorktree(path: String, sourceRoot: String) async -> String? {
+        do {
+            if FileManager.default.fileExists(atPath: path) {
+                _ = try await runner.run(executable: gitExecutable, arguments: ["-C", sourceRoot, "worktree", "remove", "--force", path], workingDirectory: sourceRoot, maximumBytes: 65536)
+            }
+            _ = try await runner.run(executable: gitExecutable, arguments: ["-C", sourceRoot, "worktree", "prune"], workingDirectory: sourceRoot, maximumBytes: 65536)
+            if FileManager.default.fileExists(atPath: path) { try FileManager.default.removeItem(atPath: path) }
+            return nil
+        } catch {
+            return "worktree_cleanup_failed"
+        }
+    }
+
+    private func publishConflictSnapshot(binding: WorktreeBindingSnapshot, lease: WorktreeMergeLeaseRecord, targetPath: String) async throws -> String {
+        let directory = URL(fileURLWithPath: baseDirectory).appendingPathComponent(".conflicts", isDirectory: true)
+        let destination = directory.appendingPathComponent("\(lease.leaseID.uuidString).json")
+        let temporary = directory.appendingPathComponent(".\(lease.leaseID.uuidString).tmp")
+        let payload = try JSONEncoder().encode([
+            "schemaVersion": "1", "bindingId": binding.bindingID.uuidString, "leaseId": lease.leaseID.uuidString,
+            "strategy": lease.strategy, "preMergeHead": lease.preMergeHead, "targetState": "conflicted"
+        ])
+        try DurableFilesystem.publish(data: payload, temporary: temporary, destination: destination)
+        let record = OwnedResourceRecord(
+            kind: .mergeConflict,
+            projectID: binding.projectID,
+            sessionID: binding.sessionID,
+            externalID: lease.leaseID,
+            internalPathIdentity: destination.path,
+            lifecycleState: .active,
+            observedBytes: Int64(payload.count),
+            contentDigest: CanonicalSigning.bodyDigest(payload),
+            metadata: ["bindingId": binding.bindingID.uuidString]
+        )
+        try await resources?.reserveOwnedResource(record)
+        return destination.path
     }
 
     private static func safeRef(_ value: String) -> Bool {
@@ -223,23 +425,64 @@ public actor WorktreeRuntimeService {
 
 public actor ArtifactRuntimeService {
     private let baseDirectory: String
+    private let resources: (any OwnedResourceRepository)?
 
-    public init(baseDirectory: String) throws {
+    public init(baseDirectory: String, resources: (any OwnedResourceRepository)? = nil) throws {
         self.baseDirectory = URL(fileURLWithPath: baseDirectory).standardizedFileURL.path
+        self.resources = resources
         try FileManager.default.createDirectory(atPath: self.baseDirectory, withIntermediateDirectories: true)
     }
 
-    public func store(projectID: UUID, sessionID: UUID?, kind: String, logicalName: String, content: Data, cursor: ServiceCursor) throws -> (ArtifactSnapshot, storageReference: String) {
+    public func store(projectID: UUID, sessionID: UUID?, kind: String, logicalName: String, content: Data, cursor: ServiceCursor) async throws -> (ArtifactSnapshot, storageReference: String) {
         guard content.count <= 64 * 1024 * 1024 else { throw ServiceAPIError(code: .invalidRequest, message: "Artifact exceeds the 64 MiB service limit") }
         let artifactID = UUID()
         let projectDirectory = URL(fileURLWithPath: baseDirectory).appendingPathComponent(projectID.uuidString)
-        try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
         let destination = projectDirectory.appendingPathComponent(artifactID.uuidString)
         let temporary = projectDirectory.appendingPathComponent(".\(artifactID.uuidString).tmp")
-        try content.write(to: temporary, options: [.atomic])
-        try FileManager.default.moveItem(at: temporary, to: destination)
+        let finalPath = try DurableFilesystem.standardizedContainedPath(root: baseDirectory, candidate: destination.path)
+        let temporaryPath = try DurableFilesystem.standardizedContainedPath(root: baseDirectory, candidate: temporary.path)
         let digest = CanonicalSigning.bodyDigest(content)
-        return (ArtifactSnapshot(artifactID: artifactID, projectID: projectID, sessionID: sessionID, kind: kind, logicalName: logicalName, contentDigest: digest, size: Int64(content.count), createdCursor: cursor), destination.path)
+        let reservation = OwnedResourceRecord(
+            kind: .artifact,
+            projectID: projectID,
+            sessionID: sessionID,
+            externalID: artifactID,
+            internalPathIdentity: finalPath,
+            temporaryPathIdentity: temporaryPath,
+            lifecycleState: .preparing,
+            observedBytes: Int64(content.count),
+            contentDigest: digest,
+            metadata: ["kind": kind, "logicalName": logicalName],
+            retentionDeadline: Date().addingTimeInterval(15 * 60)
+        )
+        try await resources?.reserveOwnedResource(reservation)
+        do {
+            try DurableFilesystem.publish(data: content, temporary: URL(fileURLWithPath: temporaryPath), destination: URL(fileURLWithPath: finalPath))
+            let persisted = try Data(contentsOf: URL(fileURLWithPath: finalPath), options: [.mappedIfSafe])
+            guard persisted.count == content.count, CanonicalSigning.bodyDigest(persisted) == digest else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Published artifact failed durability verification")
+            }
+            _ = try await resources?.transitionOwnedResource(
+                resourceID: reservation.resourceID,
+                expectedStates: [.preparing],
+                to: .prepared,
+                observedBytes: Int64(content.count),
+                contentDigest: digest,
+                cleanupError: nil
+            )
+            return (ArtifactSnapshot(artifactID: artifactID, projectID: projectID, sessionID: sessionID, kind: kind, logicalName: logicalName, contentDigest: digest, size: Int64(content.count), createdCursor: cursor), finalPath)
+        } catch {
+            try? FileManager.default.removeItem(atPath: temporaryPath)
+            _ = try? await resources?.transitionOwnedResource(
+                resourceID: reservation.resourceID,
+                expectedStates: [.preparing, .prepared],
+                to: FileManager.default.fileExists(atPath: finalPath) ? .quarantined : .failed,
+                observedBytes: Int64(content.count),
+                contentDigest: digest,
+                cleanupError: FileManager.default.fileExists(atPath: finalPath) ? "artifact_publication_unconfirmed" : nil
+            )
+            throw error
+        }
     }
 
     public func content(storageReference: String, maximumBytes: Int) throws -> Data {

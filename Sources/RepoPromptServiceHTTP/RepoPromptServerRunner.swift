@@ -29,6 +29,7 @@ public struct RepoPromptServerConfiguration: Sendable {
     public let minimumFreeBytes: Int64
     public let minimumFreeNodes: Int64
     public let maximumActiveSessions: Int
+    public let restoreActivationTokenPath: String?
 
     public static func environment(_ environment: [String: String] = ProcessInfo.processInfo.environment) throws -> Self {
         func required(_ name: String) throws -> String {
@@ -92,7 +93,8 @@ public struct RepoPromptServerConfiguration: Sendable {
             providerCredentialSources: credentialSources,
             minimumFreeBytes: Int64(environment["REPOPROMPT_MINIMUM_FREE_BYTES"] ?? "268435456") ?? 268_435_456,
             minimumFreeNodes: Int64(environment["REPOPROMPT_MINIMUM_FREE_NODES"] ?? "1024") ?? 1024,
-            maximumActiveSessions: Int(environment["REPOPROMPT_MAX_ACTIVE_SESSIONS"] ?? "64") ?? 64
+            maximumActiveSessions: Int(environment["REPOPROMPT_MAX_ACTIVE_SESSIONS"] ?? "64") ?? 64,
+            restoreActivationTokenPath: environment["REPOPROMPT_RESTORE_ACTIVATION_TOKEN_FILE"]
         )
     }
 }
@@ -110,52 +112,160 @@ public enum ConfigurationError: Error, CustomStringConvertible { case missing(St
 public enum RepoPromptServerRunner {
     public static func run(configuration: RepoPromptServerConfiguration) async throws {
         let stateDirectory = URL(fileURLWithPath: configuration.stateDatabasePath).deletingLastPathComponent().path
-        for directory in [stateDirectory, configuration.worktreeDirectory, configuration.artifactDirectory, configuration.projectDirectory, configuration.cacheDirectory, configuration.providerHomeDirectory] {
+        for directory in [
+            stateDirectory,
+            configuration.worktreeDirectory,
+            configuration.artifactDirectory,
+            configuration.projectDirectory,
+            configuration.cacheDirectory,
+            configuration.providerHomeDirectory
+        ] {
             try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
         }
-        let store = try await SQLiteServiceStore.open(storage: .file(configuration.stateDatabasePath), eventSigningKey: ServiceEventSigningKey(keyID: configuration.eventSigningKey.keyID, secret: configuration.eventSigningKey.secret))
-        let worktrees = try WorktreeRuntimeService(baseDirectory: configuration.worktreeDirectory)
-        let artifacts = try ArtifactRuntimeService(baseDirectory: configuration.artifactDirectory)
-        let processPort = try PortableProcessSupervisionPort()
-        let processOutput = URL(fileURLWithPath: configuration.stateDatabasePath).deletingLastPathComponent().appendingPathComponent("provider-output").path
-        let providerConfigurations = configuration.providerExecutables.map { kind, executable in
-            ProviderCLIConfiguration(kind: kind, executable: executable, expectedVersion: configuration.providerVersions[kind], protocolVersion: configuration.providerProtocols[kind], credentialSourceDirectory: configuration.providerCredentialSources[kind])
-        }
-        let providers = ProviderCLIAdapter(configurations: providerConfigurations, processPort: processPort, processStore: store, outputDirectory: processOutput, ephemeralHomeRoot: configuration.providerHomeDirectory)
-        let authority = RepoPromptHeadlessAuthority(store: store, worktreeService: worktrees, artifactService: artifacts, providerAdapter: providers)
-        try await authority.recover()
-        let authenticator = InternalRequestAuthenticator(keys: configuration.signingKeys, store: store)
+
+        // Parse all trust material before any listener can report ready.
         let certificateRoles = try CertificateIdentityRoleResolver.environment()
+        let tls = try RepoPromptTLSConfiguration.mutualTLS13(
+            certificatePath: configuration.certificatePath,
+            privateKeyPath: configuration.privateKeyPath,
+            trustRootsPath: configuration.clientCAPath
+        )
+        let instanceID = UUID()
+        let store = try await SQLiteServiceStore.open(
+            storage: .file(configuration.stateDatabasePath),
+            eventSigningKey: ServiceEventSigningKey(
+                keyID: configuration.eventSigningKey.keyID,
+                secret: configuration.eventSigningKey.secret
+            )
+        )
+        if let tokenPath = configuration.restoreActivationTokenPath {
+            let token = try Data(contentsOf: URL(fileURLWithPath: tokenPath))
+            _ = try await store.activateRestoredStore(activationToken: token, instanceID: instanceID)
+        }
+        guard try await store.metadata().activationState == "active" else {
+            try await store.close(clean: false)
+            throw ServiceAPIError(code: .quiescing, message: "Restored store requires activation fencing")
+        }
+
+        let worktrees = try WorktreeRuntimeService(
+            baseDirectory: configuration.worktreeDirectory,
+            resources: store,
+            ownerInstanceID: instanceID
+        )
+        let artifacts = try ArtifactRuntimeService(
+            baseDirectory: configuration.artifactDirectory,
+            resources: store
+        )
+        let reconciler = OwnedResourceReconciliationService(
+            repository: store,
+            artifactRoot: configuration.artifactDirectory,
+            worktreeRoot: configuration.worktreeDirectory,
+            providerHomeRoot: configuration.providerHomeDirectory
+        )
+        _ = await reconciler.reconcileStartup()
+        let durabilityOperations = DurabilityOperationsService(store: store, reconciler: reconciler)
+        _ = await durabilityOperations.runOnce()
+
+        let processPort = try PortableProcessSupervisionPort()
+        let processOutput = URL(fileURLWithPath: stateDirectory).appendingPathComponent("provider-output").path
+        let providerConfigurations = configuration.providerExecutables.map { kind, executable in
+            ProviderCLIConfiguration(
+                kind: kind,
+                executable: executable,
+                expectedVersion: configuration.providerVersions[kind],
+                protocolVersion: configuration.providerProtocols[kind],
+                credentialSourceDirectory: configuration.providerCredentialSources[kind]
+            )
+        }
+        let providers = ProviderCLIAdapter(
+            configurations: providerConfigurations,
+            processPort: processPort,
+            processStore: store,
+            outputDirectory: processOutput,
+            ephemeralHomeRoot: configuration.providerHomeDirectory
+        )
+        let authority = RepoPromptHeadlessAuthority(
+            store: store,
+            worktreeService: worktrees,
+            artifactService: artifacts,
+            providerAdapter: providers
+        )
+        try await authority.recover()
+
+        let drainController = MutationDrainController()
+        let authenticator = InternalRequestAuthenticator(keys: configuration.signingKeys, store: store)
         let readiness = RepoPromptReadinessService(
             authority: authority,
             store: store,
             volumes: [
-                .init(name: "state", path: stateDirectory), .init(name: "artifacts", path: configuration.artifactDirectory),
-                .init(name: "projects", path: configuration.projectDirectory), .init(name: "worktrees", path: configuration.worktreeDirectory),
+                .init(name: "state", path: stateDirectory),
+                .init(name: "artifacts", path: configuration.artifactDirectory),
+                .init(name: "projects", path: configuration.projectDirectory),
+                .init(name: "worktrees", path: configuration.worktreeDirectory),
                 .init(name: "cache", path: configuration.cacheDirectory)
             ],
             requiredProviders: Set(configuration.providerExecutables.keys),
+            expectedProviderProtocols: configuration.providerProtocols,
             minimumFreeBytes: configuration.minimumFreeBytes,
             minimumFreeNodes: configuration.minimumFreeNodes,
-            maximumActiveSessions: configuration.maximumActiveSessions
+            maximumActiveSessions: configuration.maximumActiveSessions,
+            drainController: drainController,
+            trustConfigurationValid: true
         )
-        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: authenticator, eventSigningKey: configuration.eventSigningKey, certificateRoleResolver: certificateRoles, readiness: readiness)
-        let tls = try RepoPromptTLSConfiguration.mutualTLS13(certificatePath: configuration.certificatePath, privateKeyPath: configuration.privateKeyPath, trustRootsPath: configuration.clientCAPath)
-        let internalApplication = try Application(router: service.internalRouter(), server: .tls(tlsConfiguration: tls), configuration: .init(address: .hostname(configuration.bindHost, port: configuration.bindPort), serverName: "RepoPromptServer"))
-        let healthApplication = Application(router: service.healthRouter(), configuration: .init(address: .hostname(configuration.healthHost, port: configuration.healthPort), serverName: nil))
+        let service = RepoPromptHTTPService(
+            authority: authority,
+            store: store,
+            authenticator: authenticator,
+            eventSigningKey: configuration.eventSigningKey,
+            certificateRoleResolver: certificateRoles,
+            readiness: readiness,
+            drainController: drainController,
+            durabilityOperations: durabilityOperations
+        )
+        let internalApplication = try Application(
+            router: service.internalRouter(),
+            server: .tls(tlsConfiguration: tls),
+            configuration: .init(
+                address: .hostname(configuration.bindHost, port: configuration.bindPort),
+                serverName: "RepoPromptServer"
+            )
+        )
+        let healthApplication = Application(
+            router: service.healthRouter(),
+            configuration: .init(
+                address: .hostname(configuration.healthHost, port: configuration.healthPort),
+                serverName: nil
+            )
+        )
+        await durabilityOperations.start()
+
+        var serviceError: Error?
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask { try await internalApplication.runService() }
                 group.addTask { try await healthApplication.runService() }
-                try await group.next()
+                _ = try await group.next()
+                let drain = await drainController.drain(timeout: 15)
+                try await authority.quiesce()
+                await durabilityOperations.stop()
+                _ = await durabilityOperations.runOnce()
+                if !drain.drainTimedOut {
+                    try await store.checkpoint()
+                }
                 group.cancelAll()
             }
         } catch {
+            serviceError = error
+            _ = await drainController.drain(timeout: 15)
             try? await authority.quiesce()
-            try? await store.close(clean: false)
-            throw error
+            await durabilityOperations.stop()
+            _ = await durabilityOperations.runOnce()
         }
-        try await authority.quiesce()
-        try await store.close(clean: true)
+
+        let drain = await drainController.snapshot()
+        let clean = !drain.drainTimedOut && serviceError == nil
+        if clean { try await store.checkpoint() }
+        try await store.close(clean: clean)
+        if let serviceError { throw serviceError }
     }
 }

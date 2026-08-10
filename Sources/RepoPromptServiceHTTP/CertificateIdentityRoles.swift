@@ -27,10 +27,16 @@ public struct CertificateIdentityRoleResolver: Sendable {
             guard let value = environment[name], !value.isEmpty else { throw ConfigurationError.missing(name) }
             return value.lowercased()
         }
-        return try Self(identities: [
-            required("REPOPROMPT_GOBLIN_APP_CERT_IDENTITY"): .goblinApp,
-            required("REPOPROMPT_GOBLIN_SYNC_CERT_IDENTITY"): .goblinSync,
-            required("REPOPROMPT_OPERATOR_CERT_IDENTITY"): .operatorRole
+        let app = try required("REPOPROMPT_GOBLIN_APP_CERT_IDENTITY")
+        let sync = try required("REPOPROMPT_GOBLIN_SYNC_CERT_IDENTITY")
+        let operatorIdentity = try required("REPOPROMPT_OPERATOR_CERT_IDENTITY")
+        guard Set([app, sync, operatorIdentity]).count == 3 else {
+            throw ConfigurationError.invalid("Client certificate identities must be unique across roles")
+        }
+        return Self(identities: [
+            app: .goblinApp,
+            sync: .goblinSync,
+            operatorIdentity: .operatorRole
         ])
     }
 

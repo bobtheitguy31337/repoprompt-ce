@@ -296,7 +296,11 @@ final class WorkspaceAuthorityTests: XCTestCase {
         _ = try await command.run(executable: "/usr/bin/git", arguments: ["-C", root.path, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial"], workingDirectory: root.path, maximumBytes: 65536)
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let authority = try RepoPromptHeadlessAuthority(store: store, worktreeService: WorktreeRuntimeService(baseDirectory: worktrees.path), artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path))
+        let authority = try RepoPromptHeadlessAuthority(
+            store: store,
+            worktreeService: WorktreeRuntimeService(baseDirectory: worktrees.path, resources: store),
+            artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path, resources: store)
+        )
         let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-default-wt", requestDigest: "p-default-wt")
         let rootID = try XCTUnwrap(project.roots.first?.rootID)
@@ -314,6 +318,9 @@ final class WorkspaceAuthorityTests: XCTestCase {
         let childContent = try await authority.artifactContent(artifactID: childArtifact.artifactID, maximumBytes: 1024)
         XCTAssertTrue(String(decoding: rootContent, as: UTF8.self).contains("isolated worktree"))
         XCTAssertTrue(String(decoding: childContent, as: UTF8.self).contains("isolated worktree"))
+        let resources = try await store.ownedResources(states: [.active])
+        XCTAssertTrue(resources.contains { $0.kind == .worktree && $0.externalID == binding.bindingID })
+        XCTAssertTrue(resources.contains { $0.kind == .artifact && $0.externalID == rootArtifact.artifactID })
         try await store.close()
     }
 }
@@ -329,6 +336,9 @@ private actor RecordingWorkspaceRunner: WorkspaceCommandRunning {
 
     func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes _: Int) async throws -> String {
         recorded.append(Call(executable: executable, arguments: arguments, workingDirectory: workingDirectory))
+        if arguments.suffix(2) == ["rev-parse", "--show-toplevel"], arguments.count >= 2 {
+            return arguments[1]
+        }
         return ""
     }
 

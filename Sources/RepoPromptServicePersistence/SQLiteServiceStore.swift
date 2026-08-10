@@ -39,19 +39,26 @@ public actor SQLiteServiceStore {
         public let nextGlobalSequence: Int64
         public let replayFloor: Int64
         public let lastCleanShutdown: Bool
+        public let activationState: String
+        public let activationGeneration: Int64
+        public let activationInstanceID: UUID?
     }
 
     public enum Storage: Sendable { case memory, file(String) }
 
-    private let connection: SQLiteConnection
-    private let encoder: JSONEncoder
-    private let decoder: JSONDecoder
+    let connection: SQLiteConnection
+    let encoder: JSONEncoder
+    let decoder: JSONDecoder
     private let eventSigningKey: ServiceEventSigningKey?
+    let storagePath: String?
     private var closed = false
+    private var transactionActive = false
+    private var transactionWaiters: [CheckedContinuation<Void, Never>] = []
 
-    private init(connection: SQLiteConnection, eventSigningKey: ServiceEventSigningKey?) {
+    private init(connection: SQLiteConnection, eventSigningKey: ServiceEventSigningKey?, storagePath: String?) {
         self.connection = connection
         self.eventSigningKey = eventSigningKey
+        self.storagePath = storagePath
         encoder = JSONEncoder.serviceEncoder
         decoder = JSONDecoder.serviceDecoder
     }
@@ -60,7 +67,14 @@ public actor SQLiteServiceStore {
         let location: SQLiteConnection.Storage = switch storage { case .memory: .memory
         case let .file(path): .file(path: path) }
         let connection = try await SQLiteConnection.open(storage: location)
-        let store = SQLiteServiceStore(connection: connection, eventSigningKey: eventSigningKey)
+        let store = SQLiteServiceStore(
+            connection: connection,
+            eventSigningKey: eventSigningKey,
+            storagePath: {
+                if case let .file(path) = storage { return path }
+                return nil
+            }()
+        )
         try await store.migrate()
         try await store.integrityCheck()
         return store
@@ -77,13 +91,16 @@ public actor SQLiteServiceStore {
     }
 
     public func metadata() async throws -> Metadata {
-        let row = try await requireRow(connection.query("SELECT store_id, schema_version, next_global_sequence, replay_floor, last_clean_shutdown FROM service_metadata WHERE fixed_id = 1"))
+        let row = try await requireRow(connection.query("SELECT store_id, schema_version, next_global_sequence, replay_floor, last_clean_shutdown, activation_state, activation_generation, activation_instance_id FROM service_metadata WHERE fixed_id = 1"))
         return try Metadata(
             storeID: requireUUID(row.column("store_id")?.string),
             schemaVersion: row.column("schema_version")?.integer ?? 1,
             nextGlobalSequence: Int64(row.column("next_global_sequence")?.integer ?? 1),
             replayFloor: Int64(row.column("replay_floor")?.integer ?? 0),
-            lastCleanShutdown: row.column("last_clean_shutdown")?.bool ?? false
+            lastCleanShutdown: row.column("last_clean_shutdown")?.bool ?? false,
+            activationState: row.column("activation_state")?.string ?? "active",
+            activationGeneration: Int64(row.column("activation_generation")?.integer ?? 1),
+            activationInstanceID: row.column("activation_instance_id")?.string.flatMap(UUID.init(uuidString:))
         )
     }
 
@@ -186,7 +203,7 @@ public actor SQLiteServiceStore {
             }
             let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.rootSessionID, runID: nil, sessionSequence: Int64(snapshot.transcript.count), type: .sessionCreated, generation: snapshot.runGeneration, turnEpoch: snapshot.turnEpoch, actor: actor, correlationID: UUID(), payload: Data(snapshotJSON.utf8))
             if [.completed, .failed, .canceled, .interrupted, .archived].contains(snapshot.state) {
-                try await saveCheckpoint(scope: "session:\(snapshot.sessionID.uuidString)", sequence: event.globalSequence, snapshot: Data(snapshotJSON.utf8))
+                try await saveCheckpoint(scope: "session:\(snapshot.sessionID.uuidString)", sequence: event.globalSequence, snapshot: Data(snapshotJSON.utf8), retentionClass: "terminal")
             }
             try await recordImportAudit(kind: "legacy.session", digest: sourceDigest)
             return true
@@ -498,6 +515,10 @@ public actor SQLiteServiceStore {
                 "INSERT INTO worktree_bindings(binding_id,project_id,root_id,session_id,schema_version,base_ref,branch,physical_path,ownership_state,merge_state,revision) VALUES(?,?,?,?,1,?,?,?,?,?,?) ON CONFLICT(binding_id) DO UPDATE SET session_id=excluded.session_id,ownership_state=excluded.ownership_state,merge_state=excluded.merge_state,revision=excluded.revision",
                 [.text(snapshot.bindingID.uuidString), .text(snapshot.projectID.uuidString), .text(snapshot.rootID.uuidString), snapshot.sessionID.map { .text($0.uuidString) } ?? .null, .text(snapshot.baseRef), .text(snapshot.branch), .text(snapshot.physicalPath), .text(snapshot.ownershipState.rawValue), .text(snapshot.mergeState.rawValue), .integer(Int(snapshot.revision))]
             )
+            try await activatePreparedOwnedResourceIfPresent(externalID: snapshot.bindingID, kind: .worktree, path: snapshot.physicalPath)
+            if snapshot.mergeState == .merged {
+                try await commitPreparedMergeLeaseIfPresent(bindingID: snapshot.bindingID, expectedRevision: snapshot.revision - 1)
+            }
             let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.sessionID, runID: nil, sessionSequence: nil, type: snapshot.revision == 1 ? .worktreeCreated : .worktreeUpdated, generation: nil, turnEpoch: nil, actor: actor, correlationID: correlationID, payload: encoder.encode(snapshot))
             if let idempotency { try await saveIdempotency(idempotency, status: snapshot.revision == 1 ? 201 : 200, response: encoder.encode(snapshot)) }
             return event
@@ -536,6 +557,7 @@ public actor SQLiteServiceStore {
                 "INSERT INTO artifacts(artifact_id,project_id,session_id,schema_version,kind,logical_name,content_digest,storage_reference,size,created_sequence,created_at,retention_state) VALUES(?,?,?,1,?,?,?,?,?,?,CURRENT_TIMESTAMP,?)",
                 [.text(snapshot.artifactID.uuidString), .text(snapshot.projectID.uuidString), snapshot.sessionID.map { .text($0.uuidString) } ?? .null, .text(snapshot.kind), .text(snapshot.logicalName), .text(snapshot.contentDigest), .text(storageReference), .integer(Int(snapshot.size)), .integer(Int(snapshot.createdCursor.globalSequence)), .text(snapshot.retentionState)]
             )
+            try await activatePreparedOwnedResourceIfPresent(externalID: snapshot.artifactID, kind: .artifact, path: storageReference, size: snapshot.size, digest: snapshot.contentDigest)
             return try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.sessionID, runID: nil, sessionSequence: nil, type: .artifactCreated, generation: nil, turnEpoch: nil, actor: actor, correlationID: correlationID, payload: encoder.encode(snapshot))
         }
     }
@@ -649,29 +671,89 @@ public actor SQLiteServiceStore {
         _ = try await connection.query("PRAGMA wal_checkpoint(TRUNCATE)")
     }
 
-    public func archiveEvents(through sequence: Int64) async throws -> UUID? {
+    public func enforceEventRetention(policy: EventRetentionPolicy = .init(), now: Date = Date()) async throws -> UUID? {
+        let meta = try await metadata()
+        let latest = meta.nextGlobalSequence - 1
+        let ageBoundary = now.addingTimeInterval(-policy.minimumLiveAge).timeIntervalSince1970
+        let rows = try await connection.query(
+            "SELECT global_sequence,timestamp FROM events WHERE global_sequence>? ORDER BY global_sequence",
+            [.integer(Int(meta.replayFloor))]
+        )
+        var ageEligibleThrough = meta.replayFloor
+        for row in rows {
+            guard (row.column("timestamp")?.double ?? .greatestFiniteMagnitude) < ageBoundary else { break }
+            ageEligibleThrough = Int64(row.column("global_sequence")?.integer ?? Int(ageEligibleThrough))
+        }
+        guard let through = policy.eligibleThrough(latestSequence: latest, ageEligibleThrough: ageEligibleThrough, replayFloor: meta.replayFloor) else { return nil }
+        return try await archiveEvents(through: through)
+    }
+
+    func archiveEvents(through sequence: Int64) async throws -> UUID? {
         try await transaction {
             let meta = try await metadata()
             let bounded = min(sequence, meta.nextGlobalSequence - 1)
-            guard bounded >= meta.replayFloor else { return nil }
-            let rows = try await connection.query("SELECT envelope_json FROM events WHERE global_sequence<=? ORDER BY global_sequence", [.integer(Int(bounded))])
+            guard bounded > meta.replayFloor else { return nil }
+            let rows = try await connection.query(
+                "SELECT envelope_json FROM events WHERE global_sequence>? AND global_sequence<=? ORDER BY global_sequence",
+                [.integer(Int(meta.replayFloor)), .integer(Int(bounded))]
+            )
             let events = try rows.compactMap { row -> EventEnvelope? in
                 guard let text = row.column("envelope_json")?.string else { return nil }
                 return try decoder.decode(EventEnvelope.self, from: Data(text.utf8))
             }
-            guard let first = events.first, let last = events.last else { return nil }
+            guard let first = events.first, let last = events.last,
+                  first.globalSequence == meta.replayFloor + 1,
+                  last.globalSequence == bounded,
+                  events.enumerated().allSatisfy({ $0.element.globalSequence == first.globalSequence + Int64($0.offset) })
+            else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Event archive prefix is not contiguous") }
             let archiveID = UUID()
             let bytes = try encoder.encode(events)
+            let compressed = EventArchiveCompression.compress(bytes)
             let digest = CanonicalSigning.bodyDigest(bytes)
-            try await saveCheckpoint(scope: "events:\(meta.storeID.uuidString):pre-compaction", sequence: last.globalSequence, snapshot: bytes)
-            _ = try await connection.query("INSERT INTO event_archives(archive_id,first_sequence,last_sequence,event_count,canonical_events_json,digest,created_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP)", [.text(archiveID.uuidString), .integer(Int(first.globalSequence)), .integer(Int(last.globalSequence)), .integer(events.count), .text(String(decoding: bytes, as: UTF8.self)), .text(digest)])
-            _ = try await connection.query("DELETE FROM events WHERE global_sequence<=?", [.integer(Int(last.globalSequence))])
+            let compressedDigest = CanonicalSigning.bodyDigest(compressed)
+            try await saveCheckpoint(
+                scope: "events:\(meta.storeID.uuidString):pre-compaction",
+                sequence: last.globalSequence,
+                snapshot: bytes,
+                retentionClass: "pre_compaction",
+                archiveID: archiveID
+            )
+            _ = try await connection.query(
+                "INSERT INTO event_archive_blobs(archive_id,store_id,first_sequence,last_sequence,event_count,compression,compressed_events_base64,uncompressed_digest,compressed_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                [
+                    .text(archiveID.uuidString), .text(meta.storeID.uuidString), .integer(Int(first.globalSequence)),
+                    .integer(Int(last.globalSequence)), .integer(events.count), .text(EventArchiveCompression.algorithm),
+                    .text(compressed.base64EncodedString()), .text(digest), .text(compressedDigest),
+                    .float(Date().timeIntervalSince1970)
+                ]
+            )
+            _ = try await connection.query(
+                "DELETE FROM events WHERE global_sequence>=? AND global_sequence<=?",
+                [.integer(Int(first.globalSequence)), .integer(Int(last.globalSequence))]
+            )
             _ = try await connection.query("UPDATE service_metadata SET replay_floor=? WHERE fixed_id=1", [.integer(Int(last.globalSequence))])
             return archiveID
         }
     }
 
     public func archivedEvents(archiveID: UUID) async throws -> [EventEnvelope] {
+        if let row = try await connection.query("SELECT * FROM event_archive_blobs WHERE archive_id=?", [.text(archiveID.uuidString)]).first {
+            guard row.column("compression")?.string == EventArchiveCompression.algorithm,
+                  let encoded = row.column("compressed_events_base64")?.string,
+                  let compressed = Data(base64Encoded: encoded),
+                  CanonicalSigning.bodyDigest(compressed) == row.column("compressed_digest")?.string
+            else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Compressed event archive digest is invalid", retryable: false) }
+            let bytes = try EventArchiveCompression.decompress(compressed)
+            guard CanonicalSigning.bodyDigest(bytes) == row.column("uncompressed_digest")?.string else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Event archive payload digest is invalid", retryable: false)
+            }
+            let events = try decoder.decode([EventEnvelope].self, from: bytes)
+            guard events.count == row.column("event_count")?.integer,
+                  events.first?.globalSequence == Int64(row.column("first_sequence")?.integer ?? -1),
+                  events.last?.globalSequence == Int64(row.column("last_sequence")?.integer ?? -1)
+            else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Event archive sequence metadata is invalid", retryable: false) }
+            return events
+        }
         guard let text = try await connection.query("SELECT canonical_events_json FROM event_archives WHERE archive_id=?", [.text(archiveID.uuidString)]).first?.column("canonical_events_json")?.string else { throw ServiceAPIError(code: .notFound, message: "Event archive not found") }
         return try decoder.decode([EventEnvelope].self, from: Data(text.utf8))
     }
@@ -680,28 +762,68 @@ public actor SQLiteServiceStore {
         try await connection.query("SELECT sequence,digest FROM snapshot_checkpoints WHERE scope=? ORDER BY sequence", [.text(scope)]).map { (Int64($0.column("sequence")?.integer ?? 0), $0.column("digest")?.string ?? "") }
     }
 
-    public func markRestored(from priorStoreID: UUID, backupSequence: Int64, digest: String) async throws -> UUID {
+    public func prepareRestoredStore(
+        from priorStoreID: UUID,
+        backupSequence: Int64,
+        digest: String,
+        activationToken: Data
+    ) async throws -> UUID {
+        guard !activationToken.isEmpty else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Restore activation token is required")
+        }
         let current = try await metadata()
-        guard current.storeID == priorStoreID else {
-            throw ServiceAPIError(code: .invalidRequest, message: "Restore provenance does not match the current store namespace")
+        guard current.storeID == priorStoreID, current.activationState == "active" else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Restore provenance does not match the active store namespace")
         }
         let fresh = UUID()
         let restoredFloor = max(backupSequence, current.nextGlobalSequence - 1)
         let restoredCursor = ServiceCursor(storeID: fresh, globalSequence: restoredFloor)
         let projects = try await allProjects().map { replacingCursor($0, cursor: restoredCursor) }
         let sessions = try await allSessions().map { replacingCursor($0, cursor: restoredCursor) }
+        let tokenDigest = CanonicalSigning.bodyDigest(activationToken)
         try await transaction {
-            _ = try await connection.query("UPDATE service_metadata SET restored_from_store_id=store_id,store_id=?,restore_backup_sequence=?,restore_digest=?,replay_floor=?,next_global_sequence=?,last_clean_shutdown=0 WHERE fixed_id=1", [.text(fresh.uuidString), .integer(Int(backupSequence)), .text(digest), .integer(Int(restoredFloor)), .integer(Int(restoredFloor + 1))])
+            _ = try await connection.query(
+                "UPDATE service_metadata SET restored_from_store_id=store_id,store_id=?,restore_backup_sequence=?,restore_digest=?,replay_floor=?,next_global_sequence=?,last_clean_shutdown=0,activation_state='restore_prepared',activation_generation=activation_generation+1,activation_token_digest=?,activation_instance_id=NULL WHERE fixed_id=1",
+                [.text(fresh.uuidString), .integer(Int(backupSequence)), .text(digest), .integer(Int(restoredFloor)), .integer(Int(restoredFloor + 1)), .text(tokenDigest)]
+            )
             for project in projects {
                 _ = try await connection.query("UPDATE projects SET snapshot_json=?,updated_at=CURRENT_TIMESTAMP WHERE project_id=?", [.text(encodeText(project)), .text(project.projectID.uuidString)])
             }
             for session in sessions {
                 _ = try await connection.query("UPDATE sessions SET snapshot_json=?,updated_at=CURRENT_TIMESTAMP WHERE session_id=?", [.text(encodeText(session)), .text(session.sessionID.uuidString)])
             }
-            let provenance = try encodeText(["priorStoreId": priorStoreID.uuidString])
-            _ = try await connection.query("INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,1,'store.restored',?,CURRENT_TIMESTAMP)", [.text(UUID().uuidString), .text(provenance)])
+            let provenance = try encodeText(["priorStoreId": priorStoreID.uuidString, "freshStoreId": fresh.uuidString, "digest": digest])
+            try await saveCheckpoint(scope: "store:\(fresh.uuidString):restore", sequence: restoredFloor, snapshot: Data(provenance.utf8), retentionClass: "restore")
+            _ = try await connection.query("INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,2,'store.restore_prepared',?,CURRENT_TIMESTAMP)", [.text(UUID().uuidString), .text(provenance)])
             return ()
         }
+        return fresh
+    }
+
+    public func activateRestoredStore(activationToken: Data, instanceID: UUID) async throws -> UUID {
+        try await transaction {
+            let row = try await requireRow(connection.query("SELECT store_id,activation_state,activation_token_digest FROM service_metadata WHERE fixed_id=1"))
+            guard row.column("activation_state")?.string == "restore_prepared",
+                  row.column("activation_token_digest")?.string == CanonicalSigning.bodyDigest(activationToken)
+            else {
+                throw ServiceAPIError(code: .quiescing, message: "Restored store activation is fenced")
+            }
+            let storeID = try requireUUID(row.column("store_id")?.string)
+            _ = try await connection.query(
+                "UPDATE service_metadata SET activation_state='active',activation_token_digest=NULL,activation_instance_id=?,last_clean_shutdown=0 WHERE fixed_id=1 AND activation_state='restore_prepared'",
+                [.text(instanceID.uuidString)]
+            )
+            let payload = try encodeText(["storeId": storeID.uuidString, "instanceId": instanceID.uuidString])
+            _ = try await connection.query("INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,2,'store.restore_activated',?,CURRENT_TIMESTAMP)", [.text(UUID().uuidString), .text(payload)])
+            return storeID
+        }
+    }
+
+    @available(*, deprecated, message: "Use prepareRestoredStore and activateRestoredStore for operator-acknowledged activation")
+    public func markRestored(from priorStoreID: UUID, backupSequence: Int64, digest: String) async throws -> UUID {
+        let token = Data(UUID().uuidString.utf8)
+        let fresh = try await prepareRestoredStore(from: priorStoreID, backupSequence: backupSequence, digest: digest, activationToken: token)
+        _ = try await activateRestoredStore(activationToken: token, instanceID: UUID())
         return fresh
     }
 
@@ -711,7 +833,9 @@ public actor SQLiteServiceStore {
         let digest = CanonicalSigning.bodyDigest(payload)
         let keyID = eventSigningKey?.keyID ?? "unsigned-local"
         let signature = eventSigningKey.map { CanonicalSigning.hmacSHA256(message: "\(meta.storeID.uuidString)\n\(sequence)\n\(digest)", key: $0.secret) } ?? ""
-        let envelope = EventEnvelope(protocolVersion: 1, eventID: UUID(), storeID: meta.storeID, globalSequence: sequence, timestamp: Date(), projectID: projectID, sessionID: sessionID, agentID: agentID, parentAgentID: parentAgentID, rootSessionID: rootSessionID, runID: runID, sessionSequence: sessionSequence, eventType: type, payloadVersion: 1, generation: generation, turnEpoch: turnEpoch, actor: actor, correlationID: correlationID, causationID: nil, payload: payload, digest: digest, keyID: keyID, signature: signature)
+        let lastTimestamp = try await connection.query("SELECT last_event_timestamp FROM service_metadata WHERE fixed_id=1").first?.column("last_event_timestamp")?.double ?? 0
+        let eventTimestamp = Date(timeIntervalSince1970: max(Date().timeIntervalSince1970, lastTimestamp))
+        let envelope = EventEnvelope(protocolVersion: 1, eventID: UUID(), storeID: meta.storeID, globalSequence: sequence, timestamp: eventTimestamp, projectID: projectID, sessionID: sessionID, agentID: agentID, parentAgentID: parentAgentID, rootSessionID: rootSessionID, runID: runID, sessionSequence: sessionSequence, eventType: type, payloadVersion: 1, generation: generation, turnEpoch: turnEpoch, actor: actor, correlationID: correlationID, causationID: nil, payload: payload, digest: digest, keyID: keyID, signature: signature)
         let actorJSON = try actor.map(encodeText)
         let bindings: [SQLiteData] = try [
             .integer(Int(sequence)), .text(envelope.eventID.uuidString), .text(projectID.uuidString), sessionID.map { .text($0.uuidString) } ?? .null,
@@ -721,7 +845,22 @@ public actor SQLiteServiceStore {
             .text(digest), .float(envelope.timestamp.timeIntervalSince1970), .text(encodeText(envelope))
         ]
         _ = try await connection.query("INSERT INTO events(global_sequence,event_id,project_id,session_id,agent_id,parent_agent_id,root_session_id,run_id,session_sequence,event_type,payload_version,generation,turn_epoch,actor_json,payload_json,digest,timestamp,envelope_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", bindings)
-        _ = try await connection.query("UPDATE service_metadata SET next_global_sequence = next_global_sequence + 1, last_clean_shutdown = 0 WHERE fixed_id = 1")
+        _ = try await connection.query(
+            "UPDATE service_metadata SET next_global_sequence=next_global_sequence+1,last_clean_shutdown=0,last_event_timestamp=? WHERE fixed_id=1",
+            [.float(eventTimestamp.timeIntervalSince1970)]
+        )
+        if let sessionID {
+            _ = try await connection.query(
+                "INSERT INTO session_event_counters(session_id,event_count,last_sequence) VALUES(?,1,?) ON CONFLICT(session_id) DO UPDATE SET event_count=event_count+1,last_sequence=excluded.last_sequence",
+                [.text(sessionID.uuidString), .integer(Int(sequence))]
+            )
+            let count = try await connection.query("SELECT event_count FROM session_event_counters WHERE session_id=?", [.text(sessionID.uuidString)]).first?.column("event_count")?.integer ?? 0
+            if count > 0, count.isMultiple(of: 1000),
+               let snapshot = try await connection.query("SELECT snapshot_json FROM sessions WHERE session_id=?", [.text(sessionID.uuidString)]).first?.column("snapshot_json")?.string
+            {
+                try await saveCheckpoint(scope: "session:\(sessionID.uuidString)", sequence: sequence, snapshot: Data(snapshot.utf8), retentionClass: "rolling")
+            }
+        }
         return envelope
     }
 
@@ -772,8 +911,8 @@ public actor SQLiteServiceStore {
             )
         }
         let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.rootSessionID, runID: nil, sessionSequence: Int64(snapshot.transcript.count), type: eventType, generation: snapshot.runGeneration, turnEpoch: snapshot.turnEpoch, actor: actor, correlationID: correlationID, payload: Data(snapshotJSON.utf8))
-        if [.completed, .failed, .canceled, .interrupted, .archived].contains(snapshot.state) || (!snapshot.transcript.isEmpty && snapshot.transcript.count.isMultiple(of: 1000)) {
-            try await saveCheckpoint(scope: "session:\(snapshot.sessionID.uuidString)", sequence: event.globalSequence, snapshot: Data(snapshotJSON.utf8))
+        if [.completed, .failed, .canceled, .interrupted, .archived].contains(snapshot.state) {
+            try await saveCheckpoint(scope: "session:\(snapshot.sessionID.uuidString)", sequence: event.globalSequence, snapshot: Data(snapshotJSON.utf8), retentionClass: "terminal")
         }
         if let idempotency {
             try await saveIdempotency(idempotency, status: 202, response: idempotencyResponse ?? encoder.encode(snapshot))
@@ -813,10 +952,37 @@ public actor SQLiteServiceStore {
         }
         try await addColumnIfMissing(table: "events", column: "agent_id", definition: "TEXT")
         try await addColumnIfMissing(table: "events", column: "parent_agent_id", definition: "TEXT")
+        try await addColumnIfMissing(table: "service_metadata", column: "last_event_timestamp", definition: "REAL NOT NULL DEFAULT 0")
+        try await addColumnIfMissing(table: "service_metadata", column: "activation_state", definition: "TEXT NOT NULL DEFAULT 'active'")
+        try await addColumnIfMissing(table: "service_metadata", column: "activation_generation", definition: "INTEGER NOT NULL DEFAULT 1")
+        try await addColumnIfMissing(table: "service_metadata", column: "activation_token_digest", definition: "TEXT")
+        try await addColumnIfMissing(table: "service_metadata", column: "activation_instance_id", definition: "TEXT")
+        try await addColumnIfMissing(table: "owned_resources", column: "external_id", definition: "TEXT")
+        try await addColumnIfMissing(table: "owned_resources", column: "temporary_path_identity", definition: "TEXT")
+        try await addColumnIfMissing(table: "owned_resources", column: "content_digest", definition: "TEXT")
+        try await addColumnIfMissing(table: "owned_resources", column: "metadata_json", definition: "TEXT NOT NULL DEFAULT '{}'")
+        try await addColumnIfMissing(table: "owned_resources", column: "created_at", definition: "REAL NOT NULL DEFAULT 0")
+        try await addColumnIfMissing(table: "owned_resources", column: "updated_at", definition: "REAL NOT NULL DEFAULT 0")
+        try await addColumnIfMissing(table: "snapshot_checkpoints", column: "retention_class", definition: "TEXT NOT NULL DEFAULT 'rolling'")
+        try await addColumnIfMissing(table: "snapshot_checkpoints", column: "archive_id", definition: "TEXT")
+        for statement in SchemaV2.statements {
+            _ = try await connection.query(statement)
+        }
         let count = try await connection.query("SELECT COUNT(*) AS count FROM service_metadata").first?.column("count")?.integer ?? 0
         if count == 0 {
             _ = try await connection.query("INSERT INTO service_metadata(fixed_id,store_id,schema_version,created_at,last_clean_shutdown,current_boot_epoch,next_global_sequence,replay_floor) VALUES(1,?,1,CURRENT_TIMESTAMP,0,1,1,0)", [.text(UUID().uuidString)])
             _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v1',1,'initial durable service schema','v1',CURRENT_TIMESTAMP)")
+        }
+        let v2 = try await connection.query("SELECT digest FROM schema_migrations WHERE version=2").first
+        if let v2 {
+            guard v2.column("digest")?.string == SchemaV2.digest else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Schema v2 migration digest mismatch", retryable: false)
+            }
+        } else {
+            _ = try await connection.query("UPDATE owned_resources SET created_at=CASE WHEN created_at=0 THEN unixepoch() ELSE created_at END,updated_at=CASE WHEN updated_at=0 THEN unixepoch() ELSE updated_at END")
+            _ = try await connection.query("INSERT OR IGNORE INTO session_event_counters(session_id,event_count,last_sequence) SELECT session_id,COUNT(*),MAX(global_sequence) FROM events WHERE session_id IS NOT NULL GROUP BY session_id")
+            _ = try await connection.query("UPDATE service_metadata SET schema_version=2,last_event_timestamp=COALESCE((SELECT MAX(timestamp) FROM events),0) WHERE fixed_id=1")
+            _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v2',2,'owned resources, immutable archives, protected checkpoints, and restore activation',?,CURRENT_TIMESTAMP)", [.text(SchemaV2.digest)])
         }
     }
 
@@ -831,16 +997,41 @@ public actor SQLiteServiceStore {
         guard result == "ok" else { throw ServiceAPIError(code: .persistenceUnavailable, message: "SQLite integrity check failed", retryable: false) }
     }
 
-    private func transaction<T>(_ body: () async throws -> T) async throws -> T {
-        _ = try await connection.query("BEGIN IMMEDIATE")
-        do { let result = try await body()
+    func transaction<T>(_ body: () async throws -> T) async throws -> T {
+        await acquireTransactionSlot()
+        do {
+            _ = try await connection.query("BEGIN IMMEDIATE")
+            let result = try await body()
             _ = try await connection.query("COMMIT")
+            releaseTransactionSlot()
             return result
-        } catch let existing as ExistingIdempotency { _ = try await connection.query("ROLLBACK")
+        } catch let existing as ExistingIdempotency {
+            _ = try? await connection.query("ROLLBACK")
+            releaseTransactionSlot()
             throw existing
-        } catch { _ = try? await connection.query("ROLLBACK")
+        } catch {
+            _ = try? await connection.query("ROLLBACK")
+            releaseTransactionSlot()
             throw error
         }
+    }
+
+    private func acquireTransactionSlot() async {
+        guard transactionActive else {
+            transactionActive = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            transactionWaiters.append(continuation)
+        }
+    }
+
+    private func releaseTransactionSlot() {
+        guard !transactionWaiters.isEmpty else {
+            transactionActive = false
+            return
+        }
+        transactionWaiters.removeFirst().resume()
     }
 
     private func validateExpectedCursor(_ cursor: ServiceCursor) async throws {
@@ -854,7 +1045,7 @@ public actor SQLiteServiceStore {
         }
     }
 
-    private func encodeText(_ value: some Encodable) throws -> String {
+    func encodeText(_ value: some Encodable) throws -> String {
         try String(decoding: encoder.encode(value), as: UTF8.self)
     }
 
@@ -863,7 +1054,7 @@ public actor SQLiteServiceStore {
         return row
     }
 
-    private func requireUUID(_ value: String?) throws -> UUID {
+    func requireUUID(_ value: String?) throws -> UUID {
         guard let value, let id = UUID(uuidString: value) else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Persisted UUID is invalid") }
         return id
     }
@@ -908,10 +1099,37 @@ public actor SQLiteServiceStore {
         ProjectSnapshot(projectID: value.projectID, name: value.name, creator: value.creator, state: value.state, roots: value.roots, revision: value.revision, cursor: cursor)
     }
 
-    private func saveCheckpoint(scope: String, sequence: Int64, snapshot: Data) async throws {
+    private func saveCheckpoint(
+        scope: String,
+        sequence: Int64,
+        snapshot: Data,
+        retentionClass: String = "rolling",
+        archiveID: UUID? = nil
+    ) async throws {
         let digest = CanonicalSigning.bodyDigest(snapshot)
-        _ = try await connection.query("INSERT OR IGNORE INTO snapshot_checkpoints(scope,sequence,schema_version,snapshot,digest,created_at) VALUES(?,?,1,?,?,CURRENT_TIMESTAMP)", [.text(scope), .integer(Int(sequence)), .text(snapshot.base64EncodedString()), .text(digest)])
-        _ = try await connection.query("DELETE FROM snapshot_checkpoints WHERE scope=? AND sequence NOT IN (SELECT sequence FROM snapshot_checkpoints WHERE scope=? ORDER BY sequence DESC LIMIT 3)", [.text(scope), .text(scope)])
+        if let existing = try await connection.query(
+            "SELECT digest,retention_class FROM snapshot_checkpoints WHERE scope=? AND sequence=?",
+            [.text(scope), .integer(Int(sequence))]
+        ).first {
+            guard existing.column("digest")?.string == digest else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Checkpoint identity collides with different content", retryable: false)
+            }
+            if existing.column("retention_class")?.string == "rolling", retentionClass != "rolling" {
+                _ = try await connection.query(
+                    "UPDATE snapshot_checkpoints SET retention_class=?,archive_id=? WHERE scope=? AND sequence=?",
+                    [.text(retentionClass), archiveID.map { .text($0.uuidString) } ?? .null, .text(scope), .integer(Int(sequence))]
+                )
+            }
+        } else {
+            _ = try await connection.query(
+                "INSERT INTO snapshot_checkpoints(scope,sequence,schema_version,snapshot,digest,created_at,retention_class,archive_id) VALUES(?,?,2,?,?,CURRENT_TIMESTAMP,?,?)",
+                [.text(scope), .integer(Int(sequence)), .text(snapshot.base64EncodedString()), .text(digest), .text(retentionClass), archiveID.map { .text($0.uuidString) } ?? .null]
+            )
+        }
+        _ = try await connection.query(
+            "DELETE FROM snapshot_checkpoints WHERE scope=? AND retention_class='rolling' AND sequence NOT IN (SELECT sequence FROM snapshot_checkpoints WHERE scope=? AND retention_class='rolling' ORDER BY sequence DESC LIMIT 3)",
+            [.text(scope), .text(scope)]
+        )
     }
 
     private func replacingCursor(_ value: SessionSnapshot, cursor: ServiceCursor) -> SessionSnapshot {

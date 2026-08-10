@@ -26,6 +26,8 @@ public struct RepoPromptReadinessSnapshot: Codable, Sendable {
     public let degradedProjectIDs: [UUID]
     public let activeSessionCount: Int
     public let maximumActiveSessions: Int
+    public let operational: StoreOperationalSnapshot?
+    public let drain: MutationDrainSnapshot
     public let observedAt: Date
 }
 
@@ -33,6 +35,7 @@ public actor RepoPromptReadinessService {
     public struct Volume: Hashable, Sendable {
         public let name: String
         public let path: String
+
         public init(name: String, path: String) {
             self.name = name
             self.path = path
@@ -43,35 +46,73 @@ public actor RepoPromptReadinessService {
     private let store: SQLiteServiceStore
     private let volumes: [Volume]
     private let requiredProviders: Set<ProviderKind>
+    private let expectedProviderProtocols: [ProviderKind: String]
     private let minimumFreeBytes: Int64
     private let minimumFreeNodes: Int64
     private let maximumActiveSessions: Int
     private let cacheDuration: TimeInterval
+    private let drainController: MutationDrainController
+    private let trustConfigurationValid: Bool
     private var cached: RepoPromptReadinessSnapshot?
 
-    public init(authority: RepoPromptHeadlessAuthority, store: SQLiteServiceStore, volumes: [Volume] = [], requiredProviders: Set<ProviderKind> = [], minimumFreeBytes: Int64 = 268_435_456, minimumFreeNodes: Int64 = 1024, maximumActiveSessions: Int = 64, cacheDuration: TimeInterval = 15) {
+    public init(
+        authority: RepoPromptHeadlessAuthority,
+        store: SQLiteServiceStore,
+        volumes: [Volume] = [],
+        requiredProviders: Set<ProviderKind> = [],
+        expectedProviderProtocols: [ProviderKind: String] = [:],
+        minimumFreeBytes: Int64 = 268_435_456,
+        minimumFreeNodes: Int64 = 1024,
+        maximumActiveSessions: Int = 64,
+        cacheDuration: TimeInterval = 15,
+        drainController: MutationDrainController = MutationDrainController(),
+        trustConfigurationValid: Bool = true
+    ) {
         self.authority = authority
         self.store = store
         self.volumes = volumes
         self.requiredProviders = requiredProviders
+        self.expectedProviderProtocols = expectedProviderProtocols
         self.minimumFreeBytes = minimumFreeBytes
         self.minimumFreeNodes = minimumFreeNodes
         self.maximumActiveSessions = maximumActiveSessions
         self.cacheDuration = cacheDuration
+        self.drainController = drainController
+        self.trustConfigurationValid = trustConfigurationValid
     }
 
     public func snapshot(forceRefresh: Bool = false) async -> RepoPromptReadinessSnapshot {
-        if !forceRefresh, let cached, Date().timeIntervalSince(cached.observedAt) < cacheDuration { return cached }
-        var checks: [ReadinessCheck] = []
-        do {
-            let metadata = try await store.metadata()
-            checks.append(ReadinessCheck(name: "sqlite", ready: metadata.schemaVersion == 1, detail: metadata.schemaVersion == 1 ? "schema-v1" : "schema-mismatch"))
-        } catch {
-            checks.append(ReadinessCheck(name: "sqlite", ready: false, detail: "unavailable"))
+        let drain = await drainController.snapshot()
+        if drain.acceptingMutations,
+           !forceRefresh,
+           let cached,
+           Date().timeIntervalSince(cached.observedAt) < cacheDuration
+        {
+            return cached
         }
 
+        var checks = [ReadinessCheck]()
+        var operational: StoreOperationalSnapshot?
+        do {
+            let snapshot = try await store.operationalSnapshot()
+            operational = snapshot
+            checks.append(.init(name: "sqlite-integrity", ready: snapshot.integrityValid, detail: snapshot.integrityValid ? "ok" : "failed"))
+            checks.append(.init(name: "migrations", ready: snapshot.migrationsValid, detail: snapshot.migrationsValid ? "schema-v2" : "mismatch"))
+            checks.append(.init(name: "activation", ready: snapshot.activationState == "active", detail: snapshot.activationState))
+            checks.append(.init(name: "supervisor-recovery", ready: snapshot.activeProcessFamilyCount == 0, detail: "active-families=\(snapshot.activeProcessFamilyCount)"))
+            checks.append(.init(name: "owned-resources", ready: snapshot.ownedResources.ready, detail: snapshot.ownedResources.ready ? "reconciled" : "degraded"))
+        } catch {
+            checks.append(.init(name: "sqlite-integrity", ready: false, detail: "unavailable"))
+            checks.append(.init(name: "migrations", ready: false, detail: "unavailable"))
+            checks.append(.init(name: "activation", ready: false, detail: "unavailable"))
+            checks.append(.init(name: "supervisor-recovery", ready: false, detail: "unavailable"))
+            checks.append(.init(name: "owned-resources", ready: false, detail: "unavailable"))
+        }
+
+        checks.append(.init(name: "trust", ready: trustConfigurationValid, detail: trustConfigurationValid ? "validated" : "invalid"))
         let authorityReady = await authority.isReady()
-        checks.append(ReadinessCheck(name: "quiesce", ready: authorityReady, detail: authorityReady ? "accepting" : "quiescing"))
+        let accepting = drain.acceptingMutations && authorityReady
+        checks.append(.init(name: "quiesce", ready: accepting, detail: accepting ? "accepting" : "draining"))
         for volume in volumes {
             checks.append(volumeCheck(volume))
         }
@@ -79,17 +120,51 @@ public actor RepoPromptReadinessService {
         let capabilities = await authority.providerCapabilities(preflight: true)
         let providers = capabilities.map { capability in
             let required = requiredProviders.contains(capability.kind)
-            return ProviderReadiness(kind: capability.kind, required: required, ready: !required || capability.enabled, version: capability.version, protocolVersion: capability.protocolVersion, detail: capability.enabled ? "ready" : (capability.reasonUnavailable ?? "disabled"))
+            let expectedProtocol = expectedProviderProtocols[capability.kind]
+            let protocolMatches = expectedProtocol == nil || capability.protocolVersion == expectedProtocol
+            let ready = !required || (capability.enabled && protocolMatches)
+            let detail: String
+            if !capability.enabled {
+                detail = capability.reasonUnavailable ?? "disabled"
+            } else if !protocolMatches {
+                detail = "protocol-mismatch"
+            } else {
+                detail = "ready"
+            }
+            return ProviderReadiness(
+                kind: capability.kind,
+                required: required,
+                ready: ready,
+                version: capability.version,
+                protocolVersion: capability.protocolVersion,
+                detail: detail
+            )
         }
+        let representedProviders = Set(providers.map(\.kind))
+        let missingProviders = requiredProviders.subtracting(representedProviders).map {
+            ProviderReadiness(kind: $0, required: true, ready: false, version: nil, protocolVersion: nil, detail: "missing")
+        }
+        let completeProviders = (providers + missingProviders).sorted { $0.kind.rawValue < $1.kind.rawValue }
+
         let sessions = await authority.sessionSnapshots()
         let activeStates: Set<SessionLifecycleState> = [.preparing, .running, .waiting]
         let activeSessionCount = sessions.count(where: { activeStates.contains($0.state) })
         let capacityReady = activeSessionCount < maximumActiveSessions
-        checks.append(ReadinessCheck(name: "session-capacity", ready: capacityReady, detail: "\(activeSessionCount)/\(maximumActiveSessions)"))
+        checks.append(.init(name: "session-capacity", ready: capacityReady, detail: "\(activeSessionCount)/\(maximumActiveSessions)"))
         let projects = await authority.projectSnapshots()
         let degraded = projects.filter { $0.state == .degraded }.map(\.projectID).sorted { $0.uuidString < $1.uuidString }
-        let ready = checks.allSatisfy(\.ready) && providers.allSatisfy(\.ready)
-        let result = RepoPromptReadinessSnapshot(ready: ready, checks: checks, providers: providers, degradedProjectIDs: degraded, activeSessionCount: activeSessionCount, maximumActiveSessions: maximumActiveSessions, observedAt: Date())
+        let ready = checks.allSatisfy(\.ready) && completeProviders.allSatisfy(\.ready)
+        let result = RepoPromptReadinessSnapshot(
+            ready: ready,
+            checks: checks,
+            providers: completeProviders,
+            degradedProjectIDs: degraded,
+            activeSessionCount: activeSessionCount,
+            maximumActiveSessions: maximumActiveSessions,
+            operational: operational,
+            drain: drain,
+            observedAt: Date()
+        )
         cached = result
         return result
     }
@@ -98,7 +173,7 @@ public actor RepoPromptReadinessService {
         let manager = FileManager.default
         var isDirectory: ObjCBool = false
         guard manager.fileExists(atPath: volume.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-            return ReadinessCheck(name: "volume:\(volume.name)", ready: false, detail: "missing")
+            return .init(name: "volume:\(volume.name)", ready: false, detail: "missing")
         }
         let probe = URL(fileURLWithPath: volume.path, isDirectory: true).appendingPathComponent(".repoprompt-readiness-\(UUID().uuidString)")
         do {
@@ -108,9 +183,9 @@ public actor RepoPromptReadinessService {
             let freeBytes = (attributes[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
             let freeNodes = (attributes[.systemFreeNodes] as? NSNumber)?.int64Value ?? minimumFreeNodes
             let ready = freeBytes >= minimumFreeBytes && freeNodes >= minimumFreeNodes
-            return ReadinessCheck(name: "volume:\(volume.name)", ready: ready, detail: ready ? "writable" : "capacity-low")
+            return .init(name: "volume:\(volume.name)", ready: ready, detail: ready ? "writable" : "capacity-low")
         } catch {
-            return ReadinessCheck(name: "volume:\(volume.name)", ready: false, detail: "not-writable")
+            return .init(name: "volume:\(volume.name)", ready: false, detail: "not-writable")
         }
     }
 }
@@ -121,4 +196,7 @@ struct RepoPromptDiagnostics: Codable {
     let nextGlobalSequence: Int64
     let replayFloor: Int64
     let readiness: RepoPromptReadinessSnapshot
+    let operational: StoreOperationalSnapshot?
+    let drain: MutationDrainSnapshot
+    let maintenance: DurabilityMaintenanceSnapshot?
 }
