@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptAgentRuntimeCore
 import RepoPromptHeadlessRuntime
 import RepoPromptServicePersistence
+import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 private struct ImmediateClock: RuntimeClock {
@@ -54,6 +55,19 @@ private actor FakeProcessPort: ProcessSupervisionPort {
 }
 
 final class ProviderSupervisorTests: XCTestCase {
+    func testCodexJSONLPublishesDurableIdentityAndUsesNativeResumeCommand() async throws {
+        let runner = RecordingProviderRunner()
+        let adapter = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: "/usr/bin/true")], runner: runner)
+        let first = try await adapter.execute(kind: .codex, model: "gpt-test", prompt: "first", workingDirectory: "/tmp")
+        XCTAssertEqual(first.providerSessionID, "11111111-1111-1111-1111-111111111111")
+        XCTAssertEqual(first.output, "done")
+        _ = try await adapter.execute(kind: .codex, model: nil, prompt: "continue", workingDirectory: "/tmp", resumeProviderSessionID: first.providerSessionID)
+        let calls = await runner.calls()
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(Array(calls[1].prefix(4)), ["exec", "resume", "--json", "--skip-git-repo-check"])
+        XCTAssertTrue(calls[1].contains("11111111-1111-1111-1111-111111111111"))
+    }
+
     func testProviderUsesAuthorityRunIDAndRemovesEphemeralCredentialHome() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let executable = directory.appendingPathComponent("provider")
@@ -152,5 +166,21 @@ final class ProviderSupervisorTests: XCTestCase {
         let result = await port.result()
         XCTAssertEqual(result.reaped.sorted(), [300, 301])
         try await store.close()
+    }
+}
+
+private actor RecordingProviderRunner: WorkspaceCommandRunning {
+    private var arguments: [[String]] = []
+
+    func run(executable _: String, arguments: [String], workingDirectory _: String, maximumBytes _: Int) async throws -> String {
+        self.arguments.append(arguments)
+        return """
+        {"type":"thread.started","thread_id":"11111111-1111-1111-1111-111111111111"}
+        {"type":"item.completed","item":{"type":"agent_message","text":"done"}}
+        """
+    }
+
+    func calls() -> [[String]] {
+        arguments
     }
 }

@@ -660,6 +660,7 @@ public actor RepoPromptHeadlessAuthority {
             providerTasks[binding.runID] = nil
             try await providerAdapter?.cancel(runID: binding.runID)
             guard await session.settle(binding: binding, terminal: .sessionInterrupted, lifecycle: .interrupted) == .accepted else { continue }
+            try await finishPersistedRun(sessionID: snapshot.sessionID, binding: binding, state: "interrupted", reason: "service-quiesce")
             let cursor = try await store.nextCursor()
             let event = try await store.persistSession(replacingCursor(session.snapshot(), cursor: cursor), eventType: .sessionInterrupted, actor: nil, correlationID: ids.next(), idempotency: nil)
             await eventHub.publish(event)
@@ -747,7 +748,17 @@ public actor RepoPromptHeadlessAuthority {
     private func startProviderRun(command: SessionCommand, sessionID: UUID, session: SessionAuthority, actor: ExternalActor, idempotency: IdempotencyInput) async throws -> CommandReceipt {
         guard let providerAdapter else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider runtime is not configured") }
         let snapshot = await session.snapshot()
-        guard await providerAdapter.capabilities().contains(where: { $0.kind == snapshot.provider && $0.enabled }) else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Session provider is unavailable") }
+        guard let capability = await providerAdapter.capabilities().first(where: { $0.kind == snapshot.provider && $0.enabled }) else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Session provider is unavailable") }
+        let resumeMode: String = switch command {
+        case let .resumeSession(_, mode): mode
+        default: "fresh"
+        }
+        guard ["fresh", "resume", "auto"].contains(resumeMode) else { throw ServiceAPIError(code: .invalidRequest, message: "Unsupported provider resume mode") }
+        let previousRun = try await store.latestRun(sessionID: sessionID)
+        let resumeIdentity = resumeMode == "fresh" ? nil : previousRun?.providerSessionID
+        if resumeMode == "resume", !capability.supportsResume || resumeIdentity == nil {
+            throw ServiceAPIError(code: .resumeUnsupported, message: "No durable provider identity is available for native resume")
+        }
         let binding = try await session.beginRun(connectionGeneration: snapshot.runGeneration + 1)
         let current = await session.snapshot()
         let cursor = try await store.nextCursor()
@@ -756,10 +767,12 @@ public actor RepoPromptHeadlessAuthority {
         let event = try await store.persistSession(persisted, eventType: .sessionResumed, actor: actor, correlationID: ids.next(), idempotency: idempotency, idempotencyResponse: JSONEncoder.serviceEncoder.encode(receipt))
         await eventHub.publish(event)
         try await updateAgentLifecycle(sessionID: sessionID, state: .running, eventType: .agentUpdated, actor: actor)
+        let run = ProviderRunSnapshot(runID: binding.runID, sessionID: sessionID, provider: snapshot.provider, providerSessionID: resumeIdentity, state: "running", generation: binding.generation, turnEpoch: binding.turnEpoch, startReason: resumeIdentity == nil ? "fresh" : "resume", startedAt: clock.now())
+        try await store.persistRun(run)
         let project = try await projectSnapshot(projectID: snapshot.projectID)
         guard let workingDirectory = project.roots.first?.canonicalPath else { throw ServiceAPIError(code: .rootUnauthorized, message: "Project has no roots") }
         let prompt = snapshot.transcript.last(where: { $0.kind == .human })?.content ?? "Continue the repository task."
-        providerTasks[binding.runID] = Task { await self.performProviderRun(sessionID: sessionID, binding: binding, prompt: prompt, workingDirectory: workingDirectory) }
+        providerTasks[binding.runID] = Task { await self.performProviderRun(sessionID: sessionID, binding: binding, run: run, prompt: prompt, workingDirectory: workingDirectory) }
         return receipt
     }
 
@@ -774,7 +787,8 @@ public actor RepoPromptHeadlessAuthority {
         await eventHub.publish(event)
         let project = try await projectSnapshot(projectID: current.projectID)
         guard let workingDirectory = project.roots.first?.canonicalPath else { throw ServiceAPIError(code: .rootUnauthorized, message: "Project has no roots") }
-        providerTasks[binding.runID] = Task { await self.performProviderRun(sessionID: sessionID, binding: binding, prompt: text, workingDirectory: workingDirectory) }
+        let run = await (try? store.latestRun(sessionID: sessionID)) ?? ProviderRunSnapshot(runID: binding.runID, sessionID: sessionID, provider: current.provider, state: "running", generation: binding.generation, turnEpoch: binding.turnEpoch, startReason: "steer", startedAt: clock.now())
+        providerTasks[binding.runID] = Task { await self.performProviderRun(sessionID: sessionID, binding: binding, run: run, prompt: text, workingDirectory: workingDirectory) }
         return receipt
     }
 
@@ -787,6 +801,7 @@ public actor RepoPromptHeadlessAuthority {
         providerTasks[binding.runID] = nil
         try await providerAdapter?.cancel(runID: binding.runID)
         guard await session.settle(binding: binding, terminal: .sessionCanceled, lifecycle: .canceled) == .accepted else { throw ServiceAPIError(code: .staleRevision, message: "Run is already settled") }
+        try await finishPersistedRun(sessionID: sessionID, binding: binding, state: "canceled", reason: "user-cancel")
         let cursor = try await store.nextCursor()
         let receipt = CommandReceipt(commandID: ids.next(), sessionID: sessionID, operation: command.operation, acceptedCursor: cursor, status: "accepted")
         let event = try await store.persistSession(replacingCursor(session.snapshot(), cursor: cursor), eventType: .sessionCanceled, actor: actor, correlationID: ids.next(), idempotency: idempotency, idempotencyResponse: JSONEncoder.serviceEncoder.encode(receipt))
@@ -814,6 +829,7 @@ public actor RepoPromptHeadlessAuthority {
                 providerTasks[binding.runID] = nil
                 try await providerAdapter?.cancel(runID: binding.runID)
                 _ = await child.settle(binding: binding, terminal: .sessionCanceled, lifecycle: .canceled)
+                try await finishPersistedRun(sessionID: snapshot.sessionID, binding: binding, state: "canceled", reason: "root-cancel")
             } else {
                 try await child.cancelWithoutActiveRun()
             }
@@ -830,12 +846,14 @@ public actor RepoPromptHeadlessAuthority {
         }
     }
 
-    private func performProviderRun(sessionID: UUID, binding: RunBindingIdentity, prompt: String, workingDirectory: String) async {
+    private func performProviderRun(sessionID: UUID, binding: RunBindingIdentity, run: ProviderRunSnapshot, prompt: String, workingDirectory: String) async {
         guard let providerAdapter, let session = sessions[sessionID] else { return }
         let initial = await session.snapshot()
         do {
-            let output = try await providerAdapter.complete(kind: initial.provider, model: initial.model, prompt: prompt, workingDirectory: workingDirectory, runID: binding.runID)
-            guard !Task.isCancelled, await session.acceptProviderOutput(binding: binding, kind: .assistant, content: output) == .accepted else { return }
+            let result = try await providerAdapter.execute(kind: initial.provider, model: initial.model, prompt: prompt, workingDirectory: workingDirectory, runID: binding.runID, resumeProviderSessionID: run.providerSessionID)
+            let durableIdentity = result.providerSessionID ?? run.providerSessionID
+            if let durableIdentity { try await updateAgentProviderIdentity(sessionID: sessionID, providerSessionID: durableIdentity) }
+            guard !Task.isCancelled, await session.acceptProviderOutput(binding: binding, kind: .assistant, content: result.output) == .accepted else { return }
             var cursor = try await store.nextCursor()
             var event = try await store.persistSession(replacingCursor(session.snapshot(), cursor: cursor), eventType: .transcriptMessage, actor: nil, correlationID: ids.next(), idempotency: nil)
             await eventHub.publish(event)
@@ -843,12 +861,14 @@ public actor RepoPromptHeadlessAuthority {
             cursor = try await store.nextCursor()
             event = try await store.persistSession(replacingCursor(session.snapshot(), cursor: cursor), eventType: .sessionCompleted, actor: nil, correlationID: ids.next(), idempotency: nil)
             await eventHub.publish(event)
+            try await store.persistRun(ProviderRunSnapshot(runID: run.runID, sessionID: run.sessionID, provider: run.provider, providerSessionID: durableIdentity, state: "completed", generation: run.generation, turnEpoch: binding.turnEpoch, startReason: run.startReason, endReason: "completed", startedAt: run.startedAt, endedAt: clock.now()))
             try await updateAgentLifecycle(sessionID: sessionID, state: .completed, eventType: .agentCompleted, actor: nil)
         } catch {
             guard await session.settle(binding: binding, terminal: .sessionFailed, lifecycle: .failed) == .accepted else { return }
             if let cursor = try? await store.nextCursor(), let event = try? await store.persistSession(replacingCursor(session.snapshot(), cursor: cursor), eventType: .sessionFailed, actor: nil, correlationID: ids.next(), idempotency: nil) {
                 await eventHub.publish(event)
             }
+            try? await store.persistRun(ProviderRunSnapshot(runID: run.runID, sessionID: run.sessionID, provider: run.provider, providerSessionID: run.providerSessionID, state: "failed", generation: run.generation, turnEpoch: binding.turnEpoch, startReason: run.startReason, endReason: error is CancellationError ? "canceled" : "provider-error", startedAt: run.startedAt, endedAt: clock.now()))
             try? await updateAgentLifecycle(sessionID: sessionID, state: .failed, eventType: .agentFailed, actor: nil)
         }
         providerTasks[binding.runID] = nil
@@ -861,6 +881,20 @@ public actor RepoPromptHeadlessAuthority {
         let event = try await store.persistAgent(updated, projectID: session.projectID, actor: actor, correlationID: ids.next(), eventType: eventType)
         agents[sessionID] = updated
         await eventHub.publish(event)
+    }
+
+    private func updateAgentProviderIdentity(sessionID: UUID, providerSessionID: String) async throws {
+        guard let current = agents[sessionID], current.providerNativeIdentity != providerSessionID else { return }
+        let updated = AgentSnapshot(agentID: current.agentID, sessionID: current.sessionID, rootSessionID: current.rootSessionID, parentAgentID: current.parentAgentID, providerNativeIdentity: providerSessionID, role: current.role, label: current.label, state: current.state, revision: current.revision + 1)
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        let event = try await store.persistAgent(updated, projectID: session.projectID, actor: nil, correlationID: ids.next(), eventType: .agentUpdated)
+        agents[sessionID] = updated
+        await eventHub.publish(event)
+    }
+
+    private func finishPersistedRun(sessionID: UUID, binding: RunBindingIdentity, state: String, reason: String) async throws {
+        guard let run = try await store.latestRun(sessionID: sessionID), run.runID == binding.runID else { return }
+        try await store.persistRun(ProviderRunSnapshot(runID: run.runID, sessionID: run.sessionID, provider: run.provider, providerSessionID: run.providerSessionID, state: state, generation: run.generation, turnEpoch: binding.turnEpoch, startReason: run.startReason, endReason: reason, startedAt: run.startedAt, endedAt: clock.now()))
     }
 
     private func replacingCursor(_ value: SessionSnapshot, cursor: ServiceCursor) -> SessionSnapshot {

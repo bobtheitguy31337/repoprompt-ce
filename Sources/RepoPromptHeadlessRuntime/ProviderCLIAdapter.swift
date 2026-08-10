@@ -20,6 +20,11 @@ public struct ProviderCLIConfiguration: Codable, Hashable, Sendable {
     }
 }
 
+public struct ProviderExecutionResult: Sendable {
+    public let output: String
+    public let providerSessionID: String?
+}
+
 public actor ProviderCLIAdapter {
     private let configurations: [ProviderKind: ProviderCLIConfiguration]
     private let runner: any WorkspaceCommandRunning
@@ -56,7 +61,7 @@ public actor ProviderCLIAdapter {
                 enabled: executable,
                 executable: executable ? configuration.executable : nil,
                 supportsResume: kind == .codex || kind == .claudeCompatible,
-                supportsSteering: kind != .mcp,
+                supportsSteering: false,
                 version: configuration.expectedVersion,
                 protocolVersion: configuration.protocolVersion,
                 reasonUnavailable: executable ? nil : "configured binary is not executable"
@@ -87,36 +92,46 @@ public actor ProviderCLIAdapter {
     }
 
     public func complete(kind: ProviderKind, model: String?, prompt: String, workingDirectory: String, maximumBytes: Int = 8_388_608, runID requestedRunID: UUID? = nil) async throws -> String {
+        try await execute(kind: kind, model: model, prompt: prompt, workingDirectory: workingDirectory, maximumBytes: maximumBytes, runID: requestedRunID).output
+    }
+
+    public func execute(kind: ProviderKind, model: String?, prompt: String, workingDirectory: String, maximumBytes: Int = 8_388_608, runID requestedRunID: UUID? = nil, resumeProviderSessionID: String? = nil) async throws -> ProviderExecutionResult {
         guard let configuration = configurations[kind], FileManager.default.isExecutableFile(atPath: configuration.executable) else {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Requested provider is not installed")
         }
         let arguments: [String]
         switch kind {
         case .codex:
-            arguments = ["exec", "--skip-git-repo-check", "--color", "never"] + (model.map { ["--model", $0] } ?? []) + [prompt]
+            let command = resumeProviderSessionID.map { ["exec", "resume", "--json", "--skip-git-repo-check", $0] } ?? ["exec", "--json", "--skip-git-repo-check", "--color", "never"]
+            arguments = command + (model.map { ["--model", $0] } ?? []) + [prompt]
         case .claudeCompatible:
-            arguments = ["--print", "--output-format", "text"] + (model.map { ["--model", $0] } ?? []) + [prompt]
+            arguments = ["--print", "--output-format", "stream-json", "--verbose"] + (resumeProviderSessionID.map { ["--resume", $0] } ?? []) + (model.map { ["--model", $0] } ?? []) + [prompt]
         case .openCodeACP:
+            guard resumeProviderSessionID == nil else { throw ServiceAPIError(code: .resumeUnsupported, message: "OpenCode ACP resume is unavailable") }
             arguments = ["run"] + (model.map { ["--model", $0] } ?? []) + [prompt]
         case .cursorACP:
+            guard resumeProviderSessionID == nil else { throw ServiceAPIError(code: .resumeUnsupported, message: "Cursor ACP resume is unavailable") }
             arguments = ["--print"] + (model.map { ["--model", $0] } ?? []) + [prompt]
         case .headlessAdapter, .mcp:
             throw ServiceAPIError(code: .capabilityMissing, message: "Requested provider kind cannot execute a CLI workflow directly")
         }
         guard let processPort, let processSupervisor else {
-            return try await runner.run(executable: configuration.executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes)
+            let output = try await runner.run(executable: configuration.executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes)
+            return parseOutput(output, kind: kind)
         }
         let runID = requestedRunID ?? UUID()
         let helperToken = runID.uuidString
         let home = try prepareEphemeralHome(runID: runID, configuration: configuration)
         defer { try? FileManager.default.removeItem(at: home) }
-        let environment = [
+        var environment = [
             "HOME": home.path,
             "XDG_CONFIG_HOME": home.appendingPathComponent(".config", isDirectory: true).path,
             "XDG_CACHE_HOME": home.appendingPathComponent(".cache", isDirectory: true).path,
             "DISABLE_AUTOUPDATER": "1",
             "CURSOR_AGENT_DISABLE_AUTO_UPDATE": "1"
         ]
+        environment["CODEX_HOME"] = home.appendingPathComponent(".codex", isDirectory: true).path
+        environment["CLAUDE_CONFIG_DIR"] = home.appendingPathComponent(".claude", isDirectory: true).path
         let captured = try await processPort.launchCaptured(executable: configuration.executable, arguments: arguments, environment: environment, workingDirectory: workingDirectory, helperToken: helperToken, outputDirectory: outputDirectory)
         try await processSupervisor.register(runID: runID, leader: captured.identity)
         do {
@@ -126,11 +141,24 @@ public actor ProviderCLIAdapter {
                 Task { try? await processSupervisor.cancel(runID: runID) }
             }
             await processSupervisor.forget(runID: runID)
-            return output
+            return parseOutput(output, kind: kind)
         } catch {
             if !(error is CancellationError) { await processSupervisor.forget(runID: runID) }
             throw error
         }
+    }
+
+    private func parseOutput(_ output: String, kind: ProviderKind) -> ProviderExecutionResult {
+        guard kind == .codex || kind == .claudeCompatible else { return ProviderExecutionResult(output: output, providerSessionID: nil) }
+        var providerSessionID: String?
+        var finalText: String?
+        for line in output.split(whereSeparator: \.isNewline) {
+            guard let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { continue }
+            providerSessionID = providerSessionID ?? object["thread_id"] as? String ?? object["session_id"] as? String
+            if let item = object["item"] as? [String: Any], item["type"] as? String == "agent_message" { finalText = item["text"] as? String ?? finalText }
+            if object["type"] as? String == "result" { finalText = object["result"] as? String ?? finalText }
+        }
+        return ProviderExecutionResult(output: finalText ?? output, providerSessionID: providerSessionID)
     }
 
     private func prepareEphemeralHome(runID: UUID, configuration: ProviderCLIConfiguration) throws -> URL {
@@ -150,6 +178,8 @@ public actor ProviderCLIAdapter {
         }
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".config", isDirectory: true), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try FileManager.default.createDirectory(at: home.appendingPathComponent(".cache", isDirectory: true), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".codex", isDirectory: true), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".claude", isDirectory: true), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         return home
     }
 }

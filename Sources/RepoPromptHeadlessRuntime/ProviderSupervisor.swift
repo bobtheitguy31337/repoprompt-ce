@@ -13,7 +13,7 @@ public actor ProviderRegistry {
         ProviderKind.allCases.map { kind in
             guard let path = configuredExecutables[kind] else { return ProviderCapability(kind: kind, enabled: false, executable: nil, supportsResume: false, supportsSteering: false, reasonUnavailable: "not configured") }
             let executable = FileManager.default.isExecutableFile(atPath: path)
-            return ProviderCapability(kind: kind, enabled: executable, executable: executable ? path : nil, supportsResume: kind == .codex || kind == .claudeCompatible, supportsSteering: kind != .mcp, reasonUnavailable: executable ? nil : "configured binary is not executable")
+            return ProviderCapability(kind: kind, enabled: executable, executable: executable ? path : nil, supportsResume: kind == .codex || kind == .claudeCompatible, supportsSteering: false, reasonUnavailable: executable ? nil : "configured binary is not executable")
         }
     }
 }

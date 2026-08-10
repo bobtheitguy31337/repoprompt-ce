@@ -105,6 +105,34 @@ public struct AgentSnapshot: Codable, Hashable, Sendable {
     }
 }
 
+public struct ProviderRunSnapshot: Codable, Hashable, Sendable {
+    public let runID: UUID
+    public let sessionID: UUID
+    public let provider: ProviderKind
+    public let providerSessionID: String?
+    public let state: String
+    public let generation: Int64
+    public let turnEpoch: Int64
+    public let startReason: String
+    public let endReason: String?
+    public let startedAt: Date
+    public let endedAt: Date?
+
+    public init(runID: UUID, sessionID: UUID, provider: ProviderKind, providerSessionID: String? = nil, state: String, generation: Int64, turnEpoch: Int64, startReason: String, endReason: String? = nil, startedAt: Date, endedAt: Date? = nil) {
+        self.runID = runID
+        self.sessionID = sessionID
+        self.provider = provider
+        self.providerSessionID = providerSessionID
+        self.state = state
+        self.generation = generation
+        self.turnEpoch = turnEpoch
+        self.startReason = startReason
+        self.endReason = endReason
+        self.startedAt = startedAt
+        self.endedAt = endedAt
+    }
+}
+
 public struct SessionSnapshot: Codable, Hashable, Sendable {
     public let schemaVersion: Int
     public let sessionID: UUID

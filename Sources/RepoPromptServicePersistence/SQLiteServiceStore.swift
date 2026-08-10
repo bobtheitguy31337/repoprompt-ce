@@ -246,6 +246,23 @@ public actor SQLiteServiceStore {
         }
     }
 
+    public func persistRun(_ snapshot: ProviderRunSnapshot) async throws {
+        _ = try await connection.query(
+            "INSERT INTO runs(run_id,session_id,schema_version,provider_kind,provider_session_id,state,generation,turn_epoch,start_reason,end_reason,started_at,ended_at) VALUES(?,?,1,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET provider_session_id=excluded.provider_session_id,state=excluded.state,turn_epoch=excluded.turn_epoch,end_reason=excluded.end_reason,ended_at=excluded.ended_at",
+            [.text(snapshot.runID.uuidString), .text(snapshot.sessionID.uuidString), .text(snapshot.provider.rawValue), snapshot.providerSessionID.map(SQLiteData.text) ?? .null, .text(snapshot.state), .integer(Int(snapshot.generation)), .integer(Int(snapshot.turnEpoch)), .text(snapshot.startReason), snapshot.endReason.map(SQLiteData.text) ?? .null, .float(snapshot.startedAt.timeIntervalSince1970), snapshot.endedAt.map { .float($0.timeIntervalSince1970) } ?? .null]
+        )
+    }
+
+    public func latestRun(sessionID: UUID) async throws -> ProviderRunSnapshot? {
+        guard let row = try await connection.query("SELECT * FROM runs WHERE session_id=? ORDER BY generation DESC LIMIT 1", [.text(sessionID.uuidString)]).first,
+              let runID = UUID(uuidString: row.column("run_id")?.string ?? ""),
+              let provider = ProviderKind(rawValue: row.column("provider_kind")?.string ?? ""),
+              let state = row.column("state")?.string,
+              let startReason = row.column("start_reason")?.string
+        else { return nil }
+        return ProviderRunSnapshot(runID: runID, sessionID: sessionID, provider: provider, providerSessionID: row.column("provider_session_id")?.string, state: state, generation: Int64(row.column("generation")?.integer ?? 0), turnEpoch: Int64(row.column("turn_epoch")?.integer ?? 0), startReason: startReason, endReason: row.column("end_reason")?.string, startedAt: Date(timeIntervalSince1970: row.column("started_at")?.double ?? 0), endedAt: row.column("ended_at")?.double.map(Date.init(timeIntervalSince1970:)))
+    }
+
     public func events(after cursor: ServiceCursor?, limit: Int) async throws -> EventPage {
         let meta = try await metadata()
         if let cursor {
