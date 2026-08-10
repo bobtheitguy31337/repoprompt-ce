@@ -16,19 +16,21 @@ public actor SQLiteServiceStore {
     private let connection: SQLiteConnection
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
+    private let eventSigningKey: ServiceEventSigningKey?
     private var closed = false
 
-    private init(connection: SQLiteConnection) {
+    private init(connection: SQLiteConnection, eventSigningKey: ServiceEventSigningKey?) {
         self.connection = connection
+        self.eventSigningKey = eventSigningKey
         encoder = JSONEncoder.serviceEncoder
         decoder = JSONDecoder.serviceDecoder
     }
 
-    public static func open(storage: Storage) async throws -> SQLiteServiceStore {
+    public static func open(storage: Storage, eventSigningKey: ServiceEventSigningKey? = nil) async throws -> SQLiteServiceStore {
         let location: SQLiteConnection.Storage = switch storage { case .memory: .memory
         case let .file(path): .file(path: path) }
         let connection = try await SQLiteConnection.open(storage: location)
-        let store = SQLiteServiceStore(connection: connection)
+        let store = SQLiteServiceStore(connection: connection, eventSigningKey: eventSigningKey)
         try await store.migrate()
         try await store.integrityCheck()
         return store
@@ -101,6 +103,9 @@ public actor SQLiteServiceStore {
                 _ = try await connection.query("INSERT OR IGNORE INTO transcript_entries(session_id,entry_id,schema_version,session_sequence,entry_json,content_digest) VALUES(?,?,1,?,?,?)", [.text(snapshot.sessionID.uuidString), .text(entry.entryID.uuidString), .integer(Int(entry.sessionSequence)), .text(encodeText(entry)), .text(CanonicalSigning.bodyDigest(encoder.encode(entry)))])
             }
             let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.rootSessionID, runID: nil, sessionSequence: Int64(snapshot.transcript.count), type: eventType, generation: snapshot.runGeneration, turnEpoch: snapshot.turnEpoch, actor: actor, correlationID: correlationID, payload: Data(snapshotJSON.utf8))
+            if [.completed, .failed, .canceled, .interrupted, .archived].contains(snapshot.state) || (!snapshot.transcript.isEmpty && snapshot.transcript.count.isMultiple(of: 1000)) {
+                try await saveCheckpoint(scope: "session:\(snapshot.sessionID.uuidString)", sequence: event.globalSequence, snapshot: Data(snapshotJSON.utf8))
+            }
             if let idempotency {
                 try await saveIdempotency(idempotency, status: 202, response: idempotencyResponse ?? encoder.encode(snapshot))
             }
@@ -278,6 +283,36 @@ public actor SQLiteServiceStore {
         _ = try await connection.query("PRAGMA wal_checkpoint(TRUNCATE)")
     }
 
+    public func archiveEvents(through sequence: Int64) async throws -> UUID? {
+        try await transaction {
+            let meta = try await metadata()
+            let bounded = min(sequence, meta.nextGlobalSequence - 1)
+            guard bounded >= meta.replayFloor else { return nil }
+            let rows = try await connection.query("SELECT envelope_json FROM events WHERE global_sequence<=? ORDER BY global_sequence", [.integer(Int(bounded))])
+            let events = try rows.compactMap { row -> EventEnvelope? in
+                guard let text = row.column("envelope_json")?.string else { return nil }
+                return try decoder.decode(EventEnvelope.self, from: Data(text.utf8))
+            }
+            guard let first = events.first, let last = events.last else { return nil }
+            let archiveID = UUID()
+            let bytes = try encoder.encode(events)
+            let digest = CanonicalSigning.bodyDigest(bytes)
+            _ = try await connection.query("INSERT INTO event_archives(archive_id,first_sequence,last_sequence,event_count,canonical_events_json,digest,created_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP)", [.text(archiveID.uuidString), .integer(Int(first.globalSequence)), .integer(Int(last.globalSequence)), .integer(events.count), .text(String(decoding: bytes, as: UTF8.self)), .text(digest)])
+            _ = try await connection.query("DELETE FROM events WHERE global_sequence<=?", [.integer(Int(last.globalSequence))])
+            _ = try await connection.query("UPDATE service_metadata SET replay_floor=? WHERE fixed_id=1", [.integer(Int(last.globalSequence))])
+            return archiveID
+        }
+    }
+
+    public func archivedEvents(archiveID: UUID) async throws -> [EventEnvelope] {
+        guard let text = try await connection.query("SELECT canonical_events_json FROM event_archives WHERE archive_id=?", [.text(archiveID.uuidString)]).first?.column("canonical_events_json")?.string else { throw ServiceAPIError(code: .notFound, message: "Event archive not found") }
+        return try decoder.decode([EventEnvelope].self, from: Data(text.utf8))
+    }
+
+    public func snapshotCheckpoints(scope: String) async throws -> [(sequence: Int64, digest: String)] {
+        try await connection.query("SELECT sequence,digest FROM snapshot_checkpoints WHERE scope=? ORDER BY sequence", [.text(scope)]).map { (Int64($0.column("sequence")?.integer ?? 0), $0.column("digest")?.string ?? "") }
+    }
+
     public func markRestored(from priorStoreID: UUID, backupSequence: Int64, digest: String) async throws -> UUID {
         let current = try await metadata()
         guard current.storeID == priorStoreID else {
@@ -307,7 +342,9 @@ public actor SQLiteServiceStore {
         let meta = try await metadata()
         let sequence = meta.nextGlobalSequence
         let digest = CanonicalSigning.bodyDigest(payload)
-        let envelope = EventEnvelope(protocolVersion: 1, eventID: UUID(), storeID: meta.storeID, globalSequence: sequence, timestamp: Date(), projectID: projectID, sessionID: sessionID, agentID: nil, parentAgentID: nil, rootSessionID: rootSessionID, runID: runID, sessionSequence: sessionSequence, eventType: type, payloadVersion: 1, generation: generation, turnEpoch: turnEpoch, actor: actor, correlationID: correlationID, causationID: nil, payload: payload, digest: digest, keyID: "unsigned-local", signature: "")
+        let keyID = eventSigningKey?.keyID ?? "unsigned-local"
+        let signature = eventSigningKey.map { CanonicalSigning.hmacSHA256(message: "\(meta.storeID.uuidString)\n\(sequence)\n\(digest)", key: $0.secret) } ?? ""
+        let envelope = EventEnvelope(protocolVersion: 1, eventID: UUID(), storeID: meta.storeID, globalSequence: sequence, timestamp: Date(), projectID: projectID, sessionID: sessionID, agentID: nil, parentAgentID: nil, rootSessionID: rootSessionID, runID: runID, sessionSequence: sessionSequence, eventType: type, payloadVersion: 1, generation: generation, turnEpoch: turnEpoch, actor: actor, correlationID: correlationID, causationID: nil, payload: payload, digest: digest, keyID: keyID, signature: signature)
         let actorJSON = try actor.map(encodeText)
         let bindings: [SQLiteData] = try [
             .integer(Int(sequence)), .text(envelope.eventID.uuidString), .text(projectID.uuidString), sessionID.map { .text($0.uuidString) } ?? .null,
@@ -416,6 +453,12 @@ public actor SQLiteServiceStore {
 
     private func replacingCursor(_ value: ProjectSnapshot, cursor: ServiceCursor) -> ProjectSnapshot {
         ProjectSnapshot(projectID: value.projectID, name: value.name, creator: value.creator, state: value.state, roots: value.roots, revision: value.revision, cursor: cursor)
+    }
+
+    private func saveCheckpoint(scope: String, sequence: Int64, snapshot: Data) async throws {
+        let digest = CanonicalSigning.bodyDigest(snapshot)
+        _ = try await connection.query("INSERT OR IGNORE INTO snapshot_checkpoints(scope,sequence,schema_version,snapshot,digest,created_at) VALUES(?,?,1,?,?,CURRENT_TIMESTAMP)", [.text(scope), .integer(Int(sequence)), .text(snapshot.base64EncodedString()), .text(digest)])
+        _ = try await connection.query("DELETE FROM snapshot_checkpoints WHERE scope=? AND sequence NOT IN (SELECT sequence FROM snapshot_checkpoints WHERE scope=? ORDER BY sequence DESC LIMIT 3)", [.text(scope), .text(scope)])
     }
 
     private func replacingCursor(_ value: SessionSnapshot, cursor: ServiceCursor) -> SessionSnapshot {

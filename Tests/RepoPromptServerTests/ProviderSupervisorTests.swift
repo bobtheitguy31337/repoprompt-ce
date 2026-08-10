@@ -48,6 +48,19 @@ private actor FakeProcessPort: ProcessSupervisionPort {
 }
 
 final class ProviderSupervisorTests: XCTestCase {
+    func testPortablePortCapturesAndReapsProviderOutput() async throws {
+        let executable = ["/bin/echo", "/usr/bin/echo"].first { FileManager.default.isExecutableFile(atPath: $0) }
+        let echo = try XCTUnwrap(executable)
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: output) }
+        let port = try PortableProcessSupervisionPort()
+        let captured = try await port.launchCaptured(executable: echo, arguments: ["provider-output"], environment: [:], workingDirectory: FileManager.default.temporaryDirectory.path, helperToken: UUID().uuidString, outputDirectory: output.path)
+        let result = try await port.waitForCapturedProcess(captured, maximumBytes: 1024)
+        XCTAssertEqual(result.trimmingCharacters(in: .whitespacesAndNewlines), "provider-output")
+        let reaped = try await port.inspect(pid: captured.identity.pid)
+        XCTAssertNil(reaped)
+    }
+
     func testProcStatParserHandlesSpacesAndParenthesesInCommand() {
         let fields = ["S", "1", "42", "42"] + Array(repeating: "0", count: 15) + ["987654"]
         let line = "123 (provider worker (sandbox)) " + fields.joined(separator: " ")

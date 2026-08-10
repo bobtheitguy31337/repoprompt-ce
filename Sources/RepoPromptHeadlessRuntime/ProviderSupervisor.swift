@@ -47,6 +47,10 @@ public actor ProviderProcessSupervisor {
         families[runID] = [leader]
     }
 
+    public func forget(runID: UUID) {
+        families[runID] = nil
+    }
+
     public func cancel(runID: UUID, termSignal: Int32 = 15, killSignal: Int32 = 9) async throws {
         guard let recorded = families[runID], let leader = recorded.first else { return }
         guard let current = try await processPort.inspect(pid: leader.pid), current == leader else { families[runID] = nil

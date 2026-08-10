@@ -12,12 +12,14 @@ public actor RepoPromptHeadlessAuthority {
     private let commandRunner: any WorkspaceCommandRunning
     private let worktreeService: WorktreeRuntimeService?
     private let artifactService: ArtifactRuntimeService?
+    private let providerAdapter: ProviderCLIAdapter?
     private let workflowCatalog = BuiltinWorkflowCatalog()
     private let projects = ProjectRuntimeSupervisor()
     private let eventHub = ServiceEventHub()
     private var sessions: [UUID: SessionAuthority] = [:]
     private var tools: [UUID: ProjectToolAuthority] = [:]
     private var selections: [UUID: SessionSelectionAuthority] = [:]
+    private var providerTasks: [UUID: Task<Void, Never>] = [:]
     private var quiescing = false
 
     public init(
@@ -27,7 +29,8 @@ public actor RepoPromptHeadlessAuthority {
         filesystem: any FilesystemAuthorityPort = LocalFilesystemAuthority(),
         commandRunner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(),
         worktreeService: WorktreeRuntimeService? = nil,
-        artifactService: ArtifactRuntimeService? = nil
+        artifactService: ArtifactRuntimeService? = nil,
+        providerAdapter: ProviderCLIAdapter? = nil
     ) {
         self.store = store
         self.clock = clock
@@ -36,16 +39,25 @@ public actor RepoPromptHeadlessAuthority {
         self.commandRunner = commandRunner
         self.worktreeService = worktreeService
         self.artifactService = artifactService
+        self.providerAdapter = providerAdapter
     }
 
     public func recover() async throws {
+        let unclean = !(try await store.metadata().lastCleanShutdown)
         for snapshot in try await store.allProjects() {
             let roots = snapshot.roots.map { CanonicalRoot(snapshot: $0, filesystemIdentity: "persisted") }
             let project = ProjectAuthority(snapshot: snapshot, roots: roots)
             await projects.install(project)
             tools[snapshot.projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
         }
-        for snapshot in try await store.allSessions() {
+        for storedSnapshot in try await store.allSessions() {
+            var snapshot = storedSnapshot
+            if unclean, [.preparing, .running, .waiting].contains(snapshot.state) {
+                let cursor = try await store.nextCursor()
+                snapshot = replacingLifecycle(snapshot, state: .interrupted, cursor: cursor)
+                let event = try await store.persistSession(snapshot, eventType: .serviceRecovery, actor: nil, correlationID: ids.next(), idempotency: nil)
+                await eventHub.publish(event)
+            }
             sessions[snapshot.sessionID] = SessionAuthority(snapshot: snapshot, clock: clock, ids: ids)
             let persistedSelection = try await store.selection(sessionID: snapshot.sessionID)
             selections[snapshot.sessionID] = SessionSelectionAuthority(
@@ -123,15 +135,13 @@ public actor RepoPromptHeadlessAuthority {
         case let .sendFollowup(text, expectedRevision):
             try await session.appendHumanMessage(text, actor: externalActor, expectedRevision: expectedRevision)
             eventType = .transcriptMessage
-        case .resumeSession:
-            _ = try await session.beginRun(connectionGeneration: before.runGeneration + 1)
-            eventType = .sessionResumed
-        case let .cancelSession(_, generation):
-            guard generation == before.runGeneration else { throw ServiceAPIError(code: .staleRevision, message: "Run generation is stale", currentRevision: before.runGeneration) }
-            eventType = .sessionCanceled
-        case let .steerSession(_, targetTurnEpoch):
-            guard targetTurnEpoch == before.turnEpoch else { throw ServiceAPIError(code: .staleRevision, message: "Turn epoch is stale", currentRevision: before.turnEpoch) }
-            eventType = .sessionUpdated
+        case let .resumeSession(expectedRunID, _):
+            guard expectedRunID == nil else { throw ServiceAPIError(code: .staleRevision, message: "No inactive run may match an expected run ID") }
+            return try await startProviderRun(command: command, sessionID: sessionID, session: session, actor: externalActor, idempotency: idempotency)
+        case let .cancelSession(expectedRunID, generation):
+            return try await cancelProviderRun(command: command, sessionID: sessionID, session: session, expectedRunID: expectedRunID, generation: generation, actor: externalActor, idempotency: idempotency)
+        case let .steerSession(text, targetTurnEpoch):
+            return try await steerProviderRun(command: command, sessionID: sessionID, session: session, text: text, targetTurnEpoch: targetTurnEpoch, actor: externalActor, idempotency: idempotency)
         case let .archiveSession(expectedRevision):
             guard expectedRevision == before.revision else { throw ServiceAPIError(code: .staleRevision, message: "Session revision is stale", currentRevision: before.revision) }
             eventType = .sessionArchived
@@ -150,8 +160,15 @@ public actor RepoPromptHeadlessAuthority {
                 _ = try await removeSelection(sessionID: sessionID, rootID: rootID, logicalPaths: Set(entries.map(\.logicalPath)), expectedRevision: expectedRevision, actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
             }
             return try await commandReceipt(command: command, sessionID: sessionID)
-        case .buildContext, .runContextBuilder, .askOracle:
-            throw ServiceAPIError(code: .capabilityMissing, message: "Context Builder or Oracle runtime has not been configured")
+        case let .buildContext(expectedSelectionRevision, include):
+            _ = try await buildContext(sessionID: sessionID, expectedSelectionRevision: expectedSelectionRevision, include: include, actor: externalActor)
+            return try await commandReceipt(command: command, sessionID: sessionID)
+        case let .runContextBuilder(expectedSelectionRevision, instructions, budget):
+            _ = try await runContextBuilder(sessionID: sessionID, input: .init(expectedSelectionRevision: expectedSelectionRevision, instructions: instructions, budget: budget), actor: externalActor)
+            return try await commandReceipt(command: command, sessionID: sessionID)
+        case let .askOracle(chatID, prompt, contextMode):
+            _ = try await askOracle(sessionID: sessionID, input: .init(chatID: chatID, prompt: prompt, contextMode: contextMode), actor: externalActor)
+            return try await commandReceipt(command: command, sessionID: sessionID)
         case let .createWorktree(rootID, baseRef, branchName):
             _ = try await createWorktree(sessionID: sessionID, rootID: rootID, baseRef: baseRef, branch: branchName, actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
             return try await commandReceipt(command: command, sessionID: sessionID)
@@ -160,7 +177,8 @@ public actor RepoPromptHeadlessAuthority {
         case let .mergeWorktree(bindingID, strategy, expectedRevision):
             _ = try await mergeWorktree(sessionID: sessionID, bindingID: bindingID, strategy: strategy, expectedRevision: expectedRevision, actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
             return try await commandReceipt(command: command, sessionID: sessionID)
-        case .retrySession: eventType = .sessionResumed
+        case .retrySession:
+            return try await startProviderRun(command: command, sessionID: sessionID, session: session, actor: externalActor, idempotency: idempotency)
         }
         let current = await session.snapshot()
         let cursor = try await store.nextCursor()
@@ -202,8 +220,40 @@ public actor RepoPromptHeadlessAuthority {
         return try await tool.diff(request)
     }
 
+    public func refreshProject(projectID: UUID, expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> ProjectSnapshot {
+        try ensureWritable()
+        let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "refreshProject", key: idempotencyKey, requestDigest: requestDigest)
+        if let existing = try await store.idempotencyResult(idempotency) { return try JSONDecoder.serviceDecoder.decode(ProjectSnapshot.self, from: existing.response) }
+        let current = try await projectSnapshot(projectID: projectID)
+        guard current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Project revision is stale", currentRevision: current.revision) }
+        var roots: [CanonicalRoot] = []
+        var degraded = false
+        for root in current.roots {
+            do {
+                let canonical = try filesystem.canonicalizeRoot(root.canonicalPath)
+                roots.append(CanonicalRoot(snapshot: root, filesystemIdentity: canonical.identity))
+            } catch {
+                degraded = true
+                roots.append(CanonicalRoot(snapshot: root, filesystemIdentity: "unavailable"))
+            }
+        }
+        let cursor = try await store.nextCursor()
+        let snapshot = ProjectSnapshot(projectID: current.projectID, name: current.name, creator: current.creator, state: degraded ? .degraded : .active, roots: current.roots, revision: current.revision + 1, cursor: cursor)
+        let event = try await store.persistProject(snapshot, eventType: .projectRefreshed, actor: actor, correlationID: ids.next(), idempotency: idempotency)
+        let project = ProjectAuthority(snapshot: snapshot, roots: roots)
+        await projects.install(project)
+        tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
+        await eventHub.publish(event)
+        return snapshot
+    }
+
     public func workflowSnapshots() async throws -> [WorkflowSnapshot] {
         try await store.workflows()
+    }
+
+    public func providerCapabilities(preflight: Bool = false) async -> [ProviderCapability] {
+        guard let providerAdapter else { return ProviderKind.allCases.map { ProviderCapability(kind: $0, enabled: false, executable: nil, supportsResume: false, supportsSteering: false, reasonUnavailable: "provider runtime not configured") } }
+        return preflight ? await providerAdapter.preflight() : await providerAdapter.capabilities()
     }
 
     public func selectionSnapshot(sessionID: UUID) async throws -> SelectionSnapshot {
@@ -312,6 +362,58 @@ public actor RepoPromptHeadlessAuthority {
         return try await artifactService.content(storageReference: artifact.storageReference, maximumBytes: maximumBytes)
     }
 
+    public func buildContext(sessionID: UUID, expectedSelectionRevision: Int64, include: [String], actor: ExternalActor) async throws -> ArtifactSnapshot {
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        let selection = try await selectionSnapshot(sessionID: sessionID)
+        guard selection.revision == expectedSelectionRevision else { throw ServiceAPIError(code: .staleRevision, message: "Selection revision is stale", currentRevision: selection.revision) }
+        let content = try await materializedContext(projectID: session.projectID, selection: selection, include: include)
+        return try await createArtifact(projectID: session.projectID, sessionID: sessionID, kind: "context", logicalName: "context-r\(selection.revision).md", content: Data(content.utf8), actor: actor)
+    }
+
+    public func runContextBuilder(sessionID: UUID, input: ContextBuilderInput, actor: ExternalActor) async throws -> SelectionSnapshot {
+        guard let providerAdapter else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider runtime is not configured") }
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        let current = try await selectionSnapshot(sessionID: sessionID)
+        guard current.revision == input.expectedSelectionRevision else { throw ServiceAPIError(code: .staleRevision, message: "Selection revision is stale", currentRevision: current.revision) }
+        let project = try await projectSnapshot(projectID: session.projectID)
+        guard let workingRoot = project.roots.first else { throw ServiceAPIError(code: .rootUnauthorized, message: "Project has no roots") }
+        var inventory: [String] = []
+        for root in project.roots {
+            let entries = try await projectTree(projectID: project.projectID, request: .init(rootID: root.rootID, maximumDepth: 12, maximumEntries: min(max(input.budget, 100), 10_000)))
+            inventory.append(contentsOf: entries.filter { !$0.isDirectory }.map { "\(root.rootID.uuidString)\t\($0.logicalPath)" })
+        }
+        let prompt = """
+        You are RepoPrompt Context Builder. Select the smallest set of repository files that satisfies the instructions.
+        Return only a JSON array of objects with string fields rootID and path. Do not return markdown.
+        Instructions: \(input.instructions)
+        Repository inventory:
+        \(inventory.joined(separator: "\n"))
+        """
+        let output = try await providerAdapter.complete(kind: session.provider, model: session.model, prompt: prompt, workingDirectory: workingRoot.canonicalPath)
+        let proposals = try decodeContextBuilderOutput(output)
+        let entries = proposals.map { LogicalSelectionEntry(rootID: $0.rootID, logicalPath: $0.path, mode: .full) }
+        return try await replaceSelection(sessionID: sessionID, entries: entries, expectedRevision: input.expectedSelectionRevision, actor: actor)
+    }
+
+    public func askOracle(sessionID: UUID, input: OracleInput, actor: ExternalActor) async throws -> OracleSnapshot {
+        guard let providerAdapter else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider runtime is not configured") }
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        let project = try await projectSnapshot(projectID: session.projectID)
+        guard let workingRoot = project.roots.first else { throw ServiceAPIError(code: .rootUnauthorized, message: "Project has no roots") }
+        let selection = try await selectionSnapshot(sessionID: sessionID)
+        let context = try await materializedContext(projectID: project.projectID, selection: selection, include: ["files"])
+        let prompt = """
+        You are the RepoPrompt Oracle. Answer the request using the authoritative selected context. Clearly identify uncertainty.
+        Request: \(input.prompt)
+        Context mode: \(input.contextMode)
+
+        \(context)
+        """
+        let response = try await providerAdapter.complete(kind: session.provider, model: session.model, prompt: prompt, workingDirectory: workingRoot.canonicalPath)
+        let artifact = try await createArtifact(projectID: project.projectID, sessionID: sessionID, kind: "oracle", logicalName: "oracle-\(input.chatID?.uuidString ?? "new").md", content: Data(response.utf8), actor: actor)
+        return OracleSnapshot(chatID: input.chatID ?? ids.next(), response: response, artifactID: artifact.artifactID)
+    }
+
     public func sessionSnapshot(sessionID: UUID) async throws -> SessionSnapshot {
         guard let session = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
         return await session.snapshot()
@@ -327,6 +429,11 @@ public actor RepoPromptHeadlessAuthority {
             await values.append(session.snapshot())
         }
         return values.sorted { $0.sessionID.uuidString < $1.sessionID.uuidString }
+    }
+
+    public func childSessionSnapshots(parentSessionID: UUID) async throws -> [SessionSnapshot] {
+        guard sessions[parentSessionID] != nil else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
+        return await sessionSnapshots().filter { $0.parentSessionID == parentSessionID }
     }
 
     public func events(after cursor: ServiceCursor?, limit: Int, projectID: UUID? = nil, sessionID: UUID? = nil) async throws -> EventPage {
@@ -373,7 +480,8 @@ public actor RepoPromptHeadlessAuthority {
 
     public func capabilities() async throws -> ServiceCapabilities {
         let meta = try await store.metadata()
-        return ServiceCapabilities(protocolMinimum: 1, protocolMaximum: 1, schemaVersion: meta.schemaVersion, storeID: meta.storeID, replayFloor: meta.replayFloor, providers: ProviderKind.allCases, eventTypes: EventType.allCases)
+        let availableProviders = await providerCapabilities().filter(\.enabled).map(\.kind)
+        return ServiceCapabilities(protocolMinimum: 1, protocolMaximum: 1, schemaVersion: meta.schemaVersion, storeID: meta.storeID, replayFloor: meta.replayFloor, providers: availableProviders, eventTypes: EventType.allCases)
     }
 
     public func authoritativeSnapshot() async throws -> AuthoritativeSnapshot {
@@ -420,7 +528,115 @@ public actor RepoPromptHeadlessAuthority {
         return try JSONDecoder.serviceDecoder.decode(T.self, from: existing.response)
     }
 
+    private struct ContextBuilderProposal: Decodable {
+        let rootID: UUID
+        let path: String
+    }
+
+    private func decodeContextBuilderOutput(_ output: String) throws -> [ContextBuilderProposal] {
+        guard let start = output.firstIndex(of: "["), let end = output.lastIndex(of: "]"), start <= end else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Context Builder provider did not return a JSON selection")
+        }
+        return try JSONDecoder.serviceDecoder.decode([ContextBuilderProposal].self, from: Data(output[start ... end].utf8))
+    }
+
+    private func materializedContext(projectID: UUID, selection: SelectionSnapshot, include: [String]) async throws -> String {
+        var sections = ["# RepoPrompt Context", "selection-revision: \(selection.revision)"]
+        for entry in selection.entries {
+            let file = try await projectFile(projectID: projectID, request: .init(rootID: entry.rootID, logicalPath: entry.logicalPath, maximumBytes: 1_048_576))
+            let content: String
+            if entry.mode == .slices, !entry.ranges.isEmpty {
+                let lines = file.content.split(separator: "\n", omittingEmptySubsequences: false)
+                content = entry.ranges.flatMap { range in range.compactMap { index in lines.indices.contains(index - 1) ? String(lines[index - 1]) : nil } }.joined(separator: "\n")
+            } else {
+                content = file.content
+            }
+            sections.append("## \(entry.logicalPath)\n```\n\(content)\n```")
+        }
+        if include.contains("transcript") { sections.append("transcript: included-by-session-endpoint") }
+        return sections.joined(separator: "\n\n")
+    }
+
+    private func createArtifact(projectID: UUID, sessionID: UUID?, kind: String, logicalName: String, content: Data, actor: ExternalActor?) async throws -> ArtifactSnapshot {
+        guard let artifactService else { throw ServiceAPIError(code: .capabilityMissing, message: "Artifact storage is not configured") }
+        let cursor = try await store.nextCursor()
+        let stored = try await artifactService.store(projectID: projectID, sessionID: sessionID, kind: kind, logicalName: logicalName, content: content, cursor: cursor)
+        let event = try await store.persistArtifact(stored.0, storageReference: stored.storageReference, actor: actor, correlationID: ids.next())
+        await eventHub.publish(event)
+        return stored.0
+    }
+
+    private func startProviderRun(command: SessionCommand, sessionID: UUID, session: SessionAuthority, actor: ExternalActor, idempotency: IdempotencyInput) async throws -> CommandReceipt {
+        guard let providerAdapter else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider runtime is not configured") }
+        let snapshot = await session.snapshot()
+        guard await providerAdapter.capabilities().contains(where: { $0.kind == snapshot.provider && $0.enabled }) else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Session provider is unavailable") }
+        let binding = try await session.beginRun(connectionGeneration: snapshot.runGeneration + 1)
+        let current = await session.snapshot()
+        let cursor = try await store.nextCursor()
+        let persisted = replacingCursor(current, cursor: cursor)
+        let receipt = CommandReceipt(commandID: ids.next(), sessionID: sessionID, operation: command.operation, acceptedCursor: cursor, status: "accepted")
+        let event = try await store.persistSession(persisted, eventType: .sessionResumed, actor: actor, correlationID: ids.next(), idempotency: idempotency, idempotencyResponse: JSONEncoder.serviceEncoder.encode(receipt))
+        await eventHub.publish(event)
+        let project = try await projectSnapshot(projectID: snapshot.projectID)
+        guard let workingDirectory = project.roots.first?.canonicalPath else { throw ServiceAPIError(code: .rootUnauthorized, message: "Project has no roots") }
+        let prompt = snapshot.transcript.last(where: { $0.kind == .human })?.content ?? "Continue the repository task."
+        providerTasks[binding.runID] = Task { await self.performProviderRun(sessionID: sessionID, binding: binding, prompt: prompt, workingDirectory: workingDirectory) }
+        return receipt
+    }
+
+    private func steerProviderRun(command: SessionCommand, sessionID: UUID, session: SessionAuthority, text: String, targetTurnEpoch: Int64, actor: ExternalActor, idempotency: IdempotencyInput) async throws -> CommandReceipt {
+        let binding = try await session.steer(text, actor: actor, targetTurnEpoch: targetTurnEpoch)
+        providerTasks[binding.runID]?.cancel()
+        let current = await session.snapshot()
+        let cursor = try await store.nextCursor()
+        let receipt = CommandReceipt(commandID: ids.next(), sessionID: sessionID, operation: command.operation, acceptedCursor: cursor, status: "accepted")
+        let event = try await store.persistSession(replacingCursor(current, cursor: cursor), eventType: .sessionUpdated, actor: actor, correlationID: ids.next(), idempotency: idempotency, idempotencyResponse: JSONEncoder.serviceEncoder.encode(receipt))
+        await eventHub.publish(event)
+        let project = try await projectSnapshot(projectID: current.projectID)
+        guard let workingDirectory = project.roots.first?.canonicalPath else { throw ServiceAPIError(code: .rootUnauthorized, message: "Project has no roots") }
+        providerTasks[binding.runID] = Task { await self.performProviderRun(sessionID: sessionID, binding: binding, prompt: text, workingDirectory: workingDirectory) }
+        return receipt
+    }
+
+    private func cancelProviderRun(command: SessionCommand, sessionID: UUID, session: SessionAuthority, expectedRunID: UUID?, generation: Int64, actor: ExternalActor, idempotency: IdempotencyInput) async throws -> CommandReceipt {
+        guard let binding = await session.activeBinding(), binding.generation == generation, expectedRunID == nil || expectedRunID == binding.runID else { throw ServiceAPIError(code: .staleRevision, message: "Run identity is stale", currentRevision: (await session.snapshot()).runGeneration) }
+        providerTasks[binding.runID]?.cancel()
+        providerTasks[binding.runID] = nil
+        guard await session.settle(binding: binding, terminal: .sessionCanceled, lifecycle: .canceled) == .accepted else { throw ServiceAPIError(code: .staleRevision, message: "Run is already settled") }
+        let cursor = try await store.nextCursor()
+        let receipt = CommandReceipt(commandID: ids.next(), sessionID: sessionID, operation: command.operation, acceptedCursor: cursor, status: "accepted")
+        let event = try await store.persistSession(replacingCursor(await session.snapshot(), cursor: cursor), eventType: .sessionCanceled, actor: actor, correlationID: ids.next(), idempotency: idempotency, idempotencyResponse: JSONEncoder.serviceEncoder.encode(receipt))
+        await eventHub.publish(event)
+        return receipt
+    }
+
+    private func performProviderRun(sessionID: UUID, binding: RunBindingIdentity, prompt: String, workingDirectory: String) async {
+        guard let providerAdapter, let session = sessions[sessionID] else { return }
+        let initial = await session.snapshot()
+        do {
+            let output = try await providerAdapter.complete(kind: initial.provider, model: initial.model, prompt: prompt, workingDirectory: workingDirectory)
+            guard !Task.isCancelled, await session.acceptProviderOutput(binding: binding, kind: .assistant, content: output) == .accepted else { return }
+            var cursor = try await store.nextCursor()
+            var event = try await store.persistSession(replacingCursor(await session.snapshot(), cursor: cursor), eventType: .transcriptMessage, actor: nil, correlationID: ids.next(), idempotency: nil)
+            await eventHub.publish(event)
+            guard await session.settle(binding: binding, terminal: .sessionCompleted, lifecycle: .completed) == .accepted else { return }
+            cursor = try await store.nextCursor()
+            event = try await store.persistSession(replacingCursor(await session.snapshot(), cursor: cursor), eventType: .sessionCompleted, actor: nil, correlationID: ids.next(), idempotency: nil)
+            await eventHub.publish(event)
+        } catch {
+            guard await session.settle(binding: binding, terminal: .sessionFailed, lifecycle: .failed) == .accepted else { return }
+            if let cursor = try? await store.nextCursor(), let event = try? await store.persistSession(replacingCursor(await session.snapshot(), cursor: cursor), eventType: .sessionFailed, actor: nil, correlationID: ids.next(), idempotency: nil) {
+                await eventHub.publish(event)
+            }
+        }
+        providerTasks[binding.runID] = nil
+    }
+
     private func replacingCursor(_ value: SessionSnapshot, cursor: ServiceCursor) -> SessionSnapshot {
         SessionSnapshot(sessionID: value.sessionID, projectID: value.projectID, parentSessionID: value.parentSessionID, rootSessionID: value.rootSessionID, creator: value.creator, provider: value.provider, model: value.model, visibility: value.visibility, state: value.state, runGeneration: value.runGeneration, turnEpoch: value.turnEpoch, revision: value.revision, transcript: value.transcript, interactions: value.interactions, cursor: cursor)
+    }
+
+    private func replacingLifecycle(_ value: SessionSnapshot, state: SessionLifecycleState, cursor: ServiceCursor) -> SessionSnapshot {
+        SessionSnapshot(sessionID: value.sessionID, projectID: value.projectID, parentSessionID: value.parentSessionID, rootSessionID: value.rootSessionID, creator: value.creator, provider: value.provider, model: value.model, visibility: value.visibility, state: state, runGeneration: value.runGeneration, turnEpoch: value.turnEpoch, revision: value.revision + 1, transcript: value.transcript, interactions: value.interactions, cursor: cursor)
     }
 }

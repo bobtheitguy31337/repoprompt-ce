@@ -199,6 +199,14 @@ public struct ProjectTreeRequest: Codable, Sendable {
     }
 }
 
+public struct ProjectRefreshInput: Codable, Sendable {
+    public let expectedRevision: Int64
+
+    public init(expectedRevision: Int64) {
+        self.expectedRevision = expectedRevision
+    }
+}
+
 public struct ProjectTreeEntry: Codable, Hashable, Sendable {
     public let rootID: UUID
     public let logicalPath: String
@@ -304,5 +312,51 @@ public struct ProjectDiffSnapshot: Codable, Hashable, Sendable {
         self.patch = patch
         self.truncated = truncated
         self.contentDigest = contentDigest
+    }
+}
+
+public struct ContextBuildInput: Codable, Sendable {
+    public let expectedSelectionRevision: Int64
+    public let include: [String]
+
+    public init(expectedSelectionRevision: Int64, include: [String]) {
+        self.expectedSelectionRevision = expectedSelectionRevision
+        self.include = include
+    }
+}
+
+public struct ContextBuilderInput: Codable, Sendable {
+    public let expectedSelectionRevision: Int64
+    public let instructions: String
+    public let budget: Int
+
+    public init(expectedSelectionRevision: Int64, instructions: String, budget: Int) {
+        self.expectedSelectionRevision = expectedSelectionRevision
+        self.instructions = instructions
+        self.budget = budget
+    }
+}
+
+public struct OracleInput: Codable, Sendable {
+    public let chatID: UUID?
+    public let prompt: String
+    public let contextMode: String
+
+    public init(chatID: UUID?, prompt: String, contextMode: String) {
+        self.chatID = chatID
+        self.prompt = prompt
+        self.contextMode = contextMode
+    }
+}
+
+public struct OracleSnapshot: Codable, Hashable, Sendable {
+    public let chatID: UUID
+    public let response: String
+    public let artifactID: UUID?
+
+    public init(chatID: UUID, response: String, artifactID: UUID?) {
+        self.chatID = chatID
+        self.response = response
+        self.artifactID = artifactID
     }
 }

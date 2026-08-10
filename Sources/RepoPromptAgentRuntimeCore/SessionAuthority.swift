@@ -60,6 +60,22 @@ public actor SessionAuthority {
         replaceSnapshot(transcript: transcript)
     }
 
+    public func activeBinding() -> RunBindingIdentity? {
+        state.gate?.binding
+    }
+
+    public func steer(_ text: String, actor: ExternalActor, targetTurnEpoch: Int64) throws -> RunBindingIdentity {
+        guard var gate = state.gate, gate.binding.turnEpoch == targetTurnEpoch else {
+            throw ServiceAPIError(code: .staleRevision, message: "Turn epoch is stale", currentRevision: state.snapshot.turnEpoch)
+        }
+        var transcript = state.snapshot.transcript
+        transcript.append(TranscriptEntry(entryID: ids.next(), sessionSequence: Int64(transcript.count + 1), kind: .human, content: text, actor: actor, timestamp: clock.now()))
+        gate.advanceTurn(runID: gate.binding.runID)
+        state.gate = gate
+        replaceSnapshot(epoch: gate.binding.turnEpoch, transcript: transcript)
+        return gate.binding
+    }
+
     private func replaceSnapshot(state lifecycle: SessionLifecycleState? = nil, generation: Int64? = nil, epoch: Int64? = nil, transcript: [TranscriptEntry]? = nil) {
         let current = state.snapshot
         state.snapshot = SessionSnapshot(sessionID: current.sessionID, projectID: current.projectID, parentSessionID: current.parentSessionID, rootSessionID: current.rootSessionID, creator: current.creator, provider: current.provider, model: current.model, visibility: current.visibility, state: lifecycle ?? current.state, runGeneration: generation ?? current.runGeneration, turnEpoch: epoch ?? current.turnEpoch, revision: current.revision + 1, transcript: transcript ?? current.transcript, interactions: current.interactions, cursor: current.cursor)

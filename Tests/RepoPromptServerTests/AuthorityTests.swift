@@ -2,9 +2,38 @@ import Foundation
 import RepoPromptHeadlessRuntime
 import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
+import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 final class AuthorityTests: XCTestCase {
+    func testProviderRunSupportsSteeringCompletionAndCancellation() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let runner = DelayedProviderRunner()
+        let provider = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: "/usr/bin/true")], runner: runner)
+        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-run", requestDigest: "p-run")
+        let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "first"), externalActor: actor, idempotencyKey: "s-run", requestDigest: "s-run")
+
+        _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "resume", requestDigest: "resume")
+        _ = try await authority.execute(command: .steerSession(text: "second", targetTurnEpoch: 1), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "steer", requestDigest: "steer")
+        try await Task.sleep(for: .milliseconds(150))
+        let completed = try await authority.sessionSnapshot(sessionID: session.sessionID)
+        XCTAssertEqual(completed.state, .completed)
+        XCTAssertEqual(completed.transcript.suffix(2).map(\.content), ["second", "provider:second"])
+
+        let cancelSession = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "cancel"), externalActor: actor, idempotencyKey: "s-cancel", requestDigest: "s-cancel")
+        await runner.setDelay(.seconds(10))
+        _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: cancelSession.sessionID, externalActor: actor, idempotencyKey: "resume-cancel", requestDigest: "resume-cancel")
+        _ = try await authority.execute(command: .cancelSession(expectedRunID: nil, expectedGeneration: 1), sessionID: cancelSession.sessionID, externalActor: actor, idempotencyKey: "cancel", requestDigest: "cancel")
+        let canceled = try await authority.sessionSnapshot(sessionID: cancelSession.sessionID)
+        XCTAssertEqual(canceled.state, .canceled)
+        try await store.close()
+    }
+
     func testProjectRoutingAndSessionPersistence() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -96,5 +125,16 @@ final class AuthorityTests: XCTestCase {
             XCTFail("expected not found")
         } catch let error as ServiceAPIError { XCTAssertEqual(error.code, .notFound) }
         try await store.close()
+    }
+}
+
+private actor DelayedProviderRunner: WorkspaceCommandRunning {
+    private var delay: Duration = .milliseconds(50)
+
+    func setDelay(_ value: Duration) { delay = value }
+
+    func run(executable _: String, arguments: [String], workingDirectory _: String, maximumBytes _: Int) async throws -> String {
+        try await Task.sleep(for: delay)
+        return "provider:\(arguments.last ?? "")"
     }
 }

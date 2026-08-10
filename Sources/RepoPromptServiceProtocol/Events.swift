@@ -1,5 +1,15 @@
 import Foundation
 
+public struct ServiceEventSigningKey: Sendable {
+    public let keyID: String
+    public let secret: Data
+
+    public init(keyID: String, secret: Data) {
+        self.keyID = keyID
+        self.secret = secret
+    }
+}
+
 public enum EventType: String, Codable, CaseIterable, Sendable {
     case projectCreated = "project.created", projectUpdated = "project.updated", projectRemoved = "project.removed", projectRefreshed = "project.refreshed", workflowUpdated = "workflow.updated"
     case sessionCreated = "session.created", sessionUpdated = "session.updated", sessionWaiting = "session.waiting", sessionCompleted = "session.completed", sessionFailed = "session.failed", sessionCanceled = "session.canceled", sessionInterrupted = "session.interrupted", sessionResumed = "session.resumed", sessionArchived = "session.archived"
