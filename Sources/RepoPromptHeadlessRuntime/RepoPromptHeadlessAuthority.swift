@@ -184,7 +184,22 @@ public actor RepoPromptHeadlessAuthority {
         guard input.parentSessionID == nil else {
             throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Child sessions must be created through the authority-managed agent lifecycle")
         }
-        return try await createAuthoritySession(input: input, externalActor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
+        let frozenInput = try input.frozenForExecution()
+        let created = try await createAuthoritySession(input: frozenInput, externalActor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
+        guard frozenInput.hasInitialProviderIntent, let session = sessions[created.sessionID] else { return created }
+        let current = await session.snapshot()
+        guard current.state == .idle else { return current }
+        let command = SessionCommand.resumeSession(expectedRunID: nil, providerResumeMode: .fresh)
+        let initialRun = IdempotencyInput(
+            actorID: externalActor.goblinUserID,
+            operation: command.operation,
+            key: "\(idempotencyKey):initial-run",
+            requestDigest: requestDigest
+        )
+        if try await store.idempotencyResult(initialRun) == nil {
+            _ = try await startProviderRun(command: command, sessionID: created.sessionID, session: session, actor: externalActor, idempotency: initialRun)
+        }
+        return try await sessionSnapshot(sessionID: created.sessionID)
     }
 
     /// Admits a legacy embedded-host identity into the durable authority. This
@@ -344,7 +359,7 @@ public actor RepoPromptHeadlessAuthority {
         userMessage: String,
         providerPrompt: String,
         presentationPayload: Data? = nil,
-        resumeMode: String = "auto",
+        resumeMode: ProviderResumeMode = .auto,
         idempotencyKey: String,
         requestDigest: String
     ) async throws -> AuthoritySessionSnapshot {
@@ -545,7 +560,7 @@ public actor RepoPromptHeadlessAuthority {
                 message: "Managed child entry point may not target a root session"
             )
         }
-        let command = SessionCommand.resumeSession(expectedRunID: nil, providerResumeMode: "new")
+        let command = SessionCommand.resumeSession(expectedRunID: nil, providerResumeMode: .fresh)
         let idempotency = IdempotencyInput(
             actorID: snapshot.creator.goblinUserID,
             operation: "agentRun",
@@ -600,7 +615,7 @@ public actor RepoPromptHeadlessAuthority {
         return try await store.agents(rootSessionID: rootSessionID)
     }
 
-    public func execute(command: SessionCommand, sessionID: UUID, externalActor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> CommandReceipt {
+    public func execute(command: SessionCommand, sessionID: UUID, externalActor: ExternalActor, idempotencyKey: String, requestDigest: String, authorizationDecision: GoblinAuthorizationDecision? = nil) async throws -> CommandReceipt {
         try ensureWritable()
         let idempotency = IdempotencyInput(actorID: externalActor.goblinUserID, operation: command.operation, key: idempotencyKey, requestDigest: requestDigest)
         if let existing = try await store.idempotencyResult(idempotency) {
@@ -609,14 +624,26 @@ public actor RepoPromptHeadlessAuthority {
         guard let session = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
         let before = await session.snapshot()
         guard before.parentSessionID == nil else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "External commands may target only root sessions") }
-        try await authorizeExternalCommand(command, session: before, actor: externalActor)
+        if let authorizationDecision {
+            guard authorizationDecision.sessionID == sessionID,
+                  authorizationDecision.operation == command.operation,
+                  authorizationDecision.actor.goblinUserID == externalActor.goblinUserID,
+                  authorizationDecision.requestDigest == requestDigest
+            else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Verified Goblin authorization decision is not bound to this command") }
+        } else {
+            try await authorizeExternalCommand(command, session: before, actor: externalActor)
+        }
         let eventType: EventType
         switch command {
         case let .sendFollowup(text, expectedRevision):
             try await session.appendHumanMessage(text, actor: externalActor, expectedRevision: expectedRevision)
             eventType = .transcriptMessage
         case let .resumeSession(expectedRunID, _):
-            guard expectedRunID == nil else { throw ServiceAPIError(code: .staleRevision, message: "No inactive run may match an expected run ID") }
+            if let expectedRunID {
+                guard try await store.latestRun(sessionID: sessionID)?.runID == expectedRunID else {
+                    throw ServiceAPIError(code: .staleRevision, message: "Most recent run identity is stale")
+                }
+            }
             return try await startProviderRun(command: command, sessionID: sessionID, session: session, actor: externalActor, idempotency: idempotency)
         case let .cancelSession(expectedRunID, generation):
             return try await cancelProviderRun(command: command, sessionID: sessionID, session: session, expectedRunID: expectedRunID, generation: generation, actor: externalActor, idempotency: idempotency)
@@ -633,7 +660,7 @@ public actor RepoPromptHeadlessAuthority {
             return try await commandReceipt(command: command, sessionID: sessionID)
         case let .setSessionVisibility(expectedPolicyRevision, visibility, collaborativeSteeringEnabled, controllerUserID):
             let receipt = try await CommandReceipt(commandID: ids.next(), sessionID: sessionID, operation: command.operation, acceptedCursor: store.nextCursor(), status: "accepted")
-            _ = try await updateCollaborationMetadata(sessionID: sessionID, input: .init(expectedPolicyRevision: expectedPolicyRevision, visibility: visibility, collaborativeSteeringEnabled: collaborativeSteeringEnabled, controllerUserID: controllerUserID), actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest, idempotencyResponse: JSONEncoder.serviceEncoder.encode(receipt))
+            _ = try await updateCollaborationMetadata(sessionID: sessionID, input: .init(expectedPolicyRevision: expectedPolicyRevision, visibility: visibility, collaborativeSteeringEnabled: collaborativeSteeringEnabled, controllerUserID: controllerUserID), actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest, idempotencyResponse: JSONEncoder.serviceEncoder.encode(receipt), authorizationDecision: authorizationDecision)
             return receipt
         case let .updateSelection(mode, expectedRevision, operations):
             guard mode == "remove" else { throw ServiceAPIError(code: .invalidRequest, message: "Selection commands with structured entries must use the selection endpoints") }
@@ -933,15 +960,24 @@ public actor RepoPromptHeadlessAuthority {
         guard !input.controllerUserID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw ServiceAPIError(code: .invalidRequest, message: "Controller user ID is required") }
         let controllerChanged = current.controllerUserID != input.controllerUserID
         let membershipChanged = current.visibility != input.visibility
+        let policyChanged = membershipChanged
+            || current.collaborativeSteeringEnabled != input.collaborativeSteeringEnabled
+            || controllerChanged
+        let resultingPolicyRevision = input.policyRevision ?? current.policyRevision + (policyChanged ? 1 : 0)
+        let resultingControllerRevision = input.controllerRevision ?? current.controllerRevision + (controllerChanged ? 1 : 0)
+        let resultingMembershipRevision = input.membershipRevision ?? current.membershipRevision + (membershipChanged ? 1 : 0)
+        guard resultingPolicyRevision == current.policyRevision + (policyChanged ? 1 : 0),
+              resultingControllerRevision == current.controllerRevision + (controllerChanged ? 1 : 0),
+              resultingMembershipRevision == current.membershipRevision + (membershipChanged ? 1 : 0)
+        else { throw ServiceAPIError(code: .staleRevision, message: "Goblin collaboration result revisions are not the exact next authority revisions", currentRevision: current.policyRevision) }
         if let authorizationDecision {
             guard authorizationDecision.sessionID == sessionID,
-                  authorizationDecision.projectID == authoritySession.projectID,
                   authorizationDecision.actor.goblinUserID == actor.goblinUserID,
                   authorizationDecision.operation == "setSessionVisibility",
                   authorizationDecision.requestDigest == requestDigest,
-                  authorizationDecision.policyRevision == current.policyRevision,
-                  authorizationDecision.controllerRevision == current.controllerRevision,
-                  authorizationDecision.membershipRevision == current.membershipRevision,
+                  authorizationDecision.policyRevision == resultingPolicyRevision,
+                  authorizationDecision.controllerRevision == resultingControllerRevision,
+                  authorizationDecision.membershipRevision == resultingMembershipRevision,
                   authorizationDecision.issuedAt <= clock.now(),
                   authorizationDecision.expiresAt > clock.now(),
                   authorizationDecision.attributionLabels?.creatorUserID == nil
@@ -951,12 +987,9 @@ public actor RepoPromptHeadlessAuthority {
                   authorizationDecision.attributionLabels?.visibility == nil
                     || authorizationDecision.attributionLabels?.visibility == input.visibility
             else {
-                throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Goblin collaboration decision does not acknowledge the current authority revisions")
+                throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Goblin collaboration decision does not acknowledge the exact resulting revisions")
             }
         }
-        let resultingPolicyRevision = current.policyRevision + 1
-        let resultingControllerRevision = current.controllerRevision + (controllerChanged ? 1 : 0)
-        let resultingMembershipRevision = current.membershipRevision + (membershipChanged ? 1 : 0)
         let acknowledgement = authorizationDecision.map {
             GoblinCollaborationAcknowledgement(
                 decisionID: $0.decisionID,
@@ -1688,14 +1721,13 @@ public actor RepoPromptHeadlessAuthority {
         guard permissions.mode != "disabled" else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Provider execution is disabled by session policy") }
         guard ["readOnly", "workspaceWrite", "fullAccess"].contains(permissions.mode) else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Execution permission mode is invalid") }
         guard let capability = await providerAdapter.capabilities().first(where: { $0.kind == snapshot.provider && $0.enabled }) else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Session provider is unavailable") }
-        let resumeMode: String = switch command {
+        let resumeMode: ProviderResumeMode = switch command {
         case let .resumeSession(_, mode): mode
-        default: "fresh"
+        default: .fresh
         }
-        guard ["fresh", "resume", "auto"].contains(resumeMode) else { throw ServiceAPIError(code: .invalidRequest, message: "Unsupported provider resume mode") }
         let previousRun = try await store.latestRun(sessionID: sessionID)
-        let resumeIdentity = resumeMode == "fresh" ? nil : previousRun?.providerSessionID
-        if resumeMode == "resume", !capability.supportsResume || resumeIdentity == nil {
+        let resumeIdentity = resumeMode == .fresh ? nil : previousRun?.providerSessionID
+        if resumeMode == .resume, !capability.supportsResume || resumeIdentity == nil {
             throw ServiceAPIError(code: .resumeUnsupported, message: "No durable provider identity is available for native resume")
         }
         let binding = try await session.beginRun(connectionGeneration: snapshot.runGeneration + 1)

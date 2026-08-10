@@ -235,7 +235,7 @@ public struct RepoPromptHTTPService: Sendable {
             let data = try await bodyData(request)
             let command = try JSONDecoder.serviceDecoder.decode(SessionCommand.self, from: data)
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: command.operation, sessionID: id)
-            let receipt = try await authority.execute(command: command, sessionID: id, externalActor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data))
+            let receipt = try await authority.execute(command: command, sessionID: id, externalActor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data), authorizationDecision: auth.decision)
             return try HTTPResponses.json(receipt, status: .accepted)
         } }
         router.get("/internal/v1/sessions/:id/context/selection") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
@@ -346,8 +346,11 @@ public struct RepoPromptHTTPService: Sendable {
         } }
         router.get("/internal/v1/sessions/:id/artifacts/:artifactId/content") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let artifactID = try context.parameters.require("artifactId", as: UUID.self)
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "downloadArtifact", sessionID: id)
             let requestedRange = try parseByteRange(request.headers[.range])
+            let signedTarget = requestedRange.map {
+                "\(request.uri.string)#range=bytes=\($0.lowerBound)-\($0.upperBound - 1)"
+            } ?? request.uri.string
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "downloadArtifact", sessionID: id, pathAndQuery: signedTarget)
             let result = try await authority.artifactContent(sessionID: id, artifactID: artifactID, range: requestedRange)
             var headers = HTTPFields()
             headers[.contentType] = "application/octet-stream"
@@ -559,10 +562,10 @@ public struct RepoPromptHTTPService: Sendable {
         return Data(buffer.readableBytesView)
     }
 
-    private func authenticate(_ request: Request, context: RepoPromptRequestContext, body: Data, roles: Set<InternalRouteRole>, operation: String, projectID: UUID? = nil, sessionID: UUID? = nil) async throws -> AuthenticatedInternalRequest {
+    private func authenticate(_ request: Request, context: RepoPromptRequestContext, body: Data, roles: Set<InternalRouteRole>, operation: String, projectID: UUID? = nil, sessionID: UUID? = nil, pathAndQuery: String? = nil) async throws -> AuthenticatedInternalRequest {
         guard let keyID = request.headers[.internalKeyID], let timestamp = request.headers[.internalTimestamp], let nonce = request.headers[.internalNonce], let bodyDigest = request.headers[.internalBodyDigest], let signature = request.headers[.internalSignature] else { throw ServiceAPIError(code: .internalAuthFailed, message: "Signed internal headers are required") }
         let decisionData = request.headers[.goblinAuthorizationDecision].flatMap(CanonicalSigning.base64URLDecode)
-        let authenticated = try await authenticator.verify(SignedInternalRequest(method: String(describing: request.method), pathAndQuery: request.uri.string, timestamp: timestamp, nonce: nonce, body: body, bodyDigest: bodyDigest, authorizationDecisionData: decisionData, authorizationDecisionDigest: request.headers[.internalAuthorizationDigest], keyID: keyID, signature: signature), allowedRoles: roles, operation: operation, projectID: projectID, sessionID: sessionID)
+        let authenticated = try await authenticator.verify(SignedInternalRequest(method: String(describing: request.method), pathAndQuery: pathAndQuery ?? request.uri.string, timestamp: timestamp, nonce: nonce, body: body, bodyDigest: bodyDigest, authorizationDecisionData: decisionData, authorizationDecisionDigest: request.headers[.internalAuthorizationDigest], keyID: keyID, signature: signature), allowedRoles: roles, operation: operation, projectID: projectID, sessionID: sessionID)
         if let certificateRoleResolver {
             guard let certificate = try await context.channel.nioSSL_peerCertificate().get() else { throw ServiceAPIError(code: .internalAuthFailed, message: "A client certificate is required") }
             guard try certificateRoleResolver.role(certificate: certificate) == authenticated.role else { throw ServiceAPIError(code: .internalAuthFailed, message: "Client certificate and HMAC roles do not match") }
@@ -640,10 +643,14 @@ public struct RepoPromptHTTPService: Sendable {
     }
 
     private func cursorExpiredStream(_ error: ServiceAPIError) throws -> Response {
+        guard let cursor = error.cursor else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Cursor transition metadata is unavailable", retryable: true)
+        }
         var headers = HTTPFields()
         headers[.contentType] = "text/event-stream"
         headers[.cacheControl] = "no-store"
-        let payload = String(decoding: try JSONEncoder.serviceEncoder.encode(error), as: UTF8.self)
+        let transition = CursorExpiredResponse(storeID: cursor.storeID, replayFloor: cursor.globalSequence)
+        let payload = String(decoding: try JSONEncoder.serviceEncoder.encode(transition), as: UTF8.self)
         return Response(status: .ok, headers: headers, body: ResponseBody { writer in
             try await writer.write(ByteBuffer(string: "event: cursor_expired\ndata: \(payload)\n\n"))
             try await writer.finish(nil)

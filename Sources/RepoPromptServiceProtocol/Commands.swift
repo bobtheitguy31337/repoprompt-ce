@@ -53,6 +53,75 @@ public struct RemoveProjectInput: Codable, Sendable {
     }
 }
 
+public struct SelectedMessageContext: Codable, Hashable, Sendable {
+    public struct Message: Codable, Hashable, Sendable {
+        public let roomID: String
+        public let messageID: String
+        public let text: String
+        public let senderID: String
+        public let timestamp: String
+        public let revision: String
+        public let threadID: String?
+
+        public init(roomID: String, messageID: String, text: String, senderID: String, timestamp: String, revision: String, threadID: String? = nil) {
+            self.roomID = roomID
+            self.messageID = messageID
+            self.text = text
+            self.senderID = senderID
+            self.timestamp = timestamp
+            self.revision = revision
+            self.threadID = threadID
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case roomID = "roomId"
+            case messageID = "messageId"
+            case text
+            case senderID = "senderId"
+            case timestamp, revision
+            case threadID = "threadId"
+        }
+    }
+
+    public let schemaVersion: Int
+    public let source: String
+    public let messages: [Message]
+
+    public init(schemaVersion: Int = 1, source: String, messages: [Message]) {
+        self.schemaVersion = schemaVersion
+        self.source = source
+        self.messages = messages
+    }
+
+    public func validated() throws -> Self {
+        guard schemaVersion == 1, source == "goblin-explicit-selection", !messages.isEmpty, messages.count <= 50 else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Selected message context is invalid")
+        }
+        var totalBytes = 0
+        for message in messages {
+            guard !message.roomID.isEmpty, !message.messageID.isEmpty, !message.senderID.isEmpty,
+                  message.roomID.utf8.count <= 256, message.messageID.utf8.count <= 256,
+                  message.senderID.utf8.count <= 256, message.text.utf8.count <= 8_000,
+                  message.timestamp.utf8.count <= 64, message.revision.utf8.count <= 64,
+                  (message.threadID?.utf8.count ?? 0) <= 256
+            else { throw ServiceAPIError(code: .invalidRequest, message: "Selected message context exceeds its bounds") }
+            totalBytes += message.text.utf8.count
+        }
+        guard totalBytes <= 64_000 else { throw ServiceAPIError(code: .invalidRequest, message: "Selected message context exceeds its total bound") }
+        return self
+    }
+
+    public func frozenPrompt(userPrompt: String?) -> String {
+        let rendered = messages.map { message in
+            let thread = message.threadID.map { " threadId=\($0)" } ?? ""
+            return "[roomId=\(message.roomID) messageId=\(message.messageID) senderId=\(message.senderID) timestamp=\(message.timestamp) revision=\(message.revision)\(thread)]\n\(message.text)"
+        }.joined(separator: "\n\n")
+        let context = "<selected-message-context schemaVersion=\"1\" source=\"goblin-explicit-selection\">\n\(rendered)\n</selected-message-context>"
+        guard let userPrompt, !userPrompt.isEmpty else { return context }
+        return "\(context)\n\n<user-request>\n\(userPrompt)\n</user-request>"
+    }
+}
+
 public struct CreateSessionInput: Codable, Sendable {
     public let projectID: UUID
     public let parentSessionID: UUID?
@@ -60,13 +129,37 @@ public struct CreateSessionInput: Codable, Sendable {
     public let model: String?
     public let visibility: Visibility
     public let initialPrompt: String?
-    public init(projectID: UUID, parentSessionID: UUID? = nil, provider: ProviderKind, model: String? = nil, visibility: Visibility, initialPrompt: String? = nil) {
+    public let selectedMessageContext: SelectedMessageContext?
+    public let startImmediately: Bool?
+
+    public init(projectID: UUID, parentSessionID: UUID? = nil, provider: ProviderKind, model: String? = nil, visibility: Visibility, initialPrompt: String? = nil, selectedMessageContext: SelectedMessageContext? = nil, startImmediately: Bool = false) {
         self.projectID = projectID
         self.parentSessionID = parentSessionID
         self.provider = provider
         self.model = model
         self.visibility = visibility
         self.initialPrompt = initialPrompt
+        self.selectedMessageContext = selectedMessageContext
+        self.startImmediately = startImmediately
+    }
+
+    public var hasInitialProviderIntent: Bool {
+        startImmediately == true && (!(initialPrompt ?? "").isEmpty || selectedMessageContext != nil)
+    }
+
+    public func frozenForExecution() throws -> Self {
+        guard (initialPrompt?.utf8.count ?? 0) <= 64_000 else { throw ServiceAPIError(code: .invalidRequest, message: "Initial prompt exceeds its bound") }
+        let context = try selectedMessageContext?.validated()
+        return CreateSessionInput(
+            projectID: projectID,
+            parentSessionID: parentSessionID,
+            provider: provider,
+            model: model,
+            visibility: visibility,
+            initialPrompt: context?.frozenPrompt(userPrompt: initialPrompt) ?? initialPrompt,
+            selectedMessageContext: nil,
+            startImmediately: startImmediately == true
+        )
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -76,11 +169,17 @@ public struct CreateSessionInput: Codable, Sendable {
         case model
         case visibility
         case initialPrompt
+        case selectedMessageContext
+        case startImmediately
     }
 }
 
+public enum ProviderResumeMode: String, Codable, CaseIterable, Sendable {
+    case fresh, resume, auto
+}
+
 public enum SessionCommand: Codable, Sendable {
-    case resumeSession(expectedRunID: UUID?, providerResumeMode: String)
+    case resumeSession(expectedRunID: UUID?, providerResumeMode: ProviderResumeMode)
     case sendFollowup(text: String, expectedSessionRevision: Int64)
     case steerSession(text: String, targetTurnEpoch: Int64)
     case cancelSession(expectedRunID: UUID?, expectedGeneration: Int64)
@@ -139,7 +238,7 @@ public enum SessionCommand: Codable, Sendable {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         let operation = try values.decode(String.self, forKey: .operation)
         switch operation {
-        case "resumeSession": self = try .resumeSession(expectedRunID: values.decodeIfPresent(UUID.self, forKey: .expectedRunID), providerResumeMode: values.decode(String.self, forKey: .providerResumeMode))
+        case "resumeSession": self = try .resumeSession(expectedRunID: values.decodeIfPresent(UUID.self, forKey: .expectedRunID), providerResumeMode: values.decode(ProviderResumeMode.self, forKey: .providerResumeMode))
         case "sendFollowup": self = try .sendFollowup(text: values.decode(String.self, forKey: .text), expectedSessionRevision: values.decode(Int64.self, forKey: .expectedSessionRevision))
         case "steerSession": self = try .steerSession(text: values.decode(String.self, forKey: .text), targetTurnEpoch: values.decode(Int64.self, forKey: .targetTurnEpoch))
         case "cancelSession": self = try .cancelSession(expectedRunID: values.decodeIfPresent(UUID.self, forKey: .expectedRunID), expectedGeneration: values.decode(Int64.self, forKey: .expectedGeneration))

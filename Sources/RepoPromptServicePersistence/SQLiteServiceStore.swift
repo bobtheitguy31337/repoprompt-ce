@@ -216,7 +216,7 @@ public actor SQLiteServiceStore {
             for entry in snapshot.transcript {
                 _ = try await connection.query("INSERT INTO transcript_entries(session_id,entry_id,schema_version,session_sequence,entry_json,content_digest) VALUES(?,?,1,?,?,?)", [.text(snapshot.sessionID.uuidString), .text(entry.entryID.uuidString), .integer(Int(entry.sessionSequence)), .text(encodeText(entry)), .text(CanonicalSigning.bodyDigest(encoder.encode(entry)))])
             }
-            let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.rootSessionID, runID: nil, sessionSequence: Int64(snapshot.transcript.count), type: .sessionCreated, generation: snapshot.runGeneration, turnEpoch: snapshot.turnEpoch, actor: actor, correlationID: UUID(), payload: Data(snapshotJSON.utf8))
+            let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.rootSessionID, runID: nil, sessionSequence: nil, type: .sessionCreated, generation: snapshot.runGeneration, turnEpoch: snapshot.turnEpoch, actor: actor, correlationID: UUID(), payload: Data(snapshotJSON.utf8))
             if [.completed, .failed, .canceled, .interrupted, .archived].contains(snapshot.state) {
                 try await saveCheckpoint(scope: "session:\(snapshot.sessionID.uuidString)", sequence: event.globalSequence, snapshot: Data(snapshotJSON.utf8), retentionClass: "terminal")
             }
@@ -351,7 +351,7 @@ public actor SQLiteServiceStore {
                 parentAgentID: session.parentSessionID,
                 rootSessionID: session.rootSessionID,
                 runID: run?.runID,
-                sessionSequence: Int64(session.transcript.count),
+                sessionSequence: nil,
                 type: eventType,
                 generation: session.runGeneration,
                 turnEpoch: session.turnEpoch,
@@ -540,7 +540,7 @@ public actor SQLiteServiceStore {
             try await upsertCollaboration(metadata)
             let payload = try encoder.encode(metadata)
             let visibility = try await persistSessionInTransaction(session, eventType: .visibilityUpdated, actor: actor, correlationID: correlationID, idempotency: nil, idempotencyResponse: nil, initialSelection: nil, eventPayload: payload)
-            let controller = try await appendEvent(projectID: session.projectID, sessionID: session.sessionID, rootSessionID: session.rootSessionID, runID: nil, sessionSequence: Int64(session.transcript.count), type: .controllerUpdated, generation: session.runGeneration, turnEpoch: session.turnEpoch, actor: actor, correlationID: correlationID, payload: payload)
+            let controller = try await appendEvent(projectID: session.projectID, sessionID: session.sessionID, rootSessionID: session.rootSessionID, runID: nil, sessionSequence: nil, type: .controllerUpdated, generation: session.runGeneration, turnEpoch: session.turnEpoch, actor: actor, correlationID: correlationID, payload: payload)
             try await saveIdempotency(idempotency, status: 202, response: idempotencyResponse ?? payload)
             return [visibility, controller]
         }
@@ -773,10 +773,17 @@ public actor SQLiteServiceStore {
                 throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision was already consumed")
             }
             if let sessionID = decision.sessionID, let collaboration = try await collaboration(sessionID: sessionID) {
-                guard decision.policyRevision == collaboration.policyRevision,
-                      decision.controllerRevision == collaboration.controllerRevision,
-                      decision.membershipRevision == collaboration.membershipRevision
-                else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision revisions do not match durable session policy") }
+                if decision.operation == "setSessionVisibility" {
+                    guard (collaboration.policyRevision ... collaboration.policyRevision + 1).contains(decision.policyRevision),
+                          (collaboration.controllerRevision ... collaboration.controllerRevision + 1).contains(decision.controllerRevision),
+                          (collaboration.membershipRevision ... collaboration.membershipRevision + 1).contains(decision.membershipRevision)
+                    else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Collaboration acknowledgement revisions are not current or exactly next") }
+                } else {
+                    guard decision.policyRevision == collaboration.policyRevision,
+                          decision.controllerRevision == collaboration.controllerRevision,
+                          decision.membershipRevision == collaboration.membershipRevision
+                    else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision revisions do not match durable session policy") }
+                }
             }
             if let row = try await connection.query("SELECT policy_revision,controller_revision,membership_revision FROM authorization_revision_fences WHERE scope_key=?", [.text(scope)]).first {
                 guard decision.policyRevision >= Int64(row.column("policy_revision")?.integer ?? 0),
@@ -907,6 +914,12 @@ public actor SQLiteServiceStore {
             _ = try await connection.query(
                 "UPDATE service_metadata SET restored_from_store_id=store_id,store_id=?,restore_backup_sequence=?,restore_digest=?,replay_floor=?,next_global_sequence=?,last_clean_shutdown=0,activation_state='restore_prepared',activation_generation=activation_generation+1,activation_token_digest=?,activation_instance_id=NULL WHERE fixed_id=1",
                 [.text(fresh.uuidString), .integer(Int(backupSequence)), .text(digest), .integer(Int(restoredFloor)), .integer(Int(restoredFloor + 1)), .text(tokenDigest)]
+            )
+            // Preserve prior records for expiry/audit while making their cached
+            // responses unreachable in the fresh store namespace.
+            _ = try await connection.query(
+                "UPDATE idempotency_records SET idempotency_key=? || idempotency_key",
+                [.text("restored:\(fresh.uuidString):")]
             )
             for project in projects {
                 _ = try await connection.query("UPDATE projects SET snapshot_json=?,updated_at=CURRENT_TIMESTAMP WHERE project_id=?", [.text(encodeText(project)), .text(project.projectID.uuidString)])
@@ -1045,7 +1058,10 @@ public actor SQLiteServiceStore {
                 [.text(initialSelection.sessionID.uuidString), .text(encodeText(Array(Set(initialSelection.entries.map(\.rootID))))), .text(encodeText(initialSelection)), .integer(Int(initialSelection.revision)), .integer(Int(initialSelection.bindingRevision)), .text(UUID().uuidString)]
             )
         }
-        let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.rootSessionID, runID: nil, sessionSequence: Int64(snapshot.transcript.count), type: eventType, generation: snapshot.runGeneration, turnEpoch: snapshot.turnEpoch, actor: actor, correlationID: correlationID, payload: eventPayload ?? Data(snapshotJSON.utf8))
+        let sessionSequence = [EventType.transcriptMessage, .transcriptProgress].contains(eventType)
+            ? snapshot.transcript.last?.sessionSequence
+            : nil
+        let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.rootSessionID, runID: nil, sessionSequence: sessionSequence, type: eventType, generation: snapshot.runGeneration, turnEpoch: snapshot.turnEpoch, actor: actor, correlationID: correlationID, payload: eventPayload ?? Data(snapshotJSON.utf8))
         if [.completed, .failed, .canceled, .interrupted, .archived].contains(snapshot.state) {
             try await saveCheckpoint(scope: "session:\(snapshot.sessionID.uuidString)", sequence: event.globalSequence, snapshot: Data(snapshotJSON.utf8), retentionClass: "terminal")
         }

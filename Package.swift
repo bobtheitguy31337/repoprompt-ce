@@ -206,7 +206,7 @@ private func makeServerPackage() -> Package {
             .target(name: "RepoPromptMCPAdapter", dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptHeadlessRuntime", "RepoPromptDomainRuntime", .product(name: "MCP", package: "swift-sdk")], path: "Sources/RepoPromptMCPAdapter", swiftSettings: swift6LanguageMode),
             .executableTarget(name: "RepoPromptServerExecutable", dependencies: ["RepoPromptServiceHTTP", "RepoPromptHeadlessRuntime", "RepoPromptServicePersistence"], path: "Sources/RepoPromptServerExecutable", swiftSettings: swift6LanguageMode),
             .testTarget(name: "RepoPromptDomainRuntimeTests", dependencies: ["RepoPromptDomainRuntime", .product(name: "MCP", package: "swift-sdk")], path: "Tests/RepoPromptDomainRuntimeTests", swiftSettings: swift6LanguageMode),
-            .testTarget(name: "RepoPromptServerTests", dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptWorkspaceRuntimeCore", "RepoPromptServicePersistence", "RepoPromptHeadlessRuntime", "RepoPromptServiceHTTP", "RepoPromptMCPAdapter", .product(name: "HummingbirdTesting", package: "hummingbird")], path: "Tests/RepoPromptServerTests", swiftSettings: swift6LanguageMode)
+            .testTarget(name: "RepoPromptServerTests", dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptWorkspaceRuntimeCore", "RepoPromptServicePersistence", "RepoPromptHeadlessRuntime", "RepoPromptServiceHTTP", "RepoPromptMCPAdapter", .product(name: "HummingbirdTesting", package: "hummingbird")], path: "Tests/RepoPromptServerTests", resources: [.copy("Fixtures")], swiftSettings: swift6LanguageMode)
         ],
         swiftLanguageModes: [.v5]
     )
@@ -437,6 +437,7 @@ private func makeServerPackage() -> Package {
                         .product(name: "HummingbirdTesting", package: "hummingbird")
                     ],
                     path: "Tests/RepoPromptServerTests",
+                    resources: [.copy("Fixtures")],
                     swiftSettings: swift6LanguageMode
                 )
             ],

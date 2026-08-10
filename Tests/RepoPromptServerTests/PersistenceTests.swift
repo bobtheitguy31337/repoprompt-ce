@@ -111,7 +111,9 @@ final class PersistenceTests: XCTestCase {
         let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
         let priorCursor = try await store.nextCursor()
         let project = ProjectSnapshot(projectID: UUID(), name: "P", creator: actor, state: .active, roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)], revision: 1, cursor: priorCursor)
-        _ = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: nil)
+        let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "createProject", key: "before-restore", requestDigest: "digest")
+        _ = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: idempotency)
+        XCTAssertNotNil(try await store.idempotencyResult(idempotency))
 
         let activationToken = Data("restore-activation".utf8)
         let fresh = try await store.prepareRestoredStore(
@@ -121,6 +123,7 @@ final class PersistenceTests: XCTestCase {
             activationToken: activationToken
         )
         _ = try await store.activateRestoredStore(activationToken: activationToken, instanceID: UUID())
+        XCTAssertNil(try await store.idempotencyResult(idempotency))
         XCTAssertNotEqual(prior, fresh)
         let restored = try await store.metadata()
         XCTAssertEqual(restored.storeID, fresh)

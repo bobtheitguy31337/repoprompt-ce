@@ -109,7 +109,7 @@ final class AgentModeAuthorityAdapter {
             userMessage: userMessage,
             providerPrompt: providerPrompt,
             presentationPayload: payload,
-            resumeMode: admitted.activeRun?.providerSessionID == nil ? "auto" : "resume",
+            resumeMode: admitted.activeRun?.providerSessionID == nil ? .auto : .resume,
             idempotencyKey: "macos-run:\(UUID().uuidString)",
             requestDigest: digest
         )

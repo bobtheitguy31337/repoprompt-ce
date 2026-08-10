@@ -400,14 +400,20 @@ public struct CollaborationMetadataInput: Codable, Sendable {
     public let expectedPolicyRevision: Int64
     public let expectedControllerRevision: Int64?
     public let expectedMembershipRevision: Int64?
+    public let policyRevision: Int64?
+    public let controllerRevision: Int64?
+    public let membershipRevision: Int64?
     public let visibility: Visibility
     public let collaborativeSteeringEnabled: Bool
     public let controllerUserID: String
 
-    public init(expectedPolicyRevision: Int64, expectedControllerRevision: Int64? = nil, expectedMembershipRevision: Int64? = nil, visibility: Visibility, collaborativeSteeringEnabled: Bool, controllerUserID: String) {
+    public init(expectedPolicyRevision: Int64, expectedControllerRevision: Int64? = nil, expectedMembershipRevision: Int64? = nil, policyRevision: Int64? = nil, controllerRevision: Int64? = nil, membershipRevision: Int64? = nil, visibility: Visibility, collaborativeSteeringEnabled: Bool, controllerUserID: String) {
         self.expectedPolicyRevision = expectedPolicyRevision
         self.expectedControllerRevision = expectedControllerRevision
         self.expectedMembershipRevision = expectedMembershipRevision
+        self.policyRevision = policyRevision
+        self.controllerRevision = controllerRevision
+        self.membershipRevision = membershipRevision
         self.visibility = visibility
         self.collaborativeSteeringEnabled = collaborativeSteeringEnabled
         self.controllerUserID = controllerUserID
@@ -417,6 +423,9 @@ public struct CollaborationMetadataInput: Codable, Sendable {
         case expectedPolicyRevision
         case expectedControllerRevision
         case expectedMembershipRevision
+        case policyRevision
+        case controllerRevision
+        case membershipRevision
         case visibility
         case collaborativeSteeringEnabled
         case controllerUserID = "controllerUserId"

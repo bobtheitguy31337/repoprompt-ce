@@ -113,6 +113,21 @@ public enum ConfigurationError: Error, CustomStringConvertible { case missing(St
     }
 }
 
+private struct RestoreActivationRequest: Decodable {
+    let schemaVersion: Int
+    let acknowledged: Bool
+    let restoredFromStoreID: UUID
+    let backupSequence: Int64
+    let backupCreatedAt: String
+    let backupManifestSHA256: String
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, acknowledged, backupSequence, backupCreatedAt
+        case restoredFromStoreID = "restoredFromStoreId"
+        case backupManifestSHA256 = "backupManifestSha256"
+    }
+}
+
 public enum RepoPromptServerRunner {
     public static func run(configuration: RepoPromptServerConfiguration) async throws {
         let stateDirectory = URL(fileURLWithPath: configuration.stateDatabasePath).deletingLastPathComponent().path
@@ -144,7 +159,33 @@ public enum RepoPromptServerRunner {
         )
         if let tokenPath = configuration.restoreActivationTokenPath {
             let token = try Data(contentsOf: URL(fileURLWithPath: tokenPath))
-            _ = try await store.activateRestoredStore(activationToken: token, instanceID: instanceID)
+            guard token.count >= 32 else { throw ServiceAPIError(code: .invalidRequest, message: "Restore activation token must contain at least 256 bits") }
+            let requestURL = URL(fileURLWithPath: stateDirectory).appendingPathComponent("restore-request.json")
+            var metadata = try await store.metadata()
+            if metadata.activationState == "active", FileManager.default.fileExists(atPath: requestURL.path) {
+                let request = try JSONDecoder.serviceDecoder.decode(RestoreActivationRequest.self, from: Data(contentsOf: requestURL))
+                guard request.schemaVersion == 1, request.acknowledged,
+                      request.restoredFromStoreID == metadata.storeID,
+                      request.backupSequence >= 0,
+                      request.backupCreatedAt.utf8.count <= 128,
+                      request.backupManifestSHA256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil
+                else { throw ServiceAPIError(code: .invalidRequest, message: "Restore activation request is invalid or does not match this store") }
+                _ = try await store.prepareRestoredStore(
+                    from: request.restoredFromStoreID,
+                    backupSequence: request.backupSequence,
+                    digest: request.backupManifestSHA256,
+                    activationToken: token
+                )
+                metadata = try await store.metadata()
+            }
+            if metadata.activationState == "restore_prepared" {
+                _ = try await store.activateRestoredStore(activationToken: token, instanceID: instanceID)
+                if FileManager.default.fileExists(atPath: requestURL.path) {
+                    try FileManager.default.removeItem(at: requestURL)
+                }
+            } else if metadata.activationState != "active" {
+                throw ServiceAPIError(code: .quiescing, message: "Restored store requires activation fencing")
+            }
         }
         guard try await store.metadata().activationState == "active" else {
             try await store.close(clean: false)

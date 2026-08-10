@@ -67,4 +67,31 @@ final class ProtocolAndLifecycleTests: XCTestCase {
         XCTAssertEqual(gate.accept(binding: .init(runID: binding.runID, generation: 2, turnEpoch: 3, connectionGeneration: 6)), .staleTurnEpoch)
         XCTAssertEqual(gate.accept(binding: .init(runID: binding.runID, generation: 2, turnEpoch: 4, connectionGeneration: 5)), .staleConnection)
     }
+
+    func testGoblinCommandFixtureDecodesEveryClosedV1Variant() throws {
+        let fixtureURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("Fixtures/goblin-session-commands-v1.json")
+        let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: fixtureURL)) as? [String: Any])
+        XCTAssertEqual(fixture["schemaVersion"] as? Int, 1)
+        let vectors = try XCTUnwrap(fixture["vectors"] as? [[String: Any]])
+        XCTAssertEqual(vectors.count, 17)
+        for vector in vectors {
+            let body = try XCTUnwrap(vector["internalBody"] as? [String: Any])
+            let command = try JSONDecoder.serviceDecoder.decode(SessionCommand.self, from: JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]))
+            XCTAssertEqual(command.operation, body["operation"] as? String)
+            let encoded = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder.serviceEncoder.encode(command)) as? [String: Any])
+            XCTAssertEqual(encoded["operation"] as? String, body["operation"] as? String)
+        }
+    }
+
+    func testGoblinSelectedMessageContextIsValidatedAndFrozenIntoInitialPrompt() throws {
+        let data = Data("""
+        {"projectId":"11111111-1111-4111-8111-111111111111","provider":"codex","visibility":"private","initialPrompt":"Investigate the regression","startImmediately":true,"selectedMessageContext":{"schemaVersion":1,"source":"goblin-explicit-selection","messages":[{"roomId":"room-1","messageId":"message-1","text":"Exact selected chat text","senderId":"user-1","timestamp":"2026-08-10T12:00:00.000Z","revision":"2026-08-10T12:00:01.000Z","threadId":"thread-1"}]}}
+        """.utf8)
+        let decoded = try JSONDecoder.serviceDecoder.decode(CreateSessionInput.self, from: data)
+        let frozen = try decoded.frozenForExecution()
+        XCTAssertTrue(frozen.hasInitialProviderIntent)
+        XCTAssertNil(frozen.selectedMessageContext)
+        XCTAssertTrue(try XCTUnwrap(frozen.initialPrompt).contains("Exact selected chat text"))
+        XCTAssertTrue(try XCTUnwrap(frozen.initialPrompt).contains("Investigate the regression"))
+    }
 }

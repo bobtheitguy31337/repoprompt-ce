@@ -326,8 +326,14 @@ final class AuthenticationAndHTTPTests: XCTestCase {
                 XCTAssertEqual(response.status, .ok)
                 let eventStream = String(decoding: response.body.readableBytesView, as: UTF8.self)
                 XCTAssertTrue(eventStream.contains("event: cursor_expired"))
-                XCTAssertTrue(eventStream.contains("data: {"), eventStream)
-                XCTAssertTrue(eventStream.contains("\"storeId\""), eventStream)
+                let dataLine = try XCTUnwrap(eventStream.split(separator: "\n").first { $0.hasPrefix("data: ") })
+                let payload = try JSONDecoder.serviceDecoder.decode(
+                    CursorExpiredResponse.self,
+                    from: Data(dataLine.dropFirst("data: ".count).utf8)
+                )
+                XCTAssertEqual(payload.storeID, metadata.storeID)
+                XCTAssertEqual(payload.replayFloor, 1)
+                XCTAssertEqual(payload.snapshotURL, "/internal/v1/snapshot")
             }
         }
         try await store.close()

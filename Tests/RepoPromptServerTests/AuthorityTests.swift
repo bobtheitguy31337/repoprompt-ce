@@ -40,7 +40,7 @@ final class AuthorityTests: XCTestCase {
         _ = try await authority.execute(command: .sendFollowup(text: "collaborator", expectedSessionRevision: 2), sessionID: session.sessionID, externalActor: owner, idempotencyKey: "collaborator-followup", requestDigest: "collaborator-followup")
         _ = try await authority.updatePermissions(sessionID: session.sessionID, expectedRevision: 1, mode: "disabled", providerSettings: [:], actor: controller, idempotencyKey: "disable-provider", requestDigest: "disable-provider")
         do {
-            _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: session.sessionID, externalActor: controller, idempotencyKey: "disabled-run", requestDigest: "disabled-run")
+            _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh), sessionID: session.sessionID, externalActor: controller, idempotencyKey: "disabled-run", requestDigest: "disabled-run")
             XCTFail("expected execution policy rejection")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .authorizationDecisionRejected)
@@ -79,9 +79,9 @@ final class AuthorityTests: XCTestCase {
             projectID: project.projectID,
             operation: "setSessionVisibility",
             requestDigest: "ack-digest",
-            policyRevision: 1,
-            controllerRevision: 1,
-            membershipRevision: 1,
+            policyRevision: 2,
+            controllerRevision: 2,
+            membershipRevision: 2,
             attributionLabels: .init(
                 creatorUserID: owner.goblinUserID,
                 controllerUserID: controller.goblinUserID,
@@ -119,6 +119,9 @@ final class AuthorityTests: XCTestCase {
                     expectedPolicyRevision: 1,
                     expectedControllerRevision: 1,
                     expectedMembershipRevision: 1,
+                    policyRevision: 2,
+                    controllerRevision: 2,
+                    membershipRevision: 2,
                     visibility: .collaborative,
                     collaborativeSteeringEnabled: true,
                     controllerUserID: controller.goblinUserID
@@ -140,6 +143,9 @@ final class AuthorityTests: XCTestCase {
                 expectedPolicyRevision: 1,
                 expectedControllerRevision: 1,
                 expectedMembershipRevision: 1,
+                policyRevision: 2,
+                controllerRevision: 2,
+                membershipRevision: 2,
                 visibility: .collaborative,
                 collaborativeSteeringEnabled: true,
                 controllerUserID: controller.goblinUserID
@@ -151,9 +157,9 @@ final class AuthorityTests: XCTestCase {
         )
         let expectedAck = GoblinCollaborationAcknowledgement(
             decisionID: decisionID,
-            acknowledgedPolicyRevision: 1,
-            acknowledgedControllerRevision: 1,
-            acknowledgedMembershipRevision: 1,
+            acknowledgedPolicyRevision: 2,
+            acknowledgedControllerRevision: 2,
+            acknowledgedMembershipRevision: 2,
             resultingPolicyRevision: 2,
             resultingControllerRevision: 2,
             resultingMembershipRevision: 2,
@@ -200,7 +206,7 @@ final class AuthorityTests: XCTestCase {
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "first"), externalActor: actor, idempotencyKey: "s-run", requestDigest: "s-run")
 
         do {
-            _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "resume", requestDigest: "resume")
+            _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "resume", requestDigest: "resume")
         } catch {
             print("NATIVE RESUME ERROR: \(error)")
             XCTFail("native resume failed: \(error)")
@@ -224,7 +230,7 @@ final class AuthorityTests: XCTestCase {
         do {
             cancelSession = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "cancel"), externalActor: actor, idempotencyKey: "s-cancel", requestDigest: "s-cancel")
             await runtime.holdNextRun()
-            _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: cancelSession.sessionID, externalActor: actor, idempotencyKey: "resume-cancel", requestDigest: "resume-cancel")
+            _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh), sessionID: cancelSession.sessionID, externalActor: actor, idempotencyKey: "resume-cancel", requestDigest: "resume-cancel")
             _ = try await authority.execute(command: .cancelSession(expectedRunID: nil, expectedGeneration: 1), sessionID: cancelSession.sessionID, externalActor: actor, idempotencyKey: "cancel", requestDigest: "cancel")
         } catch {
             print("NATIVE CANCEL ERROR: \(error)")
@@ -253,7 +259,7 @@ final class AuthorityTests: XCTestCase {
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-policy-runtime", requestDigest: "p-policy-runtime")
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "inspect"), externalActor: actor, idempotencyKey: "s-policy-runtime", requestDigest: "s-policy-runtime")
         _ = try await authority.updatePermissions(sessionID: session.sessionID, expectedRevision: 1, mode: "readOnly", providerSettings: ["codex.approvalPolicy": "never"], actor: actor)
-        _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "run-policy-runtime", requestDigest: "run-policy-runtime")
+        _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "run-policy-runtime", requestDigest: "run-policy-runtime")
         await authority.waitForProviderRunsToSettle()
         let recordedPolicy = await runtime.lastPolicy()
         let policy = try XCTUnwrap(recordedPolicy)
@@ -275,7 +281,7 @@ final class AuthorityTests: XCTestCase {
         let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-events", requestDigest: "p-events")
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "run"), externalActor: actor, idempotencyKey: "s-events", requestDigest: "s-events")
-        _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "run-events", requestDigest: "run-events")
+        _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "run-events", requestDigest: "run-events")
 
         var interaction: InteractionSnapshot?
         for _ in 0 ..< 100 {
@@ -397,7 +403,7 @@ final class AuthorityTests: XCTestCase {
         XCTAssertEqual(hierarchy.first(where: { $0.sessionID == child.sessionID })?.role, "explore")
         XCTAssertEqual(hierarchy.first(where: { $0.sessionID == child.sessionID })?.label, "probe")
 
-        _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: rootSession.sessionID, externalActor: actor, idempotencyKey: "resume-tree", requestDigest: "resume-tree")
+        _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh), sessionID: rootSession.sessionID, externalActor: actor, idempotencyKey: "resume-tree", requestDigest: "resume-tree")
         _ = try await authority.execute(command: .cancelSession(expectedRunID: nil, expectedGeneration: 1), sessionID: rootSession.sessionID, externalActor: actor, idempotencyKey: "cancel-tree", requestDigest: "cancel-tree")
         let canceledChild = try await authority.sessionSnapshot(sessionID: child.sessionID)
         let canceledRoot = try await authority.sessionSnapshot(sessionID: rootSession.sessionID)
@@ -427,7 +433,7 @@ final class AuthorityTests: XCTestCase {
         let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-drain", requestDigest: "p-drain")
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "run"), externalActor: actor, idempotencyKey: "s-drain", requestDigest: "s-drain")
-        _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "resume-drain", requestDigest: "resume-drain")
+        _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "resume-drain", requestDigest: "resume-drain")
 
         try await authority.quiesce()
 
