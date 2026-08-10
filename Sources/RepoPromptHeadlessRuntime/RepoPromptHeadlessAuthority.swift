@@ -69,19 +69,7 @@ public actor RepoPromptHeadlessAuthority {
         let unclean = try await !(store.metadata().lastCleanShutdown)
         try await providerAdapter?.recoverProcessFamilies()
         for snapshot in try await store.allProjects() {
-            let persistedIdentities = try await store.projectRootIdentities(projectID: snapshot.projectID)
-            let roots = snapshot.roots.map { root in
-                let persisted = persistedIdentities[root.rootID]
-                let identity = if let persisted, !["pending", "legacy-import"].contains(persisted) {
-                    persisted
-                } else {
-                    (try? filesystem.canonicalizeRoot(root.canonicalPath).identity) ?? "unavailable"
-                }
-                return CanonicalRoot(snapshot: root, filesystemIdentity: identity)
-            }
-            let project = ProjectAuthority(snapshot: snapshot, roots: roots)
-            await projects.install(project)
-            tools[snapshot.projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
+            try await installProjectRuntime(snapshot)
         }
         for storedSnapshot in try await store.allSessions() {
             var snapshot = storedSnapshot
@@ -113,7 +101,17 @@ public actor RepoPromptHeadlessAuthority {
             agents[snapshot.sessionID] = synthesized
             await eventHub.publish(event)
         }
+        try await recoverExecutionWorkspaces()
         try await store.installWorkflows(workflowCatalog.workflows())
+    }
+
+    private func recoverExecutionWorkspaces() async throws {
+        guard let worktreeService else { return }
+        let rootSessions = try await sessionSnapshots().filter { $0.parentSessionID == nil && $0.state != .archived }
+        try await worktreeService.removeOrphanedExecutionWorkspaces(validOwnerSessionIDs: Set(rootSessions.map(\.sessionID)))
+        for session in rootSessions {
+            try await ensureExecutionWorkspaceLocked(session: session)
+        }
     }
 
     public func createProject(
@@ -126,7 +124,7 @@ public actor RepoPromptHeadlessAuthority {
         try ensureWritable()
         let idempotency = IdempotencyInput(actorID: externalActor.goblinUserID, operation: "createProject", key: idempotencyKey, requestDigest: requestDigest)
         if let existing = try await store.idempotencyResult(idempotency) {
-            return try JSONDecoder.serviceDecoder.decode(ProjectSnapshot.self, from: existing.response)
+            return try await replayProject(response: existing.response, status: existing.status)
         }
         let projectName = input.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !projectName.isEmpty, projectName.utf8.count <= 200,
@@ -142,12 +140,45 @@ public actor RepoPromptHeadlessAuthority {
         }
         let cursor = try await store.nextCursor()
         let snapshot = ProjectSnapshot(projectID: projectID, name: projectName, creator: externalActor, state: .active, roots: canonicalRoots.map(\.snapshot), revision: 1, cursor: cursor)
-        let event = try await store.persistProject(snapshot, rootIdentities: Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.snapshot.rootID, $0.filesystemIdentity) }), eventType: .projectCreated, actor: externalActor, correlationID: correlationID ?? ids.next(), idempotency: idempotency, expectedRevision: 0)
-        let project = ProjectAuthority(snapshot: snapshot, roots: canonicalRoots)
+        do {
+            let event = try await store.persistProject(snapshot, rootIdentities: Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.snapshot.rootID, $0.filesystemIdentity) }), eventType: .projectCreated, actor: externalActor, correlationID: correlationID ?? ids.next(), idempotency: idempotency, expectedRevision: 0)
+            try await installProjectRuntime(snapshot)
+            await eventHub.publish(event)
+            return snapshot
+        } catch let existing as ExistingIdempotency {
+            return try await replayProject(response: existing.response, status: existing.status)
+        }
+    }
+
+    private func installProjectRuntime(_ snapshot: ProjectSnapshot) async throws {
+        let persistedIdentities = try await store.projectRootIdentities(projectID: snapshot.projectID)
+        let roots = snapshot.roots.map { root in
+            let persisted = persistedIdentities[root.rootID]
+            let identity = if let persisted, !["pending", "legacy-import"].contains(persisted) {
+                persisted
+            } else {
+                (try? filesystem.canonicalizeRoot(root.canonicalPath).identity) ?? "unavailable"
+            }
+            return CanonicalRoot(snapshot: root, filesystemIdentity: identity)
+        }
+        let project = ProjectAuthority(snapshot: snapshot, roots: roots)
         await projects.install(project)
-        tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
-        await eventHub.publish(event)
-        return snapshot
+        tools[snapshot.projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
+    }
+
+    private func replayProject(response: Data, status: Int) async throws -> ProjectSnapshot {
+        guard status == 201 else {
+            throw ServiceAPIError(code: .persistenceUnavailable, message: "Persisted project creation replay status is invalid", retryable: false)
+        }
+        do {
+            let snapshot = try JSONDecoder.serviceDecoder.decode(ProjectSnapshot.self, from: response)
+            try await installProjectRuntime(snapshot)
+            return snapshot
+        } catch let error as ServiceAPIError {
+            throw error
+        } catch {
+            throw ServiceAPIError(code: .persistenceUnavailable, message: "Persisted project creation replay is invalid", retryable: false)
+        }
     }
 
     public func projectSourceCapabilities() async -> ProjectSourceCapabilities? {
@@ -858,7 +889,7 @@ public actor RepoPromptHeadlessAuthority {
         }
         let binding = await sessionAuthority.activeBinding()
         let run = try await store.latestRun(sessionID: sessionID)
-        let worktrees = try await store.worktrees(projectID: session.projectID).filter { $0.sessionID == sessionID }
+        let worktrees = try await effectiveWorktreeBindings(session: session)
         return AuthoritySessionSnapshot(
             session: session,
             activeRun: run,
@@ -873,9 +904,17 @@ public actor RepoPromptHeadlessAuthority {
         try ensureWritable()
         let idempotency = IdempotencyInput(actorID: externalActor.goblinUserID, operation: "startSession", key: idempotencyKey, requestDigest: requestDigest)
         if let existing = try await store.idempotencyResult(idempotency) {
-            return try JSONDecoder.serviceDecoder.decode(SessionSnapshot.self, from: existing.response)
+            return try await replaySession(response: existing.response, status: existing.status)
         }
         _ = try await projects.authority(projectID: input.projectID)
+        let ownsWorkspaceBarrier = input.parentSessionID == nil
+        if ownsWorkspaceBarrier, !projectRepositoryMutationBarriers.insert(input.projectID).inserted {
+            throw ServiceAPIError(code: .runAlreadyActive, message: "Project repositories are changing")
+        }
+        defer {
+            if ownsWorkspaceBarrier { projectRepositoryMutationBarriers.remove(input.projectID) }
+        }
+        let project = try await projectSnapshot(projectID: input.projectID)
         var parent: SessionSnapshot?
         if let parentID = input.parentSessionID {
             guard let parentAuthority = sessions[parentID] else { throw ServiceAPIError(code: .notFound, message: "Parent session not found") }
@@ -900,19 +939,85 @@ public actor RepoPromptHeadlessAuthority {
         let agent = AgentSnapshot(agentID: sessionID, sessionID: sessionID, rootSessionID: rootSessionID, parentAgentID: input.parentSessionID, role: input.parentSessionID == nil ? "root" : "child", state: snapshot.state, revision: 1)
         let permissions = ExecutionPermissionSnapshot(sessionID: sessionID, mode: "workspaceWrite", providerSettings: [:], revision: 1, updatedActor: externalActor)
         let collaboration = CollaborationMetadataSnapshot(sessionID: sessionID, visibility: input.visibility, collaborativeSteeringEnabled: false, controllerUserID: externalActor.goblinUserID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
-        let events = try await store.persistNewSession(snapshot, agent: agent, actor: externalActor, correlationID: ids.next(), agentCorrelationID: ids.next(), idempotency: idempotency, initialSelection: seededSelection, initialPermissions: permissions, initialCollaboration: collaboration)
+        var initialWorktrees: [WorktreeBindingSnapshot] = []
+        if input.parentSessionID == nil, let worktreeService, !project.roots.isEmpty {
+            do {
+                for root in project.roots where root.writable {
+                    let sessionPrefix = sessionID.uuidString.lowercased().prefix(12)
+                    let rootPrefix = root.rootID.uuidString.lowercased().prefix(12)
+                    let branch = "repoprompt/session-\(sessionPrefix)-\(rootPrefix)"
+                    initialWorktrees.append(try await worktreeService.create(project: project, root: root, sessionID: sessionID, baseRef: "HEAD", branch: branch))
+                }
+                _ = try await worktreeService.materializeExecutionWorkspace(project: project, ownerSessionID: sessionID, bindings: initialWorktrees)
+            } catch {
+                await discardPreparedWorktrees(initialWorktrees, project: project, ownerSessionID: sessionID)
+                throw error
+            }
+        }
+        let currentProject = try await projectSnapshot(projectID: input.projectID)
+        guard currentProject.revision == project.revision,
+              currentProject.roots.map(\.rootID) == project.roots.map(\.rootID)
+        else {
+            await discardPreparedWorktrees(initialWorktrees, project: project, ownerSessionID: sessionID)
+            throw ServiceAPIError(code: .staleRevision, message: "Project repositories changed during session preparation", currentRevision: currentProject.revision)
+        }
+        let events: (session: EventEnvelope, agent: EventEnvelope, worktrees: [EventEnvelope])
+        do {
+            events = try await store.persistNewSession(
+                snapshot,
+                agent: agent,
+                actor: externalActor,
+                correlationID: ids.next(),
+                agentCorrelationID: ids.next(),
+                idempotency: idempotency,
+                initialSelection: seededSelection,
+                initialPermissions: permissions,
+                initialCollaboration: collaboration,
+                initialWorktrees: initialWorktrees
+            )
+        } catch let existing as ExistingIdempotency {
+            await discardPreparedWorktrees(initialWorktrees, project: project, ownerSessionID: sessionID)
+            return try await replaySession(response: existing.response, status: existing.status)
+        } catch {
+            await discardPreparedWorktrees(initialWorktrees, project: project, ownerSessionID: sessionID)
+            throw error
+        }
         sessions[sessionID] = SessionAuthority(snapshot: snapshot, clock: clock, ids: ids)
         agents[sessionID] = agent
         selections[sessionID] = SessionSelectionAuthority(sessionID: sessionID, template: seededSelection.entries, revision: seededSelection.revision, bindingRevision: seededSelection.bindingRevision)
         await eventHub.publish(events.session)
         await eventHub.publish(events.agent)
-        if input.parentSessionID == nil, let worktreeService {
-            let project = try await projectSnapshot(projectID: input.projectID)
-            if let root = project.roots.first(where: \.writable) {
-                let branch = "repoprompt/session-\(sessionID.uuidString.lowercased().prefix(12))"
-                let binding = try await worktreeService.create(project: project, root: root, sessionID: sessionID, baseRef: "HEAD", branch: branch)
-                let worktreeEvent = try await store.persistWorktree(binding, actor: externalActor, correlationID: ids.next())
-                await eventHub.publish(worktreeEvent)
+        for event in events.worktrees { await eventHub.publish(event) }
+        return snapshot
+    }
+
+    private func replaySession(response: Data, status: Int) async throws -> SessionSnapshot {
+        guard status == 201 else {
+            throw ServiceAPIError(code: .persistenceUnavailable, message: "Persisted session creation replay status is invalid", retryable: false)
+        }
+        let snapshot: SessionSnapshot
+        do {
+            snapshot = try JSONDecoder.serviceDecoder.decode(SessionSnapshot.self, from: response)
+        } catch {
+            throw ServiceAPIError(code: .persistenceUnavailable, message: "Persisted session creation replay is invalid", retryable: false)
+        }
+        sessions[snapshot.sessionID] = sessions[snapshot.sessionID] ?? SessionAuthority(snapshot: snapshot, clock: clock, ids: ids)
+        if let agent = try await store.agents().first(where: { $0.sessionID == snapshot.sessionID }) {
+            agents[snapshot.sessionID] = agent
+        }
+        if let selection = try await store.selection(sessionID: snapshot.sessionID) {
+            selections[snapshot.sessionID] = SessionSelectionAuthority(
+                sessionID: snapshot.sessionID,
+                template: selection.entries,
+                revision: selection.revision,
+                bindingRevision: selection.bindingRevision
+            )
+        }
+        if snapshot.parentSessionID == nil, let worktreeService {
+            let project = try await projectSnapshot(projectID: snapshot.projectID)
+            if !project.roots.isEmpty {
+                let bindings = try await effectiveWorktreeBindings(session: snapshot)
+                _ = try await worktreeService.materializeExecutionWorkspace(project: project, ownerSessionID: snapshot.sessionID, bindings: bindings)
             }
         }
         return snapshot
@@ -1530,6 +1635,14 @@ public actor RepoPromptHeadlessAuthority {
             throw ServiceAPIError(code: .runAlreadyActive, message: "A worktree cannot be changed while a run is active")
         }
         let session = await sessionAuthority.snapshot()
+        guard session.parentSessionID == nil else {
+            throw ServiceAPIError(code: .worktreeConflict, message: "Only a root session may replace the project execution workspace")
+        }
+        try await ensureProjectHasNoActiveProviderRun(projectID: session.projectID)
+        guard projectRepositoryMutationBarriers.insert(session.projectID).inserted else {
+            throw ServiceAPIError(code: .runAlreadyActive, message: "Project repositories or worktrees are changing")
+        }
+        defer { projectRepositoryMutationBarriers.remove(session.projectID) }
         let project = try await projectSnapshot(projectID: session.projectID)
         let rootIDs = Set(project.roots.map(\.rootID))
         guard desired.allSatisfy({
@@ -1540,7 +1653,9 @@ public actor RepoPromptHeadlessAuthority {
         }) else {
             throw ServiceAPIError(code: .worktreeConflict, message: "Embedded worktree replacement contains an unauthorized binding")
         }
-        guard Set(desired.map(\.bindingID)).count == desired.count else {
+        guard Set(desired.map(\.bindingID)).count == desired.count,
+              Set(desired.map(\.rootID)).count == desired.count
+        else {
             throw ServiceAPIError(code: .invalidRequest, message: "Embedded worktree replacement contains duplicate identities")
         }
 
@@ -1592,12 +1707,29 @@ public actor RepoPromptHeadlessAuthority {
         if let idempotency, let prior: WorktreeBindingSnapshot = try await priorResult(idempotency) { return prior }
         guard let worktreeService else { throw ServiceAPIError(code: .capabilityMissing, message: "Worktree storage is not configured") }
         let session = try await sessionSnapshot(sessionID: sessionID)
+        guard session.parentSessionID == nil else {
+            throw ServiceAPIError(code: .worktreeConflict, message: "Only a root session may create project worktrees")
+        }
+        try await ensureProjectHasNoActiveProviderRun(projectID: session.projectID)
+        guard projectRepositoryMutationBarriers.insert(session.projectID).inserted else {
+            throw ServiceAPIError(code: .runAlreadyActive, message: "Project repositories or worktrees are changing")
+        }
+        defer { projectRepositoryMutationBarriers.remove(session.projectID) }
         let project = try await projectSnapshot(projectID: session.projectID)
         guard let root = project.roots.first(where: { $0.rootID == rootID }) else { throw ServiceAPIError(code: .rootUnauthorized, message: "Unknown project root") }
+        let currentBindings = try await effectiveWorktreeBindings(session: session)
+        guard !currentBindings.contains(where: { $0.rootID == rootID }) else {
+            throw ServiceAPIError(code: .worktreeConflict, message: "Project root already has an active session worktree")
+        }
         let snapshot = try await worktreeService.create(project: project, root: root, sessionID: sessionID, baseRef: baseRef, branch: branch)
-        let event = try await store.persistWorktree(snapshot, actor: actor, correlationID: ids.next(), idempotency: idempotency)
-        await eventHub.publish(event)
-        return snapshot
+        do {
+            let event = try await store.persistWorktree(snapshot, actor: actor, correlationID: ids.next(), idempotency: idempotency)
+            await eventHub.publish(event)
+            return snapshot
+        } catch {
+            await worktreeService.discardPrepared(snapshot, sourceRoot: root.canonicalPath)
+            throw error
+        }
     }
 
     public func bindWorktree(sessionID: UUID, bindingID: UUID, expectedRevision: Int64, expectedSelectionBindingRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> WorktreeBindingSnapshot {
@@ -1699,9 +1831,9 @@ public actor RepoPromptHeadlessAuthority {
         guard current.revision == input.expectedSelectionRevision else { throw ServiceAPIError(code: .staleRevision, message: "Selection revision is stale", currentRevision: current.revision) }
         let project = try await projectSnapshot(projectID: session.projectID)
         let frozenContext = try await sessionContext(sessionID: sessionID)
-        let frozenBinding = try await sessionWorktreeBinding(session: session)
+        let frozenBindings = try await effectiveWorktreeBindings(session: session)
         let tool = try await sessionToolAuthority(session: session)
-        let workingDirectory = try await workingDirectory(session: session)
+        let workingDirectory = try await executionLocation(session: session).workingDirectory
         var candidates: [ContextBuilderFileCandidate] = []
         for root in project.roots {
             let entries = try await tool.tree(.init(rootID: root.rootID, maximumDepth: 32, maximumEntries: 20000))
@@ -1755,13 +1887,13 @@ public actor RepoPromptHeadlessAuthority {
         let latestProject = try await projectSnapshot(projectID: session.projectID)
         let latestSelection = try await selectionSnapshot(sessionID: sessionID)
         let latestContext = try await sessionContext(sessionID: sessionID)
-        let latestBinding = try await sessionWorktreeBinding(session: session)
+        let latestBindings = try await effectiveWorktreeBindings(session: session)
         guard latestProject.revision == project.revision,
               latestSelection.revision == current.revision,
               latestSelection.bindingRevision == current.bindingRevision,
               latestContext.contextRevision == frozenContext.contextRevision,
               latestContext.prompt == frozenContext.prompt,
-              latestBinding == frozenBinding
+              latestBindings == frozenBindings
         else {
             throw ServiceAPIError(code: .staleRevision, message: "Context Builder frozen workspace changed before commit", currentRevision: latestSelection.revision)
         }
@@ -1797,7 +1929,7 @@ public actor RepoPromptHeadlessAuthority {
         guard let oracleRuntime else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Oracle runtime is not configured") }
         let session = try await sessionSnapshot(sessionID: sessionID)
         let project = try await projectSnapshot(projectID: session.projectID)
-        let workingDirectory = try await workingDirectory(session: session)
+        let workingDirectory = try await executionLocation(session: session).workingDirectory
         let selection = try await selectionSnapshot(sessionID: sessionID)
         let context = try await materializedContext(projectID: project.projectID, selection: selection, include: ["files"])
         let chatID = input.chatID ?? ids.next()
@@ -1974,6 +2106,62 @@ public actor RepoPromptHeadlessAuthority {
         if quiescing { throw ServiceAPIError(code: .quiescing, message: "Service is quiescing", retryable: true) }
     }
 
+    private func ensureExecutionWorkspaceLocked(session: SessionSnapshot) async throws {
+        guard let worktreeService else { return }
+        let project = try await projectSnapshot(projectID: session.projectID)
+        guard !project.roots.isEmpty else { return }
+        let allBindings = try await store.worktrees(projectID: project.projectID).filter { $0.sessionID == session.rootSessionID }
+        var activeBindings = try await effectiveWorktreeBindings(session: session)
+        let missingRoots = project.roots.filter { root in
+            root.writable && !activeBindings.contains(where: { $0.rootID == root.rootID })
+        }
+        for root in missingRoots where allBindings.contains(where: { $0.rootID == root.rootID && $0.ownershipState == .released }) {
+            throw ServiceAPIError(code: .worktreeConflict, message: "A released project worktree must be rebound explicitly")
+        }
+        guard !missingRoots.isEmpty else {
+            _ = try await worktreeService.materializeExecutionWorkspace(project: project, ownerSessionID: session.rootSessionID, bindings: activeBindings)
+            return
+        }
+        try await ensureProjectHasNoActiveProviderRun(projectID: project.projectID)
+        var prepared: [WorktreeBindingSnapshot] = []
+        do {
+            for root in missingRoots {
+                let sessionPrefix = session.rootSessionID.uuidString.lowercased().prefix(12)
+                let rootPrefix = root.rootID.uuidString.lowercased().prefix(12)
+                let attemptPrefix = ids.next().uuidString.lowercased().prefix(8)
+                let branch = "repoprompt/session-\(sessionPrefix)-\(rootPrefix)-\(attemptPrefix)"
+                prepared.append(try await worktreeService.create(project: project, root: root, sessionID: session.rootSessionID, baseRef: "HEAD", branch: branch))
+            }
+            let currentProject = try await projectSnapshot(projectID: project.projectID)
+            guard currentProject.revision == project.revision,
+                  currentProject.roots.map(\.rootID) == project.roots.map(\.rootID)
+            else {
+                throw ServiceAPIError(code: .staleRevision, message: "Project repositories changed during workspace preparation", currentRevision: currentProject.revision)
+            }
+            try await worktreeService.removeExecutionWorkspace(projectID: project.projectID, ownerSessionID: session.rootSessionID)
+            activeBindings.append(contentsOf: prepared)
+            _ = try await worktreeService.materializeExecutionWorkspace(project: project, ownerSessionID: session.rootSessionID, bindings: activeBindings)
+            let events = try await store.persistWorktrees(prepared, actor: session.creator, correlationID: ids.next())
+            for event in events { await eventHub.publish(event) }
+        } catch {
+            await discardPreparedWorktrees(prepared, project: project, ownerSessionID: session.rootSessionID)
+            throw error
+        }
+    }
+
+    private func discardPreparedWorktrees(
+        _ bindings: [WorktreeBindingSnapshot],
+        project: ProjectSnapshot,
+        ownerSessionID: UUID
+    ) async {
+        guard let worktreeService else { return }
+        for binding in bindings.reversed() {
+            guard let root = project.roots.first(where: { $0.rootID == binding.rootID }) else { continue }
+            await worktreeService.discardPrepared(binding, sourceRoot: root.canonicalPath)
+        }
+        try? await worktreeService.removeExecutionWorkspace(projectID: project.projectID, ownerSessionID: ownerSessionID)
+    }
+
     private func ensureProjectHasNoActiveProviderRun(projectID: UUID) async throws {
         for session in sessions.values {
             let snapshot = await session.snapshot()
@@ -2113,9 +2301,10 @@ public actor RepoPromptHeadlessAuthority {
     ) async throws -> CommandReceipt {
         guard let providerAdapter else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider runtime is not configured") }
         let snapshot = await session.snapshot()
-        guard !projectRepositoryMutationBarriers.contains(snapshot.projectID) else {
+        guard projectRepositoryMutationBarriers.insert(snapshot.projectID).inserted else {
             throw ServiceAPIError(code: .runAlreadyActive, message: "A repository mutation is active for this project")
         }
+        defer { projectRepositoryMutationBarriers.remove(snapshot.projectID) }
         guard let permissions = try await store.permissions(sessionID: sessionID) else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Execution permissions are not configured") }
         guard permissions.mode != "disabled" else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Provider execution is disabled by session policy") }
         guard ["readOnly", "workspaceWrite", "fullAccess"].contains(permissions.mode) else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Execution permission mode is invalid") }
@@ -2129,7 +2318,8 @@ public actor RepoPromptHeadlessAuthority {
         if resumeMode == .resume, !capability.supportsResume || resumeIdentity == nil {
             throw ServiceAPIError(code: .resumeUnsupported, message: "No durable provider identity is available for native resume")
         }
-        let workingDirectory = try await workingDirectory(session: snapshot)
+        try await ensureExecutionWorkspaceLocked(session: snapshot)
+        let executionLocation = try await executionLocation(session: snapshot)
         let binding = try await session.beginRun(connectionGeneration: snapshot.runGeneration + 1)
         let current = await session.snapshot()
         let cursor = try await store.nextCursor()
@@ -2150,7 +2340,8 @@ public actor RepoPromptHeadlessAuthority {
                 binding: binding,
                 run: run,
                 prompt: prompt,
-                workingDirectory: workingDirectory,
+                workingDirectory: executionLocation.workingDirectory,
+                writableRoots: executionLocation.writableRoots,
                 permissions: permissions
             )
         }
@@ -2259,7 +2450,7 @@ public actor RepoPromptHeadlessAuthority {
         }
     }
 
-    private func performProviderRun(sessionID: UUID, binding: RunBindingIdentity, run: ProviderRunSnapshot, prompt: String, workingDirectory: String, permissions: ExecutionPermissionSnapshot) async {
+    private func performProviderRun(sessionID: UUID, binding: RunBindingIdentity, run: ProviderRunSnapshot, prompt: String, workingDirectory: String, writableRoots: [String], permissions: ExecutionPermissionSnapshot) async {
         guard let providerAdapter, let session = sessions[sessionID] else { return }
         defer { Task { await providerAdapter.forgetRun(runID: binding.runID) } }
         let initial = await session.snapshot()
@@ -2280,7 +2471,7 @@ public actor RepoPromptHeadlessAuthority {
                     maximumBytes: 8_388_608,
                     runID: binding.runID,
                     resumeProviderSessionID: run.providerSessionID,
-                    policy: .init(mode: executionMode, writableRoots: executionMode == .workspaceWrite ? [workingDirectory] : [], providerSettings: permissions.providerSettings)
+                    policy: .init(mode: executionMode, writableRoots: executionMode == .workspaceWrite ? writableRoots : [], providerSettings: permissions.providerSettings)
                 )
             ) { event in
                 await eventState.observe(event)
@@ -2416,36 +2607,82 @@ public actor RepoPromptHeadlessAuthority {
         try await store.persistRun(ProviderRunSnapshot(runID: run.runID, sessionID: run.sessionID, provider: run.provider, providerSessionID: run.providerSessionID, state: state, generation: run.generation, turnEpoch: binding.turnEpoch, startReason: run.startReason, endReason: reason, startedAt: run.startedAt, endedAt: clock.now()))
     }
 
-    private func sessionWorktreeBinding(session: SessionSnapshot) async throws -> WorktreeBindingSnapshot? {
-        try await store.worktrees(projectID: session.projectID).first {
-            $0.sessionID == session.sessionID || $0.sessionID == session.rootSessionID
+    private func effectiveWorktreeBindings(session: SessionSnapshot) async throws -> [WorktreeBindingSnapshot] {
+        let effective = try await store.worktrees(projectID: session.projectID).filter {
+            $0.sessionID == session.rootSessionID && $0.ownershipState == .active
         }
+        let grouped = Dictionary(grouping: effective, by: \.rootID)
+        guard grouped.values.allSatisfy({ $0.count == 1 }) else {
+            throw ServiceAPIError(code: .worktreeConflict, message: "A project root has multiple active session worktrees")
+        }
+        return effective
     }
 
-    private func workingDirectory(session: SessionSnapshot) async throws -> String {
-        if let binding = try await sessionWorktreeBinding(session: session) { return binding.physicalPath }
+    private func executionLocation(session: SessionSnapshot) async throws -> (workingDirectory: String, writableRoots: [String]) {
         let project = try await projectSnapshot(projectID: session.projectID)
+        if project.roots.isEmpty {
+            guard let projectSourceService else {
+                throw ServiceAPIError(code: .capabilityMissing, message: "Empty projects require managed workspace storage")
+            }
+            let workspace = try await projectSourceService.projectWorkspaceDirectory(projectID: project.projectID)
+            return (workspace, [workspace])
+        }
+        if let worktreeService {
+            let bindings = try await effectiveWorktreeBindings(session: session)
+            let workspace = try await worktreeService.materializeExecutionWorkspace(
+                project: project,
+                ownerSessionID: session.rootSessionID,
+                bindings: bindings
+            )
+            return (workspace.directory, workspace.writableRoots)
+        }
         if let projectSourceService {
             let workspace = try await projectSourceService.projectWorkspaceDirectory(projectID: project.projectID)
-            if project.roots.isEmpty { return workspace }
             let repositories = URL(fileURLWithPath: workspace).appendingPathComponent("repositories").path
             let prefix = repositories.hasSuffix("/") ? repositories : repositories + "/"
-            if project.roots.allSatisfy({ $0.canonicalPath.hasPrefix(prefix) }) { return workspace }
+            if project.roots.allSatisfy({ $0.canonicalPath.hasPrefix(prefix) }) {
+                return (workspace, project.roots.filter(\.writable).map(\.canonicalPath))
+            }
         }
-        guard let root = project.roots.first else {
-            throw ServiceAPIError(code: .capabilityMissing, message: "Empty projects require managed workspace storage")
+        guard project.roots.count == 1, let root = project.roots.first else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Multi-root execution requires managed worktree storage")
         }
-        return root.canonicalPath
+        return (root.canonicalPath, root.writable ? [root.canonicalPath] : [])
     }
 
     private func sessionToolAuthority(session: SessionSnapshot) async throws -> ProjectToolAuthority {
         let snapshot = try await projectSnapshot(projectID: session.projectID)
-        let binding = try await sessionWorktreeBinding(session: session)
+        let bindings = try await effectiveWorktreeBindings(session: session)
+        if let worktreeService, !snapshot.roots.isEmpty {
+            _ = try await worktreeService.materializeExecutionWorkspace(project: snapshot, ownerSessionID: session.rootSessionID, bindings: bindings)
+        }
+        let byRoot = Dictionary(uniqueKeysWithValues: bindings.map { ($0.rootID, $0) })
+        let persistedIdentities = try await store.projectRootIdentities(projectID: snapshot.projectID)
         let roots = try snapshot.roots.map { root -> CanonicalRoot in
-            let path = binding?.rootID == root.rootID ? binding?.physicalPath ?? root.canonicalPath : root.canonicalPath
+            let path: String
+            if root.writable, worktreeService != nil {
+                guard let binding = byRoot[root.rootID] else {
+                    throw ServiceAPIError(code: .worktreeConflict, message: "Writable project root is missing its session worktree")
+                }
+                path = binding.physicalPath
+            } else {
+                path = root.canonicalPath
+            }
             let canonical = try filesystem.canonicalizeRoot(path)
+            let identity: String
+            if root.writable {
+                identity = canonical.identity
+            } else {
+                guard let persisted = persistedIdentities[root.rootID],
+                      !["pending", "legacy-import"].contains(persisted),
+                      persisted == canonical.identity
+                else {
+                    throw ServiceAPIError(code: .rootUnauthorized, message: "Read-only project root identity changed")
+                }
+                identity = persisted
+            }
             let routed = ProjectRootSnapshot(rootID: root.rootID, logicalName: root.logicalName, canonicalPath: canonical.path, writable: root.writable)
-            return CanonicalRoot(snapshot: routed, filesystemIdentity: canonical.identity)
+            return CanonicalRoot(snapshot: routed, filesystemIdentity: identity)
         }
         let routedSnapshot = ProjectSnapshot(projectID: snapshot.projectID, name: snapshot.name, creator: snapshot.creator, state: snapshot.state, roots: roots.map(\.snapshot), revision: snapshot.revision, cursor: snapshot.cursor)
         return ProjectToolAuthority(project: ProjectAuthority(snapshot: routedSnapshot, roots: roots), filesystem: filesystem, commandRunner: commandRunner)

@@ -225,7 +225,9 @@ public actor OwnedResourceReconciliationService {
             workingDirectory: record.internalPathIdentity,
             maximumBytes: 65536
         )
+        let identityDigest = try await WorktreeRuntimeIdentity.digest(path: record.internalPathIdentity, runner: runner, gitExecutable: gitExecutable)
         return URL(fileURLWithPath: top.trimmingCharacters(in: .whitespacesAndNewlines)).standardizedFileURL.path == record.internalPathIdentity
+            && record.contentDigest == identityDigest
     }
 
     private func isProviderHomeResource(_ record: OwnedResourceRecord) -> Bool {

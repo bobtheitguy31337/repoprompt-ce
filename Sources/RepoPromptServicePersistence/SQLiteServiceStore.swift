@@ -224,14 +224,40 @@ public actor SQLiteServiceStore {
         idempotency: IdempotencyInput,
         initialSelection: SelectionSnapshot,
         initialPermissions: ExecutionPermissionSnapshot,
-        initialCollaboration: CollaborationMetadataSnapshot
-    ) async throws -> (session: EventEnvelope, agent: EventEnvelope) {
+        initialCollaboration: CollaborationMetadataSnapshot,
+        initialWorktrees: [WorktreeBindingSnapshot] = []
+    ) async throws -> (session: EventEnvelope, agent: EventEnvelope, worktrees: [EventEnvelope]) {
         try await transaction {
             let sessionEvent = try await persistSessionInTransaction(snapshot, eventType: .sessionCreated, actor: actor, correlationID: correlationID, idempotency: idempotency, idempotencyResponse: nil, initialSelection: initialSelection)
             try await upsertPermissions(initialPermissions)
             try await upsertCollaboration(initialCollaboration)
             let agentEvent = try await persistAgentInTransaction(agent, projectID: snapshot.projectID, actor: snapshot.parentSessionID == nil ? actor : nil, correlationID: agentCorrelationID, eventType: .agentStarted)
-            return (sessionEvent, agentEvent)
+            var worktreeEvents: [EventEnvelope] = []
+            for worktree in initialWorktrees {
+                guard worktree.projectID == snapshot.projectID, worktree.sessionID == snapshot.sessionID else {
+                    throw ServiceAPIError(code: .worktreeConflict, message: "Initial worktree does not belong to the new session")
+                }
+                try await ensureUniqueActiveWorktree(worktree)
+                _ = try await connection.query(
+                    "INSERT INTO worktree_bindings(binding_id,project_id,root_id,session_id,schema_version,base_ref,branch,physical_path,ownership_state,merge_state,revision) VALUES(?,?,?,?,1,?,?,?,?,?,?)",
+                    [.text(worktree.bindingID.uuidString), .text(worktree.projectID.uuidString), .text(worktree.rootID.uuidString), .text(snapshot.sessionID.uuidString), .text(worktree.baseRef), .text(worktree.branch), .text(worktree.physicalPath), .text(worktree.ownershipState.rawValue), .text(worktree.mergeState.rawValue), .integer(Int(worktree.revision))]
+                )
+                try await activatePreparedOwnedResourceIfPresent(externalID: worktree.bindingID, kind: .worktree, path: worktree.physicalPath)
+                worktreeEvents.append(try await appendEvent(
+                    projectID: snapshot.projectID,
+                    sessionID: snapshot.sessionID,
+                    rootSessionID: snapshot.rootSessionID,
+                    runID: nil,
+                    sessionSequence: nil,
+                    type: .worktreeCreated,
+                    generation: snapshot.runGeneration,
+                    turnEpoch: snapshot.turnEpoch,
+                    actor: actor,
+                    correlationID: correlationID,
+                    payload: encoder.encode(worktree)
+                ))
+            }
+            return (sessionEvent, agentEvent, worktreeEvents)
         }
     }
 
@@ -471,7 +497,10 @@ public actor SQLiteServiceStore {
     }
 
     public func idempotencyResult(_ input: IdempotencyInput) async throws -> (response: Data, status: Int)? {
-        guard let value = try await existingIdempotency(input) else { return nil }
+        guard let value = try await existingIdempotency(input) else {
+            try await faultInjector.hit(.afterIdempotencyPreflightMiss)
+            return nil
+        }
         return (response: value.0, status: value.1)
     }
 
@@ -658,6 +687,7 @@ public actor SQLiteServiceStore {
     public func persistWorktree(_ snapshot: WorktreeBindingSnapshot, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput? = nil) async throws -> EventEnvelope {
         try await transaction {
             if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
+            try await ensureUniqueActiveWorktree(snapshot)
             _ = try await connection.query(
                 "INSERT INTO worktree_bindings(binding_id,project_id,root_id,session_id,schema_version,base_ref,branch,physical_path,ownership_state,merge_state,revision) VALUES(?,?,?,?,1,?,?,?,?,?,?) ON CONFLICT(binding_id) DO UPDATE SET session_id=excluded.session_id,ownership_state=excluded.ownership_state,merge_state=excluded.merge_state,revision=excluded.revision",
                 [.text(snapshot.bindingID.uuidString), .text(snapshot.projectID.uuidString), .text(snapshot.rootID.uuidString), snapshot.sessionID.map { .text($0.uuidString) } ?? .null, .text(snapshot.baseRef), .text(snapshot.branch), .text(snapshot.physicalPath), .text(snapshot.ownershipState.rawValue), .text(snapshot.mergeState.rawValue), .integer(Int(snapshot.revision))]
@@ -672,6 +702,38 @@ public actor SQLiteServiceStore {
         }
     }
 
+    public func persistWorktrees(
+        _ snapshots: [WorktreeBindingSnapshot],
+        actor: ExternalActor,
+        correlationID: UUID
+    ) async throws -> [EventEnvelope] {
+        try await transaction {
+            var events: [EventEnvelope] = []
+            for snapshot in snapshots {
+                try await ensureUniqueActiveWorktree(snapshot)
+                _ = try await connection.query(
+                    "INSERT INTO worktree_bindings(binding_id,project_id,root_id,session_id,schema_version,base_ref,branch,physical_path,ownership_state,merge_state,revision) VALUES(?,?,?,?,1,?,?,?,?,?,?)",
+                    [.text(snapshot.bindingID.uuidString), .text(snapshot.projectID.uuidString), .text(snapshot.rootID.uuidString), snapshot.sessionID.map { .text($0.uuidString) } ?? .null, .text(snapshot.baseRef), .text(snapshot.branch), .text(snapshot.physicalPath), .text(snapshot.ownershipState.rawValue), .text(snapshot.mergeState.rawValue), .integer(Int(snapshot.revision))]
+                )
+                try await activatePreparedOwnedResourceIfPresent(externalID: snapshot.bindingID, kind: .worktree, path: snapshot.physicalPath)
+                events.append(try await appendEvent(
+                    projectID: snapshot.projectID,
+                    sessionID: snapshot.sessionID,
+                    rootSessionID: snapshot.sessionID,
+                    runID: nil,
+                    sessionSequence: nil,
+                    type: .worktreeCreated,
+                    generation: nil,
+                    turnEpoch: nil,
+                    actor: actor,
+                    correlationID: correlationID,
+                    payload: encoder.encode(snapshot)
+                ))
+            }
+            return events
+        }
+    }
+
     /// Atomically replaces an embedded host's authority-owned worktree set.
     /// The caller supplies already validated active/released snapshots; either
     /// every ownership transition and event commits or none does.
@@ -683,7 +745,18 @@ public actor SQLiteServiceStore {
     ) async throws -> [EventEnvelope] {
         try await transaction {
             var events: [EventEnvelope] = []
-            for snapshot in snapshots {
+            let activeKeys = snapshots.compactMap { snapshot -> String? in
+                guard snapshot.ownershipState == .active, let sessionID = snapshot.sessionID else { return nil }
+                return "\(sessionID.uuidString):\(snapshot.rootID.uuidString)"
+            }
+            guard Set(activeKeys).count == activeKeys.count else {
+                throw ServiceAPIError(code: .worktreeConflict, message: "Embedded worktree roots must be unique per session")
+            }
+            let ordered = snapshots.sorted { left, right in
+                left.ownershipState == .released && right.ownershipState != .released
+            }
+            for snapshot in ordered {
+                try await ensureUniqueActiveWorktree(snapshot)
                 _ = try await connection.query(
                     "INSERT INTO worktree_bindings(binding_id,project_id,root_id,session_id,schema_version,base_ref,branch,physical_path,ownership_state,merge_state,revision) VALUES(?,?,?,?,1,?,?,?,?,?,?) ON CONFLICT(binding_id) DO UPDATE SET session_id=excluded.session_id,base_ref=excluded.base_ref,branch=excluded.branch,physical_path=excluded.physical_path,ownership_state=excluded.ownership_state,merge_state=excluded.merge_state,revision=excluded.revision",
                     [.text(snapshot.bindingID.uuidString), .text(snapshot.projectID.uuidString), .text(snapshot.rootID.uuidString), snapshot.sessionID.map { .text($0.uuidString) } ?? .null, .text(snapshot.baseRef), .text(snapshot.branch), .text(snapshot.physicalPath), .text(snapshot.ownershipState.rawValue), .text(snapshot.mergeState.rawValue), .integer(Int(snapshot.revision))]
@@ -709,6 +782,7 @@ public actor SQLiteServiceStore {
     public func persistWorktreeBinding(_ worktree: WorktreeBindingSnapshot, selection: SelectionSnapshot, session: SessionSnapshot, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput) async throws -> (worktree: EventEnvelope, selection: EventEnvelope) {
         try await transaction {
             if let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
+            try await ensureUniqueActiveWorktree(worktree)
             _ = try await connection.query(
                 "INSERT INTO worktree_bindings(binding_id,project_id,root_id,session_id,schema_version,base_ref,branch,physical_path,ownership_state,merge_state,revision) VALUES(?,?,?,?,1,?,?,?,?,?,?) ON CONFLICT(binding_id) DO UPDATE SET session_id=excluded.session_id,ownership_state=excluded.ownership_state,merge_state=excluded.merge_state,revision=excluded.revision",
                 [.text(worktree.bindingID.uuidString), .text(worktree.projectID.uuidString), .text(worktree.rootID.uuidString), worktree.sessionID.map { .text($0.uuidString) } ?? .null, .text(worktree.baseRef), .text(worktree.branch), .text(worktree.physicalPath), .text(worktree.ownershipState.rawValue), .text(worktree.mergeState.rawValue), .integer(Int(worktree.revision))]
@@ -1283,6 +1357,17 @@ public actor SQLiteServiceStore {
     func requireUUID(_ value: String?) throws -> UUID {
         guard let value, let id = UUID(uuidString: value) else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Persisted UUID is invalid") }
         return id
+    }
+
+    private func ensureUniqueActiveWorktree(_ snapshot: WorktreeBindingSnapshot) async throws {
+        guard snapshot.ownershipState == .active, let sessionID = snapshot.sessionID else { return }
+        let collision = try await connection.query(
+            "SELECT binding_id FROM worktree_bindings WHERE project_id=? AND root_id=? AND session_id=? AND ownership_state=? AND binding_id<>? LIMIT 1",
+            [.text(snapshot.projectID.uuidString), .text(snapshot.rootID.uuidString), .text(sessionID.uuidString), .text(WorktreeBindingSnapshot.OwnershipState.active.rawValue), .text(snapshot.bindingID.uuidString)]
+        ).first
+        guard collision == nil else {
+            throw ServiceAPIError(code: .worktreeConflict, message: "A project root already has an active session worktree")
+        }
     }
 
     private func decodeWorktree(_ row: SQLiteRow) throws -> WorktreeBindingSnapshot {

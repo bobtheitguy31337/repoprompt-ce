@@ -89,6 +89,61 @@ final class PersistenceTests: XCTestCase {
         }
     }
 
+    func testConcurrentIdenticalProjectCreationReplaysCommittedWinner() async throws {
+        let barrier = TwoPartyIdempotencyPreflightBarrier()
+        let injector = PersistenceFaultInjector { point in
+            await barrier.hit(point)
+        }
+        let store = try await SQLiteServiceStore.open(storage: .memory, faultInjector: injector)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let actor = ExternalActor(goblinUserID: "concurrent-owner", username: "owner", displayName: "Owner")
+
+        async let first = authority.createProject(
+            input: .init(name: "Concurrent workspace", roots: []),
+            externalActor: actor,
+            idempotencyKey: "same-create",
+            requestDigest: "same-fingerprint"
+        )
+        async let second = authority.createProject(
+            input: .init(name: "Concurrent workspace", roots: []),
+            externalActor: actor,
+            idempotencyKey: "same-create",
+            requestDigest: "same-fingerprint"
+        )
+        let (firstResult, secondResult) = try await (first, second)
+        XCTAssertEqual(firstResult, secondResult)
+
+        let projects = try await store.allProjects()
+        XCTAssertEqual(projects, [firstResult])
+        let events = try await store.events(after: nil, limit: 10)
+        XCTAssertEqual(events.events.count(where: { $0.eventType == .projectCreated }), 1)
+        let replay = try await store.idempotencyResult(.init(
+            actorID: actor.goblinUserID,
+            operation: "createProject",
+            key: "same-create",
+            requestDigest: "same-fingerprint"
+        ))
+        XCTAssertEqual(replay?.status, 201)
+        XCTAssertEqual(try replay.map { try JSONDecoder.serviceDecoder.decode(ProjectSnapshot.self, from: $0.response) }, firstResult)
+
+        do {
+            _ = try await authority.createProject(
+                input: .init(name: "Different workspace", roots: []),
+                externalActor: actor,
+                idempotencyKey: "same-create",
+                requestDigest: "different-fingerprint"
+            )
+            XCTFail("expected conflicting fingerprint rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .idempotencyConflict)
+        }
+        let finalProjects = try await store.allProjects()
+        let finalEvents = try await store.events(after: nil, limit: 10)
+        XCTAssertEqual(finalProjects.count, 1)
+        XCTAssertEqual(finalEvents.events.count(where: { $0.eventType == .projectCreated }), 1)
+        try await store.close()
+    }
+
     func testAtomicProjectPublicationUsesMonotonicSequence() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
@@ -283,5 +338,22 @@ final class PersistenceTests: XCTestCase {
         let events = try await store.events(after: nil, limit: 20)
         XCTAssertEqual(events.events.count(where: { $0.eventType == .sessionCreated }), 2)
         try await store.close()
+    }
+}
+
+private actor TwoPartyIdempotencyPreflightBarrier {
+    private var remaining = 2
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func hit(_ point: PersistenceFaultPoint) async {
+        guard point == .afterIdempotencyPreflightMiss, remaining > 0 else { return }
+        remaining -= 1
+        if remaining == 0 {
+            let pending = waiters
+            waiters.removeAll()
+            pending.forEach { $0.resume() }
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
     }
 }

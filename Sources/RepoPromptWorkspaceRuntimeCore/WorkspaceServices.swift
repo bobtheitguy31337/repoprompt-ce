@@ -181,6 +181,55 @@ public actor ProjectToolAuthority {
     }
 }
 
+enum WorktreeRuntimeIdentity {
+    static func digest(
+        path: String,
+        runner: any WorkspaceCommandRunning,
+        gitExecutable: String
+    ) async throws -> String {
+        let filesystemIdentity = try LocalFilesystemAuthority().canonicalizeRoot(path).identity
+        let rawCommonDirectory = try await runner.run(
+            executable: gitExecutable,
+            arguments: ["-C", path, "rev-parse", "--git-common-dir"],
+            workingDirectory: path,
+            maximumBytes: 65536
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let commonDirectory = URL(
+            fileURLWithPath: rawCommonDirectory,
+            relativeTo: URL(fileURLWithPath: path, isDirectory: true)
+        ).standardizedFileURL.resolvingSymlinksInPath().path
+        return CanonicalSigning.bodyDigest(Data("\(filesystemIdentity)\u{0}\(commonDirectory)".utf8))
+    }
+}
+
+public struct ProjectExecutionWorkspace: Sendable {
+    public struct Root: Sendable {
+        public let rootID: UUID
+        public let logicalName: String
+        public let routePath: String
+        public let executionPath: String
+        public let writable: Bool
+
+        public init(rootID: UUID, logicalName: String, routePath: String, executionPath: String, writable: Bool) {
+            self.rootID = rootID
+            self.logicalName = logicalName
+            self.routePath = routePath
+            self.executionPath = executionPath
+            self.writable = writable
+        }
+    }
+
+    public let directory: String
+    public let roots: [Root]
+
+    public init(directory: String, roots: [Root]) {
+        self.directory = directory
+        self.roots = roots
+    }
+
+    public var writableRoots: [String] { roots.filter(\.writable).map(\.executionPath) }
+}
+
 public actor WorktreeRuntimeService {
     private let baseDirectory: String
     private let runner: any WorkspaceCommandRunning
@@ -195,12 +244,194 @@ public actor WorktreeRuntimeService {
         resources: (any OwnedResourceRepository)? = nil,
         ownerInstanceID: UUID = UUID()
     ) throws {
-        self.baseDirectory = URL(fileURLWithPath: baseDirectory).standardizedFileURL.path
+        self.baseDirectory = URL(fileURLWithPath: baseDirectory).standardizedFileURL.resolvingSymlinksInPath().path
         self.runner = runner
         self.gitExecutable = gitExecutable
         self.resources = resources
         self.ownerInstanceID = ownerInstanceID
         try FileManager.default.createDirectory(atPath: self.baseDirectory, withIntermediateDirectories: true)
+    }
+
+    public func materializeExecutionWorkspace(
+        project: ProjectSnapshot,
+        ownerSessionID: UUID,
+        bindings: [WorktreeBindingSnapshot]
+    ) async throws -> ProjectExecutionWorkspace {
+        guard Set(project.roots.map(\.rootID)).count == project.roots.count else {
+            throw ServiceAPIError(code: .persistenceUnavailable, message: "Project execution roots contain duplicate identities", retryable: false)
+        }
+        let active = bindings.filter { $0.ownershipState == .active }
+        guard active.allSatisfy({ binding in
+            binding.projectID == project.projectID
+                && binding.sessionID == ownerSessionID
+                && project.roots.contains(where: { $0.rootID == binding.rootID })
+        }) else {
+            throw ServiceAPIError(code: .worktreeConflict, message: "Execution workspace contains a foreign worktree binding")
+        }
+        let byRoot = Dictionary(grouping: active, by: \.rootID)
+        let executionBase = URL(fileURLWithPath: baseDirectory)
+            .appendingPathComponent(".execution-workspaces", isDirectory: true)
+            .appendingPathComponent(project.projectID.uuidString.lowercased(), isDirectory: true)
+        let destination = executionBase.appendingPathComponent(ownerSessionID.uuidString.lowercased(), isDirectory: true)
+        let staging = executionBase.appendingPathComponent(".\(ownerSessionID.uuidString.lowercased()).\(UUID().uuidString).tmp", isDirectory: true)
+        _ = try DurableFilesystem.standardizedContainedPath(root: baseDirectory, candidate: destination.path)
+        _ = try DurableFilesystem.standardizedContainedPath(root: baseDirectory, candidate: staging.path)
+        try FileManager.default.createDirectory(at: staging.appendingPathComponent("roots", isDirectory: true), withIntermediateDirectories: true)
+        try Self.requireNonSymbolicLinkDirectory(URL(fileURLWithPath: baseDirectory))
+        try Self.requireNonSymbolicLinkDirectory(executionBase.deletingLastPathComponent())
+        try Self.requireNonSymbolicLinkDirectory(executionBase)
+        try Self.requireNonSymbolicLinkDirectory(staging)
+        do {
+            var routed: [ProjectExecutionWorkspace.Root] = []
+            var manifestRoots: [[String: Any]] = []
+            for root in project.roots {
+                let candidates = byRoot[root.rootID] ?? []
+                let executionPath: String
+                if root.writable {
+                    guard candidates.count == 1, let binding = candidates.first else {
+                        throw ServiceAPIError(code: .worktreeConflict, message: "Every writable project root requires exactly one active session worktree")
+                    }
+                    executionPath = try DurableFilesystem.standardizedContainedPath(root: baseDirectory, candidate: binding.physicalPath)
+                    if let resources {
+                        let identityDigest = try await WorktreeRuntimeIdentity.digest(path: executionPath, runner: runner, gitExecutable: gitExecutable)
+                        guard let resource = try await resources.ownedResource(externalID: binding.bindingID, kind: .worktree),
+                              [.prepared, .active].contains(resource.lifecycleState),
+                              resource.projectID == project.projectID,
+                              resource.sessionID == ownerSessionID,
+                              resource.internalPathIdentity == executionPath,
+                              resource.contentDigest == identityDigest,
+                              resource.metadata["sourceRoot"] == root.canonicalPath,
+                              resource.metadata["branch"] == binding.branch
+                        else {
+                            throw ServiceAPIError(code: .worktreeConflict, message: "Session worktree ownership record is invalid")
+                        }
+                    }
+                    let verification = try await runner.run(
+                        executable: gitExecutable,
+                        arguments: ["-C", executionPath, "rev-parse", "--show-toplevel"],
+                        workingDirectory: executionPath,
+                        maximumBytes: 65536
+                    ).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let registration = try await runner.run(
+                        executable: gitExecutable,
+                        arguments: ["-C", root.canonicalPath, "worktree", "list", "--porcelain"],
+                        workingDirectory: root.canonicalPath,
+                        maximumBytes: 1_048_576
+                    )
+                    let registeredPaths = registration.split(separator: "\n").compactMap { line -> String? in
+                        let prefix = "worktree "
+                        guard line.hasPrefix(prefix) else { return nil }
+                        return URL(fileURLWithPath: String(line.dropFirst(prefix.count))).standardizedFileURL.path
+                    }
+                    guard URL(fileURLWithPath: verification).standardizedFileURL.path == executionPath,
+                          registeredPaths.contains(executionPath)
+                    else {
+                        throw ServiceAPIError(code: .worktreeConflict, message: "Session worktree identity is invalid")
+                    }
+                } else {
+                    guard candidates.isEmpty else {
+                        throw ServiceAPIError(code: .worktreeConflict, message: "Read-only project roots cannot own modifying worktrees")
+                    }
+                    executionPath = URL(fileURLWithPath: root.canonicalPath).standardizedFileURL.path
+                }
+                let relativePath = "roots/\(root.rootID.uuidString.lowercased())"
+                let route = staging.appendingPathComponent(relativePath)
+                try FileManager.default.createSymbolicLink(atPath: route.path, withDestinationPath: executionPath)
+                routed.append(.init(rootID: root.rootID, logicalName: root.logicalName, routePath: destination.appendingPathComponent(relativePath).path, executionPath: executionPath, writable: root.writable))
+                manifestRoots.append([
+                    "rootId": root.rootID.uuidString.lowercased(),
+                    "logicalName": root.logicalName,
+                    "relativePath": relativePath,
+                    "writable": root.writable
+                ])
+            }
+            let manifest: [String: Any] = [
+                "schemaVersion": 1,
+                "projectId": project.projectID.uuidString.lowercased(),
+                "ownerSessionId": ownerSessionID.uuidString.lowercased(),
+                "roots": manifestRoots
+            ]
+            let manifestData = try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try Self.requireNonSymbolicLinkDirectory(destination)
+                try Self.requireNonSymbolicLinkDirectory(destination.appendingPathComponent("roots", isDirectory: true))
+                let existingManifest = try Data(contentsOf: destination.appendingPathComponent("workspace.json"), options: [.mappedIfSafe])
+                guard existingManifest == manifestData else {
+                    throw ServiceAPIError(code: .worktreeConflict, message: "Published execution workspace manifest changed")
+                }
+                for root in routed {
+                    let routeURL = URL(fileURLWithPath: root.routePath)
+                    let values = try routeURL.resourceValues(forKeys: [.isSymbolicLinkKey])
+                    let target = try FileManager.default.destinationOfSymbolicLink(atPath: routeURL.path)
+                    guard values.isSymbolicLink == true,
+                          URL(fileURLWithPath: target).standardizedFileURL.path == root.executionPath
+                    else {
+                        throw ServiceAPIError(code: .worktreeConflict, message: "Published execution workspace route changed")
+                    }
+                }
+                try FileManager.default.removeItem(at: staging)
+                return ProjectExecutionWorkspace(directory: destination.path, roots: routed)
+            }
+            let manifestURL = staging.appendingPathComponent("workspace.json")
+            try manifestData.write(to: manifestURL, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: manifestURL.path)
+            try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: staging.appendingPathComponent("roots", isDirectory: true).path)
+            try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: staging.path)
+            try FileManager.default.moveItem(at: staging, to: destination)
+            return ProjectExecutionWorkspace(directory: destination.path, roots: routed)
+        } catch {
+            try? FileManager.default.removeItem(at: staging)
+            throw error
+        }
+    }
+
+    public func discardPrepared(_ binding: WorktreeBindingSnapshot, sourceRoot: String) async {
+        let cleanupError = await cleanupFailedWorktree(path: binding.physicalPath, sourceRoot: sourceRoot)
+        if cleanupError == nil {
+            _ = try? await runner.run(
+                executable: gitExecutable,
+                arguments: ["-C", sourceRoot, "branch", "-D", binding.branch],
+                workingDirectory: sourceRoot,
+                maximumBytes: 65536
+            )
+        }
+        if let resource = try? await resources?.ownedResource(externalID: binding.bindingID, kind: .worktree) {
+            _ = try? await resources?.transitionOwnedResource(
+                resourceID: resource.resourceID,
+                expectedStates: [.preparing, .prepared],
+                to: cleanupError == nil ? .failed : .quarantined,
+                observedBytes: nil,
+                contentDigest: nil,
+                cleanupError: cleanupError
+            )
+        }
+    }
+
+    public func removeExecutionWorkspace(projectID: UUID, ownerSessionID: UUID) throws {
+        let root = URL(fileURLWithPath: baseDirectory).appendingPathComponent(".execution-workspaces", isDirectory: true)
+        let projectDirectory = root.appendingPathComponent(projectID.uuidString.lowercased(), isDirectory: true)
+        let workspace = projectDirectory.appendingPathComponent(ownerSessionID.uuidString.lowercased(), isDirectory: true)
+        let path = try DurableFilesystem.standardizedContainedPath(root: baseDirectory, candidate: workspace.path)
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        try Self.requireNonSymbolicLinkDirectory(root)
+        try Self.requireNonSymbolicLinkDirectory(projectDirectory)
+        try Self.requireNonSymbolicLinkDirectory(workspace)
+        try FileManager.default.removeItem(atPath: path)
+    }
+
+    public func removeOrphanedExecutionWorkspaces(validOwnerSessionIDs: Set<UUID>) throws {
+        let root = URL(fileURLWithPath: baseDirectory).appendingPathComponent(".execution-workspaces", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: root.path) else { return }
+        try Self.requireNonSymbolicLinkDirectory(root)
+        for projectDirectory in try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) {
+            try Self.requireNonSymbolicLinkDirectory(projectDirectory)
+            for workspace in try FileManager.default.contentsOfDirectory(at: projectDirectory, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) {
+                try Self.requireNonSymbolicLinkDirectory(workspace)
+                if let ownerID = UUID(uuidString: workspace.lastPathComponent), validOwnerSessionIDs.contains(ownerID) { continue }
+                let path = try DurableFilesystem.standardizedContainedPath(root: baseDirectory, candidate: workspace.path)
+                try FileManager.default.removeItem(atPath: path)
+            }
+        }
     }
 
     public func create(project: ProjectSnapshot, root: ProjectRootSnapshot, sessionID: UUID, baseRef: String, branch: String) async throws -> WorktreeBindingSnapshot {
@@ -227,12 +458,17 @@ public actor WorktreeRuntimeService {
             guard URL(fileURLWithPath: verification.trimmingCharacters(in: .whitespacesAndNewlines)).standardizedFileURL.path == path else {
                 throw ServiceAPIError(code: .worktreeConflict, message: "Created Git worktree identity did not match its reservation")
             }
+            let identityDigest: String? = if resources == nil {
+                nil
+            } else {
+                try await WorktreeRuntimeIdentity.digest(path: path, runner: runner, gitExecutable: gitExecutable)
+            }
             _ = try await resources?.transitionOwnedResource(
                 resourceID: reservation.resourceID,
                 expectedStates: [.preparing],
                 to: .prepared,
                 observedBytes: nil,
-                contentDigest: nil,
+                contentDigest: identityDigest,
                 cleanupError: nil
             )
             return WorktreeBindingSnapshot(bindingID: bindingID, projectID: project.projectID, rootID: root.rootID, sessionID: sessionID, baseRef: baseRef, branch: branch, physicalPath: path, ownershipState: .active, mergeState: .clean, revision: 1)
@@ -412,6 +648,13 @@ public actor WorktreeRuntimeService {
         )
         try await resources?.reserveOwnedResource(record)
         return destination.path
+    }
+
+    private static func requireNonSymbolicLinkDirectory(_ url: URL) throws {
+        let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true else {
+            throw ServiceAPIError(code: .rootUnauthorized, message: "Execution workspace scaffold is unsafe")
+        }
     }
 
     private static func safeRef(_ value: String) -> Bool {

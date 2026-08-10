@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentRuntimeCore
 import RepoPromptHeadlessRuntime
 import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
@@ -350,47 +351,175 @@ final class WorkspaceAuthorityTests: XCTestCase {
         try await store.close()
     }
 
-    func testDefaultWorktreeRoutesRootAndChildContextByExactBinding() async throws {
+    func testProjectExecutionWorkspaceRoutesEveryWritableRepositoryAcrossRestartAndResume() async throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let root = base.appendingPathComponent("source", isDirectory: true)
+        let sourceA = base.appendingPathComponent("source-a", isDirectory: true)
+        let sourceB = base.appendingPathComponent("source-b", isDirectory: true)
         let worktrees = base.appendingPathComponent("worktrees", isDirectory: true)
         let artifacts = base.appendingPathComponent("artifacts", isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let database = base.appendingPathComponent("state.sqlite")
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: base) }
-        try "source checkout".write(to: root.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
         let command = LocalWorkspaceCommandRunner()
-        _ = try await command.run(executable: "/usr/bin/git", arguments: ["init", "-b", "main", root.path], workingDirectory: base.path, maximumBytes: 65536)
-        _ = try await command.run(executable: "/usr/bin/git", arguments: ["-C", root.path, "add", "README.md"], workingDirectory: root.path, maximumBytes: 65536)
-        _ = try await command.run(executable: "/usr/bin/git", arguments: ["-C", root.path, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial"], workingDirectory: root.path, maximumBytes: 65536)
+        for (root, content) in [(sourceA, "source checkout A"), (sourceB, "source checkout B")] {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try content.write(to: root.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+            _ = try await command.run(executable: "/usr/bin/git", arguments: ["init", "-b", "main", root.path], workingDirectory: base.path, maximumBytes: 65536)
+            _ = try await command.run(executable: "/usr/bin/git", arguments: ["-C", root.path, "add", "README.md"], workingDirectory: root.path, maximumBytes: 65536)
+            _ = try await command.run(executable: "/usr/bin/git", arguments: ["-C", root.path, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial"], workingDirectory: root.path, maximumBytes: 65536)
+        }
 
-        let store = try await SQLiteServiceStore.open(storage: .memory)
-        let authority = try RepoPromptHeadlessAuthority(
+        let provider = MultiRootWorkspaceProvider()
+        var store = try await SQLiteServiceStore.open(storage: .file(database.path))
+        var authority = try RepoPromptHeadlessAuthority(
             store: store,
             worktreeService: WorktreeRuntimeService(baseDirectory: worktrees.path, resources: store),
-            artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path, resources: store)
+            artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path, resources: store),
+            providerAdapter: provider
         )
         let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
-        let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-default-wt", requestDigest: "p-default-wt")
-        let rootID = try XCTUnwrap(project.roots.first?.rootID)
-        _ = try await authority.replaceProjectSelectionTemplate(projectID: project.projectID, entries: [.init(rootID: rootID, logicalPath: "README.md", mode: .full)], expectedRevision: 1, actor: actor, idempotencyKey: "template-default-wt", requestDigest: "template-default-wt")
-        let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "s-default-wt", requestDigest: "s-default-wt")
-        let bindings = try await authority.worktreeSnapshots(projectID: project.projectID)
-        let binding = try XCTUnwrap(bindings.first(where: { $0.sessionID == session.sessionID }))
-        XCTAssertTrue(binding.physicalPath.hasPrefix(worktrees.path))
-        try "isolated worktree".write(to: URL(fileURLWithPath: binding.physicalPath).appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        let project = try await authority.createProject(
+            input: .init(name: "P", roots: [
+                .init(logicalName: "server", path: sourceA.path, writable: true),
+                .init(logicalName: "ops", path: sourceB.path, writable: true)
+            ]),
+            externalActor: actor,
+            idempotencyKey: "p-multi-wt",
+            requestDigest: "p-multi-wt"
+        )
+        XCTAssertEqual(project.roots.count, 2)
+        _ = try await authority.replaceProjectSelectionTemplate(
+            projectID: project.projectID,
+            entries: project.roots.map { .init(rootID: $0.rootID, logicalPath: "README.md", mode: .full) },
+            expectedRevision: 1,
+            actor: actor,
+            idempotencyKey: "template-multi-wt",
+            requestDigest: "template-multi-wt"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "modify both roots", startImmediately: true),
+            externalActor: actor,
+            idempotencyKey: "s-multi-wt",
+            requestDigest: "s-multi-wt"
+        )
+        await authority.waitForProviderRunsToSettle()
+
+        let bindings = try await authority.worktreeSnapshots(projectID: project.projectID).filter { $0.sessionID == session.sessionID && $0.ownershipState == .active }
+        XCTAssertEqual(bindings.count, 2)
+        XCTAssertEqual(Set(bindings.map(\.rootID)), Set(project.roots.map(\.rootID)))
+        XCTAssertEqual(Set(bindings.map(\.physicalPath)).count, 2)
+        XCTAssertTrue(bindings.allSatisfy { $0.physicalPath.hasPrefix(worktrees.path) })
+        let initialRequests = await provider.requests()
+        let firstRequest = try XCTUnwrap(initialRequests.first)
+        XCTAssertTrue(firstRequest.workingDirectory.contains("/.execution-workspaces/"))
+        XCTAssertNotEqual(firstRequest.workingDirectory, bindings[0].physicalPath)
+        XCTAssertNotEqual(firstRequest.workingDirectory, bindings[1].physicalPath)
+        let expectedWritableRoots = try project.roots.map { root in
+            try XCTUnwrap(bindings.first(where: { $0.rootID == root.rootID })?.physicalPath)
+        }
+        XCTAssertEqual(firstRequest.writableRoots, expectedWritableRoots)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: URL(fileURLWithPath: firstRequest.workingDirectory).appendingPathComponent("workspace.json").path))
+        let initialWorkspaceIdentity = try FileManager.default.attributesOfItem(atPath: firstRequest.workingDirectory)[.systemFileNumber] as? NSNumber
+        for root in project.roots {
+            let binding = try XCTUnwrap(bindings.first(where: { $0.rootID == root.rootID }))
+            let route = URL(fileURLWithPath: firstRequest.workingDirectory).appendingPathComponent("roots/\(root.rootID.uuidString.lowercased())")
+            XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: route.path), binding.physicalPath)
+            let isolated = try String(contentsOf: URL(fileURLWithPath: binding.physicalPath).appendingPathComponent("README.md"), encoding: .utf8)
+            XCTAssertTrue(isolated.contains(root.rootID.uuidString.lowercased()))
+        }
+        XCTAssertEqual(try String(contentsOf: sourceA.appendingPathComponent("README.md"), encoding: .utf8), "source checkout A")
+        XCTAssertEqual(try String(contentsOf: sourceB.appendingPathComponent("README.md"), encoding: .utf8), "source checkout B")
 
         let rootArtifact = try await authority.buildContext(sessionID: session.sessionID, expectedSelectionRevision: 1, include: ["files"], actor: actor)
-        let child = try await authority.spawnChildSession(parentSessionID: session.sessionID, initialPrompt: "inspect")
+        let child = try await authority.spawnChildSession(parentSessionID: session.sessionID, initialPrompt: "inspect both")
         let childArtifact = try await authority.buildContext(sessionID: child.sessionID, expectedSelectionRevision: 1, include: ["files"], actor: actor)
-        let rootContent = try await authority.artifactContent(artifactID: rootArtifact.artifactID, maximumBytes: 1024)
-        let childContent = try await authority.artifactContent(artifactID: childArtifact.artifactID, maximumBytes: 1024)
-        XCTAssertTrue(String(decoding: rootContent, as: UTF8.self).contains("isolated worktree"))
-        XCTAssertTrue(String(decoding: childContent, as: UTF8.self).contains("isolated worktree"))
+        let rootContent = String(decoding: try await authority.artifactContent(artifactID: rootArtifact.artifactID, maximumBytes: 4096), as: UTF8.self)
+        let childContent = String(decoding: try await authority.artifactContent(artifactID: childArtifact.artifactID, maximumBytes: 4096), as: UTF8.self)
+        for root in project.roots {
+            XCTAssertTrue(rootContent.contains(root.rootID.uuidString.lowercased()))
+            XCTAssertTrue(childContent.contains(root.rootID.uuidString.lowercased()))
+        }
+        let childAuthoritySnapshot = try await authority.authoritySessionSnapshot(sessionID: child.sessionID)
+        XCTAssertEqual(childAuthoritySnapshot.worktrees.count, 2)
+        let reusedWorkspaceIdentity = try FileManager.default.attributesOfItem(atPath: firstRequest.workingDirectory)[.systemFileNumber] as? NSNumber
+        XCTAssertEqual(reusedWorkspaceIdentity, initialWorkspaceIdentity)
+
+        try await store.close()
+        store = try await SQLiteServiceStore.open(storage: .file(database.path))
+        authority = try RepoPromptHeadlessAuthority(
+            store: store,
+            worktreeService: WorktreeRuntimeService(baseDirectory: worktrees.path, resources: store),
+            artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path, resources: store),
+            providerAdapter: provider
+        )
+        try await authority.recover()
+        _ = try await authority.execute(
+            command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh),
+            sessionID: session.sessionID,
+            externalActor: actor,
+            idempotencyKey: "resume-multi-wt",
+            requestDigest: "resume-multi-wt"
+        )
+        await authority.waitForProviderRunsToSettle()
+        let requests = await provider.requests()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests[1].workingDirectory, requests[0].workingDirectory)
+        XCTAssertEqual(requests[1].writableRoots, expectedWritableRoots)
+        let recoveredBindings = try await authority.authoritySessionSnapshot(sessionID: session.sessionID).worktrees
+        XCTAssertEqual(Set(recoveredBindings.map(\.bindingID)), Set(bindings.map(\.bindingID)))
         let resources = try await store.ownedResources(states: [.active])
-        XCTAssertTrue(resources.contains { $0.kind == .worktree && $0.externalID == binding.bindingID })
-        XCTAssertTrue(resources.contains { $0.kind == .artifact && $0.externalID == rootArtifact.artifactID })
+        XCTAssertEqual(resources.filter { $0.kind == .worktree && bindings.map(\.bindingID).contains($0.externalID) }.count, 2)
         try await store.close()
     }
+}
+
+private actor MultiRootWorkspaceProvider: AgentProviderDispatcher {
+    struct CapturedRequest: Sendable {
+        let workingDirectory: String
+        let writableRoots: [String]
+    }
+
+    private var captured: [CapturedRequest] = []
+
+    func capabilities() -> [ProviderCapability] {
+        [.init(kind: .codex, enabled: true, executable: "/usr/bin/true", supportsResume: false, supportsSteering: false)]
+    }
+
+    func preflight() -> [ProviderCapability] { capabilities() }
+    func recoverProcessFamilies() throws {}
+    func cancel(runID _: UUID) throws {}
+
+    func execute(
+        kind _: ProviderKind,
+        model _: String?,
+        prompt _: String,
+        workingDirectory _: String,
+        maximumBytes _: Int,
+        runID _: UUID?,
+        resumeProviderSessionID _: String?,
+        onProviderSessionIdentity _: @escaping @Sendable (String) async -> Void
+    ) async throws -> ProviderExecutionResult {
+        ProviderExecutionResult(output: "unused", providerSessionID: nil)
+    }
+
+    func executeStreaming(
+        _ request: ProviderExecutionRequest,
+        onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
+    ) async throws -> ProviderExecutionResult {
+        captured.append(.init(workingDirectory: request.workingDirectory, writableRoots: request.policy.writableRoots))
+        let routes = URL(fileURLWithPath: request.workingDirectory).appendingPathComponent("roots", isDirectory: true)
+        let roots = try FileManager.default.contentsOfDirectory(at: routes, includingPropertiesForKeys: nil).sorted { $0.lastPathComponent < $1.lastPathComponent }
+        guard roots.count == 2 else {
+            throw ServiceAPIError(code: .worktreeConflict, message: "Provider did not receive the complete project workspace")
+        }
+        for root in roots {
+            try "isolated \(root.lastPathComponent)".write(to: root.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        }
+        await onEvent(.completed(providerSessionID: nil))
+        return ProviderExecutionResult(output: "modified both roots", providerSessionID: nil)
+    }
+
+    func requests() -> [CapturedRequest] { captured }
 }
 
 private actor RecordingWorkspaceRunner: WorkspaceCommandRunning {

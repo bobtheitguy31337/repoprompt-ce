@@ -1,6 +1,7 @@
 import Foundation
 
 public enum PersistenceFaultPoint: String, Sendable {
+    case afterIdempotencyPreflightMiss
     case afterTransactionBegin
     case afterEventInsertBeforeSequenceAdvance
     case beforeTransactionCommit
