@@ -280,6 +280,24 @@ final class ProjectSourceProvisioningTests: XCTestCase {
         XCTAssertTrue(gone)
     }
 
+    func testLinuxSupervisorSourceKeepsParentDeathAndDescriptorFallbackContracts() throws {
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repository.appendingPathComponent("Sources/RepoPromptC/src/Utils/anchored_process_supervisor.c"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(source.contains("prctl(PR_SET_PDEATHSIG, SIGCONT)"))
+        XCTAssertTrue(source.contains("getppid() != expected_parent"))
+        XCTAssertTrue(source.contains("opendir(\"/proc/self/fd\")"))
+        XCTAssertTrue(source.contains("readdir(directory)"))
+        XCTAssertTrue(source.contains("limit.rlim_cur != RLIM_INFINITY"))
+        XCTAssertFalse(source.contains("65535U"), "The exhaustive fallback must not retain the old descriptor cap")
+    }
+
     #if os(Linux)
     func testLinuxSupervisorAnchorsFinalValidationThenSuccessReleasesWithoutLaterSignal() async throws {
         let fixture = try RealRunnerFixture(script: "#!/bin/sh\nexit 23\n")
@@ -333,6 +351,126 @@ final class ProjectSourceProvisioningTests: XCTestCase {
         lifecycle.signal(SIGKILL)
         XCTAssertTrue(await waitForSupervisorExit(lifecycle))
         XCTAssertNotEqual(kill(anchorPID, 0), 0)
+    }
+
+    func testLinuxStoppedSupervisorParentDeathWakesAndCleansDescendants() throws {
+        let fixture = try RealRunnerFixture(
+            script: "#!/bin/sh\nsh -c 'trap \"\" TERM; while :; do sleep 1; done' &\necho $! > child.pid\ntouch ready.marker\nwait\n"
+        )
+        defer { fixture.cleanup() }
+        let invocation = fixture.invocation(timeoutSeconds: 30)
+        XCTAssertTrue(FileManager.default.createFile(atPath: invocation.outputPath, contents: nil))
+        let output = try FileHandle(forWritingTo: URL(fileURLWithPath: invocation.outputPath))
+        defer { try? output.close() }
+        var reportPipe = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(pipe(&reportPipe), 0)
+        defer { if reportPipe[0] >= 0 { close(reportPipe[0]) } }
+
+        let helperPID = fork()
+        if helperPID == 0 {
+            close(reportPipe[0])
+            let lifecycle = ManagedProjectSourceProcess()
+            do {
+                try LocalProjectSourceGitRunner.spawnLinuxSupervisor(
+                    invocation,
+                    outputDescriptor: output.fileDescriptor,
+                    lifecycle: lifecycle
+                )
+                let readyPath = fixture.directory.appendingPathComponent("ready.marker").path
+                for _ in 0 ..< 500 {
+                    if readyPath.withCString({ access($0, F_OK) }) == 0 { break }
+                    usleep(10_000)
+                }
+                var supervisorPID = lifecycle.testSupervisorProcessID
+                if readyPath.withCString({ access($0, F_OK) }) != 0 || kill(supervisorPID, SIGSTOP) != 0 {
+                    supervisorPID = -1
+                }
+                _ = withUnsafeBytes(of: &supervisorPID) { bytes in
+                    write(reportPipe[1], bytes.baseAddress, bytes.count)
+                }
+            } catch {
+                var failure = pid_t(-1)
+                _ = withUnsafeBytes(of: &failure) { bytes in
+                    write(reportPipe[1], bytes.baseAddress, bytes.count)
+                }
+            }
+            _exit(0)
+        }
+        guard helperPID > 0 else {
+            let forkError = errno
+            close(reportPipe[0])
+            close(reportPipe[1])
+            reportPipe = [-1, -1]
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(forkError))
+        }
+
+        close(reportPipe[1])
+        reportPipe[1] = -1
+        var supervisorPID = pid_t(-1)
+        let reportCount = withUnsafeMutableBytes(of: &supervisorPID) { bytes in
+            read(reportPipe[0], bytes.baseAddress, bytes.count)
+        }
+        close(reportPipe[0])
+        reportPipe[0] = -1
+        var helperStatus: Int32 = 0
+        XCTAssertEqual(waitpid(helperPID, &helperStatus, 0), helperPID)
+        guard reportCount == MemoryLayout<pid_t>.size, supervisorPID > 1 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(ECHILD))
+        }
+        let descendantPID = try fixture.processID(named: "child.pid")
+        defer {
+            _ = kill(supervisorPID, SIGCONT)
+            _ = kill(supervisorPID, SIGKILL)
+            _ = kill(descendantPID, SIGKILL)
+        }
+
+        XCTAssertTrue(
+            processIsGoneSynchronously(supervisorPID),
+            "Parent death must wake and terminate a SIGSTOPed supervisor"
+        )
+        XCTAssertTrue(
+            processIsGoneSynchronously(descendantPID),
+            "Parent-death cleanup must not leave a SIGTERM-resistant descendant"
+        )
+    }
+
+    func testLinuxCloseRangeFallbackClosesInheritedDescriptorAbove65535BeforeGitExec() async throws {
+        var sentinelPipe = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(pipe(&sentinelPipe), 0)
+        var inheritedDescriptor = fcntl(sentinelPipe[0], F_DUPFD, 70_000)
+        close(sentinelPipe[0])
+        close(sentinelPipe[1])
+        guard inheritedDescriptor >= 70_000 else {
+            throw XCTSkip("RLIMIT_NOFILE does not permit a descriptor above 65535")
+        }
+        defer { if inheritedDescriptor >= 0 { close(inheritedDescriptor) } }
+
+        let fixture = try RealRunnerFixture(
+            script: "#!/bin/sh\nif [ -e /proc/self/fd/\(inheritedDescriptor) ]; then touch inherited-fd.marker; exit 91; fi\nexit 0\n"
+        )
+        defer { fixture.cleanup() }
+        let invocation = fixture.invocation(
+            timeoutSeconds: 5,
+            environmentOverrides: ["REPOPROMPT_TEST_FORCE_CLOSE_RANGE_FALLBACK": "1"]
+        )
+        XCTAssertTrue(FileManager.default.createFile(atPath: invocation.outputPath, contents: nil))
+        let output = try FileHandle(forWritingTo: URL(fileURLWithPath: invocation.outputPath))
+        defer { try? output.close() }
+        let lifecycle = ManagedProjectSourceProcess()
+        try LocalProjectSourceGitRunner.spawnLinuxSupervisor(
+            invocation,
+            outputDescriptor: output.fileDescriptor,
+            lifecycle: lifecycle
+        )
+        close(inheritedDescriptor)
+        inheritedDescriptor = -1
+
+        XCTAssertEqual(await waitForGitStatus(lifecycle), 0)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.directory.appendingPathComponent("inherited-fd.marker").path
+        ))
+        XCTAssertTrue(lifecycle.releaseSupervisor())
+        XCTAssertTrue(await waitForSupervisorExit(lifecycle))
     }
 
     func testLinuxSupervisorFailureSignalsFamilyWhileAnchorIsOwned() async throws {
@@ -700,11 +838,16 @@ private struct RealRunnerFixture {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
     }
 
-    func invocation(maximumOutputBytes: Int = 16_384, timeoutSeconds: Int) -> ProjectSourceGitInvocation {
+    func invocation(
+        maximumOutputBytes: Int = 16_384,
+        timeoutSeconds: Int,
+        environmentOverrides: [String: String] = [:]
+    ) -> ProjectSourceGitInvocation {
         ProjectSourceGitInvocation(
             executable: script.path,
             arguments: [],
-            environment: ["PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"],
+            environment: ["PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"]
+                .merging(environmentOverrides) { _, override in override },
             workingDirectory: directory.path,
             outputPath: directory.appendingPathComponent("output").path,
             observedDirectory: directory.path,
@@ -735,6 +878,14 @@ private struct RealRunnerFixture {
 }
 
 #if os(Linux)
+private func processIsGoneSynchronously(_ processID: pid_t) -> Bool {
+    for _ in 0 ..< 250 {
+        if kill(processID, 0) != 0 { return true }
+        usleep(20_000)
+    }
+    return false
+}
+
 private func waitForGitStatus(_ lifecycle: ManagedProjectSourceProcess) async -> Int32? {
     for _ in 0 ..< 100 {
         if let status = lifecycle.terminationStatus() { return status }

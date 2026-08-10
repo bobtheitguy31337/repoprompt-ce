@@ -1,8 +1,10 @@
 #define _GNU_SOURCE
 #include "anchored_process_supervisor.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -14,6 +16,10 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 #if !defined(__linux__)
 int rp_anchored_process_spawn(
@@ -122,23 +128,67 @@ static void rp_terminate_on_parent_loss(void) {
     _exit(255);
 }
 
-static void rp_close_descriptor_range(unsigned int first, unsigned int last) {
-#if defined(SYS_close_range)
-    if (syscall(SYS_close_range, first, last, 0) == 0) return;
-#endif
-    struct rlimit limit;
-    unsigned int upper = last == ~0U ? 65535U : last;
-    if (getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur > 0) {
-        rlim_t final_descriptor = limit.rlim_cur - 1;
-        if (final_descriptor < upper) upper = (unsigned int)final_descriptor;
+static int rp_force_close_range_fallback(char *const environment[]) {
+    static const char variable[] = "REPOPROMPT_TEST_FORCE_CLOSE_RANGE_FALLBACK=1";
+    if (environment == NULL) return 0;
+    for (size_t index = 0; environment[index] != NULL; ++index) {
+        if (strcmp(environment[index], variable) == 0) return 1;
     }
-    for (unsigned int descriptor = first; descriptor <= upper; ++descriptor) {
-        close((int)descriptor);
+    return 0;
+}
+
+static void rp_close_descriptor_range(unsigned int first, unsigned int last, int force_fallback) {
+#if defined(SYS_close_range)
+    if (!force_fallback && syscall(SYS_close_range, first, last, 0) == 0) return;
+#endif
+
+    // Linux exposes the actual open descriptor set through procfs. Enumerating
+    // it avoids both arbitrary descriptor caps and pathological close loops.
+    DIR *directory = opendir("/proc/self/fd");
+    if (directory != NULL) {
+        int enumeration_fd = dirfd(directory);
+        struct dirent *entry;
+        while ((entry = readdir(directory)) != NULL) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long value = strtoul(entry->d_name, &end, 10);
+            if (errno != 0 || end == entry->d_name || *end != '\0' || value > INT_MAX) continue;
+            unsigned int descriptor = (unsigned int)value;
+            if (descriptor >= first && descriptor <= last && (int)descriptor != enumeration_fd) {
+                (void)close((int)descriptor);
+            }
+        }
+        (void)closedir(directory);
+        return;
+    }
+
+    // Procfs may be unavailable in a restricted namespace. A finite rlimit is
+    // an exhaustive upper bound and must not be truncated. If it is infinite,
+    // sysconf normally reports Linux's finite open-file ceiling; INT_MAX is the
+    // final exhaustive bound because file descriptors are signed ints.
+    struct rlimit limit;
+    rlim_t upper;
+    if (getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY) {
+        if (limit.rlim_cur == 0) return;
+        upper = limit.rlim_cur - 1;
+    } else {
+        long configured = sysconf(_SC_OPEN_MAX);
+        upper = configured > 0 ? (rlim_t)(configured - 1) : (rlim_t)INT_MAX;
+    }
+    if (upper > (rlim_t)INT_MAX) upper = (rlim_t)INT_MAX;
+    if (last != UINT_MAX && upper > (rlim_t)last) upper = (rlim_t)last;
+    for (rlim_t descriptor = first; descriptor <= upper; ++descriptor) {
+        (void)close((int)descriptor);
         if (descriptor == upper) break;
     }
 }
 
-static int rp_isolate_supervisor_descriptors(int *output_fd, int *status_fd, int *control_fd) {
+static int rp_isolate_supervisor_descriptors(
+    int *output_fd,
+    int *status_fd,
+    int *control_fd,
+    int force_close_range_fallback
+) {
     int output_copy = fcntl(*output_fd, F_DUPFD_CLOEXEC, 200);
     if (output_copy < 0) return errno;
     int status_copy = fcntl(*status_fd, F_DUPFD_CLOEXEC, output_copy + 1);
@@ -150,8 +200,8 @@ static int rp_isolate_supervisor_descriptors(int *output_fd, int *status_fd, int
     if (dup2(output_copy, 100) < 0 || dup2(status_copy, 101) < 0 || dup2(control_copy, 102) < 0) {
         int result = errno; close(output_copy); close(status_copy); close(control_copy); return result;
     }
-    rp_close_descriptor_range(3, 99);
-    rp_close_descriptor_range(103, ~0U);
+    rp_close_descriptor_range(3, 99, force_close_range_fallback);
+    rp_close_descriptor_range(103, UINT_MAX, force_close_range_fallback);
     *output_fd = 100;
     *status_fd = 101;
     *control_fd = 102;
@@ -165,9 +215,17 @@ static void rp_supervise(
     const char *working_directory,
     int output_fd,
     int status_write_fd,
-    int control_read_fd
+    int control_read_fd,
+    pid_t expected_parent,
+    int parent_was_lost
 ) {
-    if (rp_isolate_supervisor_descriptors(&output_fd, &status_write_fd, &control_read_fd) != 0) _exit(126);
+    int force_close_range_fallback = rp_force_close_range_fallback(environment);
+    if (rp_isolate_supervisor_descriptors(
+        &output_fd,
+        &status_write_fd,
+        &control_read_fd,
+        force_close_range_fallback
+    ) != 0) _exit(126);
     if (setsid() < 0) _exit(126);
 
     sigset_t unblocked;
@@ -189,6 +247,11 @@ static void rp_supervise(
     // Status is a pipe so ignoring SIGPIPE is required: parent loss must
     // reach the explicit family cleanup path instead of killing the anchor.
     (void)sigaction(SIGPIPE, &ignored, NULL);
+
+    // PR_SET_PDEATHSIG is armed before setup begins. Delay family cleanup until
+    // setsid() makes this supervisor the process-group owner, then recheck once
+    // more so parent loss during setup cannot launch an unowned Git process.
+    if (parent_was_lost || getppid() != expected_parent) rp_terminate_on_parent_loss();
 
     pid_t git_pid = fork();
     if (git_pid == 0) {
@@ -306,6 +369,7 @@ int rp_anchored_process_spawn(
         return result;
     }
 
+    pid_t expected_parent = getpid();
     pid_t pid = fork();
     if (pid < 0) {
         result = errno;
@@ -314,9 +378,30 @@ int rp_anchored_process_spawn(
         return result;
     }
     if (pid == 0) {
+        // SIGCONT wakes an externally stopped supervisor without terminating it;
+        // the closed control socket then drives the normal whole-family cleanup.
+        // The immediate parent check closes the fork-to-prctl race.
+        struct sigaction continued;
+        memset(&continued, 0, sizeof(continued));
+        continued.sa_handler = SIG_DFL;
+        sigemptyset(&continued.sa_mask);
+        (void)sigaction(SIGCONT, &continued, NULL);
+        if (prctl(PR_SET_PDEATHSIG, SIGCONT) != 0) _exit(126);
+        int parent_was_lost = getppid() != expected_parent;
+
         close(status_pipe[0]);
         close(control_socket[1]);
-        rp_supervise(executable, arguments, environment, working_directory, output_fd, status_pipe[1], control_socket[0]);
+        rp_supervise(
+            executable,
+            arguments,
+            environment,
+            working_directory,
+            output_fd,
+            status_pipe[1],
+            control_socket[0],
+            expected_parent,
+            parent_was_lost
+        );
         _exit(255);
     }
 
