@@ -54,6 +54,31 @@ private actor FakeProcessPort: ProcessSupervisionPort {
 }
 
 final class ProviderSupervisorTests: XCTestCase {
+    func testProviderUsesAuthorityRunIDAndRemovesEphemeralCredentialHome() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let executable = directory.appendingPathComponent("provider")
+        let homes = directory.appendingPathComponent("homes", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'provider 1.0'; exit 0; fi\ntouch \"$HOME/provider-wrote\"\nexec /bin/echo \"$HOME\"\n".utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let port = try PortableProcessSupervisionPort()
+        let adapter = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: executable.path, expectedVersion: "1.0")], processPort: port, processStore: store, outputDirectory: directory.appendingPathComponent("output").path, ephemeralHomeRoot: homes.path)
+        let capabilities = await adapter.preflight()
+        XCTAssertEqual(capabilities.first { $0.kind == .codex }?.enabled, true)
+        XCTAssertEqual(capabilities.first { $0.kind == .codex }?.version, "provider 1.0")
+        let runID = UUID()
+
+        let output = try await adapter.complete(kind: .codex, model: nil, prompt: "prompt", workingDirectory: directory.path, runID: runID)
+
+        XCTAssertEqual(output.trimmingCharacters(in: .whitespacesAndNewlines), homes.appendingPathComponent(runID.uuidString).path)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: homes.appendingPathComponent(runID.uuidString).path))
+        let processFamilyState = try await store.processFamilyState(runID: runID)
+        XCTAssertEqual(processFamilyState, "exited")
+        try await store.close()
+    }
+
     func testPortablePortCapturesAndReapsProviderOutput() async throws {
         let executable = ["/bin/echo", "/usr/bin/echo"].first { FileManager.default.isExecutableFile(atPath: $0) }
         let echo = try XCTUnwrap(executable)

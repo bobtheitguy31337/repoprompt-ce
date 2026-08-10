@@ -152,6 +152,57 @@ jobs:
         working-directory: Packages/RepoPromptAgentProviders
         run: swift test
 
+  linux-server:
+    name: Linux Server and Canonical Image
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Swift 6.2.4
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.2.4"
+
+      - name: Build portable server graph from exact lockfile
+        env:
+          REPOPROMPT_SERVER_ONLY: "1"
+        run: swift build --disable-automatic-resolution --product RepoPromptServer
+
+      - name: Run portable server tests
+        env:
+          REPOPROMPT_SERVER_ONLY: "1"
+        run: swift test --disable-automatic-resolution
+
+      - name: Build canonical non-root server image
+        run: |
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          docker build \
+            --file Dockerfile.server \
+            --build-arg REPOPROMPT_COMMIT="$GITHUB_SHA" \
+            --build-arg SOURCE_DATE_EPOCH="$(date -u -d "@$source_date_epoch" +%Y-%m-%dT%H:%M:%SZ)" \
+            --tag repoprompt-server:ci .
+
+      - name: Verify image identity, providers, labels, ports, and runtime UID
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect repoprompt-server:ci --format '{{.Config.User}}')" = "65532:65532"
+          ports="$(docker image inspect repoprompt-server:ci --format '{{json .Config.ExposedPorts}}')"
+          grep -Fq '9443/tcp' <<<"$ports"
+          grep -Fq '9080/tcp' <<<"$ports"
+          test "$(docker image inspect repoprompt-server:ci --format '{{index .Config.Labels "io.degentlemen.repoprompt.protocol-version"}}')" = "1"
+          test "$(docker image inspect repoprompt-server:ci --format '{{index .Config.Labels "io.degentlemen.repoprompt.provider.codex"}}')" = "0.147.0;app-server-v2"
+          docker run --rm --entrypoint /bin/sh repoprompt-server:ci -c '
+            test "$(id -u)" = 65532
+            test -x /usr/local/bin/RepoPromptServer
+            codex --version | grep -F 0.147.0
+            claude --version | grep -F 2.1.226
+            opencode --version | grep -F 1.15.11
+            cursor-agent --version | grep -F 2026.08.04-aaa8809
+          '
+
   secret-scan:
     name: Secret Scan
     runs-on: macos-26

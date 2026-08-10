@@ -216,6 +216,11 @@ public actor RepoPromptHeadlessAuthority {
         return try await tool.readFile(request)
     }
 
+    public func projectCodeMap(projectID: UUID, request: ProjectCodeMapRequest) async throws -> ProjectCodeMapSnapshot {
+        guard let tool = tools[projectID] else { throw ServiceAPIError(code: .notFound, message: "Project not found") }
+        return try await tool.codeMap(request)
+    }
+
     public func projectDiff(projectID: UUID, request: ProjectDiffRequest) async throws -> ProjectDiffSnapshot {
         guard let tool = tools[projectID] else { throw ServiceAPIError(code: .notFound, message: "Project not found") }
         return try await tool.diff(request)
@@ -544,6 +549,11 @@ public actor RepoPromptHeadlessAuthority {
     private func materializedContext(projectID: UUID, selection: SelectionSnapshot, include: [String]) async throws -> String {
         var sections = ["# RepoPrompt Context", "selection-revision: \(selection.revision)"]
         for entry in selection.entries {
+            if entry.mode == .codeMap {
+                let codeMap = try await projectCodeMap(projectID: projectID, request: .init(rootID: entry.rootID, logicalPath: entry.logicalPath))
+                sections.append("## \(entry.logicalPath) [codemap:\(codeMap.status)]\n```\n\(codeMap.content)\n```")
+                continue
+            }
             let file = try await projectFile(projectID: projectID, request: .init(rootID: entry.rootID, logicalPath: entry.logicalPath, maximumBytes: 1_048_576))
             let content: String
             if entry.mode == .slices, !entry.ranges.isEmpty {
@@ -615,7 +625,7 @@ public actor RepoPromptHeadlessAuthority {
         guard let providerAdapter, let session = sessions[sessionID] else { return }
         let initial = await session.snapshot()
         do {
-            let output = try await providerAdapter.complete(kind: initial.provider, model: initial.model, prompt: prompt, workingDirectory: workingDirectory)
+            let output = try await providerAdapter.complete(kind: initial.provider, model: initial.model, prompt: prompt, workingDirectory: workingDirectory, runID: binding.runID)
             guard !Task.isCancelled, await session.acceptProviderOutput(binding: binding, kind: .assistant, content: output) == .accepted else { return }
             var cursor = try await store.nextCursor()
             var event = try await store.persistSession(replacingCursor(await session.snapshot(), cursor: cursor), eventType: .transcriptMessage, actor: nil, correlationID: ids.next(), idempotency: nil)

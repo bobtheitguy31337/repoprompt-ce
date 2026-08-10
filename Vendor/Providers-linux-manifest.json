@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "providers": {
+    "codex": {
+      "version": "0.147.0",
+      "protocol": "app-server-v2",
+      "amd64": {
+        "url": "https://github.com/openai/codex/releases/download/rust-v0.147.0/codex-package-x86_64-unknown-linux-musl.tar.gz",
+        "sha256": "bd758d53d56e41dc65e045f4589df79a038ed197a011adcb52a258e6ad64cfda"
+      },
+      "arm64": {
+        "url": "https://github.com/openai/codex/releases/download/rust-v0.147.0/codex-package-aarch64-unknown-linux-musl.tar.gz",
+        "sha256": "89cbf79bd5ae6f9c58da47e8079f311c84219350c9c43c070d42f3e9b2a81401"
+      }
+    },
+    "claudeCompatible": {
+      "version": "2.1.226",
+      "protocol": "stream-json-v1",
+      "npmPackage": "@anthropic-ai/claude-code",
+      "integrity": "sha512-mUkA81SbzATHFsHNz/rPy3Itw0D0S9kQMsIUJ3qPGwpNJMqPePyDP6xnWHI0jfFlspVjs8r/GfolMUyiy8P1FQ=="
+    },
+    "openCodeACP": {
+      "version": "1.15.11",
+      "protocol": "acp-v1",
+      "amd64": {
+        "url": "https://github.com/anomalyco/opencode/releases/download/v1.15.11/opencode-linux-x64.tar.gz",
+        "sha256": "49317253722c698394980e1921ff28e919d79bb29d5c3f4cf314a4adaf7037cd"
+      },
+      "arm64": {
+        "url": "https://github.com/anomalyco/opencode/releases/download/v1.15.11/opencode-linux-arm64.tar.gz",
+        "sha256": "93e4399f308c49387c25ec2b570602bf0f9dd5f57989427946c0c28dbf259ff4"
+      }
+    },
+    "cursorACP": {
+      "version": "2026.08.04-aaa8809",
+      "protocol": "acp-v1-beta",
+      "amd64": {
+        "url": "https://downloads.cursor.com/lab/2026.08.04-aaa8809/linux/x64/agent-cli-package.tar.gz",
+        "sha256": "e282068dcb5cdd668b8ce2e3456c58be13bb64a834e1ad49f8534b5cd7aa2fe5"
+      },
+      "arm64": {
+        "url": "https://downloads.cursor.com/lab/2026.08.04-aaa8809/linux/arm64/agent-cli-package.tar.gz",
+        "sha256": "d5196289292a660b59807ac508c9ac36ec1e1a1a7e4697af3ef6824fdea984ee"
+      }
+    }
+  }
+}

@@ -7,14 +7,18 @@ public struct ProviderCapability: Codable, Hashable, Sendable {
     public let executable: String?
     public let supportsResume: Bool
     public let supportsSteering: Bool
+    public let version: String?
+    public let protocolVersion: String?
     public let reasonUnavailable: String?
 
-    public init(kind: ProviderKind, enabled: Bool, executable: String?, supportsResume: Bool, supportsSteering: Bool, reasonUnavailable: String? = nil) {
+    public init(kind: ProviderKind, enabled: Bool, executable: String?, supportsResume: Bool, supportsSteering: Bool, version: String? = nil, protocolVersion: String? = nil, reasonUnavailable: String? = nil) {
         self.kind = kind
         self.enabled = enabled
         self.executable = executable
         self.supportsResume = supportsResume
         self.supportsSteering = supportsSteering
+        self.version = version
+        self.protocolVersion = protocolVersion
         self.reasonUnavailable = reasonUnavailable
     }
 }

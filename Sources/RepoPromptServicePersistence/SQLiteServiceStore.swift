@@ -414,6 +414,10 @@ public actor SQLiteServiceStore {
         }
     }
 
+    public func processFamilyState(runID: UUID) async throws -> String? {
+        try await connection.query("SELECT state FROM process_families WHERE run_id=?", [.text(runID.uuidString)]).first?.column("state")?.string
+    }
+
     public func consumeNonce(direction: String, keyID: String, nonce: String, observedAt: Date, expiresAt: Date) async throws {
         do {
             _ = try await connection.query("INSERT INTO request_nonces(direction,key_id,nonce,observed_at,expires_at) VALUES(?,?,?,?,?)", [.text(direction), .text(keyID), .text(nonce), .float(observedAt.timeIntervalSince1970), .float(expiresAt.timeIntervalSince1970)])

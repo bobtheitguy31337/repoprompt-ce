@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodeMapCore
 import RepoPromptServiceProtocol
 
 public protocol WorkspaceCommandRunning: Sendable {
@@ -117,6 +118,24 @@ public actor ProjectToolAuthority {
         let end = min(lines.count, start + max(1, min(request.lineCount ?? lines.count, 20000)))
         let content = start < end ? lines[start ..< end].joined(separator: "\n") : ""
         return ProjectFileSnapshot(rootID: request.rootID, logicalPath: request.logicalPath, content: content, contentDigest: CanonicalSigning.bodyDigest(data), truncated: data.count > maximumBytes || end < lines.count)
+    }
+
+    public func codeMap(_ request: ProjectCodeMapRequest) async throws -> ProjectCodeMapSnapshot {
+        let path = try await project.authorize(rootID: request.rootID, logicalPath: request.logicalPath, filesystem: filesystem)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            throw ServiceAPIError(code: .notFound, message: "Authorized file was not found")
+        }
+        let maximumBytes = max(1, min(request.maximumBytes, 5_242_880))
+        let data = try Data(contentsOf: URL(fileURLWithPath: path), options: [.mappedIfSafe])
+        guard data.count <= maximumBytes else {
+            return ProjectCodeMapSnapshot(rootID: request.rootID, logicalPath: request.logicalPath, status: PortableCodeMapResult.Status.oversize.rawValue, language: nil, content: "", contentDigest: CanonicalSigning.bodyDigest(data))
+        }
+        guard let source = String(data: data, encoding: .utf8) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "File is not UTF-8 text")
+        }
+        let result = try PortableCodeMapService.build(content: source, fileExtension: URL(fileURLWithPath: path).pathExtension)
+        return ProjectCodeMapSnapshot(rootID: request.rootID, logicalPath: request.logicalPath, status: result.status.rawValue, language: result.language, content: result.content, contentDigest: result.contentDigest)
     }
 
     public func diff(_ request: ProjectDiffRequest) async throws -> ProjectDiffSnapshot {

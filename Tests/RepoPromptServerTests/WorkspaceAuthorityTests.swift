@@ -11,6 +11,7 @@ final class WorkspaceAuthorityTests: XCTestCase {
         let database = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).sqlite")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try "alpha\nbeta needle\ngamma".write(to: root.appendingPathComponent("notes.txt"), atomically: true, encoding: .utf8)
+        try "struct Greeter {\n    func hello(name: String) -> String { name }\n}\n".write(to: root.appendingPathComponent("Greeter.swift"), atomically: true, encoding: .utf8)
         defer {
             try? FileManager.default.removeItem(at: root)
             try? FileManager.default.removeItem(at: database)
@@ -27,11 +28,16 @@ final class WorkspaceAuthorityTests: XCTestCase {
         XCTAssertEqual(project.roots.first?.canonicalPath, root.path)
 
         let tree = try await authority.projectTree(projectID: project.projectID, request: .init(rootID: rootID))
-        XCTAssertEqual(tree.map(\.logicalPath), ["notes.txt"])
+        XCTAssertEqual(tree.map(\.logicalPath), ["Greeter.swift", "notes.txt"])
         let hits = try await authority.projectSearch(projectID: project.projectID, request: .init(rootID: rootID, query: "needle"))
         XCTAssertEqual(hits.first?.line, 2)
         let file = try await authority.projectFile(projectID: project.projectID, request: .init(rootID: rootID, logicalPath: "notes.txt", startLine: 2, lineCount: 1))
         XCTAssertEqual(file.content, "beta needle")
+        let codeMap = try await authority.projectCodeMap(projectID: project.projectID, request: .init(rootID: rootID, logicalPath: "Greeter.swift"))
+        XCTAssertEqual(codeMap.status, "ready")
+        XCTAssertEqual(codeMap.language, "swift")
+        XCTAssertTrue(codeMap.content.contains("Greeter"))
+        XCTAssertTrue(codeMap.content.contains("hello"))
 
         let entry = LogicalSelectionEntry(rootID: rootID, logicalPath: "notes.txt", mode: .full)
         let selected = try await authority.replaceSelection(sessionID: session.sessionID, entries: [entry], expectedRevision: 1, actor: actor)

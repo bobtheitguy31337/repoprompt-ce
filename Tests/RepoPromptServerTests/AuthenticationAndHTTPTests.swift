@@ -54,4 +54,46 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         }
         try await store.close()
     }
+
+    func testReadinessFailsClosedForMissingVolumeAndCapacity() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let provider = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: "/usr/bin/true")])
+        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
+        let missing = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
+        let readiness = RepoPromptReadinessService(authority: authority, store: store, volumes: [.init(name: "missing", path: missing)], requiredProviders: [.codex], minimumFreeBytes: 0, minimumFreeNodes: 0, maximumActiveSessions: 0, cacheDuration: 0)
+        let auth = InternalRequestAuthenticator(keys: [], store: store)
+        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth, readiness: readiness)
+        let app = Application(router: service.healthRouter())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/health/live", method: .get) { response in XCTAssertEqual(response.status, .ok) }
+            try await client.execute(uri: "/health/ready", method: .get) { response in
+                XCTAssertEqual(response.status, .serviceUnavailable)
+                XCTAssertEqual(response.body.readableBytes, 0)
+            }
+        }
+        let snapshot = await readiness.snapshot(forceRefresh: true)
+        XCTAssertFalse(snapshot.ready)
+        XCTAssertEqual(snapshot.providers.first { $0.kind == .codex }?.ready, true)
+        XCTAssertEqual(snapshot.checks.first { $0.name == "volume:missing" }?.detail, "missing")
+        XCTAssertEqual(snapshot.checks.first { $0.name == "session-capacity" }?.ready, false)
+        try await store.close()
+    }
+
+    func testDegradedProjectIsDiagnosticWithoutFailingUnrelatedReadiness() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(input: .init(name: "degraded", roots: [.init(logicalName: "root", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "project", requestDigest: "project")
+        try FileManager.default.removeItem(at: root)
+        let degraded = try await authority.refreshProject(projectID: project.projectID, expectedRevision: project.revision, actor: actor, idempotencyKey: "refresh", requestDigest: "refresh")
+        XCTAssertEqual(degraded.state, .degraded)
+        let readiness = RepoPromptReadinessService(authority: authority, store: store, minimumFreeBytes: 0, minimumFreeNodes: 0, maximumActiveSessions: 10, cacheDuration: 0)
+        let snapshot = await readiness.snapshot(forceRefresh: true)
+        XCTAssertTrue(snapshot.ready)
+        XCTAssertEqual(snapshot.degradedProjectIDs, [project.projectID])
+        try await store.close()
+    }
 }

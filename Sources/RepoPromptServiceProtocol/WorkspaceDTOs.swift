@@ -285,6 +285,36 @@ public struct ProjectFileSnapshot: Codable, Hashable, Sendable {
     }
 }
 
+public struct ProjectCodeMapRequest: Codable, Sendable {
+    public let rootID: UUID
+    public let logicalPath: String
+    public let maximumBytes: Int
+
+    public init(rootID: UUID, logicalPath: String, maximumBytes: Int = 5_242_880) {
+        self.rootID = rootID
+        self.logicalPath = logicalPath
+        self.maximumBytes = maximumBytes
+    }
+}
+
+public struct ProjectCodeMapSnapshot: Codable, Hashable, Sendable {
+    public let rootID: UUID
+    public let logicalPath: String
+    public let status: String
+    public let language: String?
+    public let content: String
+    public let contentDigest: String
+
+    public init(rootID: UUID, logicalPath: String, status: String, language: String?, content: String, contentDigest: String) {
+        self.rootID = rootID
+        self.logicalPath = logicalPath
+        self.status = status
+        self.language = language
+        self.content = content
+        self.contentDigest = contentDigest
+    }
+}
+
 public struct ProjectDiffRequest: Codable, Sendable {
     public let rootID: UUID
     public let comparison: String

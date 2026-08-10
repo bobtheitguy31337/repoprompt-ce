@@ -11,19 +11,21 @@ public struct RepoPromptHTTPService: Sendable {
     private let authenticator: InternalRequestAuthenticator
     private let eventSigningKey: InternalSigningKey?
     private let certificateRoleResolver: CertificateIdentityRoleResolver?
+    private let readiness: RepoPromptReadinessService
 
-    public init(authority: RepoPromptHeadlessAuthority, store: SQLiteServiceStore, authenticator: InternalRequestAuthenticator, eventSigningKey: InternalSigningKey? = nil, certificateRoleResolver: CertificateIdentityRoleResolver? = nil) {
+    public init(authority: RepoPromptHeadlessAuthority, store: SQLiteServiceStore, authenticator: InternalRequestAuthenticator, eventSigningKey: InternalSigningKey? = nil, certificateRoleResolver: CertificateIdentityRoleResolver? = nil, readiness: RepoPromptReadinessService? = nil) {
         self.authority = authority
         self.store = store
         self.authenticator = authenticator
         self.eventSigningKey = eventSigningKey
         self.certificateRoleResolver = certificateRoleResolver
+        self.readiness = readiness ?? RepoPromptReadinessService(authority: authority, store: store)
     }
 
     public func healthRouter() -> Router<BasicRequestContext> {
         let router = Router<BasicRequestContext>()
         router.get("/health/live") { _, _ in Response(status: .ok) }
-        router.get("/health/ready") { _, _ in await authority.isReady() ? Response(status: .ok) : Response(status: .serviceUnavailable) }
+        router.get("/health/ready") { _, _ in await readiness.snapshot().ready ? Response(status: .ok) : Response(status: .serviceUnavailable) }
         return router
     }
 
@@ -34,11 +36,14 @@ public struct RepoPromptHTTPService: Sendable {
         } }
         router.get("/internal/v1/diagnostics") { request, context in await respond { _ = try await authenticate(request, context: context, body: Data(), roles: [.operatorRole], operation: "diagnostics")
             let meta = try await store.metadata()
-            return try await HTTPResponses.json(["storeId": meta.storeID.uuidString, "schemaVersion": String(meta.schemaVersion), "nextGlobalSequence": String(meta.nextGlobalSequence), "ready": String(authority.isReady())])
+            let currentReadiness = await readiness.snapshot()
+            return try HTTPResponses.json(RepoPromptDiagnostics(storeID: meta.storeID, schemaVersion: meta.schemaVersion, nextGlobalSequence: meta.nextGlobalSequence, replayFloor: meta.replayFloor, readiness: currentReadiness))
         } }
         router.get("/metrics") { request, context in await respond { _ = try await authenticate(request, context: context, body: Data(), roles: [.operatorRole], operation: "metrics")
             let meta = try await store.metadata()
-            let text = await "repoprompt_ready \(authority.isReady() ? 1 : 0)\nrepoprompt_event_latest_sequence \(max(0, meta.nextGlobalSequence - 1))\n"
+            let currentReadiness = await readiness.snapshot()
+            let degradedCount = currentReadiness.degradedProjectIDs.count
+            let text = "repoprompt_ready \(currentReadiness.ready ? 1 : 0)\nrepoprompt_event_latest_sequence \(max(0, meta.nextGlobalSequence - 1))\nrepoprompt_active_sessions \(currentReadiness.activeSessionCount)\nrepoprompt_degraded_projects \(degradedCount)\n"
             var headers = HTTPFields()
             headers[.contentType] = "text/plain; version=0.0.4"
             return Response(status: .ok, headers: headers, body: .init(byteBuffer: ByteBuffer(string: text)))
@@ -75,6 +80,11 @@ public struct RepoPromptHTTPService: Sendable {
             let data = try await bodyData(request)
             _ = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "getFile", projectID: id)
             return try await HTTPResponses.json(authority.projectFile(projectID: id, request: JSONDecoder.serviceDecoder.decode(ProjectFileRequest.self, from: data)))
+        } }
+        router.post("/internal/v1/projects/:id/codemap") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            _ = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "getCodeMap", projectID: id)
+            return try await HTTPResponses.json(authority.projectCodeMap(projectID: id, request: JSONDecoder.serviceDecoder.decode(ProjectCodeMapRequest.self, from: data)))
         } }
         router.post("/internal/v1/projects/:id/diff") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
