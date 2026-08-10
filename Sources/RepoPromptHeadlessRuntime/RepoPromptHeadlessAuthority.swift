@@ -18,9 +18,11 @@ public actor RepoPromptHeadlessAuthority {
     private let projects = ProjectRuntimeSupervisor()
     private let eventHub = ServiceEventHub()
     private var sessions: [UUID: SessionAuthority] = [:]
+    private var agents: [UUID: AgentSnapshot] = [:]
     private var tools: [UUID: ProjectToolAuthority] = [:]
     private var selections: [UUID: SessionSelectionAuthority] = [:]
     private var providerTasks: [UUID: Task<Void, Never>] = [:]
+    private var cancellationBarriers: Set<UUID> = []
     private var quiescing = false
 
     public init(
@@ -46,7 +48,7 @@ public actor RepoPromptHeadlessAuthority {
     }
 
     public func recover() async throws {
-        let unclean = !(try await store.metadata().lastCleanShutdown)
+        let unclean = try await !(store.metadata().lastCleanShutdown)
         try await providerAdapter?.recoverProcessFamilies()
         for snapshot in try await store.allProjects() {
             let roots = snapshot.roots.map { CanonicalRoot(snapshot: $0, filesystemIdentity: "persisted") }
@@ -70,6 +72,15 @@ public actor RepoPromptHeadlessAuthority {
                 revision: persistedSelection?.revision ?? 1,
                 bindingRevision: persistedSelection?.bindingRevision ?? 1
             )
+        }
+        for agent in try await store.agents() {
+            agents[agent.sessionID] = agent
+        }
+        for snapshot in await sessionSnapshots() where agents[snapshot.sessionID] == nil {
+            let synthesized = AgentSnapshot(agentID: snapshot.sessionID, sessionID: snapshot.sessionID, rootSessionID: snapshot.rootSessionID, parentAgentID: snapshot.parentSessionID, role: snapshot.parentSessionID == nil ? "root" : "child", state: snapshot.state, revision: 1)
+            let event = try await store.persistAgent(synthesized, projectID: snapshot.projectID, actor: nil, correlationID: ids.next(), eventType: .agentStarted)
+            agents[snapshot.sessionID] = synthesized
+            await eventHub.publish(event)
         }
         try await store.installWorkflows(workflowCatalog.workflows())
     }
@@ -111,6 +122,7 @@ public actor RepoPromptHeadlessAuthority {
             guard let parentAuthority = sessions[parentID] else { throw ServiceAPIError(code: .notFound, message: "Parent session not found") }
             parent = await parentAuthority.snapshot()
             guard parent?.projectID == input.projectID else { throw ServiceAPIError(code: .rootUnauthorized, message: "Child session cannot cross project runtime") }
+            guard let rootSessionID = parent?.rootSessionID, !cancellationBarriers.contains(rootSessionID) else { throw ServiceAPIError(code: .quiescing, message: "Root session is canceling; new children are fenced") }
         }
         let sessionID = ids.next()
         let rootSessionID = parent?.rootSessionID ?? sessionID
@@ -126,11 +138,33 @@ public actor RepoPromptHeadlessAuthority {
         var transcript: [TranscriptEntry] = []
         if let prompt = input.initialPrompt, !prompt.isEmpty { transcript.append(TranscriptEntry(entryID: ids.next(), sessionSequence: 1, kind: .human, content: prompt, actor: externalActor, timestamp: clock.now())) }
         let snapshot = SessionSnapshot(sessionID: sessionID, projectID: input.projectID, parentSessionID: input.parentSessionID, rootSessionID: rootSessionID, creator: externalActor, provider: input.provider, model: input.model, visibility: input.visibility, state: .idle, runGeneration: 0, turnEpoch: 0, revision: 1, transcript: transcript, interactions: [], cursor: cursor)
-        let event = try await store.persistSession(snapshot, eventType: .sessionCreated, actor: externalActor, correlationID: ids.next(), idempotency: idempotency, initialSelection: seededSelection)
+        let agent = AgentSnapshot(agentID: sessionID, sessionID: sessionID, rootSessionID: rootSessionID, parentAgentID: input.parentSessionID, role: input.parentSessionID == nil ? "root" : "child", state: snapshot.state, revision: 1)
+        let events = try await store.persistNewSession(snapshot, agent: agent, actor: externalActor, correlationID: ids.next(), agentCorrelationID: ids.next(), idempotency: idempotency, initialSelection: seededSelection)
         sessions[sessionID] = SessionAuthority(snapshot: snapshot, clock: clock, ids: ids)
+        agents[sessionID] = agent
         selections[sessionID] = SessionSelectionAuthority(sessionID: sessionID, template: seededSelection.entries, revision: seededSelection.revision, bindingRevision: seededSelection.bindingRevision)
-        await eventHub.publish(event)
+        await eventHub.publish(events.session)
+        await eventHub.publish(events.agent)
         return snapshot
+    }
+
+    public func spawnChildSession(parentSessionID: UUID, provider: ProviderKind? = nil, model: String? = nil, initialPrompt: String, role: String = "child", label: String? = nil) async throws -> SessionSnapshot {
+        guard let parentAuthority = sessions[parentSessionID] else { throw ServiceAPIError(code: .notFound, message: "Parent session not found") }
+        let parent = await parentAuthority.snapshot()
+        guard !cancellationBarriers.contains(parent.rootSessionID) else { throw ServiceAPIError(code: .quiescing, message: "Root session is canceling; new children are fenced") }
+        let child = try await createSession(input: CreateSessionInput(projectID: parent.projectID, parentSessionID: parentSessionID, provider: provider ?? parent.provider, model: model ?? parent.model, visibility: parent.visibility, initialPrompt: initialPrompt), externalActor: parent.creator, idempotencyKey: "agent-manage:\(ids.next().uuidString)", requestDigest: CanonicalSigning.bodyDigest(Data(initialPrompt.utf8)))
+        if var agent = agents[child.sessionID] {
+            agent = AgentSnapshot(agentID: agent.agentID, sessionID: agent.sessionID, rootSessionID: agent.rootSessionID, parentAgentID: agent.parentAgentID, providerNativeIdentity: agent.providerNativeIdentity, role: role, label: label, state: agent.state, revision: agent.revision + 1)
+            let agentEvent = try await store.persistAgent(agent, projectID: child.projectID, actor: nil, correlationID: ids.next(), eventType: .agentUpdated)
+            agents[child.sessionID] = agent
+            await eventHub.publish(agentEvent)
+        }
+        return child
+    }
+
+    public func agentSnapshots(rootSessionID: UUID) async throws -> [AgentSnapshot] {
+        guard sessions[rootSessionID] != nil else { throw ServiceAPIError(code: .notFound, message: "Root session not found") }
+        return try await store.agents(rootSessionID: rootSessionID)
     }
 
     public func execute(command: SessionCommand, sessionID: UUID, externalActor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> CommandReceipt {
@@ -187,7 +221,7 @@ public actor RepoPromptHeadlessAuthority {
             _ = try await createWorktree(sessionID: sessionID, rootID: rootID, baseRef: baseRef, branch: branchName, actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
             return try await commandReceipt(command: command, sessionID: sessionID)
         case let .bindWorktree(bindingID, expectedRevision):
-            _ = try await bindWorktree(sessionID: sessionID, bindingID: bindingID, expectedRevision: expectedRevision, expectedSelectionBindingRevision: (try await selectionSnapshot(sessionID: sessionID)).bindingRevision, actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
+            _ = try await bindWorktree(sessionID: sessionID, bindingID: bindingID, expectedRevision: expectedRevision, expectedSelectionBindingRevision: selectionSnapshot(sessionID: sessionID).bindingRevision, actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
             return try await commandReceipt(command: command, sessionID: sessionID)
         case let .mergeWorktree(bindingID, strategy, expectedRevision):
             _ = try await mergeWorktree(sessionID: sessionID, bindingID: bindingID, strategy: strategy, expectedRevision: expectedRevision, actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
@@ -356,7 +390,7 @@ public actor RepoPromptHeadlessAuthority {
     public func requestInteraction(sessionID: UUID, kind: InteractionSnapshot.Kind, payload: Data, expiresAt: Date? = nil) async throws -> InteractionSnapshot {
         guard let sessionAuthority = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
         let session = await sessionAuthority.snapshot()
-        let interaction = InteractionSnapshot(interactionID: ids.next(), runID: await sessionAuthority.activeBinding()?.runID, kind: kind, state: .pending, payload: payload, revision: 1, expiresAt: expiresAt)
+        let interaction = await InteractionSnapshot(interactionID: ids.next(), runID: sessionAuthority.activeBinding()?.runID, kind: kind, state: .pending, payload: payload, revision: 1, expiresAt: expiresAt)
         let event = try await store.persistInteraction(interaction, session: session, actor: nil, correlationID: ids.next())
         await eventHub.publish(event)
         return interaction
@@ -490,7 +524,7 @@ public actor RepoPromptHeadlessAuthority {
         guard let workingRoot = project.roots.first else { throw ServiceAPIError(code: .rootUnauthorized, message: "Project has no roots") }
         var inventory: [String] = []
         for root in project.roots {
-            let entries = try await projectTree(projectID: project.projectID, request: .init(rootID: root.rootID, maximumDepth: 12, maximumEntries: min(max(input.budget, 100), 10_000)))
+            let entries = try await projectTree(projectID: project.projectID, request: .init(rootID: root.rootID, maximumDepth: 12, maximumEntries: min(max(input.budget, 100), 10000)))
             inventory.append(contentsOf: entries.filter { !$0.isDirectory }.map { "\(root.rootID.uuidString)\t\($0.logicalPath)" })
         }
         let prompt = """
@@ -707,6 +741,7 @@ public actor RepoPromptHeadlessAuthority {
         let receipt = CommandReceipt(commandID: ids.next(), sessionID: sessionID, operation: command.operation, acceptedCursor: cursor, status: "accepted")
         let event = try await store.persistSession(persisted, eventType: .sessionResumed, actor: actor, correlationID: ids.next(), idempotency: idempotency, idempotencyResponse: JSONEncoder.serviceEncoder.encode(receipt))
         await eventHub.publish(event)
+        try await updateAgentLifecycle(sessionID: sessionID, state: .running, eventType: .agentUpdated, actor: actor)
         let project = try await projectSnapshot(projectID: snapshot.projectID)
         guard let workingDirectory = project.roots.first?.canonicalPath else { throw ServiceAPIError(code: .rootUnauthorized, message: "Project has no roots") }
         let prompt = snapshot.transcript.last(where: { $0.kind == .human })?.content ?? "Continue the repository task."
@@ -717,6 +752,7 @@ public actor RepoPromptHeadlessAuthority {
     private func steerProviderRun(command: SessionCommand, sessionID: UUID, session: SessionAuthority, text: String, targetTurnEpoch: Int64, actor: ExternalActor, idempotency: IdempotencyInput) async throws -> CommandReceipt {
         let binding = try await session.steer(text, actor: actor, targetTurnEpoch: targetTurnEpoch)
         providerTasks[binding.runID]?.cancel()
+        try await providerAdapter?.cancel(runID: binding.runID)
         let current = await session.snapshot()
         let cursor = try await store.nextCursor()
         let receipt = CommandReceipt(commandID: ids.next(), sessionID: sessionID, operation: command.operation, acceptedCursor: cursor, status: "accepted")
@@ -729,15 +765,55 @@ public actor RepoPromptHeadlessAuthority {
     }
 
     private func cancelProviderRun(command: SessionCommand, sessionID: UUID, session: SessionAuthority, expectedRunID: UUID?, generation: Int64, actor: ExternalActor, idempotency: IdempotencyInput) async throws -> CommandReceipt {
-        guard let binding = await session.activeBinding(), binding.generation == generation, expectedRunID == nil || expectedRunID == binding.runID else { throw ServiceAPIError(code: .staleRevision, message: "Run identity is stale", currentRevision: (await session.snapshot()).runGeneration) }
+        guard let binding = await session.activeBinding(), binding.generation == generation, expectedRunID == nil || expectedRunID == binding.runID else { throw await ServiceAPIError(code: .staleRevision, message: "Run identity is stale", currentRevision: (session.snapshot()).runGeneration) }
+        let rootSessionID = await (session.snapshot()).rootSessionID
+        cancellationBarriers.insert(rootSessionID)
+        try await cancelDescendants(rootSessionID: rootSessionID, excluding: sessionID, actor: actor)
         providerTasks[binding.runID]?.cancel()
         providerTasks[binding.runID] = nil
+        try await providerAdapter?.cancel(runID: binding.runID)
         guard await session.settle(binding: binding, terminal: .sessionCanceled, lifecycle: .canceled) == .accepted else { throw ServiceAPIError(code: .staleRevision, message: "Run is already settled") }
         let cursor = try await store.nextCursor()
         let receipt = CommandReceipt(commandID: ids.next(), sessionID: sessionID, operation: command.operation, acceptedCursor: cursor, status: "accepted")
-        let event = try await store.persistSession(replacingCursor(await session.snapshot(), cursor: cursor), eventType: .sessionCanceled, actor: actor, correlationID: ids.next(), idempotency: idempotency, idempotencyResponse: JSONEncoder.serviceEncoder.encode(receipt))
+        let event = try await store.persistSession(replacingCursor(session.snapshot(), cursor: cursor), eventType: .sessionCanceled, actor: actor, correlationID: ids.next(), idempotency: idempotency, idempotencyResponse: JSONEncoder.serviceEncoder.encode(receipt))
         await eventHub.publish(event)
+        try await updateAgentLifecycle(sessionID: sessionID, state: .canceled, eventType: .agentFailed, actor: actor)
         return receipt
+    }
+
+    private func cancelDescendants(rootSessionID: UUID, excluding rootID: UUID, actor: ExternalActor) async throws {
+        let snapshots = await sessionSnapshots().filter { $0.rootSessionID == rootSessionID && $0.sessionID != rootID }
+        let byID = Dictionary(uniqueKeysWithValues: snapshots.map { ($0.sessionID, $0) })
+        func depth(_ snapshot: SessionSnapshot) -> Int {
+            var current = snapshot
+            var result = 0
+            while let parentID = current.parentSessionID, let parent = byID[parentID] {
+                result += 1
+                current = parent
+            }
+            return result
+        }
+        for snapshot in snapshots.sorted(by: { depth($0) > depth($1) }) {
+            guard ![SessionLifecycleState.completed, .failed, .canceled, .archived].contains(snapshot.state), let child = sessions[snapshot.sessionID] else { continue }
+            if let binding = await child.activeBinding() {
+                providerTasks[binding.runID]?.cancel()
+                providerTasks[binding.runID] = nil
+                try await providerAdapter?.cancel(runID: binding.runID)
+                _ = await child.settle(binding: binding, terminal: .sessionCanceled, lifecycle: .canceled)
+            } else {
+                try await child.cancelWithoutActiveRun()
+            }
+            let cursor = try await store.nextCursor()
+            let updated = await replacingCursor(child.snapshot(), cursor: cursor)
+            let sessionEvent = try await store.persistSession(updated, eventType: .sessionCanceled, actor: actor, correlationID: ids.next(), idempotency: nil)
+            await eventHub.publish(sessionEvent)
+            if let currentAgent = agents[snapshot.sessionID] {
+                let canceledAgent = AgentSnapshot(agentID: currentAgent.agentID, sessionID: currentAgent.sessionID, rootSessionID: currentAgent.rootSessionID, parentAgentID: currentAgent.parentAgentID, providerNativeIdentity: currentAgent.providerNativeIdentity, role: currentAgent.role, label: currentAgent.label, state: .canceled, revision: currentAgent.revision + 1)
+                let agentEvent = try await store.persistAgent(canceledAgent, projectID: snapshot.projectID, actor: actor, correlationID: ids.next(), eventType: .agentFailed)
+                agents[snapshot.sessionID] = canceledAgent
+                await eventHub.publish(agentEvent)
+            }
+        }
     }
 
     private func performProviderRun(sessionID: UUID, binding: RunBindingIdentity, prompt: String, workingDirectory: String) async {
@@ -747,19 +823,30 @@ public actor RepoPromptHeadlessAuthority {
             let output = try await providerAdapter.complete(kind: initial.provider, model: initial.model, prompt: prompt, workingDirectory: workingDirectory, runID: binding.runID)
             guard !Task.isCancelled, await session.acceptProviderOutput(binding: binding, kind: .assistant, content: output) == .accepted else { return }
             var cursor = try await store.nextCursor()
-            var event = try await store.persistSession(replacingCursor(await session.snapshot(), cursor: cursor), eventType: .transcriptMessage, actor: nil, correlationID: ids.next(), idempotency: nil)
+            var event = try await store.persistSession(replacingCursor(session.snapshot(), cursor: cursor), eventType: .transcriptMessage, actor: nil, correlationID: ids.next(), idempotency: nil)
             await eventHub.publish(event)
             guard await session.settle(binding: binding, terminal: .sessionCompleted, lifecycle: .completed) == .accepted else { return }
             cursor = try await store.nextCursor()
-            event = try await store.persistSession(replacingCursor(await session.snapshot(), cursor: cursor), eventType: .sessionCompleted, actor: nil, correlationID: ids.next(), idempotency: nil)
+            event = try await store.persistSession(replacingCursor(session.snapshot(), cursor: cursor), eventType: .sessionCompleted, actor: nil, correlationID: ids.next(), idempotency: nil)
             await eventHub.publish(event)
+            try await updateAgentLifecycle(sessionID: sessionID, state: .completed, eventType: .agentCompleted, actor: nil)
         } catch {
             guard await session.settle(binding: binding, terminal: .sessionFailed, lifecycle: .failed) == .accepted else { return }
-            if let cursor = try? await store.nextCursor(), let event = try? await store.persistSession(replacingCursor(await session.snapshot(), cursor: cursor), eventType: .sessionFailed, actor: nil, correlationID: ids.next(), idempotency: nil) {
+            if let cursor = try? await store.nextCursor(), let event = try? await store.persistSession(replacingCursor(session.snapshot(), cursor: cursor), eventType: .sessionFailed, actor: nil, correlationID: ids.next(), idempotency: nil) {
                 await eventHub.publish(event)
             }
+            try? await updateAgentLifecycle(sessionID: sessionID, state: .failed, eventType: .agentFailed, actor: nil)
         }
         providerTasks[binding.runID] = nil
+    }
+
+    private func updateAgentLifecycle(sessionID: UUID, state: SessionLifecycleState, eventType: EventType, actor: ExternalActor?) async throws {
+        guard let current = agents[sessionID], current.state != state else { return }
+        let updated = AgentSnapshot(agentID: current.agentID, sessionID: current.sessionID, rootSessionID: current.rootSessionID, parentAgentID: current.parentAgentID, providerNativeIdentity: current.providerNativeIdentity, role: current.role, label: current.label, state: state, revision: current.revision + 1)
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        let event = try await store.persistAgent(updated, projectID: session.projectID, actor: actor, correlationID: ids.next(), eventType: eventType)
+        agents[sessionID] = updated
+        await eventHub.publish(event)
     }
 
     private func replacingCursor(_ value: SessionSnapshot, cursor: ServiceCursor) -> SessionSnapshot {

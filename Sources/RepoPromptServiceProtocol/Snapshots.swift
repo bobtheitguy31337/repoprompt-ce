@@ -81,6 +81,30 @@ public struct TranscriptEntry: Codable, Hashable, Sendable {
     }
 }
 
+public struct AgentSnapshot: Codable, Hashable, Sendable {
+    public let agentID: UUID
+    public let sessionID: UUID
+    public let rootSessionID: UUID
+    public let parentAgentID: UUID?
+    public let providerNativeIdentity: String?
+    public let role: String
+    public let label: String?
+    public let state: SessionLifecycleState
+    public let revision: Int64
+
+    public init(agentID: UUID, sessionID: UUID, rootSessionID: UUID, parentAgentID: UUID?, providerNativeIdentity: String? = nil, role: String, label: String? = nil, state: SessionLifecycleState, revision: Int64) {
+        self.agentID = agentID
+        self.sessionID = sessionID
+        self.rootSessionID = rootSessionID
+        self.parentAgentID = parentAgentID
+        self.providerNativeIdentity = providerNativeIdentity
+        self.role = role
+        self.label = label
+        self.state = state
+        self.revision = revision
+    }
+}
+
 public struct SessionSnapshot: Codable, Hashable, Sendable {
     public let schemaVersion: Int
     public let sessionID: UUID

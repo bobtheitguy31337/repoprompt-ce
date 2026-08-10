@@ -120,33 +120,23 @@ public actor SQLiteServiceStore {
         initialSelection: SelectionSnapshot? = nil
     ) async throws -> EventEnvelope {
         try await transaction {
-            try await validateExpectedCursor(snapshot.cursor)
-            if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
-            let snapshotJSON = try encodeText(snapshot)
-            let sessionBindings: [SQLiteData] = [
-                .text(snapshot.sessionID.uuidString), .text(snapshot.projectID.uuidString), snapshot.parentSessionID.map { .text($0.uuidString) } ?? .null,
-                .text(snapshot.rootSessionID.uuidString), .text(snapshot.creator.goblinUserID), .text(snapshot.state.rawValue), .text(snapshot.provider.rawValue),
-                snapshot.model.map(SQLiteData.text) ?? .null, .text(snapshot.visibility.rawValue), .integer(Int(snapshot.runGeneration)), .integer(Int(snapshot.turnEpoch)),
-                .integer(Int(snapshot.revision)), .text(snapshotJSON)
-            ]
-            _ = try await connection.query("INSERT INTO sessions(session_id,project_id,parent_session_id,root_session_id,schema_version,creator_external_id,lifecycle_state,provider_kind,model,visibility,run_generation,turn_epoch,revision,snapshot_json,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET lifecycle_state=excluded.lifecycle_state,run_generation=excluded.run_generation,turn_epoch=excluded.turn_epoch,revision=excluded.revision,snapshot_json=excluded.snapshot_json,updated_at=CURRENT_TIMESTAMP", sessionBindings)
-            for entry in snapshot.transcript {
-                _ = try await connection.query("INSERT OR IGNORE INTO transcript_entries(session_id,entry_id,schema_version,session_sequence,entry_json,content_digest) VALUES(?,?,1,?,?,?)", [.text(snapshot.sessionID.uuidString), .text(entry.entryID.uuidString), .integer(Int(entry.sessionSequence)), .text(encodeText(entry)), .text(CanonicalSigning.bodyDigest(encoder.encode(entry)))])
-            }
-            if let initialSelection {
-                _ = try await connection.query(
-                    "INSERT INTO session_selections(session_id,schema_version,allowed_roots_json,selection_json,selection_revision,binding_revision,transactional_commit_id) VALUES(?,1,?,?,?,?,?) ON CONFLICT(session_id) DO NOTHING",
-                    [.text(initialSelection.sessionID.uuidString), .text(try encodeText(Array(Set(initialSelection.entries.map(\.rootID))))), .text(try encodeText(initialSelection)), .integer(Int(initialSelection.revision)), .integer(Int(initialSelection.bindingRevision)), .text(UUID().uuidString)]
-                )
-            }
-            let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.rootSessionID, runID: nil, sessionSequence: Int64(snapshot.transcript.count), type: eventType, generation: snapshot.runGeneration, turnEpoch: snapshot.turnEpoch, actor: actor, correlationID: correlationID, payload: Data(snapshotJSON.utf8))
-            if [.completed, .failed, .canceled, .interrupted, .archived].contains(snapshot.state) || (!snapshot.transcript.isEmpty && snapshot.transcript.count.isMultiple(of: 1000)) {
-                try await saveCheckpoint(scope: "session:\(snapshot.sessionID.uuidString)", sequence: event.globalSequence, snapshot: Data(snapshotJSON.utf8))
-            }
-            if let idempotency {
-                try await saveIdempotency(idempotency, status: 202, response: idempotencyResponse ?? encoder.encode(snapshot))
-            }
-            return event
+            try await persistSessionInTransaction(snapshot, eventType: eventType, actor: actor, correlationID: correlationID, idempotency: idempotency, idempotencyResponse: idempotencyResponse, initialSelection: initialSelection)
+        }
+    }
+
+    public func persistNewSession(
+        _ snapshot: SessionSnapshot,
+        agent: AgentSnapshot,
+        actor: ExternalActor,
+        correlationID: UUID,
+        agentCorrelationID: UUID,
+        idempotency: IdempotencyInput,
+        initialSelection: SelectionSnapshot
+    ) async throws -> (session: EventEnvelope, agent: EventEnvelope) {
+        try await transaction {
+            let sessionEvent = try await persistSessionInTransaction(snapshot, eventType: .sessionCreated, actor: actor, correlationID: correlationID, idempotency: idempotency, idempotencyResponse: nil, initialSelection: initialSelection)
+            let agentEvent = try await persistAgentInTransaction(agent, projectID: snapshot.projectID, actor: snapshot.parentSessionID == nil ? actor : nil, correlationID: agentCorrelationID, eventType: .agentStarted)
+            return (sessionEvent, agentEvent)
         }
     }
 
@@ -212,7 +202,7 @@ public actor SQLiteServiceStore {
     }
 
     public func completeLegacyImport(sourceDigest: String) async throws {
-        guard !(try await importAuditExists(kind: "legacy.import.completed", digest: sourceDigest)) else { return }
+        guard try await !importAuditExists(kind: "legacy.import.completed", digest: sourceDigest) else { return }
         try await transaction { try await recordImportAudit(kind: "legacy.import.completed", digest: sourceDigest) }
     }
 
@@ -232,6 +222,28 @@ public actor SQLiteServiceStore {
 
     public func allSessions() async throws -> [SessionSnapshot] {
         try await decodeRows("SELECT snapshot_json FROM sessions ORDER BY created_at", as: SessionSnapshot.self)
+    }
+
+    public func persistAgent(_ snapshot: AgentSnapshot, projectID: UUID, actor: ExternalActor?, correlationID: UUID, eventType: EventType) async throws -> EventEnvelope {
+        try await transaction {
+            try await persistAgentInTransaction(snapshot, projectID: projectID, actor: actor, correlationID: correlationID, eventType: eventType)
+        }
+    }
+
+    public func agents(rootSessionID: UUID? = nil) async throws -> [AgentSnapshot] {
+        let rows = if let rootSessionID {
+            try await connection.query("SELECT * FROM agents WHERE root_session_id=? ORDER BY created_at", [.text(rootSessionID.uuidString)])
+        } else {
+            try await connection.query("SELECT * FROM agents ORDER BY created_at")
+        }
+        return try rows.map { row in
+            guard let agentID = UUID(uuidString: row.column("agent_id")?.string ?? ""),
+                  let sessionID = UUID(uuidString: row.column("session_id")?.string ?? ""),
+                  let rootID = UUID(uuidString: row.column("root_session_id")?.string ?? ""),
+                  let state = SessionLifecycleState(rawValue: row.column("lifecycle_state")?.string ?? "")
+            else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Persisted agent is invalid") }
+            return AgentSnapshot(agentID: agentID, sessionID: sessionID, rootSessionID: rootID, parentAgentID: row.column("parent_agent_id")?.string.flatMap(UUID.init(uuidString:)), providerNativeIdentity: row.column("provider_native_identity")?.string, role: row.column("role")?.string ?? "agent", label: row.column("label")?.string, state: state, revision: Int64(row.column("revision")?.integer ?? 1))
+        }
     }
 
     public func events(after cursor: ServiceCursor?, limit: Int) async throws -> EventPage {
@@ -259,9 +271,9 @@ public actor SQLiteServiceStore {
             if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             _ = try await connection.query(
                 "INSERT INTO session_selections(session_id,schema_version,allowed_roots_json,selection_json,selection_revision,binding_revision,transactional_commit_id) VALUES(?,1,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET selection_json=excluded.selection_json,selection_revision=excluded.selection_revision,binding_revision=excluded.binding_revision,transactional_commit_id=excluded.transactional_commit_id",
-                [.text(snapshot.sessionID.uuidString), .text(try encodeText(Array(Set(snapshot.entries.map(\.rootID))))), .text(try encodeText(snapshot)), .integer(Int(snapshot.revision)), .integer(Int(snapshot.bindingRevision)), .text(UUID().uuidString)]
+                [.text(snapshot.sessionID.uuidString), .text(encodeText(Array(Set(snapshot.entries.map(\.rootID))))), .text(encodeText(snapshot)), .integer(Int(snapshot.revision)), .integer(Int(snapshot.bindingRevision)), .text(UUID().uuidString)]
             )
-            let event = try await appendEvent(projectID: projectID, sessionID: snapshot.sessionID, rootSessionID: rootSessionID, runID: nil, sessionSequence: nil, type: .selectionUpdated, generation: nil, turnEpoch: nil, actor: actor, correlationID: correlationID, payload: try encoder.encode(snapshot))
+            let event = try await appendEvent(projectID: projectID, sessionID: snapshot.sessionID, rootSessionID: rootSessionID, runID: nil, sessionSequence: nil, type: .selectionUpdated, generation: nil, turnEpoch: nil, actor: actor, correlationID: correlationID, payload: encoder.encode(snapshot))
             if let idempotency { try await saveIdempotency(idempotency, status: 200, response: encoder.encode(snapshot)) }
             return event
         }
@@ -282,9 +294,9 @@ public actor SQLiteServiceStore {
             if let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             _ = try await connection.query(
                 "INSERT INTO project_selection_templates(template_id,project_id,schema_version,selection_json,revision,transactional_commit_id) VALUES(?,?,1,?,?,?) ON CONFLICT(template_id) DO UPDATE SET selection_json=excluded.selection_json,revision=excluded.revision,transactional_commit_id=excluded.transactional_commit_id",
-                [.text(snapshot.projectID.uuidString), .text(snapshot.projectID.uuidString), .text(try encodeText(snapshot)), .integer(Int(snapshot.revision)), .text(UUID().uuidString)]
+                [.text(snapshot.projectID.uuidString), .text(snapshot.projectID.uuidString), .text(encodeText(snapshot)), .integer(Int(snapshot.revision)), .text(UUID().uuidString)]
             )
-            let event = try await appendEvent(projectID: snapshot.projectID, sessionID: nil, rootSessionID: nil, runID: nil, sessionSequence: nil, type: .selectionUpdated, generation: nil, turnEpoch: nil, actor: actor, correlationID: correlationID, payload: try encoder.encode(snapshot))
+            let event = try await appendEvent(projectID: snapshot.projectID, sessionID: nil, rootSessionID: nil, runID: nil, sessionSequence: nil, type: .selectionUpdated, generation: nil, turnEpoch: nil, actor: actor, correlationID: correlationID, payload: encoder.encode(snapshot))
             try await saveIdempotency(idempotency, status: 200, response: encoder.encode(snapshot))
             return event
         }
@@ -295,9 +307,9 @@ public actor SQLiteServiceStore {
             if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             _ = try await connection.query(
                 "INSERT INTO execution_permissions(session_id,schema_version,mode,provider_settings_json,revision,updated_actor_json,updated_at) VALUES(?,1,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET mode=excluded.mode,provider_settings_json=excluded.provider_settings_json,revision=excluded.revision,updated_actor_json=excluded.updated_actor_json,updated_at=CURRENT_TIMESTAMP",
-                [.text(snapshot.sessionID.uuidString), .text(snapshot.mode), .text(try encodeText(snapshot.providerSettings)), .integer(Int(snapshot.revision)), .text(try encodeText(snapshot.updatedActor))]
+                [.text(snapshot.sessionID.uuidString), .text(snapshot.mode), .text(encodeText(snapshot.providerSettings)), .integer(Int(snapshot.revision)), .text(encodeText(snapshot.updatedActor))]
             )
-            let event = try await appendEvent(projectID: projectID, sessionID: snapshot.sessionID, rootSessionID: rootSessionID, runID: nil, sessionSequence: nil, type: .permissionUpdated, generation: nil, turnEpoch: nil, actor: snapshot.updatedActor, correlationID: correlationID, payload: try encoder.encode(snapshot))
+            let event = try await appendEvent(projectID: projectID, sessionID: snapshot.sessionID, rootSessionID: rootSessionID, runID: nil, sessionSequence: nil, type: .permissionUpdated, generation: nil, turnEpoch: nil, actor: snapshot.updatedActor, correlationID: correlationID, payload: encoder.encode(snapshot))
             if let idempotency { try await saveIdempotency(idempotency, status: 200, response: encoder.encode(snapshot)) }
             return event
         }
@@ -309,7 +321,7 @@ public actor SQLiteServiceStore {
               let settings = row.column("provider_settings_json")?.string,
               let actor = row.column("updated_actor_json")?.string
         else { return nil }
-        return ExecutionPermissionSnapshot(sessionID: sessionID, mode: mode, providerSettings: try decoder.decode([String: String].self, from: Data(settings.utf8)), revision: Int64(row.column("revision")?.integer ?? 1), updatedActor: try decoder.decode(ExternalActor.self, from: Data(actor.utf8)))
+        return try ExecutionPermissionSnapshot(sessionID: sessionID, mode: mode, providerSettings: decoder.decode([String: String].self, from: Data(settings.utf8)), revision: Int64(row.column("revision")?.integer ?? 1), updatedActor: decoder.decode(ExternalActor.self, from: Data(actor.utf8)))
     }
 
     public func persistInteraction(_ snapshot: InteractionSnapshot, session: SessionSnapshot, actor: ExternalActor?, correlationID: UUID, idempotency: IdempotencyInput? = nil) async throws -> EventEnvelope {
@@ -321,7 +333,7 @@ public actor SQLiteServiceStore {
                 [.text(snapshot.interactionID.uuidString), .text(session.sessionID.uuidString), snapshot.runID.map { .text($0.uuidString) } ?? .null, snapshot.agentID.map { .text($0.uuidString) } ?? .null, .text(snapshot.kind.rawValue), .text(snapshot.state.rawValue), .text(snapshot.payload.base64EncodedString()), snapshot.expiresAt.map { .float($0.timeIntervalSince1970) } ?? .null, snapshot.state == .resolved ? .float(Date().timeIntervalSince1970) : .null, actorJSON.map(SQLiteData.text) ?? .null, .integer(Int(snapshot.revision))]
             )
             let eventType: EventType = snapshot.state == .resolved ? .interactionResolved : .interactionRequested
-            let event = try await appendEvent(projectID: session.projectID, sessionID: session.sessionID, rootSessionID: session.rootSessionID, runID: nil, sessionSequence: nil, type: eventType, generation: session.runGeneration, turnEpoch: session.turnEpoch, actor: actor, correlationID: correlationID, payload: try encoder.encode(snapshot))
+            let event = try await appendEvent(projectID: session.projectID, sessionID: session.sessionID, rootSessionID: session.rootSessionID, runID: nil, sessionSequence: nil, type: eventType, generation: session.runGeneration, turnEpoch: session.turnEpoch, actor: actor, correlationID: correlationID, payload: encoder.encode(snapshot))
             if let idempotency { try await saveIdempotency(idempotency, status: 200, response: encoder.encode(snapshot)) }
             return event
         }
@@ -357,7 +369,7 @@ public actor SQLiteServiceStore {
         try await transaction {
             _ = try await connection.query(
                 "INSERT INTO oracle_chats(chat_id,session_id,schema_version,chat_json,revision,created_at,updated_at) VALUES(?,?,1,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(chat_id) DO UPDATE SET chat_json=excluded.chat_json,revision=excluded.revision,updated_at=CURRENT_TIMESTAMP",
-                [.text(chat.chatID.uuidString), .text(chat.sessionID.uuidString), .text(try encodeText(chat)), .integer(Int(chat.revision))]
+                [.text(chat.chatID.uuidString), .text(chat.sessionID.uuidString), .text(encodeText(chat)), .integer(Int(chat.revision))]
             )
         }
     }
@@ -369,7 +381,7 @@ public actor SQLiteServiceStore {
                 "INSERT INTO worktree_bindings(binding_id,project_id,root_id,session_id,schema_version,base_ref,branch,physical_path,ownership_state,merge_state,revision) VALUES(?,?,?,?,1,?,?,?,?,?,?) ON CONFLICT(binding_id) DO UPDATE SET session_id=excluded.session_id,ownership_state=excluded.ownership_state,merge_state=excluded.merge_state,revision=excluded.revision",
                 [.text(snapshot.bindingID.uuidString), .text(snapshot.projectID.uuidString), .text(snapshot.rootID.uuidString), snapshot.sessionID.map { .text($0.uuidString) } ?? .null, .text(snapshot.baseRef), .text(snapshot.branch), .text(snapshot.physicalPath), .text(snapshot.ownershipState.rawValue), .text(snapshot.mergeState.rawValue), .integer(Int(snapshot.revision))]
             )
-            let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.sessionID, runID: nil, sessionSequence: nil, type: snapshot.revision == 1 ? .worktreeCreated : .worktreeUpdated, generation: nil, turnEpoch: nil, actor: actor, correlationID: correlationID, payload: try encoder.encode(snapshot))
+            let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.sessionID, runID: nil, sessionSequence: nil, type: snapshot.revision == 1 ? .worktreeCreated : .worktreeUpdated, generation: nil, turnEpoch: nil, actor: actor, correlationID: correlationID, payload: encoder.encode(snapshot))
             if let idempotency { try await saveIdempotency(idempotency, status: snapshot.revision == 1 ? 201 : 200, response: encoder.encode(snapshot)) }
             return event
         }
@@ -384,10 +396,10 @@ public actor SQLiteServiceStore {
             )
             _ = try await connection.query(
                 "INSERT INTO session_selections(session_id,schema_version,allowed_roots_json,selection_json,selection_revision,binding_revision,transactional_commit_id) VALUES(?,1,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET selection_json=excluded.selection_json,selection_revision=excluded.selection_revision,binding_revision=excluded.binding_revision,transactional_commit_id=excluded.transactional_commit_id",
-                [.text(selection.sessionID.uuidString), .text(try encodeText(Array(Set(selection.entries.map(\.rootID))))), .text(try encodeText(selection)), .integer(Int(selection.revision)), .integer(Int(selection.bindingRevision)), .text(UUID().uuidString)]
+                [.text(selection.sessionID.uuidString), .text(encodeText(Array(Set(selection.entries.map(\.rootID))))), .text(encodeText(selection)), .integer(Int(selection.revision)), .integer(Int(selection.bindingRevision)), .text(UUID().uuidString)]
             )
-            let worktreeEvent = try await appendEvent(projectID: session.projectID, sessionID: session.sessionID, rootSessionID: session.rootSessionID, runID: nil, sessionSequence: nil, type: .worktreeUpdated, generation: session.runGeneration, turnEpoch: session.turnEpoch, actor: actor, correlationID: correlationID, payload: try encoder.encode(worktree))
-            let selectionEvent = try await appendEvent(projectID: session.projectID, sessionID: session.sessionID, rootSessionID: session.rootSessionID, runID: nil, sessionSequence: nil, type: .selectionUpdated, generation: session.runGeneration, turnEpoch: session.turnEpoch, actor: actor, correlationID: correlationID, payload: try encoder.encode(selection))
+            let worktreeEvent = try await appendEvent(projectID: session.projectID, sessionID: session.sessionID, rootSessionID: session.rootSessionID, runID: nil, sessionSequence: nil, type: .worktreeUpdated, generation: session.runGeneration, turnEpoch: session.turnEpoch, actor: actor, correlationID: correlationID, payload: encoder.encode(worktree))
+            let selectionEvent = try await appendEvent(projectID: session.projectID, sessionID: session.sessionID, rootSessionID: session.rootSessionID, runID: nil, sessionSequence: nil, type: .selectionUpdated, generation: session.runGeneration, turnEpoch: session.turnEpoch, actor: actor, correlationID: correlationID, payload: encoder.encode(selection))
             try await saveIdempotency(idempotency, status: 200, response: encoder.encode(worktree))
             return (worktreeEvent, selectionEvent)
         }
@@ -407,7 +419,7 @@ public actor SQLiteServiceStore {
                 "INSERT INTO artifacts(artifact_id,project_id,session_id,schema_version,kind,logical_name,content_digest,storage_reference,size,created_sequence,created_at,retention_state) VALUES(?,?,?,1,?,?,?,?,?,?,CURRENT_TIMESTAMP,?)",
                 [.text(snapshot.artifactID.uuidString), .text(snapshot.projectID.uuidString), snapshot.sessionID.map { .text($0.uuidString) } ?? .null, .text(snapshot.kind), .text(snapshot.logicalName), .text(snapshot.contentDigest), .text(storageReference), .integer(Int(snapshot.size)), .integer(Int(snapshot.createdCursor.globalSequence)), .text(snapshot.retentionState)]
             )
-            return try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.sessionID, runID: nil, sessionSequence: nil, type: .artifactCreated, generation: nil, turnEpoch: nil, actor: actor, correlationID: correlationID, payload: try encoder.encode(snapshot))
+            return try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.sessionID, runID: nil, sessionSequence: nil, type: .artifactCreated, generation: nil, turnEpoch: nil, actor: actor, correlationID: correlationID, payload: encoder.encode(snapshot))
         }
     }
 
@@ -550,22 +562,22 @@ public actor SQLiteServiceStore {
         return fresh
     }
 
-    private func appendEvent(projectID: UUID, sessionID: UUID?, rootSessionID: UUID?, runID: UUID?, sessionSequence: Int64?, type: EventType, generation: Int64?, turnEpoch: Int64?, actor: ExternalActor?, correlationID: UUID, payload: Data) async throws -> EventEnvelope {
+    private func appendEvent(projectID: UUID, sessionID: UUID?, agentID: UUID? = nil, parentAgentID: UUID? = nil, rootSessionID: UUID?, runID: UUID?, sessionSequence: Int64?, type: EventType, generation: Int64?, turnEpoch: Int64?, actor: ExternalActor?, correlationID: UUID, payload: Data) async throws -> EventEnvelope {
         let meta = try await metadata()
         let sequence = meta.nextGlobalSequence
         let digest = CanonicalSigning.bodyDigest(payload)
         let keyID = eventSigningKey?.keyID ?? "unsigned-local"
         let signature = eventSigningKey.map { CanonicalSigning.hmacSHA256(message: "\(meta.storeID.uuidString)\n\(sequence)\n\(digest)", key: $0.secret) } ?? ""
-        let envelope = EventEnvelope(protocolVersion: 1, eventID: UUID(), storeID: meta.storeID, globalSequence: sequence, timestamp: Date(), projectID: projectID, sessionID: sessionID, agentID: nil, parentAgentID: nil, rootSessionID: rootSessionID, runID: runID, sessionSequence: sessionSequence, eventType: type, payloadVersion: 1, generation: generation, turnEpoch: turnEpoch, actor: actor, correlationID: correlationID, causationID: nil, payload: payload, digest: digest, keyID: keyID, signature: signature)
+        let envelope = EventEnvelope(protocolVersion: 1, eventID: UUID(), storeID: meta.storeID, globalSequence: sequence, timestamp: Date(), projectID: projectID, sessionID: sessionID, agentID: agentID, parentAgentID: parentAgentID, rootSessionID: rootSessionID, runID: runID, sessionSequence: sessionSequence, eventType: type, payloadVersion: 1, generation: generation, turnEpoch: turnEpoch, actor: actor, correlationID: correlationID, causationID: nil, payload: payload, digest: digest, keyID: keyID, signature: signature)
         let actorJSON = try actor.map(encodeText)
         let bindings: [SQLiteData] = try [
             .integer(Int(sequence)), .text(envelope.eventID.uuidString), .text(projectID.uuidString), sessionID.map { .text($0.uuidString) } ?? .null,
-            rootSessionID.map { .text($0.uuidString) } ?? .null, runID.map { .text($0.uuidString) } ?? .null,
+            agentID.map { .text($0.uuidString) } ?? .null, parentAgentID.map { .text($0.uuidString) } ?? .null, rootSessionID.map { .text($0.uuidString) } ?? .null, runID.map { .text($0.uuidString) } ?? .null,
             sessionSequence.map { .integer(Int($0)) } ?? .null, .text(type.rawValue), .integer(1), generation.map { .integer(Int($0)) } ?? .null,
             turnEpoch.map { .integer(Int($0)) } ?? .null, actorJSON.map(SQLiteData.text) ?? .null, .text(payload.base64EncodedString()),
             .text(digest), .float(envelope.timestamp.timeIntervalSince1970), .text(encodeText(envelope))
         ]
-        _ = try await connection.query("INSERT INTO events(global_sequence,event_id,project_id,session_id,root_session_id,run_id,session_sequence,event_type,payload_version,generation,turn_epoch,actor_json,payload_json,digest,timestamp,envelope_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", bindings)
+        _ = try await connection.query("INSERT INTO events(global_sequence,event_id,project_id,session_id,agent_id,parent_agent_id,root_session_id,run_id,session_sequence,event_type,payload_version,generation,turn_epoch,actor_json,payload_json,digest,timestamp,envelope_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", bindings)
         _ = try await connection.query("UPDATE service_metadata SET next_global_sequence = next_global_sequence + 1, last_clean_shutdown = 0 WHERE fixed_id = 1")
         return envelope
     }
@@ -588,6 +600,52 @@ public actor SQLiteServiceStore {
         _ = try await connection.query("INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,1,?,?,CURRENT_TIMESTAMP)", [.text(UUID().uuidString), .text(kind), .text(digest)])
     }
 
+    private func persistSessionInTransaction(
+        _ snapshot: SessionSnapshot,
+        eventType: EventType,
+        actor: ExternalActor?,
+        correlationID: UUID,
+        idempotency: IdempotencyInput?,
+        idempotencyResponse: Data?,
+        initialSelection: SelectionSnapshot?
+    ) async throws -> EventEnvelope {
+        try await validateExpectedCursor(snapshot.cursor)
+        if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
+        let snapshotJSON = try encodeText(snapshot)
+        let sessionBindings: [SQLiteData] = [
+            .text(snapshot.sessionID.uuidString), .text(snapshot.projectID.uuidString), snapshot.parentSessionID.map { .text($0.uuidString) } ?? .null,
+            .text(snapshot.rootSessionID.uuidString), .text(snapshot.creator.goblinUserID), .text(snapshot.state.rawValue), .text(snapshot.provider.rawValue),
+            snapshot.model.map(SQLiteData.text) ?? .null, .text(snapshot.visibility.rawValue), .integer(Int(snapshot.runGeneration)), .integer(Int(snapshot.turnEpoch)),
+            .integer(Int(snapshot.revision)), .text(snapshotJSON)
+        ]
+        _ = try await connection.query("INSERT INTO sessions(session_id,project_id,parent_session_id,root_session_id,schema_version,creator_external_id,lifecycle_state,provider_kind,model,visibility,run_generation,turn_epoch,revision,snapshot_json,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET lifecycle_state=excluded.lifecycle_state,run_generation=excluded.run_generation,turn_epoch=excluded.turn_epoch,revision=excluded.revision,snapshot_json=excluded.snapshot_json,updated_at=CURRENT_TIMESTAMP", sessionBindings)
+        for entry in snapshot.transcript {
+            _ = try await connection.query("INSERT OR IGNORE INTO transcript_entries(session_id,entry_id,schema_version,session_sequence,entry_json,content_digest) VALUES(?,?,1,?,?,?)", [.text(snapshot.sessionID.uuidString), .text(entry.entryID.uuidString), .integer(Int(entry.sessionSequence)), .text(encodeText(entry)), .text(CanonicalSigning.bodyDigest(encoder.encode(entry)))])
+        }
+        if let initialSelection {
+            _ = try await connection.query(
+                "INSERT INTO session_selections(session_id,schema_version,allowed_roots_json,selection_json,selection_revision,binding_revision,transactional_commit_id) VALUES(?,1,?,?,?,?,?) ON CONFLICT(session_id) DO NOTHING",
+                [.text(initialSelection.sessionID.uuidString), .text(encodeText(Array(Set(initialSelection.entries.map(\.rootID))))), .text(encodeText(initialSelection)), .integer(Int(initialSelection.revision)), .integer(Int(initialSelection.bindingRevision)), .text(UUID().uuidString)]
+            )
+        }
+        let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.rootSessionID, runID: nil, sessionSequence: Int64(snapshot.transcript.count), type: eventType, generation: snapshot.runGeneration, turnEpoch: snapshot.turnEpoch, actor: actor, correlationID: correlationID, payload: Data(snapshotJSON.utf8))
+        if [.completed, .failed, .canceled, .interrupted, .archived].contains(snapshot.state) || (!snapshot.transcript.isEmpty && snapshot.transcript.count.isMultiple(of: 1000)) {
+            try await saveCheckpoint(scope: "session:\(snapshot.sessionID.uuidString)", sequence: event.globalSequence, snapshot: Data(snapshotJSON.utf8))
+        }
+        if let idempotency {
+            try await saveIdempotency(idempotency, status: 202, response: idempotencyResponse ?? encoder.encode(snapshot))
+        }
+        return event
+    }
+
+    private func persistAgentInTransaction(_ snapshot: AgentSnapshot, projectID: UUID, actor: ExternalActor?, correlationID: UUID, eventType: EventType) async throws -> EventEnvelope {
+        _ = try await connection.query(
+            "INSERT INTO agents(agent_id,session_id,root_session_id,parent_agent_id,schema_version,provider_native_identity,role,label,lifecycle_state,revision,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(agent_id) DO UPDATE SET provider_native_identity=excluded.provider_native_identity,role=excluded.role,label=excluded.label,lifecycle_state=excluded.lifecycle_state,revision=excluded.revision,updated_at=CURRENT_TIMESTAMP",
+            [.text(snapshot.agentID.uuidString), .text(snapshot.sessionID.uuidString), .text(snapshot.rootSessionID.uuidString), snapshot.parentAgentID.map { .text($0.uuidString) } ?? .null, snapshot.providerNativeIdentity.map(SQLiteData.text) ?? .null, .text(snapshot.role), snapshot.label.map(SQLiteData.text) ?? .null, .text(snapshot.state.rawValue), .integer(Int(snapshot.revision))]
+        )
+        return try await appendEvent(projectID: projectID, sessionID: snapshot.sessionID, agentID: snapshot.agentID, parentAgentID: snapshot.parentAgentID, rootSessionID: snapshot.rootSessionID, runID: nil, sessionSequence: nil, type: eventType, generation: nil, turnEpoch: nil, actor: actor, correlationID: correlationID, payload: encoder.encode(snapshot))
+    }
+
     private func migrate() async throws {
         _ = try await connection.query("PRAGMA foreign_keys=ON")
         _ = try await connection.query("PRAGMA journal_mode=WAL")
@@ -596,11 +654,19 @@ public actor SQLiteServiceStore {
         for statement in SchemaV1.statements {
             _ = try await connection.query(statement)
         }
+        try await addColumnIfMissing(table: "events", column: "agent_id", definition: "TEXT")
+        try await addColumnIfMissing(table: "events", column: "parent_agent_id", definition: "TEXT")
         let count = try await connection.query("SELECT COUNT(*) AS count FROM service_metadata").first?.column("count")?.integer ?? 0
         if count == 0 {
             _ = try await connection.query("INSERT INTO service_metadata(fixed_id,store_id,schema_version,created_at,last_clean_shutdown,current_boot_epoch,next_global_sequence,replay_floor) VALUES(1,?,1,CURRENT_TIMESTAMP,0,1,1,0)", [.text(UUID().uuidString)])
             _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v1',1,'initial durable service schema','v1',CURRENT_TIMESTAMP)")
         }
+    }
+
+    private func addColumnIfMissing(table: String, column: String, definition: String) async throws {
+        let columns = try await connection.query("PRAGMA table_info(\(table))")
+        guard !columns.contains(where: { $0.column("name")?.string == column }) else { return }
+        _ = try await connection.query("ALTER TABLE \(table) ADD COLUMN \(column) \(definition)")
     }
 
     private func integrityCheck() async throws {

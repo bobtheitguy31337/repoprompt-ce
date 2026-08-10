@@ -41,6 +41,10 @@ public actor ProviderCLIAdapter {
         try await processSupervisor?.recoverPersistedFamilies()
     }
 
+    public func cancel(runID: UUID) async throws {
+        try await processSupervisor?.cancel(runID: runID)
+    }
+
     public func capabilities() -> [ProviderCapability] {
         ProviderKind.allCases.map { kind in
             guard let configuration = configurations[kind] else {
@@ -68,7 +72,7 @@ public actor ProviderCLIAdapter {
                 continue
             }
             do {
-                let output = try await runner.run(executable: configuration.executable, arguments: ["--version"], workingDirectory: FileManager.default.currentDirectoryPath, maximumBytes: 65_536)
+                let output = try await runner.run(executable: configuration.executable, arguments: ["--version"], workingDirectory: FileManager.default.currentDirectoryPath, maximumBytes: 65536)
                 let reported = output.split(whereSeparator: \.isNewline).first.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines)
                 if let expected = configuration.expectedVersion, reported?.contains(expected) != true {
                     results.append(ProviderCapability(kind: capability.kind, enabled: false, executable: capability.executable, supportsResume: capability.supportsResume, supportsSteering: capability.supportsSteering, version: reported, protocolVersion: capability.protocolVersion, reasonUnavailable: "provider version does not match the pinned image contract"))

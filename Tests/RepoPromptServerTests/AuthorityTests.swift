@@ -49,7 +49,7 @@ final class AuthorityTests: XCTestCase {
         let restored = try await authority.sessionSnapshot(sessionID: session.sessionID)
         let events = try await authority.events(after: nil, limit: 10)
         XCTAssertEqual(restored.rootSessionID, session.sessionID)
-        XCTAssertEqual(events.events.map(\.eventType), [.projectCreated, .sessionCreated])
+        XCTAssertEqual(events.events.map(\.eventType), [.projectCreated, .sessionCreated, .agentStarted])
         try await store.close()
     }
 
@@ -77,7 +77,45 @@ final class AuthorityTests: XCTestCase {
         XCTAssertEqual(receipt, repeatedReceipt)
 
         let events = try await authority.events(after: nil, limit: 10)
-        XCTAssertEqual(events.events.map(\.eventType), [.projectCreated, .sessionCreated, .transcriptMessage])
+        XCTAssertEqual(events.events.map(\.eventType), [.projectCreated, .sessionCreated, .agentStarted, .transcriptMessage])
+        try await store.close()
+    }
+
+    func testRootCancellationClosesDescendantsAndFencesNewChildren() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let runner = DelayedProviderRunner()
+        await runner.setDelay(.seconds(10))
+        let provider = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: "/usr/bin/true")], runner: runner)
+        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-tree-cancel", requestDigest: "p-tree-cancel")
+        let rootSession = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "root"), externalActor: actor, idempotencyKey: "s-tree-cancel", requestDigest: "s-tree-cancel")
+        let child = try await authority.spawnChildSession(parentSessionID: rootSession.sessionID, initialPrompt: "child", role: "explore", label: "probe")
+
+        let hierarchy = try await authority.agentSnapshots(rootSessionID: rootSession.sessionID)
+        XCTAssertEqual(hierarchy.count, 2)
+        XCTAssertEqual(hierarchy.first(where: { $0.sessionID == child.sessionID })?.parentAgentID, rootSession.sessionID)
+        XCTAssertEqual(hierarchy.first(where: { $0.sessionID == child.sessionID })?.role, "explore")
+        XCTAssertEqual(hierarchy.first(where: { $0.sessionID == child.sessionID })?.label, "probe")
+
+        _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: rootSession.sessionID, externalActor: actor, idempotencyKey: "resume-tree", requestDigest: "resume-tree")
+        _ = try await authority.execute(command: .cancelSession(expectedRunID: nil, expectedGeneration: 1), sessionID: rootSession.sessionID, externalActor: actor, idempotencyKey: "cancel-tree", requestDigest: "cancel-tree")
+        let canceledChild = try await authority.sessionSnapshot(sessionID: child.sessionID)
+        let canceledRoot = try await authority.sessionSnapshot(sessionID: rootSession.sessionID)
+        let canceledAgents = try await authority.agentSnapshots(rootSessionID: rootSession.sessionID)
+        XCTAssertEqual(canceledChild.state, .canceled)
+        XCTAssertEqual(canceledRoot.state, .canceled)
+        XCTAssertEqual(canceledAgents.first(where: { $0.sessionID == child.sessionID })?.state, .canceled)
+
+        do {
+            _ = try await authority.spawnChildSession(parentSessionID: rootSession.sessionID, initialPrompt: "late")
+            XCTFail("expected root cancellation barrier")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .quiescing)
+        }
         try await store.close()
     }
 
@@ -181,7 +219,9 @@ final class AuthorityTests: XCTestCase {
 private actor DelayedProviderRunner: WorkspaceCommandRunning {
     private var delay: Duration = .milliseconds(50)
 
-    func setDelay(_ value: Duration) { delay = value }
+    func setDelay(_ value: Duration) {
+        delay = value
+    }
 
     func run(executable _: String, arguments: [String], workingDirectory _: String, maximumBytes _: Int) async throws -> String {
         try await Task.sleep(for: delay)
@@ -196,5 +236,7 @@ private actor RecordingInteractionDelivery: InteractionDeliveryPort {
         count += 1
     }
 
-    func deliveryCount() -> Int { count }
+    func deliveryCount() -> Int {
+        count
+    }
 }

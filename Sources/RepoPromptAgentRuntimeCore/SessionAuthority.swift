@@ -70,6 +70,12 @@ public actor SessionAuthority {
         replaceSnapshot(state: .archived)
     }
 
+    public func cancelWithoutActiveRun() throws {
+        guard state.activeRunID == nil else { throw ServiceAPIError(code: .runAlreadyActive, message: "Session still has an active run") }
+        guard ![SessionLifecycleState.completed, .failed, .canceled, .archived].contains(state.snapshot.state) else { return }
+        replaceSnapshot(state: .canceled)
+    }
+
     public func updateVisibility(_ visibility: Visibility, expectedRevision: Int64) throws {
         guard expectedRevision == state.snapshot.revision else { throw ServiceAPIError(code: .staleRevision, message: "Session policy revision is stale", currentRevision: state.snapshot.revision) }
         replaceSnapshot(visibility: visibility)
