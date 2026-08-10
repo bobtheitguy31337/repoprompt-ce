@@ -53,6 +53,29 @@ final class AuthorityTests: XCTestCase {
         try await store.close()
     }
 
+    func testProjectUpdateAndRemovalUseExpectedRevisionAndArchiveAuthority() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(input: .init(name: "Old", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-mutate", requestDigest: "p-mutate")
+        let updated = try await authority.updateProject(projectID: project.projectID, input: .init(expectedRevision: project.revision, name: "New", roots: [.init(logicalName: "renamed", path: root.path, writable: false)]), actor: actor, idempotencyKey: "p-update", requestDigest: "p-update")
+        XCTAssertEqual(updated.name, "New")
+        XCTAssertEqual(updated.roots.first?.rootID, project.roots.first?.rootID)
+        XCTAssertEqual(updated.roots.first?.writable, false)
+
+        try await authority.removeProject(projectID: project.projectID, expectedRevision: updated.revision, actor: actor, idempotencyKey: "p-remove", requestDigest: "p-remove")
+        let activeProjects = await authority.projectSnapshots()
+        let archived = try await store.project(id: project.projectID)
+        let events = try await store.events(after: nil, limit: 10)
+        XCTAssertTrue(activeProjects.isEmpty)
+        XCTAssertEqual(archived?.state, .archived)
+        XCTAssertEqual(events.events.map(\.eventType), [.projectCreated, .projectUpdated, .projectRemoved])
+        try await store.close()
+    }
+
     func testIdempotencyReturnsOriginalSnapshotsAndCommandReceipt() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

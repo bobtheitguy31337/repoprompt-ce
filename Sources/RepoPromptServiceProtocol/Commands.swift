@@ -20,6 +20,24 @@ public struct CreateProjectInput: Codable, Sendable {
     }
 }
 
+public struct UpdateProjectInput: Codable, Sendable {
+    public let expectedRevision: Int64
+    public let name: String
+    public let roots: [CreateProjectInput.Root]
+    public init(expectedRevision: Int64, name: String, roots: [CreateProjectInput.Root]) {
+        self.expectedRevision = expectedRevision
+        self.name = name
+        self.roots = roots
+    }
+}
+
+public struct RemoveProjectInput: Codable, Sendable {
+    public let expectedRevision: Int64
+    public init(expectedRevision: Int64) {
+        self.expectedRevision = expectedRevision
+    }
+}
+
 public struct CreateSessionInput: Codable, Sendable {
     public let projectID: UUID
     public let parentSessionID: UUID?

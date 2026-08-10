@@ -6,7 +6,7 @@ import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 
 public struct RepoPromptHTTPService: Sendable {
-    private enum SSEFrame: Sendable {
+    private enum SSEFrame {
         case event(EventEnvelope)
         case heartbeat
     }
@@ -64,6 +64,19 @@ public struct RepoPromptHTTPService: Sendable {
             let key = try requireIdempotency(request)
             let snapshot = try await authority.createProject(input: input, externalActor: actor, idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data))
             return try HTTPResponses.json(snapshot, status: .created)
+        } }
+        router.patch("/internal/v1/projects/:id") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "updateProject", projectID: id)
+            let input = try JSONDecoder.serviceDecoder.decode(UpdateProjectInput.self, from: data)
+            return try await HTTPResponses.json(authority.updateProject(projectID: id, input: input, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data)))
+        } }
+        router.delete("/internal/v1/projects/:id") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "removeProject", projectID: id)
+            let input = try JSONDecoder.serviceDecoder.decode(RemoveProjectInput.self, from: data)
+            try await authority.removeProject(projectID: id, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data))
+            return Response(status: .noContent)
         } }
         router.get("/internal/v1/projects/:id/snapshot") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
             _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getProject", projectID: id)
@@ -415,7 +428,9 @@ public struct RepoPromptHTTPService: Sendable {
                 do {
                     try await withThrowingTaskGroup(of: Void.self) { group in
                         group.addTask {
-                            for try await event in source { continuation.yield(.event(event)) }
+                            for try await event in source {
+                                continuation.yield(.event(event))
+                            }
                         }
                         group.addTask {
                             while !Task.isCancelled {

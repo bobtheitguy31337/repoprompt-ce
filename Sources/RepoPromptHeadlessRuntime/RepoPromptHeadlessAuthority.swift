@@ -110,6 +110,55 @@ public actor RepoPromptHeadlessAuthority {
         return snapshot
     }
 
+    public func updateProject(projectID: UUID, input: UpdateProjectInput, actor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> ProjectSnapshot {
+        try ensureWritable()
+        let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "updateProject", key: idempotencyKey, requestDigest: requestDigest)
+        if let existing = try await store.idempotencyResult(idempotency) { return try JSONDecoder.serviceDecoder.decode(ProjectSnapshot.self, from: existing.response) }
+        let current = try await projectSnapshot(projectID: projectID)
+        guard current.revision == input.expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Project revision is stale", currentRevision: current.revision) }
+        guard !input.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !input.roots.isEmpty else { throw ServiceAPIError(code: .invalidRequest, message: "Project name and at least one root are required") }
+        let activeSessions = await sessionSnapshots().filter { $0.projectID == projectID && ![SessionLifecycleState.completed, .failed, .canceled, .archived].contains($0.state) }
+        let requestedPaths = Set(input.roots.map { URL(fileURLWithPath: $0.path).standardizedFileURL.resolvingSymlinksInPath().path })
+        let currentPaths = Set(current.roots.map(\.canonicalPath))
+        let worktrees = try await store.worktrees(projectID: projectID)
+        if requestedPaths != currentPaths, !activeSessions.isEmpty || !worktrees.isEmpty {
+            throw ServiceAPIError(code: .worktreeConflict, message: "Project roots cannot change while sessions or worktrees are active")
+        }
+        var canonicalRoots: [CanonicalRoot] = []
+        var identities = Set<String>()
+        for root in input.roots {
+            let canonical = try filesystem.canonicalizeRoot(root.path)
+            guard identities.insert(canonical.identity).inserted else { throw ServiceAPIError(code: .invalidRequest, message: "Duplicate physical project root") }
+            let existingID = current.roots.first(where: { $0.canonicalPath == canonical.path })?.rootID
+            canonicalRoots.append(CanonicalRoot(snapshot: ProjectRootSnapshot(rootID: existingID ?? ids.next(), logicalName: root.logicalName, canonicalPath: canonical.path, writable: root.writable), filesystemIdentity: canonical.identity))
+        }
+        let cursor = try await store.nextCursor()
+        let snapshot = ProjectSnapshot(projectID: projectID, name: input.name, creator: current.creator, state: .active, roots: canonicalRoots.map(\.snapshot), revision: current.revision + 1, cursor: cursor)
+        let event = try await store.persistProject(snapshot, eventType: .projectUpdated, actor: actor, correlationID: ids.next(), idempotency: idempotency)
+        let project = ProjectAuthority(snapshot: snapshot, roots: canonicalRoots)
+        await projects.install(project)
+        tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
+        await eventHub.publish(event)
+        return snapshot
+    }
+
+    public func removeProject(projectID: UUID, expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws {
+        try ensureWritable()
+        let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "removeProject", key: idempotencyKey, requestDigest: requestDigest)
+        if try await store.idempotencyResult(idempotency) != nil { return }
+        let current = try await projectSnapshot(projectID: projectID)
+        guard current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Project revision is stale", currentRevision: current.revision) }
+        let activeSessions = await sessionSnapshots().filter { $0.projectID == projectID && ![SessionLifecycleState.completed, .failed, .canceled, .archived].contains($0.state) }
+        let worktrees = try await store.worktrees(projectID: projectID)
+        guard activeSessions.isEmpty, worktrees.isEmpty else { throw ServiceAPIError(code: .worktreeConflict, message: "Project must have no active sessions or worktrees before removal") }
+        let cursor = try await store.nextCursor()
+        let archived = ProjectSnapshot(projectID: projectID, name: current.name, creator: current.creator, state: .archived, roots: current.roots, revision: current.revision + 1, cursor: cursor)
+        let event = try await store.persistProject(archived, eventType: .projectRemoved, actor: actor, correlationID: ids.next(), idempotency: idempotency)
+        await projects.remove(projectID: projectID)
+        tools[projectID] = nil
+        await eventHub.publish(event)
+    }
+
     public func createSession(input: CreateSessionInput, externalActor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> SessionSnapshot {
         try ensureWritable()
         let idempotency = IdempotencyInput(actorID: externalActor.goblinUserID, operation: "startSession", key: idempotencyKey, requestDigest: requestDigest)
