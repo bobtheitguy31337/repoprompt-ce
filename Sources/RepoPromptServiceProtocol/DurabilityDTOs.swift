@@ -117,6 +117,26 @@ public struct OwnedResourceRecord: Codable, Hashable, Sendable {
             updatedAt: updatedAt
         )
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case resourceID = "resourceId"
+        case kind
+        case projectID = "projectId"
+        case sessionID = "sessionId"
+        case runID = "runId"
+        case externalID = "externalId"
+        case internalPathIdentity
+        case temporaryPathIdentity
+        case lifecycleState
+        case observedBytes
+        case contentDigest
+        case metadata
+        case retentionDeadline
+        case cleanupAttempts
+        case cleanupError
+        case createdAt
+        case updatedAt
+    }
 }
 
 public enum WorktreeMergeLeaseState: String, Codable, CaseIterable, Sendable {
@@ -180,6 +200,22 @@ public struct WorktreeMergeLeaseRecord: Codable, Hashable, Sendable {
         self.updatedAt = updatedAt
         self.expiresAt = expiresAt
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case leaseID = "leaseId"
+        case bindingID = "bindingId"
+        case expectedBindingRevision
+        case strategy
+        case targetPath
+        case preMergeHead
+        case state
+        case ownerInstanceID = "ownerInstanceId"
+        case conflictArtifactPath
+        case errorCode
+        case startedAt
+        case updatedAt
+        case expiresAt
+    }
 }
 
 public struct OwnedResourceAggregate: Codable, Hashable, Sendable {
@@ -201,6 +237,14 @@ public struct OwnedResourceAggregate: Codable, Hashable, Sendable {
         self.count = count
         self.bytes = bytes
         self.oldestAgeSeconds = oldestAgeSeconds
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case state
+        case count
+        case bytes
+        case oldestAgeSeconds
     }
 }
 
@@ -233,6 +277,16 @@ public struct OwnedResourceHealthSnapshot: Codable, Hashable, Sendable {
 
     public var ready: Bool {
         cleanupFailures == 0 && missingCommittedArtifacts == 0 && unhealthyCommittedResources == 0 && abandonedReservations == 0 && conflictedMergeLeases == 0 && expiredMergeLeases == 0
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case aggregates
+        case cleanupFailures
+        case missingCommittedArtifacts
+        case unhealthyCommittedResources
+        case abandonedReservations
+        case conflictedMergeLeases
+        case expiredMergeLeases
     }
 }
 

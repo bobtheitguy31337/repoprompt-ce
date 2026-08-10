@@ -50,14 +50,16 @@ public actor SQLiteServiceStore {
     let encoder: JSONEncoder
     let decoder: JSONDecoder
     private let eventSigningKey: ServiceEventSigningKey?
+    private let faultInjector: PersistenceFaultInjector
     let storagePath: String?
     private var closed = false
     private var transactionActive = false
     private var transactionWaiters: [CheckedContinuation<Void, Never>] = []
 
-    private init(connection: SQLiteConnection, eventSigningKey: ServiceEventSigningKey?, storagePath: String?) {
+    private init(connection: SQLiteConnection, eventSigningKey: ServiceEventSigningKey?, faultInjector: PersistenceFaultInjector, storagePath: String?) {
         self.connection = connection
         self.eventSigningKey = eventSigningKey
+        self.faultInjector = faultInjector
         self.storagePath = storagePath
         encoder = JSONEncoder.serviceEncoder
         decoder = JSONDecoder.serviceDecoder
@@ -73,13 +75,14 @@ public actor SQLiteServiceStore {
         Task { try? await connection.close() }
     }
 
-    public static func open(storage: Storage, eventSigningKey: ServiceEventSigningKey? = nil) async throws -> SQLiteServiceStore {
+    public static func open(storage: Storage, eventSigningKey: ServiceEventSigningKey? = nil, faultInjector: PersistenceFaultInjector = .none) async throws -> SQLiteServiceStore {
         let location: SQLiteConnection.Storage = switch storage { case .memory: .memory
         case let .file(path): .file(path: path) }
         let connection = try await SQLiteConnection.open(storage: location)
         let store = SQLiteServiceStore(
             connection: connection,
             eventSigningKey: eventSigningKey,
+            faultInjector: faultInjector,
             storagePath: {
                 if case let .file(path) = storage { return path }
                 return nil
@@ -347,7 +350,8 @@ public actor SQLiteServiceStore {
         let bounded = max(1, min(limit, 1000))
         let rows = try await connection.query("SELECT envelope_json FROM events WHERE global_sequence > ? ORDER BY global_sequence LIMIT ?", [.integer(Int(after)), .integer(bounded)])
         let events: [EventEnvelope] = try rows.compactMap { row in guard let text = row.column("envelope_json")?.string else { return nil }
-            return try decoder.decode(EventEnvelope.self, from: Data(text.utf8))
+            let decoded = try decoder.decode(EventEnvelope.self, from: Data(text.utf8))
+            return try canonicalEventForPublication(decoded)
         }
         return EventPage(storeID: meta.storeID, events: events, nextCursor: events.last?.cursor ?? ServiceCursor(storeID: meta.storeID, globalSequence: after), replayFloor: meta.replayFloor)
     }
@@ -849,24 +853,36 @@ public actor SQLiteServiceStore {
         return fresh
     }
 
+    private func canonicalEventForPublication(_ event: EventEnvelope) throws -> EventEnvelope {
+        let keyID = eventSigningKey?.keyID ?? "unsigned-local"
+        let unsigned = event.replacingIntegrity(keyID: keyID, digest: "", signature: "")
+        let digest = CanonicalSigning.bodyDigest(try unsigned.signingData())
+        let signature = eventSigningKey.map { CanonicalSigning.hmacSHA256(message: digest, key: $0.secret) } ?? ""
+        return unsigned.replacingIntegrity(keyID: keyID, digest: digest, signature: signature)
+    }
+
     private func appendEvent(projectID: UUID, sessionID: UUID?, agentID: UUID? = nil, parentAgentID: UUID? = nil, rootSessionID: UUID?, runID: UUID?, sessionSequence: Int64?, type: EventType, generation: Int64?, turnEpoch: Int64?, actor: ExternalActor?, correlationID: UUID, payload: Data) async throws -> EventEnvelope {
         let meta = try await metadata()
         let sequence = meta.nextGlobalSequence
-        let digest = CanonicalSigning.bodyDigest(payload)
         let keyID = eventSigningKey?.keyID ?? "unsigned-local"
-        let signature = eventSigningKey.map { CanonicalSigning.hmacSHA256(message: "\(meta.storeID.uuidString)\n\(sequence)\n\(digest)", key: $0.secret) } ?? ""
         let lastTimestamp = try await connection.query("SELECT last_event_timestamp FROM service_metadata WHERE fixed_id=1").first?.column("last_event_timestamp")?.double ?? 0
         let eventTimestamp = Date(timeIntervalSince1970: max(Date().timeIntervalSince1970, lastTimestamp))
-        let envelope = EventEnvelope(protocolVersion: 1, eventID: UUID(), storeID: meta.storeID, globalSequence: sequence, timestamp: eventTimestamp, projectID: projectID, sessionID: sessionID, agentID: agentID, parentAgentID: parentAgentID, rootSessionID: rootSessionID, runID: runID, sessionSequence: sessionSequence, eventType: type, payloadVersion: 1, generation: generation, turnEpoch: turnEpoch, actor: actor, correlationID: correlationID, causationID: nil, payload: payload, digest: digest, keyID: keyID, signature: signature)
+        let objectPayload = try EventPayload(jsonData: payload)
+        let eventID = UUID()
+        let unsigned = EventEnvelope(protocolVersion: 1, eventID: eventID, storeID: meta.storeID, globalSequence: sequence, timestamp: eventTimestamp, projectID: projectID, sessionID: sessionID, agentID: agentID, parentAgentID: parentAgentID, rootSessionID: rootSessionID, runID: runID, sessionSequence: sessionSequence, eventType: type, payloadVersion: 1, generation: generation, turnEpoch: turnEpoch, actor: actor, correlationID: correlationID, causationID: nil, payload: objectPayload, digest: "", keyID: keyID, signature: "")
+        let digest = CanonicalSigning.bodyDigest(try unsigned.signingData())
+        let signature = eventSigningKey.map { CanonicalSigning.hmacSHA256(message: digest, key: $0.secret) } ?? ""
+        let envelope = EventEnvelope(protocolVersion: 1, eventID: eventID, storeID: meta.storeID, globalSequence: sequence, timestamp: eventTimestamp, projectID: projectID, sessionID: sessionID, agentID: agentID, parentAgentID: parentAgentID, rootSessionID: rootSessionID, runID: runID, sessionSequence: sessionSequence, eventType: type, payloadVersion: 1, generation: generation, turnEpoch: turnEpoch, actor: actor, correlationID: correlationID, causationID: nil, payload: objectPayload, digest: digest, keyID: keyID, signature: signature)
         let actorJSON = try actor.map(encodeText)
         let bindings: [SQLiteData] = try [
             .integer(Int(sequence)), .text(envelope.eventID.uuidString), .text(projectID.uuidString), sessionID.map { .text($0.uuidString) } ?? .null,
             agentID.map { .text($0.uuidString) } ?? .null, parentAgentID.map { .text($0.uuidString) } ?? .null, rootSessionID.map { .text($0.uuidString) } ?? .null, runID.map { .text($0.uuidString) } ?? .null,
             sessionSequence.map { .integer(Int($0)) } ?? .null, .text(type.rawValue), .integer(1), generation.map { .integer(Int($0)) } ?? .null,
-            turnEpoch.map { .integer(Int($0)) } ?? .null, actorJSON.map(SQLiteData.text) ?? .null, .text(payload.base64EncodedString()),
+            turnEpoch.map { .integer(Int($0)) } ?? .null, actorJSON.map(SQLiteData.text) ?? .null, .text(encodeText(objectPayload)),
             .text(digest), .float(envelope.timestamp.timeIntervalSince1970), .text(encodeText(envelope))
         ]
         _ = try await connection.query("INSERT INTO events(global_sequence,event_id,project_id,session_id,agent_id,parent_agent_id,root_session_id,run_id,session_sequence,event_type,payload_version,generation,turn_epoch,actor_json,payload_json,digest,timestamp,envelope_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", bindings)
+        try await faultInjector.hit(.afterEventInsertBeforeSequenceAdvance)
         _ = try await connection.query(
             "UPDATE service_metadata SET next_global_sequence=next_global_sequence+1,last_clean_shutdown=0,last_event_timestamp=? WHERE fixed_id=1",
             [.float(eventTimestamp.timeIntervalSince1970)]
@@ -1023,7 +1039,9 @@ public actor SQLiteServiceStore {
         await acquireTransactionSlot()
         do {
             _ = try await connection.query("BEGIN IMMEDIATE")
+            try await faultInjector.hit(.afterTransactionBegin)
             let result = try await body()
+            try await faultInjector.hit(.beforeTransactionCommit)
             _ = try await connection.query("COMMIT")
             releaseTransactionSlot()
             return result

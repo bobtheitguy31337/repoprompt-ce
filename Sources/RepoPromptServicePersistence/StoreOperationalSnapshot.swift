@@ -9,6 +9,10 @@ public struct CheckpointRetentionCount: Codable, Hashable, Sendable {
         self.retentionClass = retentionClass
         self.count = count
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case retentionClass, count
+    }
 }
 
 public struct StoreOperationalSnapshot: Codable, Sendable {
@@ -26,6 +30,13 @@ public struct StoreOperationalSnapshot: Codable, Sendable {
     public let walBytes: Int64
     public let ownedResources: OwnedResourceHealthSnapshot
     public let observedAt: Date
+
+    private enum CodingKeys: String, CodingKey {
+        case integrityValid, migrationsValid, activationState, activationGeneration
+        case liveEventCount, archiveSegmentCount, archivedEventCount, compressedArchiveBytes
+        case checkpointCounts, activeProcessFamilyCount, databaseBytes, walBytes
+        case ownedResources, observedAt
+    }
 }
 
 public extension SQLiteServiceStore {

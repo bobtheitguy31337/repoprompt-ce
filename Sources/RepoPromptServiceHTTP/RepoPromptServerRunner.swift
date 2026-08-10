@@ -58,6 +58,10 @@ public struct RepoPromptServerConfiguration: Sendable {
             previousKey(prefix: "REPOPROMPT_GOBLIN_SYNC", role: .goblinSync, direction: sync.direction),
             previousKey(prefix: "REPOPROMPT_OPERATOR", role: .operatorRole, direction: operatorKey.direction)
         ].compactMap(\.self)
+        let allSigningKeys = signingKeys + [event]
+        guard allSigningKeys.allSatisfy({
+            $0.keyID.range(of: "^[A-Za-z0-9_.:-]{1,128}$", options: .regularExpression) != nil && $0.secret.count >= 32
+        }) else { throw ConfigurationError.invalid("Internal signing keys require a valid key ID and at least 256 bits") }
         guard Set(signingKeys.map(\.keyID)).count == signingKeys.count else { throw ConfigurationError.invalid("Internal signing key IDs must be unique across roles and rotations") }
         var providers: [ProviderKind: String] = [
             .codex: environment["REPOPROMPT_CODEX_EXECUTABLE"] ?? "/opt/repoprompt/providers/codex",

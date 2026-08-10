@@ -17,6 +17,10 @@ public struct OwnedResourceReconciliationReport: Codable, Hashable, Sendable {
         self.failed = failed
         self.observedAt = observedAt
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case inspected, transitioned, deleted, quarantined, failed, observedAt
+    }
 }
 
 public actor OwnedResourceReconciliationService {

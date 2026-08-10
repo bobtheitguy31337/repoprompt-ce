@@ -2,7 +2,10 @@ import Foundation
 import RepoPromptHeadlessRuntime
 @testable import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
+import SQLiteNIO
 import XCTest
+
+private struct InjectedPersistenceFault: Error {}
 
 final class PersistenceTests: XCTestCase {
     func testEventsAreSignedBeforeDurablePublication() async throws {
@@ -12,12 +15,78 @@ final class PersistenceTests: XCTestCase {
         let cursor = try await store.nextCursor()
         let project = ProjectSnapshot(projectID: UUID(), name: "P", creator: actor, state: .active, roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)], revision: 1, cursor: cursor)
         let event = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: nil)
-        let expected = CanonicalSigning.hmacSHA256(message: "\(event.storeID.uuidString)\n\(event.globalSequence)\n\(event.digest)", key: key.secret)
+        let expected = CanonicalSigning.hmacSHA256(message: event.digest, key: key.secret)
+        XCTAssertEqual(event.digest, CanonicalSigning.bodyDigest(try event.signingData()))
         XCTAssertEqual(event.keyID, key.keyID)
         XCTAssertEqual(event.signature, expected)
         let persisted = try await store.events(after: nil, limit: 1)
         XCTAssertEqual(persisted.events.first?.signature, expected)
         try await store.close()
+    }
+
+    func testLegacyBase64EventEnvelopeIsCanonicallyRepublished() async throws {
+        let key = ServiceEventSigningKey(keyID: "event-v1", secret: Data("event-secret".utf8))
+        let store = try await SQLiteServiceStore.open(storage: .memory, eventSigningKey: key)
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let cursor = try await store.nextCursor()
+        let project = ProjectSnapshot(projectID: UUID(), name: "P", creator: actor, state: .active, roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/private/source", writable: true)], revision: 1, cursor: cursor)
+        let event = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: nil)
+        let encoded = try JSONEncoder.serviceEncoder.encode(event)
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        legacy["payload"] = try JSONEncoder.serviceEncoder.encode(event.payload).base64EncodedString()
+        legacy["digest"] = "legacy-payload-only-digest"
+        legacy["keyId"] = "legacy-key"
+        legacy["signature"] = "legacy-signature"
+        let legacyData = try JSONSerialization.data(withJSONObject: legacy, options: [.sortedKeys, .withoutEscapingSlashes])
+        _ = try await store.connection.query("UPDATE events SET envelope_json=? WHERE global_sequence=?", [.text(String(decoding: legacyData, as: UTF8.self)), .integer(Int(event.globalSequence))])
+
+        let replayPage = try await store.events(after: nil, limit: 1)
+        let replayed = try XCTUnwrap(replayPage.events.first)
+        XCTAssertEqual(replayed.keyID, key.keyID)
+        XCTAssertEqual(replayed.digest, CanonicalSigning.bodyDigest(try replayed.signingData()))
+        XCTAssertEqual(replayed.signature, CanonicalSigning.hmacSHA256(message: replayed.digest, key: key.secret))
+        let republishedPayload = String(decoding: try JSONEncoder.serviceEncoder.encode(replayed.payload), as: UTF8.self)
+        XCTAssertFalse(republishedPayload.contains("canonicalPath"), republishedPayload)
+        try await store.close()
+    }
+
+    func testTransactionFaultBoundariesRollbackProjectionEventAndSequence() async throws {
+        for faultPoint in [PersistenceFaultPoint.afterTransactionBegin, .afterEventInsertBeforeSequenceAdvance, .beforeTransactionCommit] {
+            let database = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).sqlite")
+            defer {
+                try? FileManager.default.removeItem(at: database)
+                try? FileManager.default.removeItem(at: URL(fileURLWithPath: database.path + "-wal"))
+                try? FileManager.default.removeItem(at: URL(fileURLWithPath: database.path + "-shm"))
+            }
+            let injector = PersistenceFaultInjector { observed in
+                if observed == faultPoint { throw InjectedPersistenceFault() }
+            }
+            let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+            var store = try await SQLiteServiceStore.open(storage: .file(database.path), faultInjector: injector)
+            let projectID = UUID()
+            let cursor = try await store.nextCursor()
+            let project = ProjectSnapshot(projectID: projectID, name: "P", creator: actor, state: .active, roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)], revision: 1, cursor: cursor)
+
+            do {
+                _ = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: nil)
+                XCTFail("Expected injected fault at \(faultPoint.rawValue)")
+            } catch is InjectedPersistenceFault {}
+
+            let rolledBackProject = try await store.project(id: projectID)
+            let rolledBackEvents = try await store.events(after: nil, limit: 10)
+            let rolledBackMetadata = try await store.metadata()
+            XCTAssertNil(rolledBackProject)
+            XCTAssertTrue(rolledBackEvents.events.isEmpty)
+            XCTAssertEqual(rolledBackMetadata.nextGlobalSequence, 1)
+            try await store.close()
+
+            store = try await SQLiteServiceStore.open(storage: .file(database.path))
+            let recoveryCursor = try await store.nextCursor()
+            let recovered = ProjectSnapshot(projectID: projectID, name: "P", creator: actor, state: .active, roots: project.roots, revision: 1, cursor: recoveryCursor)
+            let event = try await store.persistProject(recovered, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: nil)
+            XCTAssertEqual(event.globalSequence, 1)
+            try await store.close()
+        }
     }
 
     func testAtomicProjectPublicationUsesMonotonicSequence() async throws {

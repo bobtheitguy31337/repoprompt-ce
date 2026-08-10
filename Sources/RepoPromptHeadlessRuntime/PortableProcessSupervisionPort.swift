@@ -192,8 +192,8 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         try process.run()
         let pid = process.processIdentifier
         processes[pid] = process
-        try attachToDelegatedCgroupIfAvailable(pid: pid, helperToken: helperToken)
         let digest = CanonicalSigning.bodyDigest(Data(helperToken.utf8))
+        try attachToDelegatedCgroupIfAvailable(pid: pid, helperTokenDigest: digest)
         #if !os(Linux)
             let observed = ProcessIdentity(pid: pid, parentPID: getpid(), processGroupID: getpgid(pid), sessionID: getsid(pid), startTimeTicks: UInt64(ProcessInfo.processInfo.systemUptime * 100), bootID: bootID, executablePath: executable, helperTokenDigest: digest)
             identities[pid] = observed
@@ -213,6 +213,29 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
 
     public func inspect(pid: Int32) async throws -> ProcessIdentity? {
         try await inspectLinux(pid: pid, helperTokenDigest: identities[pid]?.helperTokenDigest ?? "")
+    }
+
+    public func containmentMode(for leader: ProcessIdentity) async throws -> String {
+        cgroupPaths[leader.pid] == nil ? "process-group" : "cgroup-v2"
+    }
+
+    public func reconstruct(leader: ProcessIdentity, containmentMode: String) async throws {
+        guard let observed = try await inspectLinux(pid: leader.pid, helperTokenDigest: leader.helperTokenDigest), observed == leader else {
+            throw ServiceAPIError(code: .staleRevision, message: "Persisted provider process identity no longer matches")
+        }
+        identities[leader.pid] = observed
+        #if os(Linux)
+            if containmentMode == "cgroup-v2" {
+                guard let path = cgroupPath(helperTokenDigest: leader.helperTokenDigest),
+                      FileManager.default.fileExists(atPath: path),
+                      try cgroupContains(pid: leader.pid, path: path)
+                else {
+                    identities[leader.pid] = nil
+                    throw ServiceAPIError(code: .staleRevision, message: "Persisted provider cgroup identity no longer matches")
+                }
+                cgroupPaths[leader.pid] = path
+            }
+        #endif
     }
 
     public func descendants(of pid: Int32) async throws -> [ProcessIdentity] {
@@ -312,21 +335,35 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         #endif
     }
 
-    private func attachToDelegatedCgroupIfAvailable(pid: Int32, helperToken: String) throws {
+    private func attachToDelegatedCgroupIfAvailable(pid: Int32, helperTokenDigest: String) throws {
         #if os(Linux)
-            guard let delegatedCgroupRoot else { return }
-            let safeToken = helperToken.replacingOccurrences(of: "[^A-Za-z0-9_.-]", with: "-", options: .regularExpression)
-            let path = URL(fileURLWithPath: delegatedCgroupRoot, isDirectory: true).appendingPathComponent("run-\(safeToken)", isDirectory: true)
+            guard let path = cgroupPath(helperTokenDigest: helperTokenDigest) else { return }
+            let url = URL(fileURLWithPath: path, isDirectory: true)
             do {
-                try FileManager.default.createDirectory(at: path, withIntermediateDirectories: false)
-                try Data("\(pid)\n".utf8).write(to: path.appendingPathComponent("cgroup.procs"))
-                cgroupPaths[pid] = path.path
+                try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+                try Data("\(pid)\n".utf8).write(to: url.appendingPathComponent("cgroup.procs"))
+                cgroupPaths[pid] = path
             } catch {
-                try? FileManager.default.removeItem(at: path)
+                try? FileManager.default.removeItem(at: url)
                 // Lack of delegation is an expected deployment mode. The
                 // subreaper + verified ancestry/PGID path remains authoritative.
             }
         #endif
+    }
+
+    private func cgroupPath(helperTokenDigest: String) -> String? {
+        guard let delegatedCgroupRoot,
+              helperTokenDigest.count == 64,
+              helperTokenDigest.allSatisfy({ $0.isHexDigit })
+        else { return nil }
+        return URL(fileURLWithPath: delegatedCgroupRoot, isDirectory: true)
+            .appendingPathComponent("run-\(helperTokenDigest.lowercased())", isDirectory: true)
+            .standardizedFileURL.path
+    }
+
+    private func cgroupContains(pid: Int32, path: String) throws -> Bool {
+        let members = try String(contentsOfFile: URL(fileURLWithPath: path).appendingPathComponent("cgroup.procs").path, encoding: .utf8)
+        return members.split(whereSeparator: \.isWhitespace).contains(Substring(String(pid)))
     }
 
     private static func validatedCgroupV2Root(_ configured: String?) -> String? {

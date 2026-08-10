@@ -5,7 +5,33 @@ import RepoPromptServiceProtocol
 import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
+private struct InjectedFilesystemFault: Error {}
+
 final class WorkspaceAuthorityTests: XCTestCase {
+    func testDurableFilesystemFaultBoundariesProduceOnlyOldOrCompleteState() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let payload = Data("complete durable payload".utf8)
+        let preRename: [DurableFilesystemFaultPoint] = [.temporaryCreated, .contentsWritten, .temporarySynchronized]
+        let postRename: [DurableFilesystemFaultPoint] = [.destinationRenamed, .directorySynchronized]
+
+        for point in preRename + postRename {
+            let temporary = root.appendingPathComponent("\(point.rawValue).tmp")
+            let destination = root.appendingPathComponent("\(point.rawValue).json")
+            let injector = DurableFilesystemFaultInjector { observed in
+                if observed == point { throw InjectedFilesystemFault() }
+            }
+            XCTAssertThrowsError(try DurableFilesystem.publish(data: payload, temporary: temporary, destination: destination, faultInjector: injector))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: temporary.path))
+            if preRename.contains(point) {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path), point.rawValue)
+            } else {
+                XCTAssertEqual(try Data(contentsOf: destination), payload, point.rawValue)
+            }
+        }
+    }
+
     func testProjectToolsAndSelectionAreAuthorizedAndDurable() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let database = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).sqlite")

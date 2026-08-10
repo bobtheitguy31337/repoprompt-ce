@@ -22,6 +22,16 @@ public struct ServiceAPIError: Error, Codable, Sendable {
         self.currentRevision = currentRevision
         self.cursor = cursor
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case code
+        case message
+        case requestID = "requestId"
+        case retryable
+        case currentRevision
+        case cursor
+    }
 }
 
 public struct ServiceCapabilities: Codable, Sendable {
@@ -40,5 +50,15 @@ public struct ServiceCapabilities: Codable, Sendable {
         self.replayFloor = replayFloor
         self.providers = providers
         self.eventTypes = eventTypes
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolMinimum
+        case protocolMaximum
+        case schemaVersion
+        case storeID = "storeId"
+        case replayFloor
+        case providers
+        case eventTypes
     }
 }

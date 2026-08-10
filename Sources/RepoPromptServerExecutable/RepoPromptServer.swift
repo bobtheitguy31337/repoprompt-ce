@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptHeadlessRuntime
 import RepoPromptServiceHTTP
 import RepoPromptServicePersistence
 
@@ -10,11 +11,53 @@ struct RepoPromptServer {
                 try await importJSON(arguments: Array(CommandLine.arguments.dropFirst(2)))
                 return
             }
+            if CommandLine.arguments.dropFirst().first == "process-family-smoke" {
+                try await processFamilySmoke()
+                return
+            }
             try await RepoPromptServerRunner.run(configuration: .environment())
         } catch {
             FileHandle.standardError.write(Data("RepoPromptServer failed: \(error)\n".utf8))
             throw error
         }
+    }
+
+    private static func processFamilySmoke() async throws {
+        #if os(Linux)
+            let store = try await SQLiteServiceStore.open(storage: .memory)
+            do {
+                let launchingPort = try PortableProcessSupervisionPort()
+                let leader = try await launchingPort.launch(
+                    executable: "/bin/sh",
+                    arguments: ["-c", "setsid /bin/sh -c 'sleep 30' & wait"],
+                    environment: ["PATH": "/usr/local/bin:/usr/bin:/bin"],
+                    workingDirectory: "/tmp",
+                    helperToken: UUID().uuidString
+                )
+                let runID = UUID()
+                let initial = ProviderProcessSupervisor(processPort: launchingPort, store: store)
+                try await initial.register(runID: runID, leader: leader)
+                let persistedFamilies = try await store.activeProcessFamilies()
+                guard persistedFamilies.count == 1 else {
+                    throw ConfigurationError.invalid("process family was not persisted")
+                }
+
+                let recoveredPort = try PortableProcessSupervisionPort()
+                let recovered = ProviderProcessSupervisor(processPort: recoveredPort, store: store)
+                try await recovered.recoverPersistedFamilies(graceScans: 3)
+                let remainingFamilies = try await store.activeProcessFamilies()
+                guard remainingFamilies.isEmpty else {
+                    throw ConfigurationError.invalid("recovered process family was not reaped")
+                }
+                try await store.close()
+                FileHandle.standardOutput.write(Data("RepoPromptServer process-family smoke passed\n".utf8))
+            } catch {
+                try? await store.close(clean: false)
+                throw error
+            }
+        #else
+            throw ConfigurationError.invalid("process-family-smoke is supported only on Linux")
+        #endif
     }
 
     private static func importJSON(arguments: [String]) async throws {

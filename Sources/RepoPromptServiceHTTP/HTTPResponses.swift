@@ -8,7 +8,22 @@ enum HTTPResponses {
         var headers = HTTPFields()
         headers[.contentType] = "application/json; charset=utf-8"
         headers[.cacheControl] = "no-store"
+        headers[.internalBodyDigest] = CanonicalSigning.bodyDigest(data)
         return Response(status: status, headers: headers, body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
+    }
+
+    static func empty(status: HTTPResponse.Status = .noContent) -> Response {
+        var headers = HTTPFields()
+        headers[.internalBodyDigest] = CanonicalSigning.bodyDigest(Data())
+        return Response(status: status, headers: headers)
+    }
+
+    static func bytes(_ data: Data, status: HTTPResponse.Status = .ok, contentType: String) -> Response {
+        var headers = HTTPFields()
+        headers[.contentType] = contentType
+        headers[.cacheControl] = "no-store"
+        headers[.internalBodyDigest] = CanonicalSigning.bodyDigest(data)
+        return Response(status: status, headers: headers, body: .init(byteBuffer: ByteBuffer(bytes: data)))
     }
 
     static func error(_ error: Error) -> Response {

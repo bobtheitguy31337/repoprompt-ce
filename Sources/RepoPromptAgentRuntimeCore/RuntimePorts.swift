@@ -51,12 +51,22 @@ public protocol ProcessSupervisionPort: Sendable {
     func descendants(of pid: Int32) async throws -> [ProcessIdentity]
     func signal(_ signal: Int32, processGroupID: Int32, verifiedMembers: [ProcessIdentity]) async throws
     func reap(pid: Int32) async throws
+    /// Returns the durable containment mechanism established for the leader.
+    func containmentMode(for leader: ProcessIdentity) async throws -> String
+    /// Rehydrates restart-safe identity and containment state from persistence.
+    func reconstruct(leader: ProcessIdentity, containmentMode: String) async throws
     /// Returns true when a delegated outer containment boundary accepted a
     /// complete-family kill (Linux cgroup v2). False selects ancestry/PGID fallback.
     func terminateContainedFamily(leader: ProcessIdentity) async throws -> Bool
 }
 
 public extension ProcessSupervisionPort {
+    func containmentMode(for _: ProcessIdentity) async throws -> String {
+        "process-group"
+    }
+
+    func reconstruct(leader _: ProcessIdentity, containmentMode _: String) async throws {}
+
     func terminateContainedFamily(leader _: ProcessIdentity) async throws -> Bool {
         false
     }

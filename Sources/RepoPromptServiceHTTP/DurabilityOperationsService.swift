@@ -7,6 +7,10 @@ public struct DurabilityMaintenanceSnapshot: Codable, Hashable, Sendable {
     public let archivedSegments: Int
     public let lastErrorCode: String?
     public let observedAt: Date
+
+    private enum CodingKeys: String, CodingKey {
+        case reconciliation, archivedSegments, lastErrorCode, observedAt
+    }
 }
 
 public actor DurabilityOperationsService {

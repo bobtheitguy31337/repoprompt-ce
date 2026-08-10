@@ -14,6 +14,14 @@ public struct ProjectRootSnapshot: Codable, Hashable, Sendable {
         self.writable = writable
         self.revision = revision
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case rootID = "rootId"
+        case logicalName
+        case canonicalPath
+        case writable
+        case revision
+    }
 }
 
 public struct ProjectSnapshot: Codable, Hashable, Sendable {
@@ -35,6 +43,17 @@ public struct ProjectSnapshot: Codable, Hashable, Sendable {
         self.roots = roots
         self.revision = revision
         self.cursor = cursor
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case projectID = "projectId"
+        case name
+        case creator
+        case state
+        case roots
+        case revision
+        case cursor
     }
 }
 
@@ -60,6 +79,17 @@ public struct InteractionSnapshot: Codable, Hashable, Sendable {
         self.revision = revision
         self.expiresAt = expiresAt
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case interactionID = "interactionId"
+        case runID = "runId"
+        case agentID = "agentId"
+        case kind
+        case state
+        case payload
+        case revision
+        case expiresAt
+    }
 }
 
 public struct TranscriptEntry: Codable, Hashable, Sendable {
@@ -84,6 +114,16 @@ public struct TranscriptEntry: Codable, Hashable, Sendable {
         self.timestamp = timestamp
         self.presentationPayload = presentationPayload
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case entryID = "entryId"
+        case sessionSequence
+        case kind
+        case content
+        case actor
+        case timestamp
+        case presentationPayload
+    }
 }
 
 public struct AgentSnapshot: Codable, Hashable, Sendable {
@@ -107,6 +147,18 @@ public struct AgentSnapshot: Codable, Hashable, Sendable {
         self.label = label
         self.state = state
         self.revision = revision
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case agentID = "agentId"
+        case sessionID = "sessionId"
+        case rootSessionID = "rootSessionId"
+        case parentAgentID = "parentAgentId"
+        case providerNativeIdentity
+        case role
+        case label
+        case state
+        case revision
     }
 }
 
@@ -135,6 +187,20 @@ public struct ProviderRunSnapshot: Codable, Hashable, Sendable {
         self.endReason = endReason
         self.startedAt = startedAt
         self.endedAt = endedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case runID = "runId"
+        case sessionID = "sessionId"
+        case provider
+        case providerSessionID = "providerSessionId"
+        case state
+        case generation
+        case turnEpoch
+        case startReason
+        case endReason
+        case startedAt
+        case endedAt
     }
 }
 
@@ -174,6 +240,25 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
         self.interactions = interactions
         self.cursor = cursor
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case sessionID = "sessionId"
+        case projectID = "projectId"
+        case parentSessionID = "parentSessionId"
+        case rootSessionID = "rootSessionId"
+        case creator
+        case provider
+        case model
+        case visibility
+        case state
+        case runGeneration
+        case turnEpoch
+        case revision
+        case transcript
+        case interactions
+        case cursor
+    }
 }
 
 public struct AuthoritativeSnapshot: Codable, Sendable {
@@ -189,6 +274,14 @@ public struct AuthoritativeSnapshot: Codable, Sendable {
         self.projects = projects
         self.sessions = sessions
         self.cursor = cursor
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case storeID = "storeId"
+        case projects
+        case sessions
+        case cursor
     }
 }
 
@@ -218,6 +311,15 @@ public struct AuthoritySessionSnapshot: Codable, Hashable, Sendable {
         self.interactions = interactions
         self.worktrees = worktrees
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case session
+        case activeRun
+        case activeBinding
+        case permissions
+        case interactions
+        case worktrees
+    }
 }
 
 /// Codable service representation of the runtime-core binding identity. This
@@ -234,6 +336,13 @@ public struct RunBindingSnapshot: Codable, Hashable, Sendable {
         self.generation = generation
         self.turnEpoch = turnEpoch
         self.connectionGeneration = connectionGeneration
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case runID = "runId"
+        case generation
+        case turnEpoch
+        case connectionGeneration
     }
 }
 
@@ -286,6 +395,23 @@ public struct EmbeddedSessionSeed: Codable, Hashable, Sendable {
         self.permissionMode = permissionMode
         self.providerSettings = providerSettings
         self.worktrees = worktrees
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case projectID = "projectId"
+        case projectName
+        case roots
+        case sessionID = "sessionId"
+        case parentSessionID = "parentSessionId"
+        case rootSessionID = "rootSessionId"
+        case creator
+        case provider
+        case model
+        case visibility
+        case transcript
+        case permissionMode
+        case providerSettings
+        case worktrees
     }
 }
 

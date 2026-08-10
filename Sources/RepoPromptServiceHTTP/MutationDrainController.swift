@@ -18,6 +18,10 @@ public struct MutationDrainSnapshot: Codable, Hashable, Sendable {
         self.drainStartedAt = drainStartedAt
         self.drainTimedOut = drainTimedOut
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case acceptingMutations, inFlightMutations, drainStartedAt, drainTimedOut
+    }
 }
 
 public actor MutationDrainController {

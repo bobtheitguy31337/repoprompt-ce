@@ -8,13 +8,16 @@ import RepoPromptServiceProtocol
 import XCTest
 
 final class AuthenticationAndHTTPTests: XCTestCase {
+    private let responseSigningKey = InternalSigningKey(keyID: "response-v1", role: .goblinSync, direction: "repoprompt-to-goblin-v1", secret: Data("response-secret".utf8))
+
     func testConfigurationAcceptsOverlappingRoleKeysAndRejectsDuplicateIdentity() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         func secret(_ name: String) throws -> String {
             let path = directory.appendingPathComponent(name).path
-            try Data("secret-\(name)".utf8).write(to: URL(fileURLWithPath: path))
+            let material = String(("\(name)-" + String(repeating: "x", count: 64)).prefix(32))
+            try Data(material.utf8).write(to: URL(fileURLWithPath: path))
             return path
         }
         var environment = try [
@@ -33,6 +36,32 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         XCTAssertThrowsError(try RepoPromptServerConfiguration.environment(environment))
     }
 
+    func testResponseSigningCoversJSONErrorsEmptyAndBinaryBodies() {
+        let instant = Date(timeIntervalSince1970: 1_786_368_896.789)
+        let nonce = "cmVzcG9uc2Utbm9uY2U"
+        let signer = InternalResponseSigner(key: responseSigningKey, now: { instant }, nonce: { nonce })
+        let cases: [(HTTPResponse.Status, String, Data)] = [
+            (.ok, "/internal/v1/diagnostics", Data(#"{"ok":true}"#.utf8)),
+            (.serviceUnavailable, "/internal/v1/diagnostics", Data(#"{"code":"dependencyUnavailable"}"#.utf8)),
+            (.noContent, "/internal/v1/admin/checkpoint", Data()),
+            (.partialContent, "/internal/v1/sessions/a/artifacts/b/content", Data([0, 1, 2, 255]))
+        ]
+
+        for (status, path, body) in cases {
+            let digest = CanonicalSigning.bodyDigest(body)
+            var headers = HTTPFields()
+            headers[.init("x-internal-body-digest")!] = digest
+            let signed = signer.sign(Response(status: status, headers: headers), requestPathAndQuery: path)
+            let timestamp = CanonicalSigning.iso8601String(instant)
+            let canonical = CanonicalSigning.requestString(method: "RESPONSE", pathAndQuery: "\(path)#\(status.code)", timestamp: timestamp, nonce: nonce, bodyDigest: digest, authorizationDecisionDigest: CanonicalSigning.bodyDigest(Data()), keyID: responseSigningKey.keyID)
+            XCTAssertEqual(signed.headers[.init("x-internal-body-digest")!], digest)
+            XCTAssertEqual(signed.headers[.init("x-internal-key-id")!], responseSigningKey.keyID)
+            XCTAssertEqual(signed.headers[.init("x-internal-timestamp")!], timestamp)
+            XCTAssertEqual(signed.headers[.init("x-internal-nonce")!], nonce)
+            XCTAssertEqual(signed.headers[.init("x-internal-signature")!], CanonicalSigning.hmacSHA256(message: canonical, key: responseSigningKey.secret))
+        }
+    }
+
     func testCertificateTrustConfigurationRejectsOverlappingRoleIdentities() throws {
         XCTAssertThrowsError(try CertificateIdentityRoleResolver.environment([
             "REPOPROMPT_GOBLIN_APP_CERT_IDENTITY": "shared.internal",
@@ -46,10 +75,12 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         let instant = Date(timeIntervalSince1970: 1000)
         let key = InternalSigningKey(keyID: "sync-v1", role: .goblinSync, direction: "goblin-sync-to-repoprompt-v1", secret: Data("secret".utf8))
         let auth = InternalRequestAuthenticator(keys: [key], store: store, now: { instant })
-        let timestamp = String(instant.timeIntervalSince1970)
+        let timestamp = CanonicalSigning.iso8601String(instant)
         let nonce = "abcdefghijklmnop"
-        let canonical = CanonicalSigning.requestString(method: "GET", pathAndQuery: "/internal/v1/events", timestamp: timestamp, nonce: nonce, bodyDigest: CanonicalSigning.bodyDigest(Data()), authorizationDecisionDigest: CanonicalSigning.bodyDigest(Data()), keyID: key.keyID)
-        let request = SignedInternalRequest(method: "GET", pathAndQuery: "/internal/v1/events", timestamp: timestamp, nonce: nonce, body: Data(), authorizationDecisionData: nil, keyID: key.keyID, signature: CanonicalSigning.hmacSHA256(message: canonical, key: key.secret))
+        let bodyDigest = CanonicalSigning.bodyDigest(Data())
+        let authorizationDigest = CanonicalSigning.bodyDigest(Data())
+        let canonical = CanonicalSigning.requestString(method: "GET", pathAndQuery: "/internal/v1/events", timestamp: timestamp, nonce: nonce, bodyDigest: bodyDigest, authorizationDecisionDigest: authorizationDigest, keyID: key.keyID)
+        let request = SignedInternalRequest(method: "GET", pathAndQuery: "/internal/v1/events", timestamp: timestamp, nonce: nonce, body: Data(), bodyDigest: bodyDigest, authorizationDecisionData: nil, authorizationDecisionDigest: authorizationDigest, keyID: key.keyID, signature: CanonicalSigning.hmacSHA256(message: canonical, key: key.secret))
         _ = try await auth.verify(request, allowedRoles: [.goblinSync], operation: "events")
         do { _ = try await auth.verify(request, allowedRoles: [.goblinSync], operation: "events")
             XCTFail("expected replay rejection")
@@ -65,12 +96,16 @@ final class AuthenticationAndHTTPTests: XCTestCase {
 
         func request(revision: Int64, nonce: String, decisionID: UUID = UUID()) throws -> SignedInternalRequest {
             let unsignedDecision = GoblinAuthorizationDecision(decisionID: decisionID, actor: .init(goblinUserID: "u1", username: "alice", displayName: "Alice"), operation: "listProjects", requestDigest: CanonicalSigning.bodyDigest(Data()), policyRevision: revision, controllerRevision: revision, membershipRevision: revision, issuedAt: instant, expiresAt: instant.addingTimeInterval(10), requestID: UUID(), correlationID: UUID(), keyID: key.keyID, signature: "")
-            let decision = GoblinAuthorizationDecision(decisionID: unsignedDecision.decisionID, actor: unsignedDecision.actor, operation: unsignedDecision.operation, requestDigest: unsignedDecision.requestDigest, policyRevision: unsignedDecision.policyRevision, controllerRevision: unsignedDecision.controllerRevision, membershipRevision: unsignedDecision.membershipRevision, issuedAt: unsignedDecision.issuedAt, expiresAt: unsignedDecision.expiresAt, requestID: unsignedDecision.requestID, correlationID: unsignedDecision.correlationID, keyID: key.keyID, signature: CanonicalSigning.hmacSHA256(message: auth.decisionCanonicalString(unsignedDecision), key: key.secret))
+            let unsignedData = try JSONEncoder.serviceEncoder.encode(unsignedDecision)
+            let decisionSignature = CanonicalSigning.hmacSHA256(message: try CanonicalSigning.canonicalJSONObject(unsignedData, removingTopLevelKeys: ["signature"]), key: key.secret)
+            let decision = GoblinAuthorizationDecision(decisionID: unsignedDecision.decisionID, actor: unsignedDecision.actor, operation: unsignedDecision.operation, requestDigest: unsignedDecision.requestDigest, policyRevision: unsignedDecision.policyRevision, controllerRevision: unsignedDecision.controllerRevision, membershipRevision: unsignedDecision.membershipRevision, issuedAt: unsignedDecision.issuedAt, expiresAt: unsignedDecision.expiresAt, requestID: unsignedDecision.requestID, correlationID: unsignedDecision.correlationID, keyID: key.keyID, signature: decisionSignature)
             let decisionData = try JSONEncoder.serviceEncoder.encode(decision)
-            let timestamp = String(instant.timeIntervalSince1970)
+            let timestamp = CanonicalSigning.iso8601String(instant)
             let path = "/internal/v1/projects"
-            let canonical = CanonicalSigning.requestString(method: "GET", pathAndQuery: path, timestamp: timestamp, nonce: nonce, bodyDigest: CanonicalSigning.bodyDigest(Data()), authorizationDecisionDigest: CanonicalSigning.bodyDigest(decisionData), keyID: key.keyID)
-            return SignedInternalRequest(method: "GET", pathAndQuery: path, timestamp: timestamp, nonce: nonce, body: Data(), authorizationDecisionData: decisionData, keyID: key.keyID, signature: CanonicalSigning.hmacSHA256(message: canonical, key: key.secret))
+            let bodyDigest = CanonicalSigning.bodyDigest(Data())
+            let decisionDigest = CanonicalSigning.bodyDigest(decisionData)
+            let canonical = CanonicalSigning.requestString(method: "GET", pathAndQuery: path, timestamp: timestamp, nonce: nonce, bodyDigest: bodyDigest, authorizationDecisionDigest: decisionDigest, keyID: key.keyID)
+            return SignedInternalRequest(method: "GET", pathAndQuery: path, timestamp: timestamp, nonce: nonce, body: Data(), bodyDigest: bodyDigest, authorizationDecisionData: decisionData, authorizationDecisionDigest: decisionDigest, keyID: key.keyID, signature: CanonicalSigning.hmacSHA256(message: canonical, key: key.secret))
         }
 
         let accepted = try request(revision: 2, nonce: "decisionrevision2")
@@ -88,7 +123,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
         let auth = InternalRequestAuthenticator(keys: [], store: store)
-        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth)
+        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth, eventSigningKey: responseSigningKey)
         let app = Application(router: service.healthRouter())
         try await app.test(.router) { client in
             try await client.execute(uri: "/health/live", method: .get) { response in XCTAssertEqual(response.status, .ok)
@@ -105,11 +140,18 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
         let auth = InternalRequestAuthenticator(keys: [], store: store)
-        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth)
+        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth, eventSigningKey: responseSigningKey)
+        let responseKeyID = responseSigningKey.keyID
         let app = Application(router: service.internalRouter())
         try await app.test(.router) { client in
             try await client.execute(uri: "/internal/v1/catalog/providers", method: .get) { response in
                 XCTAssertEqual(response.status, .unauthorized)
+                let body = Data(response.body.readableBytesView)
+                XCTAssertEqual(response.headers[.init("x-internal-body-digest")!], CanonicalSigning.bodyDigest(body))
+                XCTAssertEqual(response.headers[.init("x-internal-key-id")!], responseKeyID)
+                XCTAssertNotNil(response.headers[.init("x-internal-timestamp")!])
+                XCTAssertNotNil(response.headers[.init("x-internal-nonce")!])
+                XCTAssertNotNil(response.headers[.init("x-internal-signature")!])
             }
         }
         try await store.close()
@@ -118,7 +160,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
     func testEveryNormativeV1MethodAndPathIsRegistered() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: InternalRequestAuthenticator(keys: [], store: store))
+        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: InternalRequestAuthenticator(keys: [], store: store), eventSigningKey: responseSigningKey)
         let app = Application(router: service.internalRouter())
         let id = UUID().uuidString
         let routes: [(HTTPRequest.Method, String)] = [
@@ -172,7 +214,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
             cacheDuration: 0
         )
         let auth = InternalRequestAuthenticator(keys: [], store: store)
-        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth, readiness: readiness)
+        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth, eventSigningKey: responseSigningKey, readiness: readiness)
         let app = Application(router: service.healthRouter())
         try await app.test(.router) { client in
             try await client.execute(uri: "/health/live", method: .get) { response in XCTAssertEqual(response.status, .ok) }
@@ -208,6 +250,45 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         try await store.close()
     }
 
+    func testVerifiedLiveProcessFamilyRemainsReadyAndUsesCanonicalDiagnosticKeys() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let identity = PersistedProcessIdentity(
+            pid: 4242,
+            parentPID: 1,
+            processGroupID: 4242,
+            sessionID: 4242,
+            startTimeTicks: 99,
+            bootID: "boot",
+            executablePath: "/opt/repoprompt/providers/codex",
+            helperTokenDigest: "digest"
+        )
+        try await store.persistProcessFamily(
+            runID: UUID(),
+            leader: identity,
+            connectionGeneration: 1,
+            containmentMode: "cgroup-v2"
+        )
+        let readiness = RepoPromptReadinessService(
+            authority: authority,
+            store: store,
+            minimumFreeBytes: 0,
+            minimumFreeNodes: 0,
+            maximumActiveSessions: 10,
+            cacheDuration: 0
+        )
+        let snapshot = await readiness.snapshot(forceRefresh: true)
+        XCTAssertTrue(snapshot.ready)
+        XCTAssertEqual(snapshot.operational?.activeProcessFamilyCount, 1)
+        XCTAssertEqual(snapshot.checks.first { $0.name == "supervisor-recovery" }?.ready, true)
+
+        let encoded = try JSONEncoder.serviceEncoder.encode(snapshot)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertNotNil(object["degradedProjectIds"])
+        XCTAssertNil(object["degradedProjectIDs"])
+        try await store.close()
+    }
+
     func testSSELastEventIDBelowReplayFloorReturnsControlFrame() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
@@ -222,18 +303,20 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         let instant = Date(timeIntervalSince1970: 1000)
         let key = InternalSigningKey(keyID: "sync-v1", role: .goblinSync, direction: "goblin-sync-to-repoprompt-v1", secret: Data("secret".utf8))
         let auth = InternalRequestAuthenticator(keys: [key], store: store, now: { instant })
-        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth)
+        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth, eventSigningKey: responseSigningKey)
         let app = Application(router: service.internalRouter())
         let path = "/internal/v1/events/stream"
-        let timestamp = String(instant.timeIntervalSince1970)
+        let timestamp = CanonicalSigning.iso8601String(instant)
         let nonce = "expiredcursor0001"
         let canonical = CanonicalSigning.requestString(method: "GET", pathAndQuery: path, timestamp: timestamp, nonce: nonce, bodyDigest: CanonicalSigning.bodyDigest(Data()), authorizationDecisionDigest: CanonicalSigning.bodyDigest(Data()), keyID: key.keyID)
         let requestHeaders: HTTPFields = {
             var headers = HTTPFields()
-            headers[.init("X-RepoPrompt-Key-Id")!] = key.keyID
-            headers[.init("X-RepoPrompt-Timestamp")!] = timestamp
-            headers[.init("X-RepoPrompt-Nonce")!] = nonce
-            headers[.init("X-RepoPrompt-Signature")!] = CanonicalSigning.hmacSHA256(message: canonical, key: key.secret)
+            headers[.init("x-internal-key-id")!] = key.keyID
+            headers[.init("x-internal-timestamp")!] = timestamp
+            headers[.init("x-internal-nonce")!] = nonce
+            headers[.init("x-internal-body-digest")!] = CanonicalSigning.bodyDigest(Data())
+            headers[.init("x-internal-authorization-digest")!] = CanonicalSigning.bodyDigest(Data())
+            headers[.init("x-internal-signature")!] = CanonicalSigning.hmacSHA256(message: canonical, key: key.secret)
             headers[.init("Last-Event-ID")!] = "\(metadata.storeID.uuidString):0"
             return headers
         }()
@@ -241,7 +324,10 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         try await app.test(.router) { client in
             try await client.execute(uri: path, method: .get, headers: requestHeaders) { response in
                 XCTAssertEqual(response.status, .ok)
-                XCTAssertTrue(String(decoding: response.body.readableBytesView, as: UTF8.self).contains("event: cursor_expired"))
+                let eventStream = String(decoding: response.body.readableBytesView, as: UTF8.self)
+                XCTAssertTrue(eventStream.contains("event: cursor_expired"))
+                XCTAssertTrue(eventStream.contains("data: {"), eventStream)
+                XCTAssertTrue(eventStream.contains("\"storeId\""), eventStream)
             }
         }
         try await store.close()
@@ -260,7 +346,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         let instant = Date(timeIntervalSince1970: 1000)
         let key = InternalSigningKey(keyID: "sync-v1", role: .goblinSync, direction: "goblin-sync-to-repoprompt-v1", secret: Data("secret".utf8))
         let auth = InternalRequestAuthenticator(keys: [key], store: store, now: { instant })
-        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth)
+        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth, eventSigningKey: responseSigningKey)
         let app = Application(router: service.internalRouter())
         let path = "/internal/v1/events?after=\(metadata.storeID.uuidString):0"
         let headers = signedHeaders(method: "GET", path: path, key: key, instant: instant, nonce: "expiredcursorrest1")
@@ -277,13 +363,17 @@ final class AuthenticationAndHTTPTests: XCTestCase {
     }
 
     private func signedHeaders(method: String, path: String, key: InternalSigningKey, instant: Date, nonce: String) -> HTTPFields {
-        let timestamp = String(instant.timeIntervalSince1970)
-        let canonical = CanonicalSigning.requestString(method: method, pathAndQuery: path, timestamp: timestamp, nonce: nonce, bodyDigest: CanonicalSigning.bodyDigest(Data()), authorizationDecisionDigest: CanonicalSigning.bodyDigest(Data()), keyID: key.keyID)
+        let timestamp = CanonicalSigning.iso8601String(instant)
+        let bodyDigest = CanonicalSigning.bodyDigest(Data())
+        let authorizationDigest = CanonicalSigning.bodyDigest(Data())
+        let canonical = CanonicalSigning.requestString(method: method, pathAndQuery: path, timestamp: timestamp, nonce: nonce, bodyDigest: bodyDigest, authorizationDecisionDigest: authorizationDigest, keyID: key.keyID)
         var headers = HTTPFields()
-        headers[.init("X-RepoPrompt-Key-Id")!] = key.keyID
-        headers[.init("X-RepoPrompt-Timestamp")!] = timestamp
-        headers[.init("X-RepoPrompt-Nonce")!] = nonce
-        headers[.init("X-RepoPrompt-Signature")!] = CanonicalSigning.hmacSHA256(message: canonical, key: key.secret)
+        headers[.init("x-internal-key-id")!] = key.keyID
+        headers[.init("x-internal-timestamp")!] = timestamp
+        headers[.init("x-internal-nonce")!] = nonce
+        headers[.init("x-internal-body-digest")!] = bodyDigest
+        headers[.init("x-internal-authorization-digest")!] = authorizationDigest
+        headers[.init("x-internal-signature")!] = CanonicalSigning.hmacSHA256(message: canonical, key: key.secret)
         return headers
     }
 }

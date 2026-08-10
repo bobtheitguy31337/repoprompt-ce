@@ -21,6 +21,7 @@ private actor FakeProcessPort: ProcessSupervisionPort {
     private var observedSignals: [Int32] = []
     private var observedProcessGroups: [Int32] = []
     private var reapedPIDs: [Int32] = []
+    private var reconstructed: [(ProcessIdentity, String)] = []
     private var descendantScans = 0
 
     init(leader: ProcessIdentity, children: [ProcessIdentity], lateChildren: [ProcessIdentity] = []) {
@@ -52,8 +53,16 @@ private actor FakeProcessPort: ProcessSupervisionPort {
         reapedPIDs.append(pid)
     }
 
-    func result() -> (signals: [Int32], processGroups: [Int32], reaped: [Int32]) {
-        (observedSignals, observedProcessGroups, reapedPIDs)
+    func containmentMode(for _: ProcessIdentity) async throws -> String {
+        "cgroup-v2"
+    }
+
+    func reconstruct(leader: ProcessIdentity, containmentMode: String) async throws {
+        reconstructed.append((leader, containmentMode))
+    }
+
+    func result() -> (signals: [Int32], processGroups: [Int32], reaped: [Int32], reconstructed: [(ProcessIdentity, String)]) {
+        (observedSignals, observedProcessGroups, reapedPIDs, reconstructed)
     }
 }
 
@@ -446,6 +455,7 @@ final class ProviderSupervisorTests: XCTestCase {
         try await initial.register(runID: runID, leader: leader, connectionGeneration: 7)
         let activeBeforeRecovery = try await store.activeProcessFamilies()
         XCTAssertEqual(activeBeforeRecovery.map(\.runID), [runID])
+        XCTAssertEqual(activeBeforeRecovery.first?.containmentMode, "cgroup-v2")
 
         let recovered = ProviderProcessSupervisor(processPort: port, clock: ImmediateClock(), store: store)
         try await recovered.recoverPersistedFamilies()
@@ -454,6 +464,9 @@ final class ProviderSupervisorTests: XCTestCase {
         XCTAssertTrue(activeAfterRecovery.isEmpty)
         let result = await port.result()
         XCTAssertEqual(result.reaped.sorted(), [300, 301])
+        XCTAssertEqual(result.reconstructed.count, 1)
+        XCTAssertEqual(result.reconstructed.first?.0, leader)
+        XCTAssertEqual(result.reconstructed.first?.1, "cgroup-v2")
         try await store.close()
     }
 

@@ -27,16 +27,20 @@ public struct SignedInternalRequest: Sendable {
     public let timestamp: String
     public let nonce: String
     public let body: Data
+    public let bodyDigest: String
     public let authorizationDecisionData: Data?
+    public let authorizationDecisionDigest: String?
     public let keyID: String
     public let signature: String
-    public init(method: String, pathAndQuery: String, timestamp: String, nonce: String, body: Data, authorizationDecisionData: Data?, keyID: String, signature: String) {
+    public init(method: String, pathAndQuery: String, timestamp: String, nonce: String, body: Data, bodyDigest: String, authorizationDecisionData: Data?, authorizationDecisionDigest: String?, keyID: String, signature: String) {
         self.method = method
         self.pathAndQuery = pathAndQuery
         self.timestamp = timestamp
         self.nonce = nonce
         self.body = body
+        self.bodyDigest = bodyDigest
         self.authorizationDecisionData = authorizationDecisionData
+        self.authorizationDecisionDigest = authorizationDecisionDigest
         self.keyID = keyID
         self.signature = signature
     }
@@ -61,11 +65,14 @@ public actor InternalRequestAuthenticator {
     public func verify(_ request: SignedInternalRequest, allowedRoles: Set<InternalRouteRole>, operation: String, projectID: UUID? = nil, sessionID: UUID? = nil) async throws -> AuthenticatedInternalRequest {
         guard let key = keys[request.keyID], allowedRoles.contains(key.role) else { throw ServiceAPIError(code: .internalAuthFailed, message: "Signing identity is not allowed for this route") }
         guard request.nonce.range(of: "^[A-Za-z0-9_-]{16,128}$", options: .regularExpression) != nil else { throw ServiceAPIError(code: .internalAuthFailed, message: "Nonce format is invalid") }
-        guard let timestampSeconds = Double(request.timestamp) else { throw ServiceAPIError(code: .internalAuthFailed, message: "Timestamp is invalid") }
-        let observed = now(), signedAt = Date(timeIntervalSince1970: timestampSeconds)
+        guard let signedAt = CanonicalSigning.parseISO8601(request.timestamp) else { throw ServiceAPIError(code: .internalAuthFailed, message: "Timestamp is invalid") }
+        let observed = now()
         guard abs(observed.timeIntervalSince(signedAt)) <= 5 else { throw ServiceAPIError(code: .internalAuthFailed, message: "Timestamp is outside the allowed skew") }
+        let computedBodyDigest = CanonicalSigning.bodyDigest(request.body)
+        guard request.bodyDigest == computedBodyDigest else { throw ServiceAPIError(code: .internalAuthFailed, message: "Body digest does not match") }
         let decisionDigest = CanonicalSigning.bodyDigest(request.authorizationDecisionData ?? Data())
-        let canonical = CanonicalSigning.requestString(method: request.method, pathAndQuery: request.pathAndQuery, timestamp: request.timestamp, nonce: request.nonce, bodyDigest: CanonicalSigning.bodyDigest(request.body), authorizationDecisionDigest: decisionDigest, keyID: request.keyID)
+        guard (request.authorizationDecisionDigest ?? CanonicalSigning.bodyDigest(Data())) == decisionDigest else { throw ServiceAPIError(code: .internalAuthFailed, message: "Authorization decision digest does not match") }
+        let canonical = CanonicalSigning.requestString(method: request.method, pathAndQuery: request.pathAndQuery, timestamp: request.timestamp, nonce: request.nonce, bodyDigest: request.bodyDigest, authorizationDecisionDigest: decisionDigest, keyID: request.keyID)
         let expected = CanonicalSigning.hmacSHA256(message: canonical, key: key.secret)
         guard CanonicalSigning.secureEquals(expected, request.signature) else { throw ServiceAPIError(code: .internalAuthFailed, message: "Request signature is invalid") }
         try await store.consumeNonce(direction: key.direction, keyID: key.keyID, nonce: request.nonce, observedAt: observed, expiresAt: observed.addingTimeInterval(60))
@@ -75,7 +82,7 @@ public actor InternalRequestAuthenticator {
             let decision = try JSONDecoder.serviceDecoder.decode(GoblinAuthorizationDecision.self, from: data)
             guard decision.schemaVersion == 1, decision.operation == operation, decision.projectID == projectID, decision.sessionID == sessionID else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision target or operation does not match") }
             guard decision.requestDigest == CanonicalSigning.bodyDigest(request.body), decision.expiresAt >= observed, decision.issuedAt <= observed, decision.expiresAt.timeIntervalSince(decision.issuedAt) <= 30 else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision is stale or request-mismatched") }
-            let unsigned = decisionCanonicalString(decision)
+            let unsigned = try CanonicalSigning.canonicalJSONObject(data, removingTopLevelKeys: ["signature"])
             let decisionSignature = CanonicalSigning.hmacSHA256(message: unsigned, key: key.secret)
             guard decision.keyID == key.keyID, CanonicalSigning.secureEquals(decisionSignature, decision.signature) else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision signature is invalid") }
             try await store.consumeAuthorizationDecision(decision)
@@ -84,16 +91,15 @@ public actor InternalRequestAuthenticator {
         return AuthenticatedInternalRequest(role: key.role, decision: nil)
     }
 
-    public nonisolated func decisionCanonicalString(_ value: GoblinAuthorizationDecision) -> String {
-        [String(value.schemaVersion), value.decisionID.uuidString, value.actor.goblinUserID, value.projectID?.uuidString ?? "", value.sessionID?.uuidString ?? "", value.operation, value.requestDigest, String(value.policyRevision), String(value.controllerRevision), String(value.membershipRevision), String(value.issuedAt.timeIntervalSince1970), String(value.expiresAt.timeIntervalSince1970), value.requestID.uuidString, value.correlationID.uuidString, value.keyID].joined(separator: "\n")
-    }
 }
 
 extension HTTPField.Name {
-    static let repoKeyID = Self("X-RepoPrompt-Key-Id")!
-    static let repoTimestamp = Self("X-RepoPrompt-Timestamp")!
-    static let repoNonce = Self("X-RepoPrompt-Nonce")!
-    static let repoSignature = Self("X-RepoPrompt-Signature")!
-    static let repoDecision = Self("X-RepoPrompt-Authorization-Decision")!
+    static let internalKeyID = Self("x-internal-key-id")!
+    static let internalTimestamp = Self("x-internal-timestamp")!
+    static let internalNonce = Self("x-internal-nonce")!
+    static let internalBodyDigest = Self("x-internal-body-digest")!
+    static let internalAuthorizationDigest = Self("x-internal-authorization-digest")!
+    static let internalSignature = Self("x-internal-signature")!
+    static let goblinAuthorizationDecision = Self("X-Goblin-Authorization-Decision")!
     static let idempotencyKey = Self("Idempotency-Key")!
 }

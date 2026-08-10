@@ -47,8 +47,9 @@ public actor ProviderProcessSupervisor {
     }
 
     public func register(runID: UUID, leader: ProcessIdentity, connectionGeneration: Int64 = 1) async throws {
+        let containmentMode = try await processPort.containmentMode(for: leader)
         families[runID] = [leader]
-        try await store?.persistProcessFamily(runID: runID, leader: leader.persisted, connectionGeneration: connectionGeneration)
+        try await store?.persistProcessFamily(runID: runID, leader: leader.persisted, connectionGeneration: connectionGeneration, containmentMode: containmentMode)
     }
 
     public func forget(runID: UUID) async {
@@ -56,16 +57,18 @@ public actor ProviderProcessSupervisor {
         try? await store?.updateProcessFamilyState(runID: runID, state: "exited")
     }
 
-    public func recoverPersistedFamilies() async throws {
+    public func recoverPersistedFamilies(graceScans: Int = 100) async throws {
         guard let store else { return }
         for persisted in try await store.activeProcessFamilies() {
             let leader = ProcessIdentity(persisted.leader)
-            guard try await processPort.inspect(pid: leader.pid) == leader else {
+            do {
+                try await processPort.reconstruct(leader: leader, containmentMode: persisted.containmentMode)
+            } catch {
                 try await store.updateProcessFamilyState(runID: persisted.runID, state: "identity-mismatch")
                 continue
             }
             families[persisted.runID] = [leader]
-            try await cancel(runID: persisted.runID)
+            try await cancel(runID: persisted.runID, graceScans: graceScans)
         }
     }
 

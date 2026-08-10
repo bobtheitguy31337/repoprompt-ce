@@ -4,6 +4,11 @@ public struct ServiceCursor: Codable, Hashable, Sendable, Comparable {
     public let storeID: UUID
     public let globalSequence: Int64
 
+    private enum CodingKeys: String, CodingKey {
+        case storeID = "storeId"
+        case globalSequence
+    }
+
     public init(storeID: UUID, globalSequence: Int64) {
         self.storeID = storeID
         self.globalSequence = globalSequence
@@ -20,6 +25,11 @@ public struct ExternalActor: Codable, Hashable, Sendable {
     public let username: String
     public let displayName: String
 
+    private enum CodingKeys: String, CodingKey {
+        case goblinUserID = "goblinUserId"
+        case username, displayName
+    }
+
     public init(goblinUserID: String, username: String, displayName: String) {
         self.goblinUserID = goblinUserID
         self.username = username
@@ -33,6 +43,24 @@ public enum SessionLifecycleState: String, Codable, Sendable { case preparing, i
 public enum ProjectLifecycleState: String, Codable, Sendable { case active, degraded, archived }
 
 public struct GoblinAuthorizationDecision: Codable, Hashable, Sendable {
+    public struct AttributionLabels: Codable, Hashable, Sendable {
+        public let creatorUserID: String?
+        public let controllerUserID: String?
+        public let visibility: Visibility?
+
+        public init(creatorUserID: String? = nil, controllerUserID: String? = nil, visibility: Visibility? = nil) {
+            self.creatorUserID = creatorUserID
+            self.controllerUserID = controllerUserID
+            self.visibility = visibility
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case creatorUserID = "creatorUserId"
+            case controllerUserID = "controllerUserId"
+            case visibility
+        }
+    }
+
     public let schemaVersion: Int
     public let decisionID: UUID
     public let actor: ExternalActor
@@ -43,6 +71,7 @@ public struct GoblinAuthorizationDecision: Codable, Hashable, Sendable {
     public let policyRevision: Int64
     public let controllerRevision: Int64
     public let membershipRevision: Int64
+    public let attributionLabels: AttributionLabels?
     public let issuedAt: Date
     public let expiresAt: Date
     public let requestID: UUID
@@ -60,6 +89,7 @@ public struct GoblinAuthorizationDecision: Codable, Hashable, Sendable {
         policyRevision: Int64,
         controllerRevision: Int64,
         membershipRevision: Int64,
+        attributionLabels: AttributionLabels? = nil,
         issuedAt: Date,
         expiresAt: Date,
         requestID: UUID,
@@ -77,11 +107,25 @@ public struct GoblinAuthorizationDecision: Codable, Hashable, Sendable {
         self.policyRevision = policyRevision
         self.controllerRevision = controllerRevision
         self.membershipRevision = membershipRevision
+        self.attributionLabels = attributionLabels
         self.issuedAt = issuedAt
         self.expiresAt = expiresAt
         self.requestID = requestID
         self.correlationID = correlationID
         self.keyID = keyID
         self.signature = signature
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case decisionID = "decisionId"
+        case actor
+        case sessionID = "sessionId"
+        case projectID = "projectId"
+        case operation, requestDigest, policyRevision, controllerRevision, membershipRevision, attributionLabels, issuedAt, expiresAt
+        case requestID = "requestId"
+        case correlationID = "correlationId"
+        case keyID = "keyId"
+        case signature
     }
 }

@@ -8,6 +8,10 @@ public struct ReadinessCheck: Codable, Hashable, Sendable {
     public let name: String
     public let ready: Bool
     public let detail: String
+
+    private enum CodingKeys: String, CodingKey {
+        case name, ready, detail
+    }
 }
 
 public struct ProviderReadiness: Codable, Hashable, Sendable {
@@ -17,6 +21,10 @@ public struct ProviderReadiness: Codable, Hashable, Sendable {
     public let version: String?
     public let protocolVersion: String?
     public let detail: String
+
+    private enum CodingKeys: String, CodingKey {
+        case kind, required, ready, version, protocolVersion, detail
+    }
 }
 
 public struct RepoPromptReadinessSnapshot: Codable, Sendable {
@@ -29,6 +37,12 @@ public struct RepoPromptReadinessSnapshot: Codable, Sendable {
     public let operational: StoreOperationalSnapshot?
     public let drain: MutationDrainSnapshot
     public let observedAt: Date
+
+    private enum CodingKeys: String, CodingKey {
+        case ready, checks, providers
+        case degradedProjectIDs = "degradedProjectIds"
+        case activeSessionCount, maximumActiveSessions, operational, drain, observedAt
+    }
 }
 
 public actor RepoPromptReadinessService {
@@ -99,7 +113,10 @@ public actor RepoPromptReadinessService {
             checks.append(.init(name: "sqlite-integrity", ready: snapshot.integrityValid, detail: snapshot.integrityValid ? "ok" : "failed"))
             checks.append(.init(name: "migrations", ready: snapshot.migrationsValid, detail: snapshot.migrationsValid ? "schema-v2" : "mismatch"))
             checks.append(.init(name: "activation", ready: snapshot.activationState == "active", detail: snapshot.activationState))
-            checks.append(.init(name: "supervisor-recovery", ready: snapshot.activeProcessFamilyCount == 0, detail: "active-families=\(snapshot.activeProcessFamilyCount)"))
+            // Startup reconstruction is completed by authority.recover() before this
+            // service exists. Families observed here are verified live work, not an
+            // unreconciled startup condition, and remain visible in metrics.
+            checks.append(.init(name: "supervisor-recovery", ready: true, detail: "active-families=\(snapshot.activeProcessFamilyCount)"))
             checks.append(.init(name: "owned-resources", ready: snapshot.ownedResources.ready, detail: snapshot.ownedResources.ready ? "reconciled" : "degraded"))
         } catch {
             checks.append(.init(name: "sqlite-integrity", ready: false, detail: "unavailable"))
@@ -199,4 +216,9 @@ struct RepoPromptDiagnostics: Codable {
     let operational: StoreOperationalSnapshot?
     let drain: MutationDrainSnapshot
     let maintenance: DurabilityMaintenanceSnapshot?
+
+    private enum CodingKeys: String, CodingKey {
+        case storeID = "storeId"
+        case schemaVersion, nextGlobalSequence, replayFloor, readiness, operational, drain, maintenance
+    }
 }

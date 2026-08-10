@@ -13,6 +13,13 @@ public struct LogicalSelectionEntry: Codable, Hashable, Sendable {
         self.mode = mode
         self.ranges = ranges
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case rootID = "rootId"
+        case logicalPath
+        case mode
+        case ranges
+    }
 }
 
 public struct SelectionSnapshot: Codable, Hashable, Sendable {
@@ -26,6 +33,13 @@ public struct SelectionSnapshot: Codable, Hashable, Sendable {
         self.entries = entries
         self.revision = revision
         self.bindingRevision = bindingRevision
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case entries
+        case revision
+        case bindingRevision
     }
 }
 
@@ -46,6 +60,13 @@ public struct SessionContextSnapshot: Codable, Hashable, Sendable {
         self.selectionRevision = selectionRevision
         self.contextRevision = contextRevision
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case prompt
+        case selectionRevision
+        case contextRevision
+    }
 }
 
 public struct ToolInvocationSnapshot: Codable, Hashable, Sendable {
@@ -64,6 +85,15 @@ public struct ToolInvocationSnapshot: Codable, Hashable, Sendable {
         self.resultDigest = resultDigest
         self.errorCode = errorCode
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case invocationID = "invocationId"
+        case toolName
+        case state
+        case argumentDigest
+        case resultDigest
+        case errorCode
+    }
 }
 
 public struct ProjectSelectionTemplateSnapshot: Codable, Hashable, Sendable {
@@ -76,6 +106,12 @@ public struct ProjectSelectionTemplateSnapshot: Codable, Hashable, Sendable {
         self.entries = entries
         self.revision = revision
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case projectID = "projectId"
+        case entries
+        case revision
+    }
 }
 
 public struct ProjectSelectionTemplateMutationInput: Codable, Sendable {
@@ -86,6 +122,11 @@ public struct ProjectSelectionTemplateMutationInput: Codable, Sendable {
         self.entries = entries
         self.expectedRevision = expectedRevision
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case entries
+        case expectedRevision
+    }
 }
 
 public struct SelectionMutationInput: Codable, Sendable {
@@ -95,6 +136,11 @@ public struct SelectionMutationInput: Codable, Sendable {
     public init(entries: [LogicalSelectionEntry], expectedRevision: Int64) {
         self.entries = entries
         self.expectedRevision = expectedRevision
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case entries
+        case expectedRevision
     }
 }
 
@@ -107,6 +153,12 @@ public struct SelectionRemovalInput: Codable, Sendable {
         self.rootID = rootID
         self.logicalPaths = logicalPaths
         self.expectedRevision = expectedRevision
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case rootID = "rootId"
+        case logicalPaths
+        case expectedRevision
     }
 }
 
@@ -124,6 +176,14 @@ public struct ExecutionPermissionSnapshot: Codable, Hashable, Sendable {
         self.revision = revision
         self.updatedActor = updatedActor
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case mode
+        case providerSettings
+        case revision
+        case updatedActor
+    }
 }
 
 public struct ExecutionPermissionUpdateInput: Codable, Sendable {
@@ -135,6 +195,12 @@ public struct ExecutionPermissionUpdateInput: Codable, Sendable {
         self.expectedRevision = expectedRevision
         self.mode = mode
         self.providerSettings = providerSettings
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case expectedRevision
+        case mode
+        case providerSettings
     }
 }
 
@@ -156,6 +222,16 @@ public struct CollaborationMetadataSnapshot: Codable, Hashable, Sendable {
         self.controllerRevision = controllerRevision
         self.membershipRevision = membershipRevision
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case visibility
+        case collaborativeSteeringEnabled
+        case controllerUserID = "controllerUserId"
+        case policyRevision
+        case controllerRevision
+        case membershipRevision
+    }
 }
 
 public struct InteractionAnswerInput: Codable, Sendable {
@@ -167,6 +243,12 @@ public struct InteractionAnswerInput: Codable, Sendable {
         self.interactionID = interactionID
         self.expectedRevision = expectedRevision
         self.payload = payload
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case interactionID = "interactionId"
+        case expectedRevision
+        case payload
     }
 }
 
@@ -196,6 +278,19 @@ public struct WorktreeBindingSnapshot: Codable, Hashable, Sendable {
         self.mergeState = mergeState
         self.revision = revision
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case bindingID = "bindingId"
+        case projectID = "projectId"
+        case rootID = "rootId"
+        case sessionID = "sessionId"
+        case baseRef
+        case branch
+        case physicalPath
+        case ownershipState
+        case mergeState
+        case revision
+    }
 }
 
 public struct WorktreeCreateInput: Codable, Sendable {
@@ -207,6 +302,12 @@ public struct WorktreeCreateInput: Codable, Sendable {
         self.rootID = rootID
         self.baseRef = baseRef
         self.branch = branch
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case rootID = "rootId"
+        case baseRef
+        case branch
     }
 }
 
@@ -220,6 +321,12 @@ public struct WorktreeMergeInput: Codable, Sendable {
         self.strategy = strategy
         self.expectedRevision = expectedRevision
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case bindingID = "bindingId"
+        case strategy
+        case expectedRevision
+    }
 }
 
 public struct WorktreeBindInput: Codable, Sendable {
@@ -231,6 +338,12 @@ public struct WorktreeBindInput: Codable, Sendable {
         self.bindingID = bindingID
         self.expectedRevision = expectedRevision
         self.expectedSelectionBindingRevision = expectedSelectionBindingRevision
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case bindingID = "bindingId"
+        case expectedRevision
+        case expectedSelectionBindingRevision
     }
 }
 
@@ -249,6 +362,15 @@ public struct CollaborationMetadataInput: Codable, Sendable {
         self.visibility = visibility
         self.collaborativeSteeringEnabled = collaborativeSteeringEnabled
         self.controllerUserID = controllerUserID
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case expectedPolicyRevision
+        case expectedControllerRevision
+        case expectedMembershipRevision
+        case visibility
+        case collaborativeSteeringEnabled
+        case controllerUserID = "controllerUserId"
     }
 }
 
@@ -274,6 +396,18 @@ public struct ArtifactSnapshot: Codable, Hashable, Sendable {
         self.createdCursor = createdCursor
         self.retentionState = retentionState
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case artifactID = "artifactId"
+        case projectID = "projectId"
+        case sessionID = "sessionId"
+        case kind
+        case logicalName
+        case contentDigest
+        case size
+        case createdCursor
+        case retentionState
+    }
 }
 
 public struct WorkflowSnapshot: Codable, Hashable, Sendable {
@@ -292,6 +426,15 @@ public struct WorkflowSnapshot: Codable, Hashable, Sendable {
         self.contentDigest = contentDigest
         self.enabled = enabled
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case workflowID = "workflowId"
+        case source
+        case name
+        case definition
+        case contentDigest
+        case enabled
+    }
 }
 
 public struct ProjectTreeRequest: Codable, Sendable {
@@ -306,6 +449,13 @@ public struct ProjectTreeRequest: Codable, Sendable {
         self.maximumDepth = maximumDepth
         self.maximumEntries = maximumEntries
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case rootID = "rootId"
+        case logicalPath
+        case maximumDepth
+        case maximumEntries
+    }
 }
 
 public struct ProjectRefreshInput: Codable, Sendable {
@@ -313,6 +463,10 @@ public struct ProjectRefreshInput: Codable, Sendable {
 
     public init(expectedRevision: Int64) {
         self.expectedRevision = expectedRevision
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case expectedRevision
     }
 }
 
@@ -327,6 +481,13 @@ public struct ProjectTreeEntry: Codable, Hashable, Sendable {
         self.logicalPath = logicalPath
         self.isDirectory = isDirectory
         self.size = size
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case rootID = "rootId"
+        case logicalPath
+        case isDirectory
+        case size
     }
 }
 
@@ -346,6 +507,15 @@ public struct ProjectSearchRequest: Codable, Sendable {
         self.maximumResults = maximumResults
         self.maximumFileBytes = maximumFileBytes
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case rootID = "rootId"
+        case query
+        case logicalPath
+        case useRegex
+        case maximumResults
+        case maximumFileBytes
+    }
 }
 
 public struct ProjectSearchHit: Codable, Hashable, Sendable {
@@ -359,6 +529,13 @@ public struct ProjectSearchHit: Codable, Hashable, Sendable {
         self.logicalPath = logicalPath
         self.line = line
         self.preview = preview
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case rootID = "rootId"
+        case logicalPath
+        case line
+        case preview
     }
 }
 
@@ -376,6 +553,14 @@ public struct ProjectFileRequest: Codable, Sendable {
         self.lineCount = lineCount
         self.maximumBytes = maximumBytes
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case rootID = "rootId"
+        case logicalPath
+        case startLine
+        case lineCount
+        case maximumBytes
+    }
 }
 
 public struct ProjectFileSnapshot: Codable, Hashable, Sendable {
@@ -392,6 +577,14 @@ public struct ProjectFileSnapshot: Codable, Hashable, Sendable {
         self.contentDigest = contentDigest
         self.truncated = truncated
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case rootID = "rootId"
+        case logicalPath
+        case content
+        case contentDigest
+        case truncated
+    }
 }
 
 public struct ProjectCodeMapRequest: Codable, Sendable {
@@ -403,6 +596,12 @@ public struct ProjectCodeMapRequest: Codable, Sendable {
         self.rootID = rootID
         self.logicalPath = logicalPath
         self.maximumBytes = maximumBytes
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case rootID = "rootId"
+        case logicalPath
+        case maximumBytes
     }
 }
 
@@ -422,6 +621,15 @@ public struct ProjectCodeMapSnapshot: Codable, Hashable, Sendable {
         self.content = content
         self.contentDigest = contentDigest
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case rootID = "rootId"
+        case logicalPath
+        case status
+        case language
+        case content
+        case contentDigest
+    }
 }
 
 public struct ProjectDiffRequest: Codable, Sendable {
@@ -435,6 +643,13 @@ public struct ProjectDiffRequest: Codable, Sendable {
         self.comparison = comparison
         self.logicalPaths = logicalPaths
         self.maximumBytes = maximumBytes
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case rootID = "rootId"
+        case comparison
+        case logicalPaths
+        case maximumBytes
     }
 }
 
@@ -452,6 +667,14 @@ public struct ProjectDiffSnapshot: Codable, Hashable, Sendable {
         self.truncated = truncated
         self.contentDigest = contentDigest
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case rootID = "rootId"
+        case comparison
+        case patch
+        case truncated
+        case contentDigest
+    }
 }
 
 public struct ContextBuildInput: Codable, Sendable {
@@ -461,6 +684,11 @@ public struct ContextBuildInput: Codable, Sendable {
     public init(expectedSelectionRevision: Int64, include: [String]) {
         self.expectedSelectionRevision = expectedSelectionRevision
         self.include = include
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case expectedSelectionRevision
+        case include
     }
 }
 
@@ -517,6 +745,16 @@ public struct ContextBuilderSnapshot: Codable, Hashable, Sendable {
     public var selection: SelectionSnapshot {
         SelectionSnapshot(sessionID: sessionID, entries: entries, revision: revision, bindingRevision: bindingRevision)
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case entries
+        case revision
+        case bindingRevision
+        case proposalArtifactID = "proposalArtifactId"
+        case response
+        case chatID = "chatId"
+    }
 }
 
 public struct OracleInput: Codable, Sendable {
@@ -528,6 +766,12 @@ public struct OracleInput: Codable, Sendable {
         self.chatID = chatID
         self.prompt = prompt
         self.contextMode = contextMode
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case chatID = "chatId"
+        case prompt
+        case contextMode
     }
 }
 
@@ -543,6 +787,13 @@ public struct OracleSnapshot: Codable, Hashable, Sendable {
         self.artifactID = artifactID
         self.revision = revision
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case chatID = "chatId"
+        case response
+        case artifactID = "artifactId"
+        case revision
+    }
 }
 
 public struct OracleChatTurn: Codable, Hashable, Sendable {
@@ -554,6 +805,12 @@ public struct OracleChatTurn: Codable, Hashable, Sendable {
         self.prompt = prompt
         self.response = response
         self.timestamp = timestamp
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case prompt
+        case response
+        case timestamp
     }
 }
 
@@ -576,5 +833,13 @@ public struct OracleChatState: Codable, Hashable, Sendable {
         self.providerSessionID = providerSessionID
         self.turns = turns
         self.revision = revision
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case chatID = "chatId"
+        case sessionID = "sessionId"
+        case providerSessionID = "providerSessionId"
+        case turns
+        case revision
     }
 }
