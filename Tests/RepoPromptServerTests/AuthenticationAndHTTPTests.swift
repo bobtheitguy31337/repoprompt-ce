@@ -174,7 +174,8 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         let id = UUID().uuidString
         let routes: [(HTTPRequest.Method, String)] = [
             (.get, "/internal/v1/diagnostics"), (.get, "/metrics"), (.get, "/internal/v1/capabilities"),
-            (.get, "/internal/v1/projects"), (.post, "/internal/v1/projects"), (.get, "/internal/v1/projects/\(id)/snapshot"),
+            (.get, "/internal/v1/projects"), (.post, "/internal/v1/projects"),
+            (.post, "/internal/v1/projects/\(id)/source-operations"), (.get, "/internal/v1/projects/\(id)/snapshot"),
             (.patch, "/internal/v1/projects/\(id)"), (.delete, "/internal/v1/projects/\(id)"), (.post, "/internal/v1/projects/\(id)/refresh"),
             (.get, "/internal/v1/projects/\(id)/tree"), (.post, "/internal/v1/projects/\(id)/search"), (.post, "/internal/v1/projects/\(id)/file"),
             (.post, "/internal/v1/projects/\(id)/diff"), (.get, "/internal/v1/catalog/providers"), (.get, "/internal/v1/catalog/models"),

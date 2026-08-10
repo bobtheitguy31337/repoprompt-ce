@@ -113,7 +113,8 @@ final class PersistenceTests: XCTestCase {
         let project = ProjectSnapshot(projectID: UUID(), name: "P", creator: actor, state: .active, roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)], revision: 1, cursor: priorCursor)
         let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "createProject", key: "before-restore", requestDigest: "digest")
         _ = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: idempotency)
-        XCTAssertNotNil(try await store.idempotencyResult(idempotency))
+        let storedIdempotency = try await store.idempotencyResult(idempotency)
+        XCTAssertNotNil(storedIdempotency)
 
         let activationToken = Data("restore-activation".utf8)
         let fresh = try await store.prepareRestoredStore(
@@ -123,7 +124,8 @@ final class PersistenceTests: XCTestCase {
             activationToken: activationToken
         )
         _ = try await store.activateRestoredStore(activationToken: activationToken, instanceID: UUID())
-        XCTAssertNil(try await store.idempotencyResult(idempotency))
+        let restoredIdempotency = try await store.idempotencyResult(idempotency)
+        XCTAssertNil(restoredIdempotency)
         XCTAssertNotEqual(prior, fresh)
         let restored = try await store.metadata()
         XCTAssertEqual(restored.storeID, fresh)
@@ -231,6 +233,12 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(child?.rootSessionID, parentID)
         XCTAssertEqual(child?.provider, .claudeCompatible)
         XCTAssertEqual(child?.state, .interrupted)
+        let importedEvents = try await store.events(after: nil, limit: 20).events
+        let projectEvent = try XCTUnwrap(importedEvents.first(where: { $0.projectID == projectID && $0.eventType == .projectCreated }))
+        let projectPayload = String(decoding: try JSONEncoder.serviceEncoder.encode(projectEvent.payload), as: UTF8.self)
+        XCTAssertFalse(projectPayload.contains(directory.path), projectPayload)
+        XCTAssertFalse(projectPayload.contains("canonicalPath"), projectPayload)
+        XCTAssertTrue(projectPayload.contains("rootCount"), projectPayload)
         try await store.close(clean: true)
 
         store = try await SQLiteServiceStore.open(storage: .file(database.path))

@@ -1,5 +1,14 @@
 import Foundation
 
+private struct ProjectSourceCodingKey: CodingKey {
+    let stringValue: String
+    let intValue: Int? = nil
+
+    init(_ stringValue: String) { self.stringValue = stringValue }
+    init?(stringValue: String) { self.init(stringValue) }
+    init?(intValue: Int) { return nil }
+}
+
 public struct CreateProjectInput: Codable, Sendable {
     public struct Root: Codable, Sendable {
         public let logicalName: String
@@ -22,6 +31,227 @@ public struct CreateProjectInput: Codable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case name
         case roots
+    }
+}
+
+public struct CreateProjectWireInput: Codable, Hashable, Sendable {
+    public let schemaVersion: Int
+    public let name: String
+
+    public init(schemaVersion: Int = 1, name: String) {
+        self.schemaVersion = schemaVersion
+        self.name = name
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: ProjectSourceCodingKey.self)
+        let marker = ProjectSourceCodingKey("schemaVersion")
+        guard Set(values.allKeys.map(\.stringValue)) == Set(["schemaVersion", "name"]) else {
+            throw DecodingError.dataCorruptedError(forKey: marker, in: values, debugDescription: "Project creation contains unsupported fields")
+        }
+        self.init(
+            schemaVersion: try values.decode(Int.self, forKey: marker),
+            name: try values.decode(String.self, forKey: ProjectSourceCodingKey("name"))
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: ProjectSourceCodingKey.self)
+        try values.encode(schemaVersion, forKey: ProjectSourceCodingKey("schemaVersion"))
+        try values.encode(name, forKey: ProjectSourceCodingKey("name"))
+    }
+}
+
+public struct RenameProjectInput: Codable, Hashable, Sendable {
+    public let expectedRevision: Int64
+    public let name: String
+
+    public init(expectedRevision: Int64, name: String) {
+        self.expectedRevision = expectedRevision
+        self.name = name
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: ProjectSourceCodingKey.self)
+        let marker = ProjectSourceCodingKey("expectedRevision")
+        guard Set(values.allKeys.map(\.stringValue)) == Set(["expectedRevision", "name"]) else {
+            throw DecodingError.dataCorruptedError(forKey: marker, in: values, debugDescription: "Project rename contains unsupported fields")
+        }
+        self.init(
+            expectedRevision: try values.decode(Int64.self, forKey: marker),
+            name: try values.decode(String.self, forKey: ProjectSourceCodingKey("name"))
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: ProjectSourceCodingKey.self)
+        try values.encode(expectedRevision, forKey: ProjectSourceCodingKey("expectedRevision"))
+        try values.encode(name, forKey: ProjectSourceCodingKey("name"))
+    }
+}
+
+public struct AddProjectRepositoryInput: Codable, Hashable, Sendable {
+    public struct GitSource: Codable, Hashable, Sendable {
+        public let remote: String
+        public let ref: String
+
+        public init(remote: String, ref: String) {
+            self.remote = remote
+            self.ref = ref
+        }
+
+        public init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: ProjectSourceCodingKey.self)
+            let marker = ProjectSourceCodingKey("type")
+            guard Set(values.allKeys.map(\.stringValue)) == Set(["type", "remote", "ref"]),
+                  try values.decode(String.self, forKey: marker) == "gitClone"
+            else {
+                throw DecodingError.dataCorruptedError(forKey: marker, in: values, debugDescription: "Repository source must be a Git clone")
+            }
+            self.init(
+                remote: try values.decode(String.self, forKey: ProjectSourceCodingKey("remote")),
+                ref: try values.decode(String.self, forKey: ProjectSourceCodingKey("ref"))
+            )
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var values = encoder.container(keyedBy: ProjectSourceCodingKey.self)
+            try values.encode("gitClone", forKey: ProjectSourceCodingKey("type"))
+            try values.encode(remote, forKey: ProjectSourceCodingKey("remote"))
+            try values.encode(ref, forKey: ProjectSourceCodingKey("ref"))
+        }
+    }
+
+    public let schemaVersion: Int
+    public let expectedRevision: Int64
+    public let logicalName: String
+    public let source: GitSource
+
+    public init(schemaVersion: Int = 1, expectedRevision: Int64, logicalName: String, source: GitSource) {
+        self.schemaVersion = schemaVersion
+        self.expectedRevision = expectedRevision
+        self.logicalName = logicalName
+        self.source = source
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: ProjectSourceCodingKey.self)
+        let marker = ProjectSourceCodingKey("schemaVersion")
+        guard Set(values.allKeys.map(\.stringValue)) == Set(["schemaVersion", "expectedRevision", "logicalName", "source"]) else {
+            throw DecodingError.dataCorruptedError(forKey: marker, in: values, debugDescription: "Repository addition contains unsupported fields")
+        }
+        self.init(
+            schemaVersion: try values.decode(Int.self, forKey: marker),
+            expectedRevision: try values.decode(Int64.self, forKey: ProjectSourceCodingKey("expectedRevision")),
+            logicalName: try values.decode(String.self, forKey: ProjectSourceCodingKey("logicalName")),
+            source: try values.decode(GitSource.self, forKey: ProjectSourceCodingKey("source"))
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: ProjectSourceCodingKey.self)
+        try values.encode(schemaVersion, forKey: ProjectSourceCodingKey("schemaVersion"))
+        try values.encode(expectedRevision, forKey: ProjectSourceCodingKey("expectedRevision"))
+        try values.encode(logicalName, forKey: ProjectSourceCodingKey("logicalName"))
+        try values.encode(source, forKey: ProjectSourceCodingKey("source"))
+    }
+}
+
+/// Internal/admin source-acquisition primitive. Public clients use the
+/// project-scoped `AddProjectRepositoryInput` contract and cannot submit a
+/// configured-root alias, physical path, executable, environment, or secret.
+public struct ProjectSourceOperationInput: Codable, Hashable, Sendable {
+    public enum Source: Codable, Hashable, Sendable {
+        case configuredRoot(alias: String)
+        case gitClone(remote: String, ref: String)
+
+        private enum Kind: String, Codable {
+            case configuredRoot
+            case gitClone
+        }
+
+        public init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: ProjectSourceCodingKey.self)
+            let type = ProjectSourceCodingKey("type")
+            switch try values.decode(Kind.self, forKey: type) {
+            case .configuredRoot:
+                guard Set(values.allKeys.map(\.stringValue)) == Set(["type", "alias"]) else {
+                    throw DecodingError.dataCorruptedError(forKey: type, in: values, debugDescription: "Configured root source contains unsupported fields")
+                }
+                self = try .configuredRoot(alias: values.decode(String.self, forKey: ProjectSourceCodingKey("alias")))
+            case .gitClone:
+                guard Set(values.allKeys.map(\.stringValue)) == Set(["type", "remote", "ref"]) else {
+                    throw DecodingError.dataCorruptedError(forKey: type, in: values, debugDescription: "Git clone source contains unsupported fields")
+                }
+                self = try .gitClone(
+                    remote: values.decode(String.self, forKey: ProjectSourceCodingKey("remote")),
+                    ref: values.decode(String.self, forKey: ProjectSourceCodingKey("ref"))
+                )
+            }
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var values = encoder.container(keyedBy: ProjectSourceCodingKey.self)
+            switch self {
+            case let .configuredRoot(alias):
+                try values.encode(Kind.configuredRoot, forKey: ProjectSourceCodingKey("type"))
+                try values.encode(alias, forKey: ProjectSourceCodingKey("alias"))
+            case let .gitClone(remote, ref):
+                try values.encode(Kind.gitClone, forKey: ProjectSourceCodingKey("type"))
+                try values.encode(remote, forKey: ProjectSourceCodingKey("remote"))
+                try values.encode(ref, forKey: ProjectSourceCodingKey("ref"))
+            }
+        }
+    }
+
+    public let schemaVersion: Int
+    public let operationID: UUID
+    public let expectedRevision: Int64
+    public let name: String
+    public let logicalName: String
+    public let source: Source
+
+    public init(
+        schemaVersion: Int = 1,
+        operationID: UUID,
+        expectedRevision: Int64,
+        name: String,
+        logicalName: String,
+        source: Source
+    ) {
+        self.schemaVersion = schemaVersion
+        self.operationID = operationID
+        self.expectedRevision = expectedRevision
+        self.name = name
+        self.logicalName = logicalName
+        self.source = source
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: ProjectSourceCodingKey.self)
+        let expected = Set(["schemaVersion", "operationId", "expectedRevision", "name", "logicalName", "source"])
+        let marker = ProjectSourceCodingKey("schemaVersion")
+        guard Set(values.allKeys.map(\.stringValue)) == expected else {
+            throw DecodingError.dataCorruptedError(forKey: marker, in: values, debugDescription: "Project source operation contains unsupported fields")
+        }
+        self.init(
+            schemaVersion: try values.decode(Int.self, forKey: marker),
+            operationID: try values.decode(UUID.self, forKey: ProjectSourceCodingKey("operationId")),
+            expectedRevision: try values.decode(Int64.self, forKey: ProjectSourceCodingKey("expectedRevision")),
+            name: try values.decode(String.self, forKey: ProjectSourceCodingKey("name")),
+            logicalName: try values.decode(String.self, forKey: ProjectSourceCodingKey("logicalName")),
+            source: try values.decode(Source.self, forKey: ProjectSourceCodingKey("source"))
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: ProjectSourceCodingKey.self)
+        try values.encode(schemaVersion, forKey: ProjectSourceCodingKey("schemaVersion"))
+        try values.encode(operationID, forKey: ProjectSourceCodingKey("operationId"))
+        try values.encode(expectedRevision, forKey: ProjectSourceCodingKey("expectedRevision"))
+        try values.encode(name, forKey: ProjectSourceCodingKey("name"))
+        try values.encode(logicalName, forKey: ProjectSourceCodingKey("logicalName"))
+        try values.encode(source, forKey: ProjectSourceCodingKey("source"))
     }
 }
 

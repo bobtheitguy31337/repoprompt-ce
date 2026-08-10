@@ -29,6 +29,10 @@ public actor OwnedResourceReconciliationService {
     private let worktreeRoot: String
     private let providerHomeRoot: String?
     private let providerOutputRoot: String?
+    private let projectRoot: String?
+    private let projectRootIdentity: String?
+    private let pinnedProjectRoot: PinnedFilesystemRoot?
+    private let filesystem: any FilesystemAuthorityPort
     private let runner: any WorkspaceCommandRunning
     private let gitExecutable: String
 
@@ -38,14 +42,31 @@ public actor OwnedResourceReconciliationService {
         worktreeRoot: String,
         providerHomeRoot: String? = nil,
         providerOutputRoot: String? = nil,
+        projectRoot: String? = nil,
+        filesystem: any FilesystemAuthorityPort = LocalFilesystemAuthority(),
         runner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(),
         gitExecutable: String = "/usr/bin/git"
-    ) {
+    ) throws {
         self.repository = repository
         self.artifactRoot = URL(fileURLWithPath: artifactRoot).standardizedFileURL.path
         self.worktreeRoot = URL(fileURLWithPath: worktreeRoot).standardizedFileURL.path
         self.providerHomeRoot = providerHomeRoot.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
         self.providerOutputRoot = providerOutputRoot.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        if let projectRoot {
+            let standardized = URL(fileURLWithPath: projectRoot).standardizedFileURL.path
+            let canonical = try filesystem.canonicalizeRoot(standardized)
+            guard canonical.path == standardized else {
+                throw ServiceAPIError(code: .rootUnauthorized, message: "Configured project root or an ancestor is a symbolic link")
+            }
+            self.projectRoot = canonical.path
+            self.projectRootIdentity = canonical.identity
+            self.pinnedProjectRoot = try PinnedFilesystemRoot(path: canonical.path, identity: canonical.identity)
+        } else {
+            self.projectRoot = nil
+            self.projectRootIdentity = nil
+            self.pinnedProjectRoot = nil
+        }
+        self.filesystem = filesystem
         self.runner = runner
         self.gitExecutable = gitExecutable
     }
@@ -54,8 +75,9 @@ public actor OwnedResourceReconciliationService {
         await reconcile(now: now, recoverInterruptedPreparations: false)
     }
 
-    public func reconcileStartup(now: Date = Date()) async -> OwnedResourceReconciliationReport {
-        await reconcile(now: now, recoverInterruptedPreparations: true)
+    public func reconcileStartup(now: Date = Date()) async throws -> OwnedResourceReconciliationReport {
+        try validateProjectRootIdentity()
+        return await reconcile(now: now, recoverInterruptedPreparations: true)
     }
 
     private func reconcile(
@@ -135,6 +157,13 @@ public actor OwnedResourceReconciliationService {
                 if record.kind == .artifact, artifactMatches(record) { return .prepared }
                 if record.kind == .worktree, try await worktreeMatches(record) { return .prepared }
                 if isProviderResource(record), providerResourceIsSafe(record) { return .prepared }
+                if record.kind == .cloneStaging, try cloneResourceIsSafe(record) {
+                    if recoverInterruptedPreparation {
+                        try removeCloneResource(record)
+                        return .deleted
+                    }
+                    return .quarantined
+                }
                 return .quarantined
             }
             if recoverInterruptedPreparation || record.retentionDeadline.map({ $0 <= now }) == true { return .failed }
@@ -153,6 +182,10 @@ public actor OwnedResourceReconciliationService {
                 try removeProviderResource(record)
                 return .deleted
             }
+            if record.kind == .cloneStaging {
+                try removeCloneResource(record)
+                return .deleted
+            }
             return record.lifecycleState
         case .active:
             guard exists else { return .missing }
@@ -163,6 +196,7 @@ public actor OwnedResourceReconciliationService {
             }
             if record.kind == .artifact, !artifactMatches(record) { return .corrupt }
             if record.kind == .worktree, try await !worktreeMatches(record) { return .corrupt }
+            if record.kind == .cloneStaging, try !cloneResourceIsSafe(record) { return .corrupt }
             return .active
         case .missing, .corrupt, .conflicted:
             return record.lifecycleState
@@ -217,6 +251,34 @@ public actor OwnedResourceReconciliationService {
         for path in resourcePaths(record) where FileManager.default.fileExists(atPath: path) {
             try FileManager.default.removeItem(atPath: path)
             try DurableFilesystem.fsyncDirectory(URL(fileURLWithPath: path).deletingLastPathComponent().path)
+        }
+    }
+
+    private func cloneResourceIsSafe(_ record: OwnedResourceRecord) throws -> Bool {
+        guard let projectRoot else { return false }
+        try validateProjectRootIdentity()
+        return resourcePaths(record).allSatisfy {
+            isContained($0, root: projectRoot)
+                && (try? filesystem.contains(root: projectRoot, candidate: $0)) == true
+                && !isSymbolicLink($0)
+        }
+    }
+
+    private func removeCloneResource(_ record: OwnedResourceRecord) throws {
+        guard try cloneResourceIsSafe(record), let pinnedProjectRoot else {
+            throw ServiceAPIError(code: .rootUnauthorized, message: "Project clone cleanup path is unsafe")
+        }
+        for path in resourcePaths(record) {
+            try validateProjectRootIdentity()
+            try pinnedProjectRoot.removeTree(at: path)
+        }
+    }
+
+    private func validateProjectRootIdentity() throws {
+        guard let projectRoot, let projectRootIdentity else { return }
+        let canonical = try filesystem.canonicalizeRoot(projectRoot)
+        guard canonical.path == projectRoot, canonical.identity == projectRootIdentity else {
+            throw ServiceAPIError(code: .rootUnauthorized, message: "Configured project root identity changed")
         }
     }
 

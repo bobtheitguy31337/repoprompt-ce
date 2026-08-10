@@ -5,6 +5,11 @@ import RepoPromptServiceProtocol
 import RepoPromptWorkspaceRuntimeCore
 
 public actor RepoPromptHeadlessAuthority {
+    private struct InFlightProjectSourceOperation {
+        let requestDigest: String
+        var waiters: [UUID: CheckedContinuation<ProjectSourceOperationWireSnapshot, Error>]
+    }
+
     private let store: SQLiteServiceStore
     private let clock: any RuntimeClock
     private let ids: any RuntimeIDGenerator
@@ -16,6 +21,7 @@ public actor RepoPromptHeadlessAuthority {
     private let interactionDelivery: (any InteractionDeliveryPort)?
     private let contextBuilderRuntime: (any ContextBuilderRuntimeService)?
     private let oracleRuntime: (any OracleRuntimeService)?
+    private let projectSourceService: ProjectSourceProvisioningService?
     private let workflowCatalog = BuiltinWorkflowCatalog()
     private let projects = ProjectRuntimeSupervisor()
     private let eventHub = ServiceEventHub()
@@ -27,6 +33,8 @@ public actor RepoPromptHeadlessAuthority {
     private var providerToolInvocations: [UUID: [String: ToolInvocationSnapshot]] = [:]
     private var providerControlReadyRuns: Set<UUID> = []
     private var cancellationBarriers: Set<UUID> = []
+    private var inFlightProjectSourceOperations: [String: InFlightProjectSourceOperation] = [:]
+    private var projectRepositoryMutationBarriers: Set<UUID> = []
     private var quiescing = false
 
     public init(
@@ -40,7 +48,8 @@ public actor RepoPromptHeadlessAuthority {
         providerAdapter: (any AgentProviderDispatcher)? = nil,
         interactionDelivery: (any InteractionDeliveryPort)? = nil,
         contextBuilderRuntime: (any ContextBuilderRuntimeService)? = nil,
-        oracleRuntime: (any OracleRuntimeService)? = nil
+        oracleRuntime: (any OracleRuntimeService)? = nil,
+        projectSourceService: ProjectSourceProvisioningService? = nil
     ) {
         self.store = store
         self.clock = clock
@@ -53,6 +62,7 @@ public actor RepoPromptHeadlessAuthority {
         self.interactionDelivery = interactionDelivery ?? (providerAdapter as? any InteractionDeliveryPort)
         self.contextBuilderRuntime = contextBuilderRuntime ?? providerAdapter.map { ProviderContextBuilderRuntimeService(providers: $0) }
         self.oracleRuntime = oracleRuntime ?? providerAdapter.map { ProviderOracleRuntimeService(providers: $0) }
+        self.projectSourceService = projectSourceService
     }
 
     public func recover() async throws {
@@ -112,7 +122,10 @@ public actor RepoPromptHeadlessAuthority {
         if let existing = try await store.idempotencyResult(idempotency) {
             return try JSONDecoder.serviceDecoder.decode(ProjectSnapshot.self, from: existing.response)
         }
-        guard !input.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !input.roots.isEmpty else { throw ServiceAPIError(code: .invalidRequest, message: "Project name and at least one root are required") }
+        let projectName = input.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !projectName.isEmpty, projectName.utf8.count <= 200,
+              projectName.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
+        else { throw ServiceAPIError(code: .invalidRequest, message: "Project name is invalid") }
         let projectID = ids.next()
         var canonicalRoots: [CanonicalRoot] = []
         var seenIdentities = Set<String>()
@@ -122,9 +135,377 @@ public actor RepoPromptHeadlessAuthority {
             canonicalRoots.append(CanonicalRoot(snapshot: ProjectRootSnapshot(rootID: ids.next(), logicalName: root.logicalName, canonicalPath: canonical.path, writable: root.writable), filesystemIdentity: canonical.identity))
         }
         let cursor = try await store.nextCursor()
-        let snapshot = ProjectSnapshot(projectID: projectID, name: input.name, creator: externalActor, state: .active, roots: canonicalRoots.map(\.snapshot), revision: 1, cursor: cursor)
+        let snapshot = ProjectSnapshot(projectID: projectID, name: projectName, creator: externalActor, state: .active, roots: canonicalRoots.map(\.snapshot), revision: 1, cursor: cursor)
         let event = try await store.persistProject(snapshot, rootIdentities: Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.snapshot.rootID, $0.filesystemIdentity) }), eventType: .projectCreated, actor: externalActor, correlationID: ids.next(), idempotency: idempotency)
         let project = ProjectAuthority(snapshot: snapshot, roots: canonicalRoots)
+        await projects.install(project)
+        tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
+        await eventHub.publish(event)
+        return snapshot
+    }
+
+    public func projectSourceCapabilities() async -> ProjectSourceCapabilities? {
+        await projectSourceService?.capabilities()
+    }
+
+    public func createProjectFromSource(
+        input: ProjectSourceOperationInput,
+        externalActor: ExternalActor,
+        idempotencyKey: String,
+        requestDigest: String
+    ) async throws -> ProjectSourceOperationWireSnapshot {
+        let scope = externalActor.goblinUserID + "\u{0}" + idempotencyKey
+        if var existing = inFlightProjectSourceOperations[scope] {
+            guard existing.requestDigest == requestDigest else {
+                throw ServiceAPIError(code: .idempotencyConflict, message: "Idempotency key was reused with a different request")
+            }
+            let waiterID = UUID()
+            return try await withTaskCancellationHandler(operation: {
+                try await withCheckedThrowingContinuation { continuation in
+                    existing.waiters[waiterID] = continuation
+                    inFlightProjectSourceOperations[scope] = existing
+                }
+            }, onCancel: {
+                Task { await self.cancelProjectSourceWaiter(scope: scope, waiterID: waiterID) }
+            })
+        }
+        inFlightProjectSourceOperations[scope] = .init(requestDigest: requestDigest, waiters: [:])
+        do {
+            let result = try await performCreateProjectFromSource(
+                input: input,
+                externalActor: externalActor,
+                idempotencyKey: idempotencyKey,
+                requestDigest: requestDigest
+            )
+            let waiters = inFlightProjectSourceOperations.removeValue(forKey: scope)?.waiters ?? [:]
+            waiters.values.forEach { $0.resume(returning: result) }
+            return result
+        } catch {
+            let waiters = inFlightProjectSourceOperations.removeValue(forKey: scope)?.waiters ?? [:]
+            waiters.values.forEach { $0.resume(throwing: error) }
+            throw error
+        }
+    }
+
+    private func cancelProjectSourceWaiter(scope: String, waiterID: UUID) {
+        guard var flight = inFlightProjectSourceOperations[scope],
+              let waiter = flight.waiters.removeValue(forKey: waiterID)
+        else { return }
+        inFlightProjectSourceOperations[scope] = flight
+        waiter.resume(throwing: CancellationError())
+    }
+
+    private func performCreateProjectFromSource(
+        input: ProjectSourceOperationInput,
+        externalActor: ExternalActor,
+        idempotencyKey: String,
+        requestDigest: String
+    ) async throws -> ProjectSourceOperationWireSnapshot {
+        try ensureWritable()
+        guard let projectSourceService else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Project source operations are not configured")
+        }
+        let idempotency = IdempotencyInput(
+            actorID: externalActor.goblinUserID,
+            operation: "createProjectFromSource",
+            key: idempotencyKey,
+            requestDigest: requestDigest
+        )
+        if let existing = try await store.idempotencyResult(idempotency) {
+            let snapshot = try JSONDecoder.serviceDecoder.decode(ProjectSnapshot.self, from: existing.response)
+            return ProjectSourceOperationWireSnapshot(
+                operationID: input.operationID,
+                projectID: snapshot.projectID,
+                state: .completed,
+                progressRevision: 4,
+                messageCode: "project_source_completed",
+                project: ProjectWireSnapshot(snapshot)
+            )
+        }
+
+        let projectID = ids.next()
+        let rootID = ids.next()
+        func progress(_ state: ProjectSourceOperationState, revision: Int64, code: String, error: ServiceErrorCode? = nil) async {
+            let snapshot = ProjectSourceOperationWireSnapshot(
+                operationID: input.operationID,
+                projectID: projectID,
+                state: state,
+                progressRevision: revision,
+                messageCode: code,
+                errorCode: error
+            )
+            guard let payload = try? JSONEncoder.serviceEncoder.encode(snapshot),
+                  let event = try? await store.persistServiceDiagnostic(
+                      projectID: projectID,
+                      actor: externalActor,
+                      correlationID: input.operationID,
+                      payload: payload
+                  )
+            else { return }
+            await eventHub.publish(event)
+        }
+
+        await progress(.validating, revision: 1, code: "project_source_validating")
+        do {
+            switch input.source {
+            case .configuredRoot:
+                await progress(.validating, revision: 2, code: "project_source_connecting")
+            case .gitClone:
+                await progress(.cloning, revision: 2, code: "project_source_cloning")
+            }
+            let root = try await projectSourceService.provision(input: input, projectID: projectID, rootID: rootID)
+            await progress(.promoting, revision: 3, code: "project_source_promoting")
+            let cursor = try await store.nextCursor()
+            let snapshot = ProjectSnapshot(
+                projectID: projectID,
+                name: input.name.trimmingCharacters(in: .whitespacesAndNewlines),
+                creator: externalActor,
+                state: .active,
+                roots: [root.snapshot],
+                revision: 1,
+                cursor: cursor
+            )
+            let event = try await store.persistProject(
+                snapshot,
+                rootIdentities: [root.snapshot.rootID: root.filesystemIdentity],
+                eventType: .projectCreated,
+                actor: externalActor,
+                correlationID: input.operationID,
+                idempotency: idempotency
+            )
+            let project = ProjectAuthority(snapshot: snapshot, roots: [root])
+            await projects.install(project)
+            tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
+            await eventHub.publish(event)
+            await progress(.completed, revision: 4, code: "project_source_completed")
+            return ProjectSourceOperationWireSnapshot(
+                operationID: input.operationID,
+                projectID: projectID,
+                state: .completed,
+                progressRevision: 4,
+                messageCode: "project_source_completed",
+                project: ProjectWireSnapshot(snapshot)
+            )
+        } catch {
+            await projectSourceService.abandonProvisionedClone(projectID: projectID)
+            let code = (error as? ServiceAPIError)?.code ?? .dependencyUnavailable
+            await progress(.failed, revision: 4, code: "project_source_failed", error: code)
+            throw error
+        }
+    }
+
+    public func addProjectRepository(
+        projectID: UUID,
+        input: AddProjectRepositoryInput,
+        externalActor: ExternalActor,
+        idempotencyKey: String,
+        requestDigest: String
+    ) async throws -> ProjectSourceOperationWireSnapshot {
+        let scope = projectID.uuidString + "\u{0}" + externalActor.goblinUserID + "\u{0}" + idempotencyKey
+        if var existing = inFlightProjectSourceOperations[scope] {
+            guard existing.requestDigest == requestDigest else {
+                throw ServiceAPIError(code: .idempotencyConflict, message: "Idempotency key was reused with a different request")
+            }
+            let waiterID = UUID()
+            return try await withTaskCancellationHandler(operation: {
+                try await withCheckedThrowingContinuation { continuation in
+                    existing.waiters[waiterID] = continuation
+                    inFlightProjectSourceOperations[scope] = existing
+                }
+            }, onCancel: {
+                Task { await self.cancelProjectSourceWaiter(scope: scope, waiterID: waiterID) }
+            })
+        }
+        inFlightProjectSourceOperations[scope] = .init(requestDigest: requestDigest, waiters: [:])
+        do {
+            let result = try await performAddProjectRepository(
+                projectID: projectID,
+                input: input,
+                externalActor: externalActor,
+                idempotencyKey: idempotencyKey,
+                requestDigest: requestDigest
+            )
+            let waiters = inFlightProjectSourceOperations.removeValue(forKey: scope)?.waiters ?? [:]
+            waiters.values.forEach { $0.resume(returning: result) }
+            return result
+        } catch {
+            let waiters = inFlightProjectSourceOperations.removeValue(forKey: scope)?.waiters ?? [:]
+            waiters.values.forEach { $0.resume(throwing: error) }
+            throw error
+        }
+    }
+
+    private func performAddProjectRepository(
+        projectID: UUID,
+        input: AddProjectRepositoryInput,
+        externalActor: ExternalActor,
+        idempotencyKey: String,
+        requestDigest: String
+    ) async throws -> ProjectSourceOperationWireSnapshot {
+        try ensureWritable()
+        guard let projectSourceService else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Project source operations are not configured")
+        }
+        let idempotency = IdempotencyInput(
+            actorID: externalActor.goblinUserID,
+            operation: "addProjectRepository:\(projectID.uuidString)",
+            key: idempotencyKey,
+            requestDigest: requestDigest
+        )
+        if let existing = try await store.idempotencyResult(idempotency) {
+            return try JSONDecoder.serviceDecoder.decode(ProjectSourceOperationWireSnapshot.self, from: existing.response)
+        }
+
+        let logicalName = input.logicalName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard input.schemaVersion == 1, input.expectedRevision >= 1,
+              !logicalName.isEmpty, logicalName.utf8.count <= 128,
+              logicalName.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
+        else { throw ServiceAPIError(code: .invalidRequest, message: "Repository addition is invalid") }
+        let initial = try await projectSnapshot(projectID: projectID)
+        guard initial.revision == input.expectedRevision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Project revision is stale", currentRevision: initial.revision)
+        }
+        guard !initial.roots.contains(where: { $0.logicalName == logicalName }) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Repository logical name is already in use")
+        }
+        try await ensureProjectHasNoActiveProviderRun(projectID: projectID)
+        guard projectRepositoryMutationBarriers.insert(projectID).inserted else {
+            throw ServiceAPIError(code: .runAlreadyActive, message: "A repository mutation is already active for this project")
+        }
+        defer { projectRepositoryMutationBarriers.remove(projectID) }
+
+        let operationID = ids.next()
+        let rootID = ids.next()
+        func progress(_ state: ProjectSourceOperationState, revision: Int64, code: String, error: ServiceErrorCode? = nil) async {
+            let snapshot = ProjectSourceOperationWireSnapshot(
+                operationID: operationID,
+                projectID: projectID,
+                state: state,
+                progressRevision: revision,
+                messageCode: code,
+                errorCode: error
+            )
+            guard let payload = try? JSONEncoder.serviceEncoder.encode(snapshot),
+                  let event = try? await store.persistServiceDiagnostic(
+                      projectID: projectID,
+                      actor: externalActor,
+                      correlationID: operationID,
+                      payload: payload
+                  )
+            else { return }
+            await eventHub.publish(event)
+        }
+
+        await progress(.validating, revision: 1, code: "project_repository_validating")
+        do {
+            await progress(.cloning, revision: 2, code: "project_repository_cloning")
+            let root = try await projectSourceService.provisionRepository(
+                input: input,
+                operationID: operationID,
+                projectID: projectID,
+                rootID: rootID
+            )
+            await progress(.promoting, revision: 3, code: "project_repository_promoting")
+            let current = try await projectSnapshot(projectID: projectID)
+            try await ensureProjectHasNoActiveProviderRun(projectID: projectID)
+            guard current.revision == input.expectedRevision else {
+                throw ServiceAPIError(code: .staleRevision, message: "Project revision is stale", currentRevision: current.revision)
+            }
+            guard !current.roots.contains(where: { $0.logicalName == logicalName || $0.canonicalPath == root.snapshot.canonicalPath }) else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Repository root is already attached")
+            }
+            var identities = try await store.projectRootIdentities(projectID: projectID)
+            identities[rootID] = root.filesystemIdentity
+            let cursor = try await store.nextCursor()
+            let snapshot = ProjectSnapshot(
+                projectID: projectID,
+                name: current.name,
+                creator: current.creator,
+                state: .active,
+                roots: current.roots + [root.snapshot],
+                revision: current.revision + 1,
+                cursor: cursor
+            )
+            let result = ProjectSourceOperationWireSnapshot(
+                operationID: operationID,
+                projectID: projectID,
+                state: .completed,
+                progressRevision: 4,
+                messageCode: "project_repository_completed",
+                project: ProjectWireSnapshot(snapshot)
+            )
+            let event = try await store.persistProject(
+                snapshot,
+                rootIdentities: identities,
+                eventType: .projectUpdated,
+                actor: externalActor,
+                correlationID: operationID,
+                idempotency: idempotency,
+                expectedRevision: input.expectedRevision,
+                idempotencyResponse: JSONEncoder.serviceEncoder.encode(result),
+                idempotencyStatus: 201
+            )
+            let canonicalRoots = try snapshot.roots.map { snapshotRoot -> CanonicalRoot in
+                guard let identity = identities[snapshotRoot.rootID] else {
+                    throw ServiceAPIError(code: .persistenceUnavailable, message: "Project root identity is unavailable")
+                }
+                return CanonicalRoot(snapshot: snapshotRoot, filesystemIdentity: identity)
+            }
+            let project = ProjectAuthority(snapshot: snapshot, roots: canonicalRoots)
+            await projects.install(project)
+            tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
+            await eventHub.publish(event)
+            await progress(.completed, revision: 4, code: "project_repository_completed")
+            return result
+        } catch {
+            await projectSourceService.abandonProvisionedRepository(rootID: rootID)
+            let code = (error as? ServiceAPIError)?.code ?? .dependencyUnavailable
+            await progress(.failed, revision: 4, code: "project_repository_failed", error: code)
+            throw error
+        }
+    }
+
+    public func renameProject(
+        projectID: UUID,
+        input: RenameProjectInput,
+        actor: ExternalActor,
+        idempotencyKey: String,
+        requestDigest: String
+    ) async throws -> ProjectSnapshot {
+        try ensureWritable()
+        let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "renameProject", key: idempotencyKey, requestDigest: requestDigest)
+        if let existing = try await store.idempotencyResult(idempotency) {
+            return try JSONDecoder.serviceDecoder.decode(ProjectSnapshot.self, from: existing.response)
+        }
+        let current = try await projectSnapshot(projectID: projectID)
+        guard current.revision == input.expectedRevision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Project revision is stale", currentRevision: current.revision)
+        }
+        let projectName = input.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !projectName.isEmpty, projectName.utf8.count <= 200,
+              projectName.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
+        else { throw ServiceAPIError(code: .invalidRequest, message: "Project name is invalid") }
+        let cursor = try await store.nextCursor()
+        let snapshot = ProjectSnapshot(
+            projectID: projectID,
+            name: projectName,
+            creator: current.creator,
+            state: current.state,
+            roots: current.roots,
+            revision: current.revision + 1,
+            cursor: cursor
+        )
+        let event = try await store.persistProject(
+            snapshot,
+            eventType: .projectUpdated,
+            actor: actor,
+            correlationID: ids.next(),
+            idempotency: idempotency,
+            expectedRevision: input.expectedRevision
+        )
+        let identities = try await store.projectRootIdentities(projectID: projectID)
+        let roots = snapshot.roots.compactMap { root in identities[root.rootID].map { CanonicalRoot(snapshot: root, filesystemIdentity: $0) } }
+        let project = ProjectAuthority(snapshot: snapshot, roots: roots)
         await projects.install(project)
         tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
         await eventHub.publish(event)
@@ -137,7 +518,10 @@ public actor RepoPromptHeadlessAuthority {
         if let existing = try await store.idempotencyResult(idempotency) { return try JSONDecoder.serviceDecoder.decode(ProjectSnapshot.self, from: existing.response) }
         let current = try await projectSnapshot(projectID: projectID)
         guard current.revision == input.expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Project revision is stale", currentRevision: current.revision) }
-        guard !input.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !input.roots.isEmpty else { throw ServiceAPIError(code: .invalidRequest, message: "Project name and at least one root are required") }
+        let projectName = input.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !projectName.isEmpty, projectName.utf8.count <= 200,
+              projectName.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
+        else { throw ServiceAPIError(code: .invalidRequest, message: "Project name is invalid") }
         let activeSessions = try await sessionSnapshots().filter { $0.projectID == projectID && ![SessionLifecycleState.completed, .failed, .canceled, .archived].contains($0.state) }
         let requestedPaths = Set(input.roots.map { URL(fileURLWithPath: $0.path).standardizedFileURL.resolvingSymlinksInPath().path })
         let currentPaths = Set(current.roots.map(\.canonicalPath))
@@ -154,7 +538,7 @@ public actor RepoPromptHeadlessAuthority {
             canonicalRoots.append(CanonicalRoot(snapshot: ProjectRootSnapshot(rootID: existingID ?? ids.next(), logicalName: root.logicalName, canonicalPath: canonical.path, writable: root.writable), filesystemIdentity: canonical.identity))
         }
         let cursor = try await store.nextCursor()
-        let snapshot = ProjectSnapshot(projectID: projectID, name: input.name, creator: current.creator, state: .active, roots: canonicalRoots.map(\.snapshot), revision: current.revision + 1, cursor: cursor)
+        let snapshot = ProjectSnapshot(projectID: projectID, name: projectName, creator: current.creator, state: .active, roots: canonicalRoots.map(\.snapshot), revision: current.revision + 1, cursor: cursor)
         let event = try await store.persistProject(snapshot, rootIdentities: Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.snapshot.rootID, $0.filesystemIdentity) }), eventType: .projectUpdated, actor: actor, correlationID: ids.next(), idempotency: idempotency)
         let project = ProjectAuthority(snapshot: snapshot, roots: canonicalRoots)
         await projects.install(project)
@@ -211,9 +595,6 @@ public actor RepoPromptHeadlessAuthority {
         try ensureWritable()
         let isInitialImport = sessions[seed.sessionID] == nil
         if isInitialImport {
-            guard !seed.roots.isEmpty else {
-                throw ServiceAPIError(code: .invalidRequest, message: "An embedded session requires at least one project root")
-            }
             if let existingProject = await projectSnapshots().first(where: { $0.projectID == seed.projectID }) {
                 guard Set(existingProject.roots.map(\.canonicalPath)) == Set(seed.roots.map(\.canonicalPath)) else {
                     throw ServiceAPIError(code: .worktreeConflict, message: "Embedded project identity is already bound to different roots")
@@ -1587,6 +1968,15 @@ public actor RepoPromptHeadlessAuthority {
         if quiescing { throw ServiceAPIError(code: .quiescing, message: "Service is quiescing", retryable: true) }
     }
 
+    private func ensureProjectHasNoActiveProviderRun(projectID: UUID) async throws {
+        for session in sessions.values {
+            let snapshot = await session.snapshot()
+            if snapshot.projectID == projectID, await session.activeBinding() != nil {
+                throw ServiceAPIError(code: .runAlreadyActive, message: "Repositories cannot change while a project provider run is active")
+            }
+        }
+    }
+
     private func validateSelection(_ entries: [LogicalSelectionEntry], projectID: UUID) async throws {
         let project = try await projects.authority(projectID: projectID)
         for entry in entries {
@@ -1717,6 +2107,9 @@ public actor RepoPromptHeadlessAuthority {
     ) async throws -> CommandReceipt {
         guard let providerAdapter else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider runtime is not configured") }
         let snapshot = await session.snapshot()
+        guard !projectRepositoryMutationBarriers.contains(snapshot.projectID) else {
+            throw ServiceAPIError(code: .runAlreadyActive, message: "A repository mutation is active for this project")
+        }
         guard let permissions = try await store.permissions(sessionID: sessionID) else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Execution permissions are not configured") }
         guard permissions.mode != "disabled" else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Provider execution is disabled by session policy") }
         guard ["readOnly", "workspaceWrite", "fullAccess"].contains(permissions.mode) else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Execution permission mode is invalid") }
@@ -1730,6 +2123,7 @@ public actor RepoPromptHeadlessAuthority {
         if resumeMode == .resume, !capability.supportsResume || resumeIdentity == nil {
             throw ServiceAPIError(code: .resumeUnsupported, message: "No durable provider identity is available for native resume")
         }
+        let workingDirectory = try await workingDirectory(session: snapshot)
         let binding = try await session.beginRun(connectionGeneration: snapshot.runGeneration + 1)
         let current = await session.snapshot()
         let cursor = try await store.nextCursor()
@@ -1741,7 +2135,6 @@ public actor RepoPromptHeadlessAuthority {
         let run = ProviderRunSnapshot(runID: binding.runID, sessionID: sessionID, provider: snapshot.provider, providerSessionID: resumeIdentity, state: "running", generation: binding.generation, turnEpoch: binding.turnEpoch, startReason: resumeIdentity == nil ? "fresh" : "resume", startedAt: clock.now())
         try await store.persistRun(run)
         await providerAdapter.prepareRun(kind: snapshot.provider, runID: binding.runID)
-        let workingDirectory = try await workingDirectory(session: snapshot)
         let prompt = providerPrompt
             ?? snapshot.transcript.last(where: { $0.kind == .human })?.content
             ?? "Continue the repository task."
@@ -2026,7 +2419,16 @@ public actor RepoPromptHeadlessAuthority {
     private func workingDirectory(session: SessionSnapshot) async throws -> String {
         if let binding = try await sessionWorktreeBinding(session: session) { return binding.physicalPath }
         let project = try await projectSnapshot(projectID: session.projectID)
-        guard let root = project.roots.first else { throw ServiceAPIError(code: .rootUnauthorized, message: "Project has no roots") }
+        if let projectSourceService {
+            let workspace = try await projectSourceService.projectWorkspaceDirectory(projectID: project.projectID)
+            if project.roots.isEmpty { return workspace }
+            let repositories = URL(fileURLWithPath: workspace).appendingPathComponent("repositories").path
+            let prefix = repositories.hasSuffix("/") ? repositories : repositories + "/"
+            if project.roots.allSatisfy({ $0.canonicalPath.hasPrefix(prefix) }) { return workspace }
+        }
+        guard let root = project.roots.first else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Empty projects require managed workspace storage")
+        }
         return root.canonicalPath
     }
 

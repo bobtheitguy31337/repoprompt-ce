@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "vectors": [
+    {
+      "publicBody": {
+        "schemaVersion": 1,
+        "expectedRevision": 1,
+        "logicalName": "server",
+        "source": {
+          "type": "gitClone",
+          "remote": "https://github.com/degentlemen/chat-server.git",
+          "ref": "main"
+        }
+      }
+    },
+    {
+      "publicBody": {
+        "schemaVersion": 1,
+        "expectedRevision": 2,
+        "logicalName": "ops",
+        "source": {
+          "type": "gitClone",
+          "remote": "https://github.com/degentlemen/chat-ops.git",
+          "ref": "main"
+        }
+      }
+    }
+  ]
+}

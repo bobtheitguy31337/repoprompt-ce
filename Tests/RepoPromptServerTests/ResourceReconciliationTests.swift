@@ -12,11 +12,13 @@ final class ResourceReconciliationTests: XCTestCase {
         let source = directory.appendingPathComponent("source", isDirectory: true)
         let providerHomes = directory.appendingPathComponent("provider-homes", isDirectory: true)
         let providerOutput = directory.appendingPathComponent("provider-output", isDirectory: true)
+        let projects = directory.appendingPathComponent("projects", isDirectory: true)
         try FileManager.default.createDirectory(at: artifacts, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: worktrees, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: providerHomes, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: providerOutput, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: projects, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let artifactPath = artifacts.appendingPathComponent("owned.bin")
@@ -32,6 +34,17 @@ final class ResourceReconciliationTests: XCTestCase {
         let providerStderr = providerOutput.appendingPathComponent("expired.stderr")
         try Data("out".utf8).write(to: providerStdout)
         try Data("err".utf8).write(to: providerStderr)
+        let cloneOperation = projects.appendingPathComponent(".source-staging/operation", isDirectory: true)
+        let cloneFinal = projects.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let unknownProject = projects.appendingPathComponent("not-owned", isDirectory: true)
+        try FileManager.default.createDirectory(at: cloneOperation, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: cloneFinal, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: unknownProject, withIntermediateDirectories: true)
+        try Data("outside".utf8).write(to: unknownProject.appendingPathComponent("sentinel"))
+        try FileManager.default.createSymbolicLink(
+            at: cloneOperation.appendingPathComponent("repository-symlink"),
+            withDestinationURL: unknownProject
+        )
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let deadline = Date().addingTimeInterval(15 * 60)
@@ -67,29 +80,109 @@ final class ResourceReconciliationTests: XCTestCase {
             lifecycleState: .cleanupPending,
             retentionDeadline: deadline
         )
+        let interruptedClone = OwnedResourceRecord(
+            kind: .cloneStaging,
+            projectID: UUID(),
+            externalID: UUID(),
+            internalPathIdentity: cloneFinal.path,
+            temporaryPathIdentity: cloneOperation.path,
+            lifecycleState: .preparing,
+            retentionDeadline: deadline
+        )
         try await store.reserveOwnedResource(artifact)
         try await store.reserveOwnedResource(worktree)
         try await store.reserveOwnedResource(providerHome)
         try await store.reserveOwnedResource(providerCapture)
-        let reconciler = OwnedResourceReconciliationService(
+        try await store.reserveOwnedResource(interruptedClone)
+        let reconciler = try OwnedResourceReconciliationService(
             repository: store,
             artifactRoot: artifacts.path,
             worktreeRoot: worktrees.path,
             providerHomeRoot: providerHomes.path,
             providerOutputRoot: providerOutput.path,
+            projectRoot: projects.path,
             runner: DirtyWorktreeRunner()
         )
-        let report = await reconciler.reconcileStartup()
-        XCTAssertEqual(report.deleted, 3)
+        let report = try await reconciler.reconcileStartup()
+        XCTAssertEqual(report.deleted, 4)
         XCTAssertFalse(FileManager.default.fileExists(atPath: artifactPath.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: unknownPath.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: worktreePath.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: providerHomePath.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: providerStdout.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: providerStderr.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cloneOperation.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cloneFinal.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unknownProject.appendingPathComponent("sentinel").path))
         let persistedWorktree = try await store.ownedResource(externalID: XCTUnwrap(worktree.externalID), kind: .worktree)
         XCTAssertEqual(persistedWorktree?.lifecycleState, .quarantined)
         try await store.close()
+    }
+
+    func testStartupReconciliationRejectsReplacedSymlinkProjectRootWithoutDeletingOutsideVolume() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let artifacts = directory.appendingPathComponent("artifacts", isDirectory: true)
+        let worktrees = directory.appendingPathComponent("worktrees", isDirectory: true)
+        let projects = directory.appendingPathComponent("projects", isDirectory: true)
+        let outside = directory.appendingPathComponent("outside", isDirectory: true)
+        for path in [artifacts, worktrees, projects, outside] {
+            try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        }
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let reconciler = try OwnedResourceReconciliationService(
+            repository: store,
+            artifactRoot: artifacts.path,
+            worktreeRoot: worktrees.path,
+            projectRoot: projects.path
+        )
+        let outsideCheckout = outside.appendingPathComponent("checkout", isDirectory: true)
+        try FileManager.default.createDirectory(at: outsideCheckout, withIntermediateDirectories: true)
+        try Data("must survive".utf8).write(to: outsideCheckout.appendingPathComponent("sentinel"))
+        let record = OwnedResourceRecord(
+            kind: .cloneStaging,
+            projectID: UUID(),
+            externalID: UUID(),
+            internalPathIdentity: projects.appendingPathComponent("checkout").path,
+            lifecycleState: .preparing,
+            retentionDeadline: Date().addingTimeInterval(-1)
+        )
+        try await store.reserveOwnedResource(record)
+
+        try FileManager.default.removeItem(at: projects)
+        try FileManager.default.createSymbolicLink(at: projects, withDestinationURL: outside)
+        do {
+            _ = try await reconciler.reconcileStartup()
+            XCTFail("Expected immutable project-root rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .rootUnauthorized)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outsideCheckout.appendingPathComponent("sentinel").path))
+        let persisted = try await store.ownedResource(externalID: XCTUnwrap(record.externalID), kind: .cloneStaging)
+        XCTAssertEqual(persisted?.lifecycleState, .preparing)
+        try await store.close()
+    }
+
+    func testPinnedProjectRootRemovalCannotBeRedirectedByReplacementRace() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let projects = directory.appendingPathComponent("projects", isDirectory: true)
+        let original = directory.appendingPathComponent("projects-original", isDirectory: true)
+        let outside = directory.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: projects.appendingPathComponent("owned"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside.appendingPathComponent("owned"), withIntermediateDirectories: true)
+        try Data("inside".utf8).write(to: projects.appendingPathComponent("owned/sentinel"))
+        try Data("outside".utf8).write(to: outside.appendingPathComponent("owned/sentinel"))
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let canonical = try LocalFilesystemAuthority().canonicalizeRoot(projects.path)
+        let pinned = try PinnedFilesystemRoot(path: canonical.path, identity: canonical.identity)
+        try FileManager.default.moveItem(at: projects, to: original)
+        try FileManager.default.createSymbolicLink(at: projects, withDestinationURL: outside)
+        try pinned.removeTree(at: projects.appendingPathComponent("owned").path)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: original.appendingPathComponent("owned").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outside.appendingPathComponent("owned/sentinel").path))
     }
 }
 

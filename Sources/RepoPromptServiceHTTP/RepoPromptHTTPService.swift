@@ -65,7 +65,8 @@ public struct RepoPromptHTTPService: Sendable {
                 models: [],
                 workflows: try await authority.workflowSnapshots(),
                 executionModes: executionModeCatalog(),
-                eventTypes: EventType.allCases
+                eventTypes: EventType.allCases,
+                projectSources: await authority.projectSourceCapabilities()
             ))
         } }
         router.get("/internal/v1/diagnostics") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.operatorRole], operation: "diagnostics")
@@ -122,17 +123,40 @@ public struct RepoPromptHTTPService: Sendable {
         } }
         router.post("/internal/v1/projects") { request, context in await respond(request) { let data = try await bodyData(request)
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "createProject")
-            let input = try JSONDecoder.serviceDecoder.decode(CreateProjectInput.self, from: data)
+            let input = try JSONDecoder.serviceDecoder.decode(CreateProjectWireInput.self, from: data)
+            guard input.schemaVersion == 1 else { throw ServiceAPIError(code: .invalidRequest, message: "Project creation schema is unsupported") }
             let actor = try requireActor(auth)
             let key = try requireIdempotency(request)
-            let snapshot = try await authority.createProject(input: input, externalActor: actor, idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data))
+            let snapshot = try await authority.createProject(input: .init(name: input.name, roots: []), externalActor: actor, idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data))
             return try HTTPResponses.json(ProjectWireSnapshot(snapshot), status: .created)
+        } }
+        router.post("/internal/v1/projects/:id/source-operations") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(
+                request,
+                context: context,
+                body: data,
+                roles: [.goblinApp],
+                operation: "addProjectRepository",
+                projectID: id
+            )
+            let input = try JSONDecoder.serviceDecoder.decode(AddProjectRepositoryInput.self, from: data)
+            let actor = try requireActor(auth)
+            let key = try requireIdempotency(request)
+            let result = try await authority.addProjectRepository(
+                projectID: id,
+                input: input,
+                externalActor: actor,
+                idempotencyKey: key,
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            return try HTTPResponses.json(result, status: .created)
         } }
         router.patch("/internal/v1/projects/:id") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "updateProject", projectID: id)
-            let input = try JSONDecoder.serviceDecoder.decode(UpdateProjectInput.self, from: data)
-            let snapshot = try await authority.updateProject(projectID: id, input: input, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data))
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "renameProject", projectID: id)
+            let input = try JSONDecoder.serviceDecoder.decode(RenameProjectInput.self, from: data)
+            let snapshot = try await authority.renameProject(projectID: id, input: input, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data))
             return try HTTPResponses.json(ProjectWireSnapshot(snapshot))
         } }
         router.delete("/internal/v1/projects/:id") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
