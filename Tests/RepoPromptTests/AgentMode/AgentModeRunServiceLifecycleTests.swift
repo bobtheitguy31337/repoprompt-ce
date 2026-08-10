@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptServiceProtocol
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
@@ -1809,6 +1810,19 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             expectedPIDPolicyArmer: { _ in true },
             mcpServerEnabler: serverEnabler,
             workspacePathProvider: workspacePathProvider,
+            beginAuthorityRun: { session in
+                RunBindingSnapshot(
+                    runID: session.runID ?? UUID(),
+                    generation: (session.authorityRunBinding?.generation ?? 0) + 1,
+                    turnEpoch: (session.authorityRunBinding?.turnEpoch ?? 0) + 1,
+                    connectionGeneration: 1
+                )
+            },
+            settleAuthorityStartFailure: { session in
+                if let runID = session.authorityRunBinding?.runID {
+                    session.clearAuthorityRunBinding(ifCurrent: runID)
+                }
+            },
             codexCoordinator: host.test_codexCoordinator,
             claudeCoordinator: host.claudeCoordinator,
             shouldManageCodexTooling: false,

@@ -352,7 +352,10 @@ package actor DomainAgentRunSessionStore {
         activationID: UUID,
         expectedCurrentEpoch: DomainAgentRunTurnEpoch?,
         transitionKind: DomainAgentRunEpochTransitionKind,
-        seedSnapshot: DomainAgentRunSnapshot? = nil
+        seedSnapshot: DomainAgentRunSnapshot? = nil,
+        authorityEpochID: UUID? = nil,
+        authorityOrdinal: UInt64? = nil,
+        authorityGeneration: UInt64? = nil
     ) -> EpochBeginResult {
         guard var record = currentRecord(for: registration, operation: "begin_epoch") else {
             return .rejected(reason: "stale_activation")
@@ -370,18 +373,21 @@ package actor DomainAgentRunSessionStore {
         if transitionKind == .unrelated {
             record.continuityGeneration &+= 1
         }
+        if let authorityGeneration {
+            record.continuityGeneration = authorityGeneration
+        }
         let epoch = DomainAgentRunTurnEpoch(
             runtimeID: identity.runtimeID,
             runtimeGeneration: identity.lifecycleGeneration,
             sessionID: registration.sessionID,
             activationID: activationID,
             registrationGeneration: registration.generation,
-            id: UUID(),
-            ordinal: record.nextEpochOrdinal,
-            continuityGeneration: record.continuityGeneration,
+            id: authorityEpochID ?? UUID(),
+            ordinal: authorityOrdinal ?? record.nextEpochOrdinal,
+            continuityGeneration: authorityGeneration ?? record.continuityGeneration,
             transitionKind: transitionKind
         )
-        record.nextEpochOrdinal &+= 1
+        record.nextEpochOrdinal = max(record.nextEpochOrdinal &+ 1, epoch.ordinal &+ 1)
         var state = EpochState(epoch: epoch)
         state.latestSnapshot = seedSnapshot
         record.epochStates[epoch.id] = state

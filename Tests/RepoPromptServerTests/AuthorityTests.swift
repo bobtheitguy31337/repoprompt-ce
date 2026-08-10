@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAgentRuntimeCore
 import RepoPromptHeadlessRuntime
+import RepoPromptMCPAdapter
 import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 import RepoPromptWorkspaceRuntimeCore
@@ -393,6 +394,193 @@ final class AuthorityTests: XCTestCase {
         let stored = try await authority.interactionSnapshots(sessionID: session.sessionID)
         XCTAssertEqual(deliveryCount, 1)
         XCTAssertEqual(stored.first?.state, .resolved)
+        try await store.close()
+    }
+
+    func testEmbeddedMacOSAndDirectHeadlessUseOneDurableSessionAuthority() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let actor = ExternalActor(goblinUserID: "macos", username: "macos", displayName: "macOS")
+        let projectID = UUID()
+        let rootID = UUID()
+        let sessionID = UUID()
+        let worktreeID = UUID()
+        let userID = UUID()
+        let initialPayload = Data("macos-user-row".utf8)
+        let initialEntry = TranscriptEntry(
+            entryID: userID,
+            sessionSequence: 1,
+            kind: .human,
+            content: "implement",
+            actor: actor,
+            timestamp: Date(timeIntervalSince1970: 1),
+            presentationPayload: initialPayload
+        )
+        let worktree = WorktreeBindingSnapshot(
+            bindingID: worktreeID,
+            projectID: projectID,
+            rootID: rootID,
+            sessionID: sessionID,
+            baseRef: "main",
+            branch: "authority-parity",
+            physicalPath: root.path,
+            ownershipState: .active,
+            mergeState: .clean,
+            revision: 1
+        )
+        let admitted = try await authority.ensureEmbeddedSession(EmbeddedSessionSeed(
+            projectID: projectID,
+            projectName: "macOS Project",
+            roots: [ProjectRootSnapshot(rootID: rootID, logicalName: "source", canonicalPath: root.path, writable: true)],
+            sessionID: sessionID,
+            rootSessionID: sessionID,
+            creator: actor,
+            provider: .codex,
+            transcript: [initialEntry],
+            permissionMode: "workspaceWrite",
+            providerSettings: ["macos.profile": "userConfigured"],
+            worktrees: [worktree]
+        ))
+
+        XCTAssertEqual(admitted.session.sessionID, sessionID)
+        XCTAssertEqual(admitted.session.projectID, projectID)
+        XCTAssertEqual(admitted.session.transcript.first?.presentationPayload, initialPayload)
+        XCTAssertEqual(admitted.permissions.providerSettings["macos.profile"], "userConfigured")
+        XCTAssertEqual(admitted.worktrees, [worktree])
+
+        // The direct/headless MCP adapter observes the exact same admitted
+        // identity and snapshot; it does not construct another runtime.
+        let directMCP = RepoPromptMCPAdapter(authority: authority)
+        let directBinding = RepoPromptMCPBinding(sessionID: sessionID, actor: actor)
+        let directHistoryData = try await directMCP.invoke(
+            toolName: "history",
+            argumentsJSON: try JSONSerialization.data(withJSONObject: [
+                "op": "get_session",
+                "session_id": sessionID.uuidString
+            ]),
+            binding: directBinding
+        )
+        let directHistory = try JSONDecoder.serviceDecoder.decode(SessionSnapshot.self, from: directHistoryData)
+        XCTAssertEqual(directHistory, admitted.session)
+
+        let running = try await authority.beginEmbeddedRun(
+            sessionID: sessionID,
+            actor: actor,
+            connectionGeneration: 42,
+            providerSessionID: "native-thread"
+        )
+        let binding = try XCTUnwrap(running.activeBinding)
+        XCTAssertEqual(binding.runID, running.activeRun?.runID)
+        XCTAssertEqual(binding.generation, running.session.runGeneration)
+        XCTAssertEqual(binding.turnEpoch, running.session.turnEpoch)
+        XCTAssertEqual(binding.connectionGeneration, 42)
+
+        let assistantID = UUID()
+        let assistantPayload = Data("macos-assistant-row".utf8)
+        let projected = try await authority.synchronizeEmbeddedTranscript(
+            sessionID: sessionID,
+            binding: binding,
+            entries: [
+                initialEntry,
+                TranscriptEntry(
+                    entryID: assistantID,
+                    sessionSequence: 2,
+                    kind: .assistant,
+                    content: "done",
+                    actor: nil,
+                    timestamp: Date(timeIntervalSince1970: 2),
+                    presentationPayload: assistantPayload
+                )
+            ]
+        )
+        XCTAssertEqual(projected.session.transcript.map(\.entryID), [userID, assistantID])
+        XCTAssertEqual(projected.session.transcript.last?.presentationPayload, assistantPayload)
+
+        let rolledBack = try await authority.synchronizeEmbeddedTranscript(
+            sessionID: sessionID,
+            binding: binding,
+            entries: [initialEntry]
+        )
+        XCTAssertEqual(rolledBack.session.transcript.map(\.entryID), [userID])
+        _ = try await authority.synchronizeEmbeddedTranscript(
+            sessionID: sessionID,
+            binding: binding,
+            entries: projected.session.transcript
+        )
+
+        let interactionID = UUID()
+        let interaction = InteractionSnapshot(
+            interactionID: interactionID,
+            runID: binding.runID,
+            kind: .approval,
+            state: .pending,
+            payload: Data("approve".utf8),
+            revision: 1,
+            expiresAt: nil
+        )
+        _ = try await authority.synchronizeEmbeddedInteractions(
+            sessionID: sessionID,
+            interactions: [interaction],
+            actor: actor
+        )
+        let withInteraction = try await authority.authoritySessionSnapshot(sessionID: sessionID)
+        XCTAssertEqual(withInteraction.interactions, [interaction])
+
+        let settled = try await authority.settleEmbeddedRun(
+            sessionID: sessionID,
+            binding: binding,
+            outcome: .completed,
+            providerSessionID: "native-thread"
+        )
+        XCTAssertEqual(settled.session.state, .completed)
+        XCTAssertNil(settled.activeBinding)
+        XCTAssertEqual(settled.activeRun?.runID, binding.runID)
+        XCTAssertEqual(settled.activeRun?.state, "completed")
+        XCTAssertEqual(settled.interactions.first?.interactionID, interactionID)
+        XCTAssertEqual(settled.interactions.first?.state, .interrupted)
+
+        // Duplicate terminal delivery is idempotent, while late transcript
+        // output is fenced by the same authority lifecycle gate.
+        let duplicate = try await authority.settleEmbeddedRun(
+            sessionID: sessionID,
+            binding: binding,
+            outcome: .completed,
+            providerSessionID: "native-thread"
+        )
+        XCTAssertEqual(duplicate.session.revision, settled.session.revision)
+        do {
+            _ = try await authority.synchronizeEmbeddedTranscript(
+                sessionID: sessionID,
+                binding: binding,
+                entries: [TranscriptEntry(
+                    entryID: UUID(),
+                    sessionSequence: 3,
+                    kind: .assistant,
+                    content: "late",
+                    actor: nil,
+                    timestamp: Date()
+                )]
+            )
+            XCTFail("expected late provider output to be fenced")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .staleRevision)
+        }
+
+        // A fresh authority instance restores the exact same identity and all
+        // shared projections from the one persistence store.
+        let restoredAuthority = RepoPromptHeadlessAuthority(store: store)
+        try await restoredAuthority.recover()
+        let restored = try await restoredAuthority.authoritySessionSnapshot(sessionID: sessionID)
+        XCTAssertEqual(restored.session.sessionID, sessionID)
+        XCTAssertEqual(restored.session.transcript, settled.session.transcript)
+        XCTAssertEqual(restored.permissions, settled.permissions)
+        XCTAssertEqual(restored.interactions, settled.interactions)
+        XCTAssertEqual(restored.worktrees, settled.worktrees)
+        XCTAssertEqual(restored.activeRun?.runID, binding.runID)
         try await store.close()
     }
 }

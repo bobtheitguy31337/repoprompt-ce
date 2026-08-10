@@ -33,6 +33,10 @@ enum AgentModeProcessRunIdentity {
     }
 
     static func startFreshProcessRun(for session: AgentModeViewModel.TabSession) -> UUID {
+        if let authorityRunID = session.authorityRunBinding?.runID {
+            session.installRunID(authorityRunID)
+            return authorityRunID
+        }
         let runID = UUID()
         session.installRunID(runID)
         return runID

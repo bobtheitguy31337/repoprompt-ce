@@ -1,5 +1,8 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptHeadlessRuntime
+import RepoPromptServicePersistence
+import RepoPromptWorkspaceRuntimeCore
 
 private enum AppDomainRuntimeMetrics {
     static let editFlowSink = DomainRuntimeMetricsSink { metric in
@@ -84,6 +87,71 @@ final class AppDomainRuntimeComposition: Sendable {
                 metrics: AppDomainRuntimeMetrics.editFlowSink
             )
         )
+    }
+}
+
+/// Process-lifetime owner of the same durable Agent authority used by the
+/// direct MCP/server composition. AppKit view models receive only snapshots
+/// and embedded-run leases; they never construct a session lifecycle store.
+actor AppAgentAuthorityComposition {
+    static let shared = AppAgentAuthorityComposition()
+
+    private struct Prepared {
+        let store: SQLiteServiceStore
+        let authority: RepoPromptHeadlessAuthority
+    }
+
+    private var prepared: Prepared?
+    private var preparationTask: Task<Prepared, Error>?
+
+    func authority() async throws -> RepoPromptHeadlessAuthority {
+        if let prepared { return prepared.authority }
+        if let preparationTask {
+            return try await preparationTask.value.authority
+        }
+        let task = Task<Prepared, Error> {
+            let applicationSupport = FileManager.default.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask
+            ).first ?? FileManager.default.temporaryDirectory
+            let root = applicationSupport
+                .appendingPathComponent("RepoPrompt CE", isDirectory: true)
+                .appendingPathComponent("AgentAuthority", isDirectory: true)
+            let artifacts = root.appendingPathComponent("Artifacts", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: root,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            let store = try await SQLiteServiceStore.open(
+                storage: .file(root.appendingPathComponent("repoprompt.sqlite").path)
+            )
+            let authority = try RepoPromptHeadlessAuthority(
+                store: store,
+                artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path)
+            )
+            try await authority.recover()
+            return Prepared(store: store, authority: authority)
+        }
+        preparationTask = task
+        do {
+            let value = try await task.value
+            prepared = value
+            preparationTask = nil
+            return value.authority
+        } catch {
+            preparationTask = nil
+            throw error
+        }
+    }
+
+    func shutdown() async {
+        preparationTask?.cancel()
+        preparationTask = nil
+        guard let prepared else { return }
+        self.prepared = nil
+        try? await prepared.authority.quiesce()
+        try? await prepared.store.close(clean: true)
     }
 }
 
@@ -211,6 +279,7 @@ final class AppGlobalMCPServiceComposition {
         let attempt = registrationAttempt.start {
             @MainActor [runtime, networkManager, appSettingsService, windowRoutingService] in
             try await runtime.start()
+            _ = try await AppAgentAuthorityComposition.shared.authority()
             await windowRoutingService.prepareDomainTools()
             let appSettingsTools = await appSettingsService.tools
             let windowRoutingTools = await windowRoutingService.tools

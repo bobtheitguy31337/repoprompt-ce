@@ -1,9 +1,39 @@
 import Foundation
+import RepoPromptServiceProtocol
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
 @MainActor
 final class AgentModeMCPWaitEpochTests: XCTestCase {
+    func testDurableBindingDrivesCompatibilityWaitEpochIdentity() async throws {
+        let viewModel = makeViewModel()
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: nil,
+            startPending: true
+        )
+        let binding = RunBindingSnapshot(
+            runID: UUID(),
+            generation: 9,
+            turnEpoch: 12,
+            connectionGeneration: 3
+        )
+
+        await viewModel.prepareMCPWaitTrackingForRunStart(
+            session: session,
+            authorityBinding: binding
+        )
+
+        let epoch = try XCTUnwrap(session.mcpControlContext?.currentEpoch)
+        XCTAssertEqual(epoch.id, AgentModeAuthorityAdapter.epochID(binding))
+        XCTAssertEqual(epoch.ordinal, UInt64(binding.turnEpoch))
+        XCTAssertEqual(epoch.continuityGeneration, UInt64(binding.generation))
+    }
+
     func testTerminalPublicationDuringEpochBeginContextGapDoesNotLoseSessionWait() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()

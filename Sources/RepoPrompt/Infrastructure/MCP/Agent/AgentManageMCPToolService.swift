@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptServiceProtocol
 
 @MainActor
 struct AgentManageMCPToolService {
@@ -61,6 +62,7 @@ struct AgentManageMCPToolService {
     let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
     let restrictDiscoveryToRoleLabels: @MainActor (_ workspaceID: UUID?) -> Bool
     let cleanupDependencies: CleanupDependencies
+    let loadAuthoritySnapshot: @Sendable (UUID) async -> AuthoritySessionSnapshot?
 
     init(
         toolName: String,
@@ -72,7 +74,8 @@ struct AgentManageMCPToolService {
         restrictDiscoveryToRoleLabels: @escaping @MainActor (_ workspaceID: UUID?) -> Bool = { workspaceID in
             GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID).restrictMCPAgentDiscoveryToRoleLabels
         },
-        cleanupDependencies: CleanupDependencies = .live
+        cleanupDependencies: CleanupDependencies = .live,
+        loadAuthoritySnapshot: @escaping @Sendable (UUID) async -> AuthoritySessionSnapshot? = { _ in nil }
     ) {
         self.toolName = toolName
         self.captureRequestMetadata = captureRequestMetadata
@@ -82,6 +85,7 @@ struct AgentManageMCPToolService {
         self.bindCurrentRequestToTab = bindCurrentRequestToTab
         self.restrictDiscoveryToRoleLabels = restrictDiscoveryToRoleLabels
         self.cleanupDependencies = cleanupDependencies
+        self.loadAuthoritySnapshot = loadAuthoritySnapshot
     }
 
     private struct HandoffSessionInfo {
@@ -1098,6 +1102,26 @@ struct AgentManageMCPToolService {
         let normalizedReference = reference.trimmingCharacters(in: .whitespacesAndNewlines)
         let referenceUUID = UUID(uuidString: normalizedReference)
         if let referenceUUID,
+           let snapshot = await loadAuthoritySnapshot(referenceUUID)
+        {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let items = snapshot.session.transcript.compactMap { entry in
+                entry.presentationPayload.flatMap { try? decoder.decode(AgentChatItem.self, from: $0) }
+            }
+            if !items.isEmpty || snapshot.session.transcript.isEmpty {
+                let name = agentModeVM.sessionIndex[referenceUUID]?.name
+                return (
+                    referenceUUID,
+                    name,
+                    AgentTranscriptIO.importLegacyItems(
+                        items,
+                        terminalState: Self.runState(snapshot.session.state)
+                    )
+                )
+            }
+        }
+        if let referenceUUID,
            let liveSession = try agentModeVM.authoritativeLiveSession(for: referenceUUID),
            let sessionID = liveSession.activeAgentSessionID
         {
@@ -1109,6 +1133,17 @@ struct AgentManageMCPToolService {
             throw MCPError.invalidParams("Session '\(reference)' was not found in the active workspace.")
         }
         return (persisted.id, persisted.name, persisted.transcript ?? .empty)
+    }
+
+    private static func runState(_ state: SessionLifecycleState) -> AgentSessionRunState {
+        switch state {
+        case .idle, .preparing: .idle
+        case .running: .running
+        case .waiting: .waitingForUser
+        case .completed: .completed
+        case .failed, .interrupted: .failed
+        case .canceled, .archived: .cancelled
+        }
     }
 
     private func resolveHandoffSession(

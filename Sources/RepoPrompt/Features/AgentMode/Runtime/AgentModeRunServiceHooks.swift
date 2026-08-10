@@ -8,9 +8,10 @@ import RepoPromptDomainRuntime
 // group below is classified by the authority it belongs to, so the reusable
 // execution boundary stays explicit about ownership:
 //
-// - Canonical lifecycle/durable settlement stays owned by the domain layer
-//   (`DomainAgentRunSessionStore`); `TerminalSettlementHooks` only adapts into
-//   that authority and must remain exactly-once per run attempt ownership.
+// - Canonical lifecycle/durable settlement stays owned by
+//   `RepoPromptHeadlessAuthority`; `TerminalSettlementHooks` adapts the legacy
+//   provider barrier into that authority and must remain exactly-once per run
+//   attempt ownership.
 // - Presentation, binding-observation, queued-work recovery, and persistence
 //   hooks are host projections. They must never become backend authority: a
 //   headless host may implement them as no-ops without changing run semantics.
@@ -119,11 +120,11 @@ extension AgentModeRunService {
         let cancelPendingWorktreeMergeReview: (AgentModeViewModel.TabSession, String) -> Void
     }
 
-    /// Adapter into the canonical durable terminal settlement authority
-    /// (`DomainAgentRunSessionStore` behind the host's publication surface).
+    /// Adapter into the canonical durable terminal settlement authority.
     ///
-    /// Authority: canonical lifecycle command/event adaptation. The terminal
-    /// commit barrier drives these exactly once per settled run attempt.
+    /// Authority: durable lifecycle command/event adaptation. The terminal
+    /// commit barrier drives these exactly once per settled run attempt; any
+    /// MCP waiter publication that follows is a compatibility notification.
     struct TerminalSettlementHooks {
         let prepareTerminalPublication: (AgentModeViewModel.TabSession) -> Void
         let makeTerminalPublicationEnvelope: (

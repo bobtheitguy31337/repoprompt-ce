@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptServiceProtocol
 
 @MainActor
 final class AgentModeRunService {
@@ -12,6 +13,10 @@ final class AgentModeRunService {
         let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
         let mcpServerEnabler: AgentModeViewModel.MCPServerEnabler
         let workspacePathProvider: (AgentModeViewModel.TabSession) throws -> String?
+        /// Acquires the canonical durable lifecycle identity before any native
+        /// provider controller is allowed to launch.
+        let beginAuthorityRun: (AgentModeViewModel.TabSession) async throws -> RunBindingSnapshot
+        let settleAuthorityStartFailure: (AgentModeViewModel.TabSession) async -> Void
         let codexCoordinator: CodexAgentModeCoordinator
         let claudeCoordinator: ClaudeAgentModeCoordinator
         let shouldManageCodexTooling: Bool
@@ -124,14 +129,27 @@ final class AgentModeRunService {
             return selectedAgent == .codexExec ? .failed(message: message) : nil
         }
 
+        do {
+            let binding = try await dependencies.beginAuthorityRun(session)
+            session.installAuthorityRunBinding(binding)
+        } catch {
+            let message = Self.providerStartupFailureMessage(for: error)
+            await failBeforeProviderStartup(session: session, message: message)
+            return selectedAgent == .codexExec ? .failed(message: message) : nil
+        }
+
         if selectedAgent == .codexExec {
-            return await codexRunner.startRun(
+            let outcome = await codexRunner.startRun(
                 tabID: tabID,
                 session: session,
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
                 fallbackContext: codexFallbackContext
             )
+            if !outcome.didSend {
+                await dependencies.settleAuthorityStartFailure(session)
+            }
+            return outcome
         }
 
         let acpRunRequest: ACPRunRequest? = if selectedAgent.acpProviderID != nil {

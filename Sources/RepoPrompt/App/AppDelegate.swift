@@ -34,6 +34,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     private var domainRuntimeShutdownOperation: DomainRuntimeShutdownOperation = {
+        await AppAgentAuthorityComposition.shared.shutdown()
         _ = await AppDomainRuntimeComposition.shared.runtime.shutdown()
     }
 

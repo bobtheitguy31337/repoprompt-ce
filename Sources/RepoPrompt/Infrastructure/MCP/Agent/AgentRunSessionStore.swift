@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptServiceProtocol
 
 extension DomainAgentSessionRegistration {
     init(sessionID: UUID, generation: UInt64) {
@@ -13,11 +14,13 @@ extension DomainAgentSessionRegistration {
     }
 }
 
-/// App compatibility adapter over the runtime-owned Agent session authority.
+/// App compatibility adapter for MCP wait continuations and wake delivery.
 ///
-/// Existing view models keep the established static call surface while the mutable records,
-/// epochs, waiters, terminal commits, TTL, persistence, and shutdown lifecycle live in the
-/// process's single `MCPDomainRuntime` instance.
+/// Durable session/run/transcript/interaction/worktree authority belongs to
+/// `RepoPromptHeadlessAuthority`. This established surface remains only while
+/// MCP's continuation-based wait protocol is projected from accepted durable
+/// snapshots; it must never issue provider run IDs or precede durable terminal
+/// acceptance.
 enum AgentRunSessionStore {
     typealias Registration = DomainAgentSessionRegistration
     typealias WaitCursor = DomainAgentSessionWaitCursor
@@ -49,14 +52,18 @@ enum AgentRunSessionStore {
         activationID: UUID,
         expectedCurrentEpoch: AgentRunTurnEpoch?,
         transitionKind: AgentRunEpochTransitionKind,
-        seedSnapshot: AgentRunMCPSnapshot? = nil
+        seedSnapshot: AgentRunMCPSnapshot? = nil,
+        authorityBinding: RunBindingSnapshot? = nil
     ) async -> EpochBeginResult {
         await shared.beginEpoch(
             registration: registration,
             activationID: activationID,
             expectedCurrentEpoch: expectedCurrentEpoch,
             transitionKind: transitionKind,
-            seedSnapshot: seedSnapshot
+            seedSnapshot: seedSnapshot,
+            authorityEpochID: authorityBinding.map(AgentModeAuthorityAdapter.epochID),
+            authorityOrdinal: authorityBinding.map { UInt64(clamping: $0.turnEpoch) },
+            authorityGeneration: authorityBinding.map { UInt64(clamping: $0.generation) }
         )
     }
 

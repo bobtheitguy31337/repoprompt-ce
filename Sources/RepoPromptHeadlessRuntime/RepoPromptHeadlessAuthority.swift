@@ -187,6 +187,453 @@ public actor RepoPromptHeadlessAuthority {
         return try await createAuthoritySession(input: input, externalActor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
     }
 
+    /// Admits a legacy embedded-host identity into the durable authority. This
+    /// is intentionally exact-ID: macOS JSON sessions keep their public links,
+    /// while subsequent lifecycle, transcript, policy, interaction and
+    /// worktree mutations have only one owner.
+    @discardableResult
+    public func ensureEmbeddedSession(_ seed: EmbeddedSessionSeed) async throws -> AuthoritySessionSnapshot {
+        try ensureWritable()
+        guard !seed.roots.isEmpty else {
+            throw ServiceAPIError(code: .invalidRequest, message: "An embedded session requires at least one project root")
+        }
+
+        if sessions[seed.sessionID] == nil {
+            if let existingProject = await projectSnapshots().first(where: { $0.projectID == seed.projectID }) {
+                guard Set(existingProject.roots.map(\.canonicalPath)) == Set(seed.roots.map(\.canonicalPath)) else {
+                    throw ServiceAPIError(code: .worktreeConflict, message: "Embedded project identity is already bound to different roots")
+                }
+            } else {
+                var canonicalRoots: [CanonicalRoot] = []
+                var identities = Set<String>()
+                for root in seed.roots {
+                    let canonical = try filesystem.canonicalizeRoot(root.canonicalPath)
+                    guard identities.insert(canonical.identity).inserted else {
+                        throw ServiceAPIError(code: .invalidRequest, message: "Duplicate physical project root")
+                    }
+                    canonicalRoots.append(CanonicalRoot(
+                        snapshot: ProjectRootSnapshot(
+                            rootID: root.rootID,
+                            logicalName: root.logicalName,
+                            canonicalPath: canonical.path,
+                            writable: root.writable,
+                            revision: root.revision
+                        ),
+                        filesystemIdentity: canonical.identity
+                    ))
+                }
+                let cursor = try await store.nextCursor()
+                let project = ProjectSnapshot(
+                    projectID: seed.projectID,
+                    name: seed.projectName,
+                    creator: seed.creator,
+                    state: .active,
+                    roots: canonicalRoots.map(\.snapshot),
+                    revision: 1,
+                    cursor: cursor
+                )
+                let event = try await store.persistProject(
+                    project,
+                    rootIdentities: Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.snapshot.rootID, $0.filesystemIdentity) }),
+                    eventType: .projectCreated,
+                    actor: seed.creator,
+                    correlationID: ids.next(),
+                    idempotency: nil
+                )
+                let projectAuthority = ProjectAuthority(snapshot: project, roots: canonicalRoots)
+                await projects.install(projectAuthority)
+                tools[seed.projectID] = ProjectToolAuthority(project: projectAuthority, filesystem: filesystem, commandRunner: commandRunner)
+                await eventHub.publish(event)
+            }
+
+            if let parentSessionID = seed.parentSessionID {
+                guard sessions[parentSessionID] != nil else {
+                    throw ServiceAPIError(code: .notFound, message: "Embedded parent session must be admitted before its child")
+                }
+            }
+            let cursor = try await store.nextCursor()
+            let snapshot = SessionSnapshot(
+                sessionID: seed.sessionID,
+                projectID: seed.projectID,
+                parentSessionID: seed.parentSessionID,
+                rootSessionID: seed.rootSessionID,
+                creator: seed.creator,
+                provider: seed.provider,
+                model: seed.model,
+                visibility: seed.visibility,
+                state: .idle,
+                runGeneration: 0,
+                turnEpoch: 0,
+                revision: 1,
+                transcript: seed.transcript,
+                interactions: [],
+                cursor: cursor
+            )
+            let agent = AgentSnapshot(
+                agentID: seed.sessionID,
+                sessionID: seed.sessionID,
+                rootSessionID: seed.rootSessionID,
+                parentAgentID: seed.parentSessionID,
+                role: seed.parentSessionID == nil ? "root" : "child",
+                state: .idle,
+                revision: 1
+            )
+            let permissions = ExecutionPermissionSnapshot(
+                sessionID: seed.sessionID,
+                mode: seed.permissionMode,
+                providerSettings: seed.providerSettings,
+                revision: 1,
+                updatedActor: seed.creator
+            )
+            let collaboration = CollaborationMetadataSnapshot(
+                sessionID: seed.sessionID,
+                visibility: seed.visibility,
+                collaborativeSteeringEnabled: false,
+                controllerUserID: seed.creator.goblinUserID,
+                policyRevision: 1,
+                controllerRevision: 1,
+                membershipRevision: 1
+            )
+            let initialSelection = SelectionSnapshot(sessionID: seed.sessionID, entries: [], revision: 1)
+            let key = "embedded-import:\(seed.sessionID.uuidString)"
+            let idempotency = IdempotencyInput(
+                actorID: seed.creator.goblinUserID,
+                operation: "embeddedSessionImport",
+                key: key,
+                requestDigest: CanonicalSigning.bodyDigest(Data(key.utf8))
+            )
+            let events = try await store.persistNewSession(
+                snapshot,
+                agent: agent,
+                actor: seed.creator,
+                correlationID: ids.next(),
+                agentCorrelationID: ids.next(),
+                idempotency: idempotency,
+                initialSelection: initialSelection,
+                initialPermissions: permissions,
+                initialCollaboration: collaboration
+            )
+            sessions[seed.sessionID] = SessionAuthority(snapshot: snapshot, clock: clock, ids: ids)
+            agents[seed.sessionID] = agent
+            selections[seed.sessionID] = SessionSelectionAuthority(sessionID: seed.sessionID, template: [], revision: 1, bindingRevision: 1)
+            await eventHub.publish(events.session)
+            await eventHub.publish(events.agent)
+        }
+
+        try await synchronizeEmbeddedPermissions(
+            sessionID: seed.sessionID,
+            mode: seed.permissionMode,
+            providerSettings: seed.providerSettings,
+            actor: seed.creator
+        )
+        let existingWorktrees = try await store.worktrees(projectID: seed.projectID)
+        for requested in seed.worktrees {
+            let current = existingWorktrees.first { $0.bindingID == requested.bindingID }
+            let isUnchanged = current.map {
+                $0.projectID == requested.projectID
+                    && $0.rootID == requested.rootID
+                    && $0.sessionID == requested.sessionID
+                    && $0.baseRef == requested.baseRef
+                    && $0.branch == requested.branch
+                    && $0.physicalPath == requested.physicalPath
+                    && $0.ownershipState == requested.ownershipState
+                    && $0.mergeState == requested.mergeState
+            } ?? false
+            let binding = WorktreeBindingSnapshot(
+                bindingID: requested.bindingID,
+                projectID: requested.projectID,
+                rootID: requested.rootID,
+                sessionID: requested.sessionID,
+                baseRef: requested.baseRef,
+                branch: requested.branch,
+                physicalPath: requested.physicalPath,
+                ownershipState: requested.ownershipState,
+                mergeState: requested.mergeState,
+                revision: current.map { isUnchanged ? $0.revision : $0.revision + 1 } ?? 1
+            )
+            guard binding.projectID == seed.projectID, binding.sessionID == seed.sessionID else {
+                throw ServiceAPIError(code: .worktreeConflict, message: "Embedded worktree binding does not belong to the admitted session")
+            }
+            guard !isUnchanged else { continue }
+            let event = try await store.persistWorktree(binding, actor: seed.creator, correlationID: ids.next())
+            await eventHub.publish(event)
+        }
+        return try await authoritySessionSnapshot(sessionID: seed.sessionID)
+    }
+
+    public func authoritySessionSnapshot(sessionID: UUID) async throws -> AuthoritySessionSnapshot {
+        guard let sessionAuthority = sessions[sessionID] else {
+            throw ServiceAPIError(code: .notFound, message: "Session not found")
+        }
+        let session = await sessionAuthority.snapshot()
+        guard let permissions = try await store.permissions(sessionID: sessionID) else {
+            throw ServiceAPIError(code: .persistenceUnavailable, message: "Session permissions are missing")
+        }
+        let binding = await sessionAuthority.activeBinding()
+        let run = try await store.latestRun(sessionID: sessionID)
+        let worktrees = try await store.worktrees(projectID: session.projectID).filter { $0.sessionID == sessionID }
+        return AuthoritySessionSnapshot(
+            session: session,
+            activeRun: run,
+            activeBinding: binding.map(Self.bindingSnapshot),
+            permissions: permissions,
+            interactions: try await store.interactions(sessionID: sessionID),
+            worktrees: worktrees
+        )
+    }
+
+    /// Begins a run executed by an embedded provider dispatcher. The durable
+    /// authority still issues the run identity and owns terminal fencing.
+    public func beginEmbeddedRun(
+        sessionID: UUID,
+        actor: ExternalActor,
+        connectionGeneration: Int64,
+        providerSessionID: String? = nil,
+        preferredRunID: UUID? = nil
+    ) async throws -> AuthoritySessionSnapshot {
+        try ensureWritable()
+        guard let sessionAuthority = sessions[sessionID] else {
+            throw ServiceAPIError(code: .notFound, message: "Session not found")
+        }
+        let session = await sessionAuthority.snapshot()
+        guard let permissions = try await store.permissions(sessionID: sessionID),
+              permissions.mode != "disabled"
+        else {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Provider execution is disabled by session policy")
+        }
+        let binding = try await sessionAuthority.beginRun(
+            connectionGeneration: connectionGeneration,
+            runID: preferredRunID
+        )
+        let cursor = try await store.nextCursor()
+        let event = try await store.persistSession(
+            replacingCursor(await sessionAuthority.snapshot(), cursor: cursor),
+            eventType: .sessionResumed,
+            actor: actor,
+            correlationID: ids.next(),
+            idempotency: nil
+        )
+        await eventHub.publish(event)
+        try await updateAgentLifecycle(sessionID: sessionID, state: .running, eventType: .agentUpdated, actor: actor)
+        try await store.persistRun(ProviderRunSnapshot(
+            runID: binding.runID,
+            sessionID: sessionID,
+            provider: session.provider,
+            providerSessionID: providerSessionID,
+            state: "running",
+            generation: binding.generation,
+            turnEpoch: binding.turnEpoch,
+            startReason: providerSessionID == nil ? "embedded-fresh" : "embedded-resume",
+            startedAt: clock.now()
+        ))
+        return try await authoritySessionSnapshot(sessionID: sessionID)
+    }
+
+    @discardableResult
+    public func synchronizeEmbeddedTranscript(
+        sessionID: UUID,
+        binding expected: RunBindingSnapshot,
+        entries: [TranscriptEntry]
+    ) async throws -> AuthoritySessionSnapshot {
+        guard let sessionAuthority = sessions[sessionID] else {
+            throw ServiceAPIError(code: .notFound, message: "Session not found")
+        }
+        let binding = Self.runtimeBinding(expected)
+        let before = await (sessionAuthority.snapshot()).revision
+        let acceptance = await sessionAuthority.acceptTranscriptProjection(binding: binding, entries: entries)
+        guard acceptance == .accepted else {
+            throw ServiceAPIError(code: .staleRevision, message: "Transcript projection belongs to a stale run", currentRevision: before)
+        }
+        let current = await sessionAuthority.snapshot()
+        if current.revision != before {
+            let cursor = try await store.nextCursor()
+            let event = try await store.persistSession(
+                replacingCursor(current, cursor: cursor),
+                eventType: .transcriptMessage,
+                actor: nil,
+                correlationID: ids.next(),
+                idempotency: nil
+            )
+            await eventHub.publish(event)
+        }
+        return try await authoritySessionSnapshot(sessionID: sessionID)
+    }
+
+    @discardableResult
+    public func settleEmbeddedRun(
+        sessionID: UUID,
+        binding expected: RunBindingSnapshot,
+        outcome: EmbeddedRunTerminalOutcome,
+        providerSessionID: String? = nil
+    ) async throws -> AuthoritySessionSnapshot {
+        guard let sessionAuthority = sessions[sessionID] else {
+            throw ServiceAPIError(code: .notFound, message: "Session not found")
+        }
+        let binding = Self.runtimeBinding(expected)
+        let terminal: EventType
+        let lifecycle: SessionLifecycleState
+        let runState: String
+        let agentEvent: EventType
+        switch outcome {
+        case .completed:
+            terminal = .sessionCompleted
+            lifecycle = .completed
+            runState = "completed"
+            agentEvent = .agentCompleted
+        case .failed:
+            terminal = .sessionFailed
+            lifecycle = .failed
+            runState = "failed"
+            agentEvent = .agentFailed
+        case .canceled:
+            terminal = .sessionCanceled
+            lifecycle = .canceled
+            runState = "canceled"
+            agentEvent = .agentFailed
+        case .interrupted:
+            terminal = .sessionInterrupted
+            lifecycle = .interrupted
+            runState = "interrupted"
+            agentEvent = .agentFailed
+        }
+        if await sessionAuthority.activeBinding() == nil,
+           let settled = try await store.latestRun(sessionID: sessionID),
+           settled.runID == binding.runID,
+           settled.state == runState
+        {
+            return try await authoritySessionSnapshot(sessionID: sessionID)
+        }
+        guard await sessionAuthority.settle(binding: binding, terminal: terminal, lifecycle: lifecycle) == .accepted else {
+            throw ServiceAPIError(code: .staleRevision, message: "Run terminal was already settled or belongs to a stale binding")
+        }
+        let sessionAfterSettlement = await sessionAuthority.snapshot()
+        for interaction in try await store.interactions(sessionID: sessionID)
+            where interaction.state == .pending || interaction.state == .deliveryIntent
+        {
+            let interrupted = InteractionSnapshot(
+                interactionID: interaction.interactionID,
+                runID: interaction.runID,
+                agentID: interaction.agentID,
+                kind: interaction.kind,
+                state: .interrupted,
+                payload: interaction.payload,
+                revision: interaction.revision + 1,
+                expiresAt: interaction.expiresAt
+            )
+            let interactionEvent = try await store.persistInteraction(
+                interrupted,
+                session: sessionAfterSettlement,
+                actor: nil,
+                correlationID: ids.next()
+            )
+            await eventHub.publish(interactionEvent)
+        }
+        let prior = try await store.latestRun(sessionID: sessionID)
+        try await store.persistRun(ProviderRunSnapshot(
+            runID: binding.runID,
+            sessionID: sessionID,
+            provider: (await sessionAuthority.snapshot()).provider,
+            providerSessionID: providerSessionID ?? prior?.providerSessionID,
+            state: runState,
+            generation: binding.generation,
+            turnEpoch: binding.turnEpoch,
+            startReason: prior?.startReason ?? "embedded",
+            endReason: runState,
+            startedAt: prior?.startedAt ?? clock.now(),
+            endedAt: clock.now()
+        ))
+        try await updateAgentLifecycle(sessionID: sessionID, state: lifecycle, eventType: agentEvent, actor: nil)
+        let cursor = try await store.nextCursor()
+        let event = try await store.persistSession(
+            replacingCursor(await sessionAuthority.snapshot(), cursor: cursor),
+            eventType: terminal,
+            actor: nil,
+            correlationID: ids.next(),
+            idempotency: nil
+        )
+        await eventHub.publish(event)
+        return try await authoritySessionSnapshot(sessionID: sessionID)
+    }
+
+    public func synchronizeEmbeddedPermissions(
+        sessionID: UUID,
+        mode: String,
+        providerSettings: [String: String],
+        actor: ExternalActor
+    ) async throws {
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        let current = try await store.permissions(sessionID: sessionID)
+        guard current?.mode != mode || current?.providerSettings != providerSettings else { return }
+        let snapshot = ExecutionPermissionSnapshot(
+            sessionID: sessionID,
+            mode: mode,
+            providerSettings: providerSettings,
+            revision: (current?.revision ?? 0) + 1,
+            updatedActor: actor
+        )
+        let event = try await store.persistPermissions(
+            snapshot,
+            projectID: session.projectID,
+            rootSessionID: session.rootSessionID,
+            correlationID: ids.next()
+        )
+        await eventHub.publish(event)
+    }
+
+    /// Reconciles the embedded host's visible interaction adapters into the
+    /// durable broker. Missing pending interactions become interrupted rather
+    /// than disappearing, preserving exactly-once answer semantics.
+    public func synchronizeEmbeddedInteractions(
+        sessionID: UUID,
+        interactions desired: [InteractionSnapshot],
+        actor: ExternalActor
+    ) async throws -> [InteractionSnapshot] {
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        let current = try await store.interactions(sessionID: sessionID)
+        let desiredIDs = Set(desired.map(\.interactionID))
+        let activeRunID: UUID? = if let sessionAuthority = sessions[sessionID] {
+            await sessionAuthority.activeBinding()?.runID
+        } else {
+            nil
+        }
+        for interaction in desired {
+            guard interaction.runID == nil || interaction.runID == activeRunID else {
+                throw ServiceAPIError(code: .staleRevision, message: "Interaction belongs to a stale run")
+            }
+            if current.first(where: { $0.interactionID == interaction.interactionID }) != interaction {
+                let event = try await store.persistInteraction(
+                    interaction,
+                    session: session,
+                    actor: actor,
+                    correlationID: ids.next()
+                )
+                await eventHub.publish(event)
+            }
+        }
+        for interaction in current
+            where interaction.state == .pending && !desiredIDs.contains(interaction.interactionID)
+        {
+            let interrupted = InteractionSnapshot(
+                interactionID: interaction.interactionID,
+                runID: interaction.runID,
+                agentID: interaction.agentID,
+                kind: interaction.kind,
+                state: .interrupted,
+                payload: interaction.payload,
+                revision: interaction.revision + 1,
+                expiresAt: interaction.expiresAt
+            )
+            let event = try await store.persistInteraction(
+                interrupted,
+                session: session,
+                actor: actor,
+                correlationID: ids.next()
+            )
+            await eventHub.publish(event)
+        }
+        return try await store.interactions(sessionID: sessionID)
+    }
+
     private func createAuthoritySession(input: CreateSessionInput, externalActor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> SessionSnapshot {
         try ensureWritable()
         let idempotency = IdempotencyInput(actorID: externalActor.goblinUserID, operation: "startSession", key: idempotencyKey, requestDigest: requestDigest)
@@ -1593,6 +2040,24 @@ public actor RepoPromptHeadlessAuthority {
 
     private func replacingLifecycle(_ value: SessionSnapshot, state: SessionLifecycleState, cursor: ServiceCursor) -> SessionSnapshot {
         SessionSnapshot(sessionID: value.sessionID, projectID: value.projectID, parentSessionID: value.parentSessionID, rootSessionID: value.rootSessionID, creator: value.creator, provider: value.provider, model: value.model, visibility: value.visibility, state: state, runGeneration: value.runGeneration, turnEpoch: value.turnEpoch, revision: value.revision + 1, transcript: value.transcript, interactions: value.interactions, cursor: cursor)
+    }
+
+    private static func bindingSnapshot(_ binding: RunBindingIdentity) -> RunBindingSnapshot {
+        RunBindingSnapshot(
+            runID: binding.runID,
+            generation: binding.generation,
+            turnEpoch: binding.turnEpoch,
+            connectionGeneration: binding.connectionGeneration
+        )
+    }
+
+    private static func runtimeBinding(_ binding: RunBindingSnapshot) -> RunBindingIdentity {
+        RunBindingIdentity(
+            runID: binding.runID,
+            generation: binding.generation,
+            turnEpoch: binding.turnEpoch,
+            connectionGeneration: binding.connectionGeneration
+        )
     }
 }
 

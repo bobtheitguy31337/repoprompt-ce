@@ -12,9 +12,9 @@ import Foundation
 /// named single-writer operations.
 ///
 /// Authority boundaries:
-/// - Canonical durable lifecycle stays owned by `DomainAgentRunSessionStore`;
-///   this facade never publishes durable state and never makes settlement
-///   decisions.
+/// - Canonical durable lifecycle stays owned by `RepoPromptHeadlessAuthority`;
+///   this facade is an in-process provider/presentation lease and never makes
+///   settlement decisions.
 /// - `AgentRunTerminalCommitBarrier` remains the only settlement driver; the
 ///   phased terminal-commit operations below exist so the barrier's observable
 ///   ordering (revision staged before publication resolves; the in-progress

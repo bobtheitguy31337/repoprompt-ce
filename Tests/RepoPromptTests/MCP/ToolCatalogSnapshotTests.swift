@@ -418,6 +418,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
                     let orderingProbe = ServerControllerRegistrationOrderingProbe()
                     let controller = ServerController(
                         globalRegistrationOperation: { try await orderingProbe.register() },
+                        agentAuthorityReadyOperation: {},
                         beforeTransportActivationOperation: { try await orderingProbe.assertCompleted() },
                         installNetworkCallbacks: false
                     )
@@ -441,6 +442,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
                     let supersessionProbe = ServerControllerRegistrationOrderingProbe()
                     let supersededController = ServerController(
                         globalRegistrationOperation: { try await supersessionProbe.register() },
+                        agentAuthorityReadyOperation: {},
                         beforeTransportActivationOperation: { try await supersessionProbe.assertCompleted() },
                         installNetworkCallbacks: false
                     )
@@ -472,6 +474,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
                     let orderingProbe = ServerControllerRegistrationOrderingProbe()
                     let controller = ServerController(
                         globalRegistrationOperation: { try await orderingProbe.register() },
+                        agentAuthorityReadyOperation: {},
                         beforeTransportActivationOperation: { try await orderingProbe.assertCompleted() },
                         installNetworkCallbacks: false
                     )
@@ -490,6 +493,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
                     let failureProbe = ServerControllerRegistrationOrderingProbe(failsRegistration: true)
                     let failingController = ServerController(
                         globalRegistrationOperation: { try await failureProbe.register() },
+                        agentAuthorityReadyOperation: {},
                         beforeTransportActivationOperation: { try await failureProbe.assertCompleted() },
                         installNetworkCallbacks: false
                     )
@@ -522,6 +526,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
                 try await Self.withIsolatedBootstrapSocketNamespace(window: window) { _ in
                     let controller = ServerController(
                         globalRegistrationOperation: {},
+                        agentAuthorityReadyOperation: {},
                         beforeTransportActivationOperation: {},
                         installNetworkCallbacks: false
                     )

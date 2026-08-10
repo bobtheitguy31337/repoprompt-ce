@@ -53,6 +53,11 @@ var packageDependencies: [Package.Dependency] = [
 
 var repoPromptAppDependencies: [Target.Dependency] = [
     "RepoPromptDomainRuntime",
+    "RepoPromptServiceProtocol",
+    "RepoPromptAgentRuntimeCore",
+    "RepoPromptServicePersistence",
+    "RepoPromptHeadlessRuntime",
+    "RepoPromptWorkspaceRuntimeCore",
     "RepoPromptCodeMapCore",
     "RepoPromptRegexCore",
     "RepoPromptWorkspaceCore",
@@ -208,235 +213,234 @@ private func makeServerPackage() -> Package {
 }
 
 #if os(Linux)
-let package = makeServerPackage()
+    let package = makeServerPackage()
 #else
-let package: Package
-if serverOnly {
-    package = makeServerPackage()
-} else {
-    package = .init(
-        name: "RepoPromptCE",
-        platforms: [.macOS(.v14)],
-        products: [
-            .executable(name: "RepoPrompt", targets: ["RepoPrompt"]),
-            .executable(name: "repoprompt-mcp", targets: ["RepoPromptMCP"]),
-            .executable(name: "RepoPromptServer", targets: ["RepoPromptServerExecutable"]),
-            .library(name: "RepoPromptAgentRuntimeCore", targets: ["RepoPromptAgentRuntimeCore"]),
-            .library(name: "RepoPromptWorkspaceRuntimeCore", targets: ["RepoPromptWorkspaceRuntimeCore"]),
-            .library(name: "RepoPromptHeadlessRuntime", targets: ["RepoPromptHeadlessRuntime"]),
-            .library(name: "RepoPromptServiceProtocol", targets: ["RepoPromptServiceProtocol"]),
-            .library(name: "RepoPromptServicePersistence", targets: ["RepoPromptServicePersistence"]),
-            .library(name: "RepoPromptServiceHTTP", targets: ["RepoPromptServiceHTTP"]),
-            .library(name: "RepoPromptMCPAdapter", targets: ["RepoPromptMCPAdapter"])
-        ],
-        dependencies: packageDependencies,
-        targets: [
-            .executableTarget(
-                name: "RepoPrompt",
-                dependencies: ["RepoPromptApp"],
-                path: "Sources/RepoPromptExecutable"
-            ),
-            .target(
-                name: "RepoPromptDomainRuntime",
-                dependencies: [
-                    "RepoPromptShared",
-                    "RepoPromptC",
-                    "RepoPromptCodeMapCore",
-                    .product(name: "Logging", package: "swift-log"),
-                    .product(name: "MCP", package: "swift-sdk")
-                ],
-                path: "Sources/RepoPromptDomainRuntime",
-                swiftSettings: swift6LanguageMode + [
-                    .define("DEBUG", .when(configuration: .debug))
-                ]
-            ),
-            .target(
-                name: "RepoPromptWorkspaceCore",
-                path: "Sources/RepoPromptWorkspaceCore"
-            ),
-            .target(
-                name: "RepoPromptRegexCore",
-                dependencies: ["CSwiftPCRE2"],
-                path: "Sources/RepoPromptRegexCore",
-                swiftSettings: swift6LanguageMode
-            ),
-            .target(
-                name: "RepoPromptCodeMapCore",
-                dependencies: [
-                    "RepoPromptRegexCore",
-                    "TreeSitterScannerSupport",
-                    .product(name: "Crypto", package: "swift-crypto"),
-                    .product(name: "SwiftTreeSitter", package: "swift-tree-sitter"),
-                    .product(name: "TreeSitterC", package: "tree-sitter-c"),
-                    .product(name: "TreeSitterGo", package: "tree-sitter-go"),
-                    .product(name: "TreeSitterJava", package: "tree-sitter-java"),
-                    .product(name: "TreeSitterJavaScript", package: "tree-sitter-javascript"),
-                    .product(name: "TreeSitterPython", package: "tree-sitter-python"),
-                    .product(name: "TreeSitterRust", package: "tree-sitter-rust"),
-                    .product(name: "TreeSitterTypeScript", package: "tree-sitter-typescript"),
-                    .product(name: "TreeSitterRuby", package: "tree-sitter-ruby"),
-                    .product(name: "TreeSitterSwift", package: "tree-sitter-swift"),
-                    .product(name: "TreeSitterCSharp", package: "tree-sitter-c-sharp"),
-                    .product(name: "TreeSitterCPP", package: "tree-sitter-cpp"),
-                    .product(name: "TreeSitterPHP", package: "tree-sitter-php")
-                ],
-                path: "Sources/RepoPromptCodeMapCore",
-                swiftSettings: swift6LanguageMode + [
-                    .define("DEBUG", .when(configuration: .debug))
-                ]
-            ),
-            .target(
-                name: "RepoPromptApp",
-                dependencies: repoPromptAppDependencies,
-                path: "Sources/RepoPrompt",
-                swiftSettings: repoPromptAppSwiftSettings
-            ),
-            .executableTarget(
-                name: "RepoPromptMCP",
-                dependencies: ["RepoPromptShared", "RepoPromptDomainRuntime", "RepoPromptMCPAdapter", "RepoPromptServiceProtocol", "RepoPromptServicePersistence", "RepoPromptHeadlessRuntime", "RepoPromptWorkspaceRuntimeCore", "RepoPromptCodeMapCore", "RepoPromptC", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
-                path: "Sources/RepoPromptMCP",
-                swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
-            ),
-            .target(
-                name: "RepoPromptShared",
-                path: "Sources/RepoPromptShared",
-                swiftSettings: swift6LanguageMode + [
-                    .define("DEBUG", .when(configuration: .debug))
-                ]
-            ),
-            .target(
-                name: "RepoPromptServiceProtocol",
-                dependencies: [.product(name: "Crypto", package: "swift-crypto")],
-                path: "Sources/RepoPromptServiceProtocol",
-                swiftSettings: swift6LanguageMode
-            ),
-            .target(
-                name: "RepoPromptAgentRuntimeCore",
-                dependencies: ["RepoPromptServiceProtocol"],
-                path: "Sources/RepoPromptAgentRuntimeCore",
-                swiftSettings: swift6LanguageMode
-            ),
-            .target(
-                name: "RepoPromptWorkspaceRuntimeCore",
-                dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptCodeMapCore", "RepoPromptC"],
-                path: "Sources/RepoPromptWorkspaceRuntimeCore",
-                resources: [.copy("Resources")],
-                swiftSettings: swift6LanguageMode
-            ),
-            .target(
-                name: "RepoPromptServicePersistence",
-                dependencies: [
-                    "RepoPromptServiceProtocol",
-                    .product(name: "SQLiteNIO", package: "sqlite-nio")
-                ],
-                path: "Sources/RepoPromptServicePersistence",
-                swiftSettings: swift6LanguageMode
-            ),
-            .target(
-                name: "RepoPromptHeadlessRuntime",
-                dependencies: [
-                    "RepoPromptServiceProtocol",
-                    "RepoPromptServicePersistence",
-                    "RepoPromptAgentRuntimeCore",
-                    "RepoPromptWorkspaceRuntimeCore",
-                    "RepoPromptDomainRuntime",
-                    "RepoPromptLinuxSupport"
-                ],
-                path: "Sources/RepoPromptHeadlessRuntime",
-                swiftSettings: swift6LanguageMode
-            ),
-            .target(
-                name: "RepoPromptLinuxSupport",
-                path: "Sources/RepoPromptLinuxSupport",
-                publicHeadersPath: "include"
-            ),
-            .target(
-                name: "RepoPromptServiceHTTP",
-                dependencies: [
-                    "RepoPromptServiceProtocol",
-                    "RepoPromptServicePersistence",
-                    "RepoPromptHeadlessRuntime",
-                    "RepoPromptAgentRuntimeCore",
-                    .product(name: "Crypto", package: "swift-crypto"),
-                    .product(name: "Hummingbird", package: "hummingbird"),
-                    .product(name: "HummingbirdTLS", package: "hummingbird"),
-                    .product(name: "NIOSSL", package: "swift-nio-ssl"),
-                    .product(name: "X509", package: "swift-certificates")
-                ],
-                path: "Sources/RepoPromptServiceHTTP",
-                swiftSettings: swift6LanguageMode
-            ),
-            .target(
-                name: "RepoPromptMCPAdapter",
-                dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptHeadlessRuntime", "RepoPromptDomainRuntime", .product(name: "MCP", package: "swift-sdk")],
-                path: "Sources/RepoPromptMCPAdapter",
-                swiftSettings: swift6LanguageMode
-            ),
-            .executableTarget(
-                name: "RepoPromptServerExecutable",
-                dependencies: ["RepoPromptServiceHTTP", "RepoPromptHeadlessRuntime", "RepoPromptServicePersistence"],
-                path: "Sources/RepoPromptServerExecutable",
-                swiftSettings: swift6LanguageMode
-            ),
-            .target(name: "CSwiftPCRE2", path: "Sources/CSwiftPCRE2", exclude: ["deps/sljit/sljit_src/sljitNativeARM_64.c", "deps/sljit/sljit_src/sljitSerialize.c", "deps/sljit/sljit_src/sljitUtils.c", "deps/sljit/sljit_src/sljitNativeX86_common.c", "deps/sljit/sljit_src/sljitNativeX86_64.c", "deps/sljit/sljit_src/sljitNativeX86_32.c", "deps/sljit/sljit_src/allocator_src/sljitWXExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitProtExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorCore.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorApple.c"], publicHeadersPath: "include", cSettings: [.headerSearchPath("include"), .headerSearchPath("src"), .define("PCRE2_CODE_UNIT_WIDTH", to: "8"), .define("HAVE_CONFIG_H")]),
-            .target(name: "RepoPromptC", path: "Sources/RepoPromptC", publicHeadersPath: "include", cSettings: [.headerSearchPath("include")]),
-            // Exact-snapshot scanner ABI fallback for the JavaScript/Python manifests, whose
-            // FileManager source probe evaluates false in this root package graph.
-            .target(name: "TreeSitterScannerSupport", path: "Sources/TreeSitterScannerSupport", sources: ["src/javascript/scanner.c", "src/python/scanner.c"], publicHeadersPath: "include"),
-            .binaryTarget(name: "Sparkle", path: "Vendor/Sparkle/Sparkle.xcframework"),
-            .testTarget(
-                name: "RepoPromptDomainRuntimeTests",
-                dependencies: [
-                    "RepoPromptDomainRuntime",
-                    .product(name: "MCP", package: "swift-sdk")
-                ],
-                path: "Tests/RepoPromptDomainRuntimeTests",
-                swiftSettings: swift6LanguageMode
-            ),
-            .testTarget(
-                name: "RepoPromptWorkspaceCoreTests",
-                dependencies: ["RepoPromptWorkspaceCore"],
-                path: "Tests/RepoPromptWorkspaceCoreTests"
-            ),
-            .testTarget(
-                name: "RepoPromptRegexCoreTests",
-                dependencies: ["RepoPromptRegexCore"],
-                path: "Tests/RepoPromptRegexCoreTests",
-                swiftSettings: swift6LanguageMode
-            ),
-            .testTarget(
-                name: "RepoPromptCodeMapCoreTests",
-                dependencies: ["RepoPromptCodeMapCore"],
-                path: "Tests/RepoPromptCodeMapCoreTests",
-                resources: [
-                    .copy("Fixtures"),
-                    .copy("Goldens")
-                ],
-                swiftSettings: swift6LanguageMode + repoPromptCodeMapTestSwiftSettings
-            ),
-            .testTarget(
-                name: "RepoPromptTests",
-                dependencies: repoPromptTestDependencies,
-                path: "Tests/RepoPromptTests",
-                swiftSettings: repoPromptTestSwiftSettings
-            ),
-            .testTarget(
-                name: "RepoPromptServerTests",
-                dependencies: [
-                    "RepoPromptServiceProtocol",
-                    "RepoPromptAgentRuntimeCore",
-                    "RepoPromptWorkspaceRuntimeCore",
-                    "RepoPromptServicePersistence",
-                    "RepoPromptHeadlessRuntime",
-                    "RepoPromptServiceHTTP",
-                    "RepoPromptMCPAdapter",
-                    .product(name: "HummingbirdTesting", package: "hummingbird")
-                ],
-                path: "Tests/RepoPromptServerTests",
-                swiftSettings: swift6LanguageMode
-            )
-        ],
-        swiftLanguageModes: [.v5]
-    )
-}
+    let package: Package = if serverOnly {
+        makeServerPackage()
+    } else {
+        .init(
+            name: "RepoPromptCE",
+            platforms: [.macOS(.v14)],
+            products: [
+                .executable(name: "RepoPrompt", targets: ["RepoPrompt"]),
+                .executable(name: "repoprompt-mcp", targets: ["RepoPromptMCP"]),
+                .executable(name: "RepoPromptServer", targets: ["RepoPromptServerExecutable"]),
+                .library(name: "RepoPromptAgentRuntimeCore", targets: ["RepoPromptAgentRuntimeCore"]),
+                .library(name: "RepoPromptWorkspaceRuntimeCore", targets: ["RepoPromptWorkspaceRuntimeCore"]),
+                .library(name: "RepoPromptHeadlessRuntime", targets: ["RepoPromptHeadlessRuntime"]),
+                .library(name: "RepoPromptServiceProtocol", targets: ["RepoPromptServiceProtocol"]),
+                .library(name: "RepoPromptServicePersistence", targets: ["RepoPromptServicePersistence"]),
+                .library(name: "RepoPromptServiceHTTP", targets: ["RepoPromptServiceHTTP"]),
+                .library(name: "RepoPromptMCPAdapter", targets: ["RepoPromptMCPAdapter"])
+            ],
+            dependencies: packageDependencies,
+            targets: [
+                .executableTarget(
+                    name: "RepoPrompt",
+                    dependencies: ["RepoPromptApp"],
+                    path: "Sources/RepoPromptExecutable"
+                ),
+                .target(
+                    name: "RepoPromptDomainRuntime",
+                    dependencies: [
+                        "RepoPromptShared",
+                        "RepoPromptC",
+                        "RepoPromptCodeMapCore",
+                        .product(name: "Logging", package: "swift-log"),
+                        .product(name: "MCP", package: "swift-sdk")
+                    ],
+                    path: "Sources/RepoPromptDomainRuntime",
+                    swiftSettings: swift6LanguageMode + [
+                        .define("DEBUG", .when(configuration: .debug))
+                    ]
+                ),
+                .target(
+                    name: "RepoPromptWorkspaceCore",
+                    path: "Sources/RepoPromptWorkspaceCore"
+                ),
+                .target(
+                    name: "RepoPromptRegexCore",
+                    dependencies: ["CSwiftPCRE2"],
+                    path: "Sources/RepoPromptRegexCore",
+                    swiftSettings: swift6LanguageMode
+                ),
+                .target(
+                    name: "RepoPromptCodeMapCore",
+                    dependencies: [
+                        "RepoPromptRegexCore",
+                        "TreeSitterScannerSupport",
+                        .product(name: "Crypto", package: "swift-crypto"),
+                        .product(name: "SwiftTreeSitter", package: "swift-tree-sitter"),
+                        .product(name: "TreeSitterC", package: "tree-sitter-c"),
+                        .product(name: "TreeSitterGo", package: "tree-sitter-go"),
+                        .product(name: "TreeSitterJava", package: "tree-sitter-java"),
+                        .product(name: "TreeSitterJavaScript", package: "tree-sitter-javascript"),
+                        .product(name: "TreeSitterPython", package: "tree-sitter-python"),
+                        .product(name: "TreeSitterRust", package: "tree-sitter-rust"),
+                        .product(name: "TreeSitterTypeScript", package: "tree-sitter-typescript"),
+                        .product(name: "TreeSitterRuby", package: "tree-sitter-ruby"),
+                        .product(name: "TreeSitterSwift", package: "tree-sitter-swift"),
+                        .product(name: "TreeSitterCSharp", package: "tree-sitter-c-sharp"),
+                        .product(name: "TreeSitterCPP", package: "tree-sitter-cpp"),
+                        .product(name: "TreeSitterPHP", package: "tree-sitter-php")
+                    ],
+                    path: "Sources/RepoPromptCodeMapCore",
+                    swiftSettings: swift6LanguageMode + [
+                        .define("DEBUG", .when(configuration: .debug))
+                    ]
+                ),
+                .target(
+                    name: "RepoPromptApp",
+                    dependencies: repoPromptAppDependencies,
+                    path: "Sources/RepoPrompt",
+                    swiftSettings: repoPromptAppSwiftSettings
+                ),
+                .executableTarget(
+                    name: "RepoPromptMCP",
+                    dependencies: ["RepoPromptShared", "RepoPromptDomainRuntime", "RepoPromptMCPAdapter", "RepoPromptServiceProtocol", "RepoPromptServicePersistence", "RepoPromptHeadlessRuntime", "RepoPromptWorkspaceRuntimeCore", "RepoPromptCodeMapCore", "RepoPromptC", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
+                    path: "Sources/RepoPromptMCP",
+                    swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+                ),
+                .target(
+                    name: "RepoPromptShared",
+                    path: "Sources/RepoPromptShared",
+                    swiftSettings: swift6LanguageMode + [
+                        .define("DEBUG", .when(configuration: .debug))
+                    ]
+                ),
+                .target(
+                    name: "RepoPromptServiceProtocol",
+                    dependencies: [.product(name: "Crypto", package: "swift-crypto")],
+                    path: "Sources/RepoPromptServiceProtocol",
+                    swiftSettings: swift6LanguageMode
+                ),
+                .target(
+                    name: "RepoPromptAgentRuntimeCore",
+                    dependencies: ["RepoPromptServiceProtocol"],
+                    path: "Sources/RepoPromptAgentRuntimeCore",
+                    swiftSettings: swift6LanguageMode
+                ),
+                .target(
+                    name: "RepoPromptWorkspaceRuntimeCore",
+                    dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptCodeMapCore", "RepoPromptC"],
+                    path: "Sources/RepoPromptWorkspaceRuntimeCore",
+                    resources: [.copy("Resources")],
+                    swiftSettings: swift6LanguageMode
+                ),
+                .target(
+                    name: "RepoPromptServicePersistence",
+                    dependencies: [
+                        "RepoPromptServiceProtocol",
+                        .product(name: "SQLiteNIO", package: "sqlite-nio")
+                    ],
+                    path: "Sources/RepoPromptServicePersistence",
+                    swiftSettings: swift6LanguageMode
+                ),
+                .target(
+                    name: "RepoPromptHeadlessRuntime",
+                    dependencies: [
+                        "RepoPromptServiceProtocol",
+                        "RepoPromptServicePersistence",
+                        "RepoPromptAgentRuntimeCore",
+                        "RepoPromptWorkspaceRuntimeCore",
+                        "RepoPromptDomainRuntime",
+                        "RepoPromptLinuxSupport"
+                    ],
+                    path: "Sources/RepoPromptHeadlessRuntime",
+                    swiftSettings: swift6LanguageMode
+                ),
+                .target(
+                    name: "RepoPromptLinuxSupport",
+                    path: "Sources/RepoPromptLinuxSupport",
+                    publicHeadersPath: "include"
+                ),
+                .target(
+                    name: "RepoPromptServiceHTTP",
+                    dependencies: [
+                        "RepoPromptServiceProtocol",
+                        "RepoPromptServicePersistence",
+                        "RepoPromptHeadlessRuntime",
+                        "RepoPromptAgentRuntimeCore",
+                        .product(name: "Crypto", package: "swift-crypto"),
+                        .product(name: "Hummingbird", package: "hummingbird"),
+                        .product(name: "HummingbirdTLS", package: "hummingbird"),
+                        .product(name: "NIOSSL", package: "swift-nio-ssl"),
+                        .product(name: "X509", package: "swift-certificates")
+                    ],
+                    path: "Sources/RepoPromptServiceHTTP",
+                    swiftSettings: swift6LanguageMode
+                ),
+                .target(
+                    name: "RepoPromptMCPAdapter",
+                    dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptHeadlessRuntime", "RepoPromptDomainRuntime", .product(name: "MCP", package: "swift-sdk")],
+                    path: "Sources/RepoPromptMCPAdapter",
+                    swiftSettings: swift6LanguageMode
+                ),
+                .executableTarget(
+                    name: "RepoPromptServerExecutable",
+                    dependencies: ["RepoPromptServiceHTTP", "RepoPromptHeadlessRuntime", "RepoPromptServicePersistence"],
+                    path: "Sources/RepoPromptServerExecutable",
+                    swiftSettings: swift6LanguageMode
+                ),
+                .target(name: "CSwiftPCRE2", path: "Sources/CSwiftPCRE2", exclude: ["deps/sljit/sljit_src/sljitNativeARM_64.c", "deps/sljit/sljit_src/sljitSerialize.c", "deps/sljit/sljit_src/sljitUtils.c", "deps/sljit/sljit_src/sljitNativeX86_common.c", "deps/sljit/sljit_src/sljitNativeX86_64.c", "deps/sljit/sljit_src/sljitNativeX86_32.c", "deps/sljit/sljit_src/allocator_src/sljitWXExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitProtExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorCore.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorApple.c"], publicHeadersPath: "include", cSettings: [.headerSearchPath("include"), .headerSearchPath("src"), .define("PCRE2_CODE_UNIT_WIDTH", to: "8"), .define("HAVE_CONFIG_H")]),
+                .target(name: "RepoPromptC", path: "Sources/RepoPromptC", publicHeadersPath: "include", cSettings: [.headerSearchPath("include")]),
+                // Exact-snapshot scanner ABI fallback for the JavaScript/Python manifests, whose
+                // FileManager source probe evaluates false in this root package graph.
+                .target(name: "TreeSitterScannerSupport", path: "Sources/TreeSitterScannerSupport", sources: ["src/javascript/scanner.c", "src/python/scanner.c"], publicHeadersPath: "include"),
+                .binaryTarget(name: "Sparkle", path: "Vendor/Sparkle/Sparkle.xcframework"),
+                .testTarget(
+                    name: "RepoPromptDomainRuntimeTests",
+                    dependencies: [
+                        "RepoPromptDomainRuntime",
+                        .product(name: "MCP", package: "swift-sdk")
+                    ],
+                    path: "Tests/RepoPromptDomainRuntimeTests",
+                    swiftSettings: swift6LanguageMode
+                ),
+                .testTarget(
+                    name: "RepoPromptWorkspaceCoreTests",
+                    dependencies: ["RepoPromptWorkspaceCore"],
+                    path: "Tests/RepoPromptWorkspaceCoreTests"
+                ),
+                .testTarget(
+                    name: "RepoPromptRegexCoreTests",
+                    dependencies: ["RepoPromptRegexCore"],
+                    path: "Tests/RepoPromptRegexCoreTests",
+                    swiftSettings: swift6LanguageMode
+                ),
+                .testTarget(
+                    name: "RepoPromptCodeMapCoreTests",
+                    dependencies: ["RepoPromptCodeMapCore"],
+                    path: "Tests/RepoPromptCodeMapCoreTests",
+                    resources: [
+                        .copy("Fixtures"),
+                        .copy("Goldens")
+                    ],
+                    swiftSettings: swift6LanguageMode + repoPromptCodeMapTestSwiftSettings
+                ),
+                .testTarget(
+                    name: "RepoPromptTests",
+                    dependencies: repoPromptTestDependencies,
+                    path: "Tests/RepoPromptTests",
+                    swiftSettings: repoPromptTestSwiftSettings
+                ),
+                .testTarget(
+                    name: "RepoPromptServerTests",
+                    dependencies: [
+                        "RepoPromptServiceProtocol",
+                        "RepoPromptAgentRuntimeCore",
+                        "RepoPromptWorkspaceRuntimeCore",
+                        "RepoPromptServicePersistence",
+                        "RepoPromptHeadlessRuntime",
+                        "RepoPromptServiceHTTP",
+                        "RepoPromptMCPAdapter",
+                        .product(name: "HummingbirdTesting", package: "hummingbird")
+                    ],
+                    path: "Tests/RepoPromptServerTests",
+                    swiftSettings: swift6LanguageMode
+                )
+            ],
+            swiftLanguageModes: [.v5]
+        )
+    }
 #endif

@@ -21,7 +21,6 @@ actor DirectHeadlessMCPService {
         let principal: DomainClientPrincipal
         let childEndpoint: DirectHeadlessChildEndpoint
         let childLaunchCoordinator: DirectHeadlessChildLaunchCoordinator
-        let providerCoordinator: DirectHeadlessProviderCoordinator
         let durableStore: SQLiteServiceStore
         let authority: RepoPromptHeadlessAuthority
         let authorityBinding: RepoPromptMCPBinding
@@ -175,11 +174,6 @@ actor DirectHeadlessMCPService {
             workingDirectories: workingDirectories
         )
         let context = DirectHeadlessDomainContext(runtime: runtime, scopeID: scopeID)
-        let providerCoordinator = DirectHeadlessProviderCoordinator(
-            runtime: runtime,
-            context: context,
-            environment: environment
-        )
         let durable = try await prepareDurableAuthority(locations: locations)
         let adapter = RepoPromptMCPAdapter(authority: durable.authority)
         let installation = try await adapter.install(runtime: runtime, scopeID: scopeID, binding: durable.binding)
@@ -219,7 +213,6 @@ actor DirectHeadlessMCPService {
             principal: principal,
             childEndpoint: childEndpoint,
             childLaunchCoordinator: childLaunchCoordinator,
-            providerCoordinator: providerCoordinator,
             durableStore: durable.store,
             authority: durable.authority,
             authorityBinding: durable.binding
@@ -511,7 +504,6 @@ actor DirectHeadlessMCPService {
 
     func teardown(_ prepared: PreparedRuntime) async {
         await prepared.childEndpoint.stop()
-        await prepared.providerCoordinator.shutdown()
         await prepared.runtime.domainHost.cancelInvocations(
             connectionID: prepared.connectionID,
             connectionGeneration: prepared.connectionGeneration

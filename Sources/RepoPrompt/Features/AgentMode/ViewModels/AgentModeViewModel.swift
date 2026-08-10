@@ -2,6 +2,7 @@ import Combine
 import CryptoKit
 import Foundation
 import MCP
+import RepoPromptServiceProtocol
 import SwiftUI
 
 struct AgentContextUsage: Codable, Equatable {
@@ -581,6 +582,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private weak var runInteractionStateObserver: (any AgentModeRunInteractionStateObserving)?
     private let shouldManageCodexTooling: Bool
     private let usesProductionAgentDefaultsAndModelPolling: Bool
+    private let usesDurableAgentAuthority: Bool
     let clearConsumedAttachmentsAfterProviderConsumption: Bool
     let applyEditsApprovalStore: ApplyEditsApprovalStore
     private lazy var runService: AgentModeRunService = makeRunService()
@@ -1640,6 +1642,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         providerConversationCleanupRegistry = ProviderConversationCleanupRegistry()
         shouldManageCodexTooling = true
         usesProductionAgentDefaultsAndModelPolling = true
+        let testAuthorityOptIn = ProcessInfo.processInfo.environment["REPOPROMPT_TEST_DURABLE_AGENT_AUTHORITY"] == "1"
+        let isHostedTest = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+            || NSClassFromString("XCTestCase") != nil
+        usesDurableAgentAuthority = !isHostedTest || testAuthorityOptIn
         codexCoordinator = CodexAgentModeCoordinator(
             windowID: windowID,
             runtimeWorkspacePathsProvider: codexRuntimeWorkspacePathsProvider,
@@ -1826,6 +1832,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             self.providerConversationCleanupRegistry = providerConversationCleanupRegistry
             self.shouldManageCodexTooling = shouldManageCodexTooling
             usesProductionAgentDefaultsAndModelPolling = testUsesProductionAgentDefaultsAndModelPolling
+            usesDurableAgentAuthority = false
             let legacyWatchdogThreshold = testCodexStallWatchdogInactivityThreshold
             let testWatchdogProbeThreshold = testCodexStallWatchdogProbeThreshold ?? legacyWatchdogThreshold ?? 0
             let testWatchdogRecoveryThreshold: TimeInterval = if let explicitRecoveryThreshold = testCodexStallWatchdogRecoveryThreshold {
@@ -2211,6 +2218,50 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 guard let self else { return nil }
                 return try effectiveWorkspacePath(for: session)
             },
+            beginAuthorityRun: { [weak self] session in
+                guard let self else {
+                    throw ServiceAPIError(code: .persistenceUnavailable, message: "Agent host was released")
+                }
+                guard usesDurableAgentAuthority else {
+                    let prior = session.authorityRunBinding
+                    let binding = RunBindingSnapshot(
+                        runID: session.runID ?? UUID(),
+                        generation: (prior?.generation ?? 0) + 1,
+                        turnEpoch: (prior?.turnEpoch ?? 0) + 1,
+                        connectionGeneration: 1
+                    )
+                    await prepareMCPWaitTrackingForRunStart(
+                        session: session,
+                        authorityBinding: binding
+                    )
+                    return binding
+                }
+                guard let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot else {
+                    throw ServiceAPIError(code: .rootUnauthorized, message: "No workspace is available for the Agent authority")
+                }
+                let binding = try await AgentModeAuthorityAdapter.shared.beginRun(
+                    session,
+                    workspace: workspace
+                )
+                await prepareMCPWaitTrackingForRunStart(
+                    session: session,
+                    authorityBinding: binding
+                )
+                return binding
+            },
+            settleAuthorityStartFailure: { [usesDurableAgentAuthority] session in
+                let runID = session.authorityRunBinding?.runID
+                if usesDurableAgentAuthority {
+                    _ = try? await AgentModeAuthorityAdapter.shared.settle(
+                        session,
+                        terminalState: .failed,
+                        expectedRunID: runID
+                    )
+                }
+                if let runID {
+                    session.clearAuthorityRunBinding(ifCurrent: runID)
+                }
+            },
             codexCoordinator: codexCoordinator,
             claudeCoordinator: claudeCoordinator,
             shouldManageCodexTooling: shouldManageCodexTooling,
@@ -2389,6 +2440,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 },
                 publishTerminalCommit: { [weak self] session, revision, successorKind in
                     guard let self else { return .rejected(reason: "view_model_deallocated") }
+                    let durableRunID = usesDurableAgentAuthority
+                        ? session.authorityRunBinding?.runID
+                        : nil
+                    if durableRunID != nil {
+                        do {
+                            _ = try await AgentModeAuthorityAdapter.shared.settle(
+                                session,
+                                terminalState: revision.terminalState,
+                                expectedRunID: revision.expectedRunID
+                            )
+                        } catch {
+                            return .rejected(reason: "durable_authority_rejected_terminal:\(error)")
+                        }
+                    }
                     let result = await publishTerminalCommit(
                         revision,
                         successorKind: successorKind,
@@ -2399,6 +2464,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                        let runID = revision.expectedRunID
                     {
                         mcpRemoveAgentRunOracleReviewContext(sessionID: sessionID, runID: runID)
+                    }
+                    if let durableRunID {
+                        session.clearAuthorityRunBinding(ifCurrent: durableRunID)
                     }
                     return result
                 }
@@ -3503,6 +3571,34 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // deferral cannot make durability depend on derived UI refresh work.
             scheduleSave(for: session.tabID)
             scheduleDerivedTranscriptRefresh(for: session, reason: .liveMutation, mutation: mutation)
+            Task { @MainActor [weak session] in
+                guard let session else { return }
+                await AgentModeAuthorityAdapter.shared.synchronizeTranscript(session)
+            }
+        }
+        newSession.onPermissionProfileChanged = { session in
+            Task { @MainActor [weak session] in
+                guard let session else { return }
+                await AgentModeAuthorityAdapter.shared.synchronizePermissions(session)
+            }
+        }
+        newSession.onInteractionsChanged = { session in
+            Task { @MainActor [weak session] in
+                guard let session else { return }
+                await AgentModeAuthorityAdapter.shared.synchronizeInteractions(session)
+            }
+        }
+        newSession.onWorktreeBindingsChanged = { [weak self] session in
+            guard let self,
+                  let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot
+            else { return }
+            Task { @MainActor [weak session] in
+                guard let session else { return }
+                _ = try? await AgentModeAuthorityAdapter.shared.ensureSession(
+                    session,
+                    workspace: workspace
+                )
+            }
         }
         newSession.onRunStateChanged = { [weak self] session in
             guard let self else { return }
@@ -5213,7 +5309,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         #endif
         guard let envelope = revision.mcpPublicationEnvelope else {
-            return session.mcpControlContext == nil
+            // Durable settlement has already succeeded. A missing optional MCP
+            // waiter projection cannot veto terminal acceptance; only a queued
+            // successor requires an epoch to be allocated before dispatch.
+            return successorKind == nil && session.authorityRunBinding != nil
                 ? .accepted(successorEpoch: nil)
                 : .rejected(reason: "missing_terminal_publication_envelope")
         }
@@ -5222,7 +5321,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               context.activationID == envelope.epoch.activationID,
               context.registration.generation == envelope.epoch.registrationGeneration
         else {
-            return .rejected(reason: "activation_replaced")
+            return successorKind == nil && session.authorityRunBinding != nil
+                ? .accepted(successorEpoch: nil)
+                : .rejected(reason: "activation_replaced")
         }
         var result = await AgentRunSessionStore.publishTerminal(
             envelope,
@@ -5234,6 +5335,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
            case .accepted(successorEpoch: nil) = result
         {
             result = .rejected(reason: "missing_successor_epoch")
+        }
+        if successorKind == nil, session.authorityRunBinding != nil {
+            switch result {
+            case .rejected, .stale:
+                // This store is an MCP continuation notifier, not lifecycle
+                // authority. The durable binding was already settled above.
+                result = .accepted(successorEpoch: nil)
+            case .accepted:
+                break
+            }
         }
         if let successorEpoch = result.successorEpoch,
            var liveContext = session.mcpControlContext,
@@ -5484,7 +5595,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    func prepareMCPWaitTrackingForRunStart(session: TabSession) async {
+    func prepareMCPWaitTrackingForRunStart(
+        session: TabSession,
+        authorityBinding: RunBindingSnapshot? = nil
+    ) async {
         guard !session.runState.isActive,
               let originalContext = session.mcpControlContext
         else { return }
@@ -5514,7 +5628,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             registration: registration,
             activationID: originalContext.activationID,
             expectedCurrentEpoch: originalContext.currentEpoch,
-            transitionKind: transitionKind
+            transitionKind: transitionKind,
+            authorityBinding: authorityBinding
         )
         // A stale result means the existing record advanced to another epoch; only rejected
         // results are eligible for missing-record recovery through registerIfMissing.
@@ -5544,7 +5659,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 registration: registration,
                 activationID: originalContext.activationID,
                 expectedCurrentEpoch: nil,
-                transitionKind: transitionKind
+                transitionKind: transitionKind,
+                authorityBinding: authorityBinding
             )
         }
         #if DEBUG
@@ -15001,7 +15117,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .failed(message: "The tab could not be bound to an agent session.")
         }
         await prepareSessionForRunStart(tabID: tabID, session: session)
-        await prepareMCPWaitTrackingForRunStart(session: session)
         let augmentedInitialMessage = await augmentUserMessageForProviderSend(
             initialMessage,
             attachments: attachments,

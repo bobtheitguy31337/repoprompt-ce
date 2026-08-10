@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptServiceProtocol
 
 extension AgentModeViewModel {
     // MARK: - Tab Session
@@ -44,6 +45,9 @@ extension AgentModeViewModel {
         var rawToolResultPayloadRenderRevisionByItemID: [UUID: Int] = [:]
         var onSourceItemsChanged: ((TabSession, SourceItemsMutation) -> Void)?
         var onRunStateChanged: ((TabSession) -> Void)?
+        var onPermissionProfileChanged: ((TabSession) -> Void)?
+        var onWorktreeBindingsChanged: ((TabSession) -> Void)?
+        var onInteractionsChanged: ((TabSession) -> Void)?
         #if DEBUG
             private(set) var test_incrementalRetentionCompactionCount = 0
         #endif
@@ -117,11 +121,26 @@ extension AgentModeViewModel {
 
         // Wait/question state
         @Published var waitingPrompt: String? = nil
-        @Published var pendingAskUser: AgentAskUserPendingState? = nil
-        @Published var pendingUserInputRequest: AgentRequestUserInputRequest? = nil
-        @Published var pendingApproval: AgentApprovalRequest? = nil
-        @Published var pendingPermissionsRequest: AgentPermissionsRequest? = nil
-        @Published var pendingMCPElicitationRequest: AgentMCPElicitationRequest? = nil
+        @Published var pendingAskUser: AgentAskUserPendingState? = nil {
+            didSet { if pendingAskUser != oldValue { onInteractionsChanged?(self) } }
+        }
+
+        @Published var pendingUserInputRequest: AgentRequestUserInputRequest? = nil {
+            didSet { if pendingUserInputRequest != oldValue { onInteractionsChanged?(self) } }
+        }
+
+        @Published var pendingApproval: AgentApprovalRequest? = nil {
+            didSet { if pendingApproval != oldValue { onInteractionsChanged?(self) } }
+        }
+
+        @Published var pendingPermissionsRequest: AgentPermissionsRequest? = nil {
+            didSet { if pendingPermissionsRequest != oldValue { onInteractionsChanged?(self) } }
+        }
+
+        @Published var pendingMCPElicitationRequest: AgentMCPElicitationRequest? = nil {
+            didSet { if pendingMCPElicitationRequest != oldValue { onInteractionsChanged?(self) } }
+        }
+
         @Published var pendingApplyEditsReview: PendingApplyEditsReview? = nil
         @Published var pendingWorktreeMergeReview: PendingWorktreeMergeReview? = nil
         var queuedUserInputRequests: [AgentRequestUserInputRequest] = []
@@ -156,12 +175,23 @@ extension AgentModeViewModel {
         /// Whether this session was originally created by an MCP client.
         var isMCPOriginated: Bool = false
         /// Persisted logical-root to worktree bindings for this Agent session.
-        var worktreeBindings: [AgentSessionWorktreeBinding] = []
+        var worktreeBindings: [AgentSessionWorktreeBinding] = [] {
+            didSet {
+                guard worktreeBindings != oldValue else { return }
+                onWorktreeBindingsChanged?(self)
+            }
+        }
+
         /// Persisted resumable worktree-merge operations for this Agent session.
         var worktreeMergeOperations: [AgentSessionWorktreeMergeOperation] = []
         /// Permission profile for the current session. Set to `.mcpSafeDefaults`
         /// when MCP control is active, `.userConfigured` otherwise.
-        var permissionProfile: AgentPermissionProfile = .userConfigured
+        var permissionProfile: AgentPermissionProfile = .userConfigured {
+            didSet {
+                guard permissionProfile != oldValue else { return }
+                onPermissionProfileChanged?(self)
+            }
+        }
 
         // Instruction queue for when user sends while agent is not waiting (shared across all runners)
         var pendingInstructions: [String] = []
@@ -424,6 +454,7 @@ extension AgentModeViewModel {
         /// below (`installRunID`, `clearRunID(ifCurrent:)`) or the
         /// host-authoritative `AgentModeProcessRunIdentity.clearProcessRunID(for:)`.
         let runLifecycle = AgentRunAttemptLifecycle()
+        private(set) var authorityRunBinding: RunBindingSnapshot?
 
         var runID: UUID? {
             runLifecycle.currentRunID
@@ -433,6 +464,21 @@ extension AgentModeViewModel {
         /// run. The installing path owns the identity until it is cleared.
         func installRunID(_ runID: UUID) {
             runLifecycle.installRunID(runID)
+        }
+
+        func installAuthorityRunBinding(_ binding: RunBindingSnapshot) {
+            // The durable authority has already fenced concurrent starts. A
+            // replacement here is therefore an authoritative successor, not a
+            // locally decided lifecycle transition.
+            authorityRunBinding = binding
+            installRunID(binding.runID)
+        }
+
+        @discardableResult
+        func clearAuthorityRunBinding(ifCurrent runID: UUID) -> Bool {
+            guard authorityRunBinding?.runID == runID else { return false }
+            authorityRunBinding = nil
+            return true
         }
 
         /// Clears the run ID only when it still matches the caller's run, so a
@@ -1097,6 +1143,27 @@ extension AgentModeViewModel {
             if case let .notify(mutation) = dispatch {
                 onSourceItemsChanged?(self, mutation)
             }
+        }
+
+        /// Rebuilds the macOS presentation cache from the canonical durable
+        /// transcript. This path never publishes back to the authority.
+        func applyAuthorityTranscript(_ entries: [TranscriptEntry]) {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let rows = entries.compactMap { entry in
+                entry.presentationPayload.flatMap { try? decoder.decode(AgentChatItem.self, from: $0) }
+            }
+            guard !rows.isEmpty || entries.isEmpty else { return }
+            let imported = AgentTranscriptIO.importLegacyItems(
+                rows,
+                nextSequenceIndex: (rows.map(\.sequenceIndex).max() ?? -1) + 1
+            )
+            transcript = AgentTranscriptIO.runtimeNormalizedTranscript(imported)
+            commitSourceItems(
+                AgentTranscriptIO.workingSourceItems(from: transcript),
+                dispatch: .silent,
+                diagnosticContext: "durable_authority_projection"
+            )
         }
 
         private func repairedSourceItems(

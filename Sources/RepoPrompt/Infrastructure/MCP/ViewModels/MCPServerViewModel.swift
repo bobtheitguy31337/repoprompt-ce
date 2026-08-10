@@ -13,6 +13,7 @@ import Logging
 import MCP
 import Ontology
 import RepoPromptDomainRuntime
+import RepoPromptHeadlessRuntime
 import RepoPromptShared
 
 enum ReadFileAutoSelectionCoverageCertificateMissReason: String, CaseIterable, Hashable {
@@ -417,6 +418,7 @@ final class MCPServerViewModel: ObservableObject {
     // ---------------------------------------------------------------------
     let windowID: Int
     private(set) var service: MCPService
+    private let agentAuthorityProvider: @Sendable () async throws -> RepoPromptHeadlessAuthority
     let logger = Logger(label: "com.repoprompt.mcp")
 
     #if DEBUG
@@ -884,7 +886,7 @@ final class MCPServerViewModel: ObservableObject {
                     message: message,
                     metadata: metadata,
                     bindCurrentRequestToTab: { tabID, requestMetadata in
-                        try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: requestMetadata)
+                        try await self.bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: requestMetadata)
                     },
                     agentModeVM: agentModeVM,
                     agentRaw: agentRaw,
@@ -910,6 +912,10 @@ final class MCPServerViewModel: ObservableObject {
             },
             bindCurrentRequestToTab: { [self] tabID, metadata in
                 try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: metadata)
+            },
+            loadAuthoritySnapshot: { [agentAuthorityProvider] sessionID in
+                guard let authority = try? await agentAuthorityProvider() else { return nil }
+                return try? await authority.authoritySessionSnapshot(sessionID: sessionID)
             }
         )
     }
@@ -2670,9 +2676,13 @@ final class MCPServerViewModel: ObservableObject {
         domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient? = nil,
         domainReadSideEffectCoordinator: DomainReadSideEffectCoordinator? = nil,
         domainReadRuntimeIdentity: DomainRuntimeIdentity? = nil,
-        applyEditsApprovalStore: ApplyEditsApprovalStore = .shared
+        applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
+        agentAuthorityProvider: @escaping @Sendable () async throws -> RepoPromptHeadlessAuthority = {
+            try await AppAgentAuthorityComposition.shared.authority()
+        }
     ) {
         self.service = service
+        self.agentAuthorityProvider = agentAuthorityProvider
         self.windowID = windowID
         self.promptVM = promptVM
         self.oracleVM = oracleVM

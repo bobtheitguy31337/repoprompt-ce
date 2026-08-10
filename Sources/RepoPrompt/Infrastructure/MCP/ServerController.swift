@@ -76,6 +76,7 @@ final actor ServerController: ObservableObject {
 
     private let networkManager = ServerNetworkManager.shared
     private let globalRegistrationOperation: @Sendable () async throws -> Void
+    private let agentAuthorityReadyOperation: @Sendable () async throws -> Void
     private let beforeTransportActivationOperation: @Sendable () async throws -> Void
     private var lifecycleGeneration: UInt64 = 0
     private var desiredTransportState: DesiredTransportState = .stopped
@@ -105,10 +106,14 @@ final actor ServerController: ObservableObject {
         globalRegistrationOperation: @escaping @Sendable () async throws -> Void = {
             try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
         },
+        agentAuthorityReadyOperation: @escaping @Sendable () async throws -> Void = {
+            _ = try await AppAgentAuthorityComposition.shared.authority()
+        },
         beforeTransportActivationOperation: @escaping @Sendable () async throws -> Void = {},
         installNetworkCallbacks: Bool = true
     ) {
         self.globalRegistrationOperation = globalRegistrationOperation
+        self.agentAuthorityReadyOperation = agentAuthorityReadyOperation
         self.beforeTransportActivationOperation = beforeTransportActivationOperation
         if installNetworkCallbacks {
             Task { [weak self] in
@@ -453,6 +458,8 @@ final actor ServerController: ObservableObject {
 
     private func performStart(generation: UInt64) async throws {
         do {
+            try await agentAuthorityReadyOperation()
+            try requireCurrentStart(generation)
             try await globalRegistrationOperation()
             try requireCurrentStart(generation)
             try await beforeTransportActivationOperation()

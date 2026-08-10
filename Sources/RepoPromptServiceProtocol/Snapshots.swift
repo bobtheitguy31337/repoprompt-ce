@@ -70,14 +70,19 @@ public struct TranscriptEntry: Codable, Hashable, Sendable {
     public let content: String
     public let actor: ExternalActor?
     public let timestamp: Date
+    /// Optional adapter-owned rendering payload. The provider-neutral fields above
+    /// remain the canonical transcript contract; macOS uses this to round-trip its
+    /// richer chat row without creating a second transcript authority.
+    public let presentationPayload: Data?
 
-    public init(entryID: UUID, sessionSequence: Int64, kind: Kind, content: String, actor: ExternalActor?, timestamp: Date) {
+    public init(entryID: UUID, sessionSequence: Int64, kind: Kind, content: String, actor: ExternalActor?, timestamp: Date, presentationPayload: Data? = nil) {
         self.entryID = entryID
         self.sessionSequence = sessionSequence
         self.kind = kind
         self.content = content
         self.actor = actor
         self.timestamp = timestamp
+        self.presentationPayload = presentationPayload
     }
 }
 
@@ -185,4 +190,108 @@ public struct AuthoritativeSnapshot: Codable, Sendable {
         self.sessions = sessions
         self.cursor = cursor
     }
+}
+
+/// Complete session projection returned to every authority adapter. Keeping
+/// policy, interactions, worktree ownership and the live run binding together
+/// prevents UI and direct-MCP compositions from assembling competing views.
+public struct AuthoritySessionSnapshot: Codable, Hashable, Sendable {
+    public let session: SessionSnapshot
+    public let activeRun: ProviderRunSnapshot?
+    public let activeBinding: RunBindingSnapshot?
+    public let permissions: ExecutionPermissionSnapshot
+    public let interactions: [InteractionSnapshot]
+    public let worktrees: [WorktreeBindingSnapshot]
+
+    public init(
+        session: SessionSnapshot,
+        activeRun: ProviderRunSnapshot?,
+        activeBinding: RunBindingSnapshot?,
+        permissions: ExecutionPermissionSnapshot,
+        interactions: [InteractionSnapshot],
+        worktrees: [WorktreeBindingSnapshot]
+    ) {
+        self.session = session
+        self.activeRun = activeRun
+        self.activeBinding = activeBinding
+        self.permissions = permissions
+        self.interactions = interactions
+        self.worktrees = worktrees
+    }
+}
+
+/// Codable service representation of the runtime-core binding identity. This
+/// lives in the protocol target so UI, HTTP and MCP adapters share one shape
+/// without introducing a reverse dependency on AgentRuntimeCore.
+public struct RunBindingSnapshot: Codable, Hashable, Sendable {
+    public let runID: UUID
+    public let generation: Int64
+    public let turnEpoch: Int64
+    public let connectionGeneration: Int64
+
+    public init(runID: UUID, generation: Int64, turnEpoch: Int64, connectionGeneration: Int64) {
+        self.runID = runID
+        self.generation = generation
+        self.turnEpoch = turnEpoch
+        self.connectionGeneration = connectionGeneration
+    }
+}
+
+/// Exact-identity import used by an embedded host while it migrates its legacy
+/// JSON documents. It is an authority admission operation, not an alternate
+/// persistence path: once installed, every mutation uses the durable store.
+public struct EmbeddedSessionSeed: Codable, Hashable, Sendable {
+    public let projectID: UUID
+    public let projectName: String
+    public let roots: [ProjectRootSnapshot]
+    public let sessionID: UUID
+    public let parentSessionID: UUID?
+    public let rootSessionID: UUID
+    public let creator: ExternalActor
+    public let provider: ProviderKind
+    public let model: String?
+    public let visibility: Visibility
+    public let transcript: [TranscriptEntry]
+    public let permissionMode: String
+    public let providerSettings: [String: String]
+    public let worktrees: [WorktreeBindingSnapshot]
+
+    public init(
+        projectID: UUID,
+        projectName: String,
+        roots: [ProjectRootSnapshot],
+        sessionID: UUID,
+        parentSessionID: UUID? = nil,
+        rootSessionID: UUID,
+        creator: ExternalActor,
+        provider: ProviderKind,
+        model: String? = nil,
+        visibility: Visibility = .privateSession,
+        transcript: [TranscriptEntry] = [],
+        permissionMode: String = "workspaceWrite",
+        providerSettings: [String: String] = [:],
+        worktrees: [WorktreeBindingSnapshot] = []
+    ) {
+        self.projectID = projectID
+        self.projectName = projectName
+        self.roots = roots
+        self.sessionID = sessionID
+        self.parentSessionID = parentSessionID
+        self.rootSessionID = rootSessionID
+        self.creator = creator
+        self.provider = provider
+        self.model = model
+        self.visibility = visibility
+        self.transcript = transcript
+        self.permissionMode = permissionMode
+        self.providerSettings = providerSettings
+        self.worktrees = worktrees
+    }
+}
+
+public enum EmbeddedRunTerminalOutcome: String, Codable, Hashable, Sendable {
+    case completed
+    case failed
+    case canceled
+    case interrupted
 }

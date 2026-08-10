@@ -22,9 +22,9 @@ public actor SessionAuthority {
         state.snapshot
     }
 
-    public func beginRun(connectionGeneration: Int64) throws -> RunBindingIdentity {
+    public func beginRun(connectionGeneration: Int64, runID: UUID? = nil) throws -> RunBindingIdentity {
         guard state.activeRunID == nil else { throw ServiceAPIError(code: .runAlreadyActive, message: "A run is already active") }
-        let runID = ids.next()
+        let runID = runID ?? ids.next()
         let binding = RunBindingIdentity(runID: runID, generation: state.snapshot.runGeneration + 1, turnEpoch: state.snapshot.turnEpoch + 1, connectionGeneration: connectionGeneration)
         state.activeRunID = runID
         state.gate = AgentRunLifecycleGate(binding: binding)
@@ -39,6 +39,37 @@ public actor SessionAuthority {
         guard result == .accepted else { return result }
         var transcript = state.snapshot.transcript
         transcript.append(TranscriptEntry(entryID: ids.next(), sessionSequence: Int64(transcript.count + 1), kind: kind, content: content, actor: nil, timestamp: clock.now()))
+        replaceSnapshot(transcript: transcript)
+        return .accepted
+    }
+
+    /// Accepts a complete rich-host transcript through the same live binding
+    /// gate used for provider frames. The caller supplies the complete canonical
+    /// history so optimistic rows that were rolled back cannot survive as
+    /// durable ghost entries.
+    public func acceptTranscriptProjection(
+        binding: RunBindingIdentity,
+        entries: [TranscriptEntry]
+    ) -> LifecycleAcceptance {
+        guard var gate = state.gate else { return .staleGeneration }
+        let result = gate.accept(binding: binding)
+        state.gate = gate
+        guard result == .accepted else { return result }
+
+        var entriesByID: [UUID: TranscriptEntry] = [:]
+        for entry in entries {
+            entriesByID[entry.entryID] = entry
+        }
+        let transcript = entriesByID.values.sorted {
+            if $0.sessionSequence == $1.sessionSequence {
+                if $0.timestamp == $1.timestamp {
+                    return $0.entryID.uuidString < $1.entryID.uuidString
+                }
+                return $0.timestamp < $1.timestamp
+            }
+            return $0.sessionSequence < $1.sessionSequence
+        }
+        guard transcript != state.snapshot.transcript else { return .accepted }
         replaceSnapshot(transcript: transcript)
         return .accepted
     }
@@ -80,7 +111,8 @@ public actor SessionAuthority {
     }
 
     public func activeBinding() -> RunBindingIdentity? {
-        state.gate?.binding
+        guard state.activeRunID != nil else { return nil }
+        return state.gate?.binding
     }
 
     public func archive(expectedRevision: Int64) throws {
