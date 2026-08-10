@@ -3,6 +3,9 @@ FROM swift:6.2.4-noble AS build
 WORKDIR /src
 COPY Package.swift Package.resolved ./
 COPY Sources/RepoPromptServiceProtocol Sources/RepoPromptServiceProtocol
+COPY Sources/RepoPromptShared Sources/RepoPromptShared
+COPY Sources/RepoPromptDomainRuntime Sources/RepoPromptDomainRuntime
+COPY Sources/RepoPromptC Sources/RepoPromptC
 COPY Sources/RepoPromptAgentRuntimeCore Sources/RepoPromptAgentRuntimeCore
 COPY Sources/RepoPromptWorkspaceRuntimeCore Sources/RepoPromptWorkspaceRuntimeCore
 COPY Sources/RepoPromptRegexCore Sources/RepoPromptRegexCore

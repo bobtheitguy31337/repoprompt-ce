@@ -4,9 +4,9 @@ import RepoPromptLinuxSupport
 import RepoPromptServiceProtocol
 
 #if os(Linux)
-import Glibc
+    import Glibc
 #else
-import Darwin
+    import Darwin
 #endif
 
 public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
@@ -22,12 +22,12 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
 
     public init() throws {
         #if os(Linux)
-        guard rp_enable_child_subreaper() == 0 else {
-            throw ServiceAPIError(code: .dependencyUnavailable, message: "Unable to enable Linux child subreaper")
-        }
-        bootID = (try? String(contentsOfFile: "/proc/sys/kernel/random/boot_id", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) ?? "unknown-linux-boot"
+            guard rp_enable_child_subreaper() == 0 else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "Unable to enable Linux child subreaper")
+            }
+            bootID = (try? String(contentsOfFile: "/proc/sys/kernel/random/boot_id", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) ?? "unknown-linux-boot"
         #else
-        bootID = "darwin-\(ProcessInfo.processInfo.systemUptime)"
+            bootID = "darwin-\(ProcessInfo.processInfo.systemUptime)"
         #endif
     }
 
@@ -56,10 +56,20 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         }
     }
 
-    public func waitForCapturedProcess(_ captured: CapturedProcess, maximumBytes: Int) async throws -> String {
+    public func waitForCapturedProcess(
+        _ captured: CapturedProcess,
+        maximumBytes: Int,
+        onOutput: (@Sendable (String) async -> Void)? = nil
+    ) async throws -> String {
         guard let process = processes[captured.identity.pid] else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider process record is missing") }
         while process.isRunning {
             try Task.checkCancellation()
+            if let onOutput,
+               let data = try? Data(contentsOf: URL(fileURLWithPath: captured.stdoutPath)),
+               !data.isEmpty
+            {
+                await onOutput(String(decoding: data.prefix(max(1, maximumBytes)), as: UTF8.self))
+            }
             try await Task.sleep(for: .milliseconds(50))
         }
         process.waitUntilExit()
@@ -67,6 +77,9 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         try? (process.standardError as? FileHandle)?.close()
         let stdout = (try? Data(contentsOf: URL(fileURLWithPath: captured.stdoutPath))) ?? Data()
         let stderr = (try? Data(contentsOf: URL(fileURLWithPath: captured.stderrPath))) ?? Data()
+        if let onOutput, !stdout.isEmpty {
+            await onOutput(String(decoding: stdout.prefix(max(1, maximumBytes)), as: UTF8.self))
+        }
         try? FileManager.default.removeItem(atPath: captured.stdoutPath)
         try? FileManager.default.removeItem(atPath: captured.stderrPath)
         try await reap(pid: captured.identity.pid)
@@ -80,18 +93,20 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         guard FileManager.default.isExecutableFile(atPath: executable) else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider executable is unavailable") }
         let process = Process()
         #if os(Linux)
-        if FileManager.default.isExecutableFile(atPath: "/usr/bin/setsid") {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/setsid")
-            process.arguments = [executable] + arguments
-        } else {
-            throw ServiceAPIError(code: .dependencyUnavailable, message: "Linux setsid executable is required for isolated provider process groups")
-        }
+            if FileManager.default.isExecutableFile(atPath: "/usr/bin/setsid") {
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/setsid")
+                process.arguments = [executable] + arguments
+            } else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "Linux setsid executable is required for isolated provider process groups")
+            }
         #else
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
         #endif
         process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
-        process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, configured in configured }
+        var launchEnvironment = ProcessInfo.processInfo.environment.merging(environment) { _, configured in configured }
+        launchEnvironment["REPOPROMPT_HELPER_TOKEN"] = helperToken
+        process.environment = launchEnvironment
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = stdout
         process.standardError = stderr
@@ -100,19 +115,19 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         processes[pid] = process
         let digest = CanonicalSigning.bodyDigest(Data(helperToken.utf8))
         #if !os(Linux)
-        let observed = ProcessIdentity(pid: pid, parentPID: getpid(), processGroupID: getpgid(pid), sessionID: getsid(pid), startTimeTicks: UInt64(ProcessInfo.processInfo.systemUptime * 100), bootID: bootID, executablePath: executable, helperTokenDigest: digest)
-        identities[pid] = observed
-        return observed
+            let observed = ProcessIdentity(pid: pid, parentPID: getpid(), processGroupID: getpgid(pid), sessionID: getsid(pid), startTimeTicks: UInt64(ProcessInfo.processInfo.systemUptime * 100), bootID: bootID, executablePath: executable, helperTokenDigest: digest)
+            identities[pid] = observed
+            return observed
         #else
-        for _ in 0 ..< 100 {
-            if let observed = try await inspectLinux(pid: pid, helperTokenDigest: digest) {
-                identities[pid] = observed
-                return observed
+            for _ in 0 ..< 100 {
+                if let observed = try await inspectLinux(pid: pid, helperTokenDigest: digest) {
+                    identities[pid] = observed
+                    return observed
+                }
+                try await Task.sleep(for: .milliseconds(10))
             }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        process.terminate()
-        throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider process did not establish a verifiable identity")
+            process.terminate()
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider process did not establish a verifiable identity")
         #endif
     }
 
@@ -122,22 +137,17 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
 
     public func descendants(of pid: Int32) async throws -> [ProcessIdentity] {
         #if os(Linux)
-        let proc = try FileManager.default.contentsOfDirectory(atPath: "/proc").compactMap(Int32.init)
-        var observed: [Int32: ProcessIdentity] = [:]
-        for candidate in proc {
-            if let identity = try await inspectLinux(pid: candidate, helperTokenDigest: identities[pid]?.helperTokenDigest ?? "") { observed[candidate] = identity }
-        }
-        var result: [ProcessIdentity] = []
-        var frontier = [pid]
-        while let parent = frontier.popLast() {
-            for identity in observed.values where identity.parentPID == parent && !result.contains(identity) {
-                result.append(identity)
-                frontier.append(identity.pid)
+            guard let expectedDigest = identities[pid]?.helperTokenDigest, !expectedDigest.isEmpty else { return [] }
+            let proc = try FileManager.default.contentsOfDirectory(atPath: "/proc").compactMap(Int32.init)
+            var result: [ProcessIdentity] = []
+            for candidate in proc where candidate != pid {
+                if let identity = try? await inspectLinux(pid: candidate, helperTokenDigest: expectedDigest) {
+                    result.append(identity)
+                }
             }
-        }
-        return result
+            return result
         #else
-        return []
+            return []
         #endif
     }
 
@@ -165,20 +175,35 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
 
     private func inspectLinux(pid: Int32, helperTokenDigest: String) async throws -> ProcessIdentity? {
         #if os(Linux)
-        guard let statLine = try? String(contentsOfFile: "/proc/\(pid)/stat", encoding: .utf8), let stat = ProcStatParser.parse(statLine) else { return nil }
-        let executable = (try? FileManager.default.destinationOfSymbolicLink(atPath: "/proc/\(pid)/exe")) ?? ""
-        return ProcessIdentity(pid: stat.pid, parentPID: stat.parentPID, processGroupID: stat.processGroupID, sessionID: stat.sessionID, startTimeTicks: stat.startTimeTicks, bootID: bootID, executablePath: executable, helperTokenDigest: helperTokenDigest)
+            guard let statLine = try? String(contentsOfFile: "/proc/\(pid)/stat", encoding: .utf8), let stat = ProcStatParser.parse(statLine) else { return nil }
+            let executable = (try? FileManager.default.destinationOfSymbolicLink(atPath: "/proc/\(pid)/exe")) ?? ""
+            let actualHelperDigest = try helperTokenDigest(pid: pid)
+            guard helperTokenDigest.isEmpty || actualHelperDigest == helperTokenDigest else { return nil }
+            return ProcessIdentity(pid: stat.pid, parentPID: stat.parentPID, processGroupID: stat.processGroupID, sessionID: stat.sessionID, startTimeTicks: stat.startTimeTicks, bootID: bootID, executablePath: executable, helperTokenDigest: actualHelperDigest)
         #else
-        guard let identity = identities[pid], processes[pid]?.isRunning == true else { return nil }
-        return identity
+            guard let identity = identities[pid], processes[pid]?.isRunning == true else { return nil }
+            return identity
+        #endif
+    }
+
+    private func helperTokenDigest(pid: Int32) throws -> String {
+        #if os(Linux)
+            let environment = try Data(contentsOf: URL(fileURLWithPath: "/proc/\(pid)/environ"))
+            let prefix = Data("REPOPROMPT_HELPER_TOKEN=".utf8)
+            for entry in environment.split(separator: 0) where entry.starts(with: prefix) {
+                return CanonicalSigning.bodyDigest(Data(entry.dropFirst(prefix.count)))
+            }
+            return ""
+        #else
+            return identities[pid]?.helperTokenDigest ?? ""
         #endif
     }
 
     private func systemKill(_ pid: Int32, _ signal: Int32) -> Int32 {
         #if os(Linux)
-        Glibc.kill(pid, signal)
+            Glibc.kill(pid, signal)
         #else
-        Darwin.kill(pid, signal)
+            Darwin.kill(pid, signal)
         #endif
     }
 }

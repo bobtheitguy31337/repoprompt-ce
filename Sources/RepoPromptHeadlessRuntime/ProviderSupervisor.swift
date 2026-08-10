@@ -81,7 +81,7 @@ public actor ProviderProcessSupervisor {
         let initialDescendants = try await verifiedDescendants(of: leader)
         discovered.formUnion(initialDescendants)
         try await persistMembers(runID: runID, members: Array(discovered))
-        try await processPort.signal(termSignal, processGroupID: leader.processGroupID, verifiedMembers: Array(discovered))
+        try await signalGroups(termSignal, members: Array(discovered))
 
         // Re-scan for the entire grace window. Providers commonly fork cleanup helpers
         // after TERM; a single ancestry snapshot lets those late children escape.
@@ -98,7 +98,7 @@ public actor ProviderProcessSupervisor {
         for member in discovered where try await processPort.inspect(pid: member.pid) == member {
             survivors.append(member)
         }
-        if !survivors.isEmpty { try await processPort.signal(killSignal, processGroupID: leader.processGroupID, verifiedMembers: survivors) }
+        if !survivors.isEmpty { try await signalGroups(killSignal, members: survivors) }
         for member in discovered {
             try await processPort.reap(pid: member.pid)
         }
@@ -108,7 +108,14 @@ public actor ProviderProcessSupervisor {
 
     private func verifiedDescendants(of leader: ProcessIdentity) async throws -> [ProcessIdentity] {
         try await processPort.descendants(of: leader.pid).filter {
-            $0.bootID == leader.bootID && $0.processGroupID == leader.processGroupID && $0.helperTokenDigest == leader.helperTokenDigest
+            $0.bootID == leader.bootID && $0.helperTokenDigest == leader.helperTokenDigest
+        }
+    }
+
+    private func signalGroups(_ signal: Int32, members: [ProcessIdentity]) async throws {
+        let byProcessGroup = Dictionary(grouping: members, by: \ProcessIdentity.processGroupID)
+        for (processGroupID, groupMembers) in byProcessGroup {
+            try await processPort.signal(signal, processGroupID: processGroupID, verifiedMembers: groupMembers)
         }
     }
 

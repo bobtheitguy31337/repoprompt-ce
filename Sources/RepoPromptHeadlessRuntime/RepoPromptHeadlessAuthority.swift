@@ -910,7 +910,21 @@ public actor RepoPromptHeadlessAuthority {
         guard let providerAdapter, let session = sessions[sessionID] else { return }
         let initial = await session.snapshot()
         do {
-            let result = try await providerAdapter.execute(kind: initial.provider, model: initial.model, prompt: prompt, workingDirectory: workingDirectory, runID: binding.runID, resumeProviderSessionID: run.providerSessionID)
+            let result = try await providerAdapter.execute(
+                kind: initial.provider,
+                model: initial.model,
+                prompt: prompt,
+                workingDirectory: workingDirectory,
+                runID: binding.runID,
+                resumeProviderSessionID: run.providerSessionID
+            ) { providerSessionID in
+                await self.recordActiveProviderIdentity(
+                    sessionID: sessionID,
+                    run: run,
+                    binding: binding,
+                    providerSessionID: providerSessionID
+                )
+            }
             let durableIdentity = result.providerSessionID ?? run.providerSessionID
             if let durableIdentity { try await updateAgentProviderIdentity(sessionID: sessionID, providerSessionID: durableIdentity) }
             guard !Task.isCancelled, await session.acceptProviderOutput(binding: binding, kind: .assistant, content: result.output) == .accepted else { return }
@@ -950,6 +964,32 @@ public actor RepoPromptHeadlessAuthority {
         let event = try await store.persistAgent(updated, projectID: session.projectID, actor: nil, correlationID: ids.next(), eventType: .agentUpdated)
         agents[sessionID] = updated
         await eventHub.publish(event)
+    }
+
+    private func recordActiveProviderIdentity(
+        sessionID: UUID,
+        run: ProviderRunSnapshot,
+        binding: RunBindingIdentity,
+        providerSessionID: String
+    ) async {
+        guard let session = sessions[sessionID], await session.activeBinding() == binding else { return }
+        if let persisted = try? await store.latestRun(sessionID: sessionID),
+           persisted.runID == run.runID,
+           persisted.providerSessionID != providerSessionID
+        {
+            try? await store.persistRun(ProviderRunSnapshot(
+                runID: run.runID,
+                sessionID: run.sessionID,
+                provider: run.provider,
+                providerSessionID: providerSessionID,
+                state: "running",
+                generation: run.generation,
+                turnEpoch: binding.turnEpoch,
+                startReason: run.startReason,
+                startedAt: run.startedAt
+            ))
+        }
+        try? await updateAgentProviderIdentity(sessionID: sessionID, providerSessionID: providerSessionID)
     }
 
     private func finishPersistedRun(sessionID: UUID, binding: RunBindingIdentity, state: String, reason: String) async throws {

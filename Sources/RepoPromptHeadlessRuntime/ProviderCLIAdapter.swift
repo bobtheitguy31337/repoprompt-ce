@@ -61,7 +61,7 @@ public actor ProviderCLIAdapter {
                 enabled: executable,
                 executable: executable ? configuration.executable : nil,
                 supportsResume: kind == .codex || kind == .claudeCompatible,
-                supportsSteering: false,
+                supportsSteering: kind == .codex || kind == .claudeCompatible,
                 version: configuration.expectedVersion,
                 protocolVersion: configuration.protocolVersion,
                 reasonUnavailable: executable ? nil : "configured binary is not executable"
@@ -95,7 +95,16 @@ public actor ProviderCLIAdapter {
         try await execute(kind: kind, model: model, prompt: prompt, workingDirectory: workingDirectory, maximumBytes: maximumBytes, runID: requestedRunID).output
     }
 
-    public func execute(kind: ProviderKind, model: String?, prompt: String, workingDirectory: String, maximumBytes: Int = 8_388_608, runID requestedRunID: UUID? = nil, resumeProviderSessionID: String? = nil) async throws -> ProviderExecutionResult {
+    public func execute(
+        kind: ProviderKind,
+        model: String?,
+        prompt: String,
+        workingDirectory: String,
+        maximumBytes: Int = 8_388_608,
+        runID requestedRunID: UUID? = nil,
+        resumeProviderSessionID: String? = nil,
+        onProviderSessionIdentity: @escaping @Sendable (String) async -> Void = { _ in }
+    ) async throws -> ProviderExecutionResult {
         guard let configuration = configurations[kind], FileManager.default.isExecutableFile(atPath: configuration.executable) else {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Requested provider is not installed")
         }
@@ -117,7 +126,9 @@ public actor ProviderCLIAdapter {
         }
         guard let processPort, let processSupervisor else {
             let output = try await runner.run(executable: configuration.executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes)
-            return parseOutput(output, kind: kind)
+            let result = Self.parseOutput(output, kind: kind)
+            if let providerSessionID = result.providerSessionID { await onProviderSessionIdentity(providerSessionID) }
+            return result
         }
         let runID = requestedRunID ?? UUID()
         let helperToken = runID.uuidString
@@ -136,19 +147,23 @@ public actor ProviderCLIAdapter {
         try await processSupervisor.register(runID: runID, leader: captured.identity)
         do {
             let output = try await withTaskCancellationHandler {
-                try await processPort.waitForCapturedProcess(captured, maximumBytes: maximumBytes)
+                try await processPort.waitForCapturedProcess(captured, maximumBytes: maximumBytes) { output in
+                    if let providerSessionID = Self.parseOutput(output, kind: kind).providerSessionID {
+                        await onProviderSessionIdentity(providerSessionID)
+                    }
+                }
             } onCancel: {
                 Task { try? await processSupervisor.cancel(runID: runID) }
             }
             await processSupervisor.forget(runID: runID)
-            return parseOutput(output, kind: kind)
+            return Self.parseOutput(output, kind: kind)
         } catch {
             if !(error is CancellationError) { await processSupervisor.forget(runID: runID) }
             throw error
         }
     }
 
-    private func parseOutput(_ output: String, kind: ProviderKind) -> ProviderExecutionResult {
+    private nonisolated static func parseOutput(_ output: String, kind: ProviderKind) -> ProviderExecutionResult {
         guard kind == .codex || kind == .claudeCompatible else { return ProviderExecutionResult(output: output, providerSessionID: nil) }
         var providerSessionID: String?
         var finalText: String?

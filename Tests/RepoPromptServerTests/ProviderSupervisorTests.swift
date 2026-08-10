@@ -18,6 +18,7 @@ private actor FakeProcessPort: ProcessSupervisionPort {
     private let children: [ProcessIdentity]
     private let lateChildren: [ProcessIdentity]
     private var observedSignals: [Int32] = []
+    private var observedProcessGroups: [Int32] = []
     private var reapedPIDs: [Int32] = []
     private var descendantScans = 0
 
@@ -43,14 +44,15 @@ private actor FakeProcessPort: ProcessSupervisionPort {
 
     func signal(_ signal: Int32, processGroupID: Int32, verifiedMembers: [ProcessIdentity]) async throws {
         observedSignals.append(signal)
+        observedProcessGroups.append(processGroupID)
     }
 
     func reap(pid: Int32) async throws {
         reapedPIDs.append(pid)
     }
 
-    func result() -> (signals: [Int32], reaped: [Int32]) {
-        (observedSignals, reapedPIDs)
+    func result() -> (signals: [Int32], processGroups: [Int32], reaped: [Int32]) {
+        (observedSignals, observedProcessGroups, reapedPIDs)
     }
 }
 
@@ -66,6 +68,34 @@ final class ProviderSupervisorTests: XCTestCase {
         XCTAssertEqual(calls.count, 2)
         XCTAssertEqual(Array(calls[1].prefix(4)), ["exec", "resume", "--json", "--skip-git-repo-check"])
         XCTAssertTrue(calls[1].contains("11111111-1111-1111-1111-111111111111"))
+        let capabilities = await adapter.capabilities()
+        XCTAssertEqual(capabilities.first { $0.kind == .codex }?.supportsSteering, true)
+    }
+
+    func testProviderPublishesNativeIdentityBeforeProcessCompletion() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let executable = directory.appendingPathComponent("provider")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("#!/bin/sh\necho '{\"type\":\"thread.started\",\"thread_id\":\"22222222-2222-2222-2222-222222222222\"}'\nsleep 2\necho '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"done\"}}'\n".utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let port = try PortableProcessSupervisionPort()
+        let observer = ProviderIdentityObserver()
+        let adapter = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: executable.path)], processPort: port, outputDirectory: directory.appendingPathComponent("output").path, ephemeralHomeRoot: directory.appendingPathComponent("homes").path)
+
+        let task = Task {
+            try await adapter.execute(kind: .codex, model: nil, prompt: "prompt", workingDirectory: directory.path) { identity in
+                await observer.record(identity)
+            }
+        }
+        for _ in 0 ..< 30 {
+            if await observer.value() != nil { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let observedIdentity = await observer.value()
+        XCTAssertEqual(observedIdentity, "22222222-2222-2222-2222-222222222222")
+        let result = try await task.value
+        XCTAssertEqual(result.output, "done")
     }
 
     func testProviderUsesAuthorityRunIDAndRemovesEphemeralCredentialHome() async throws {
@@ -147,6 +177,21 @@ final class ProviderSupervisorTests: XCTestCase {
         XCTAssertEqual(result.reaped.sorted(), [200, 201])
     }
 
+    func testCancellationSignalsVerifiedDescendantThatEscapedLeaderProcessGroup() async throws {
+        let leader = ProcessIdentity(pid: 210, parentPID: 1, processGroupID: 210, sessionID: 210, startTimeTicks: 20, bootID: "boot", executablePath: "/provider", helperTokenDigest: "token")
+        let escaped = ProcessIdentity(pid: 211, parentPID: 210, processGroupID: 211, sessionID: 211, startTimeTicks: 21, bootID: "boot", executablePath: "/escaped-helper", helperTokenDigest: "token")
+        let port = FakeProcessPort(leader: leader, children: [escaped])
+        let supervisor = ProviderProcessSupervisor(processPort: port, clock: ImmediateClock())
+        let runID = UUID()
+        try await supervisor.register(runID: runID, leader: leader)
+
+        try await supervisor.cancel(runID: runID)
+
+        let result = await port.result()
+        XCTAssertEqual(result.processGroups.sorted(), [210, 210, 211, 211])
+        XCTAssertEqual(result.reaped.sorted(), [210, 211])
+    }
+
     func testPersistedFamilyIsReconciledAfterSupervisorRestart() async throws {
         let leader = ProcessIdentity(pid: 300, parentPID: 1, processGroupID: 300, sessionID: 300, startTimeTicks: 30, bootID: "boot", executablePath: "/provider", helperTokenDigest: "token")
         let child = ProcessIdentity(pid: 301, parentPID: 300, processGroupID: 300, sessionID: 300, startTimeTicks: 31, bootID: "boot", executablePath: "/helper", helperTokenDigest: "token")
@@ -182,5 +227,17 @@ private actor RecordingProviderRunner: WorkspaceCommandRunning {
 
     func calls() -> [[String]] {
         arguments
+    }
+}
+
+private actor ProviderIdentityObserver {
+    private var identity: String?
+
+    func record(_ value: String) {
+        identity = value
+    }
+
+    func value() -> String? {
+        identity
     }
 }
