@@ -1,6 +1,7 @@
+import CoreFoundation
 import Foundation
 
-package struct MCPDomainResponseDeliverySnapshot: Equatable, Sendable {
+package struct MCPDomainResponseDeliverySnapshot: Equatable {
     package let pendingRequestCount: Int
     package let waiterCount: Int
     package let isTerminal: Bool

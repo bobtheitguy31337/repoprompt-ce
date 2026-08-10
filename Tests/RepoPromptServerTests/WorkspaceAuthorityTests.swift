@@ -94,6 +94,8 @@ final class WorkspaceAuthorityTests: XCTestCase {
         let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-root-identity", requestDigest: "p-root-identity")
         let rootID = try XCTUnwrap(project.roots.first?.rootID)
+        try "later".write(to: root.appendingPathComponent("later.txt"), atomically: true, encoding: .utf8)
+        _ = try await authority.projectFile(projectID: project.projectID, request: .init(rootID: rootID, logicalPath: "later.txt"))
         try FileManager.default.removeItem(at: root)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try "replacement".write(to: root.appendingPathComponent("value.txt"), atomically: true, encoding: .utf8)
@@ -104,6 +106,40 @@ final class WorkspaceAuthorityTests: XCTestCase {
             XCTAssertEqual(error.code, .rootUnauthorized)
         }
         try await store.close()
+    }
+
+    func testAuthorizedRootIdentityPersistsAcrossAuthorityRecovery() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let database = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).sqlite")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try "original".write(to: root.appendingPathComponent("value.txt"), atomically: true, encoding: .utf8)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: database)
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: database.path + "-wal"))
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: database.path + "-shm"))
+        }
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let initialStore = try await SQLiteServiceStore.open(storage: .file(database.path))
+        let initialAuthority = RepoPromptHeadlessAuthority(store: initialStore)
+        let project = try await initialAuthority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "persisted-root", requestDigest: "persisted-root")
+        let rootID = try XCTUnwrap(project.roots.first?.rootID)
+        try await initialStore.close()
+
+        try FileManager.default.removeItem(at: root)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try "replacement".write(to: root.appendingPathComponent("value.txt"), atomically: true, encoding: .utf8)
+
+        let recoveredStore = try await SQLiteServiceStore.open(storage: .file(database.path))
+        let recoveredAuthority = RepoPromptHeadlessAuthority(store: recoveredStore)
+        try await recoveredAuthority.recover()
+        do {
+            _ = try await recoveredAuthority.projectFile(projectID: project.projectID, request: .init(rootID: rootID, logicalPath: "value.txt"))
+            XCTFail("expected persisted root identity rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .rootUnauthorized)
+        }
+        try await recoveredStore.close()
     }
 
     func testWorktreeServiceUsesValidatedGitArguments() async throws {

@@ -4,12 +4,16 @@
     import Glibc
 #endif
 import Foundation
+import RepoPromptC
 
 package struct DomainMutationPathIdentity: Codable, Hashable {
     package let originalPath: String
     package let resolvedPath: String
     package let device: UInt64
     package let inode: UInt64
+    /// Optional for compatibility with journals admitted before birth-time
+    /// fencing was available.
+    package let birthTimeBits: UInt64?
 }
 
 package struct DomainMutationPathFenceEntry: Codable, Hashable {
@@ -95,7 +99,7 @@ package enum DomainMutationPathFence {
     package static func revalidateBlocking(_ snapshot: DomainMutationPathFenceSnapshot) throws {
         for root in snapshot.authorizedRoots {
             let currentRoot = try identity(root.originalPath)
-            guard currentRoot == root else {
+            guard sameStableRootIdentity(currentRoot, root) else {
                 throw DomainMutationPathFenceError.rootIdentityChanged(root.originalPath)
             }
         }
@@ -153,11 +157,19 @@ package enum DomainMutationPathFence {
         guard lstat(standardized, &info) == 0 else {
             throw DomainMutationPathFenceError.rootUnavailable(path)
         }
+        var birthSeconds: UInt64 = 0
+        var birthNanoseconds: UInt32 = 0
+        let birthTimeBits: UInt64? = standardized.withCString {
+            rp_filesystem_birth_identity($0, &birthSeconds, &birthNanoseconds) == 0
+                ? birthSeconds &* 1_000_000_000 &+ UInt64(birthNanoseconds)
+                : nil
+        }
         return DomainMutationPathIdentity(
             originalPath: standardized,
             resolvedPath: URL(fileURLWithPath: standardized).resolvingSymlinksInPath().standardizedFileURL.path,
             device: UInt64(info.st_dev),
-            inode: UInt64(info.st_ino)
+            inode: UInt64(info.st_ino),
+            birthTimeBits: birthTimeBits
         )
     }
 
@@ -188,5 +200,15 @@ package enum DomainMutationPathFence {
 
     private static func isContained(_ path: String, by root: String) -> Bool {
         path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+    }
+
+    private static func sameStableRootIdentity(
+        _ lhs: DomainMutationPathIdentity,
+        _ rhs: DomainMutationPathIdentity
+    ) -> Bool {
+        lhs.originalPath == rhs.originalPath
+            && lhs.resolvedPath == rhs.resolvedPath
+            && lhs.device == rhs.device
+            && lhs.inode == rhs.inode
     }
 }

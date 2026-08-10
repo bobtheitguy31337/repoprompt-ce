@@ -1,6 +1,7 @@
 #ifndef FILE_DESCRIPTOR_PATH_H
 #define FILE_DESCRIPTOR_PATH_H
 
+#include "filesystem_birth_identity.h"
 #include <stddef.h>
 
 #ifdef __cplusplus

@@ -18,10 +18,14 @@ COPY Sources/RepoPromptLinuxSupport Sources/RepoPromptLinuxSupport
 COPY Sources/RepoPromptServiceHTTP Sources/RepoPromptServiceHTTP
 COPY Sources/RepoPromptMCPAdapter Sources/RepoPromptMCPAdapter
 COPY Sources/RepoPromptServerExecutable Sources/RepoPromptServerExecutable
+COPY Tests/RepoPromptDomainRuntimeTests Tests/RepoPromptDomainRuntimeTests
+COPY Tests/RepoPromptServerTests Tests/RepoPromptServerTests
 RUN --mount=type=cache,target=/root/.cache/org.swift.swiftpm \
     --mount=type=cache,target=/src/.build \
     REPOPROMPT_SERVER_ONLY=1 swift build --disable-automatic-resolution -c release --product RepoPromptServer && \
-    install -D -m 0755 "$(swift build -c release --show-bin-path)/RepoPromptServer" /out/usr/local/bin/RepoPromptServer
+    bin_path="$(swift build -c release --show-bin-path)" && \
+    install -D -m 0755 "$bin_path/RepoPromptServer" /out/usr/local/bin/RepoPromptServer && \
+    cp -a "$bin_path/RepoPromptCE_RepoPromptWorkspaceRuntimeCore.resources" /out/usr/local/bin/
 
 FROM ubuntu:noble AS providers
 ARG TARGETARCH
@@ -70,7 +74,7 @@ LABEL org.opencontainers.image.title="RepoPromptServer" \
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git tini util-linux && rm -rf /var/lib/apt/lists/* && \
     groupadd --gid 65532 repoprompt && useradd --uid 65532 --gid 65532 --home-dir /var/lib/repoprompt --create-home --shell /usr/sbin/nologin repoprompt && \
     install -d -o 65532 -g 65532 /var/lib/repoprompt/state /var/lib/repoprompt/artifacts /srv/repoprompt/projects /srv/repoprompt/worktrees /var/cache/repoprompt
-COPY --from=build /out/usr/local/bin/RepoPromptServer /usr/local/bin/RepoPromptServer
+COPY --from=build /out/usr/local/bin/ /usr/local/bin/
 COPY --from=providers /opt/repoprompt /opt/repoprompt
 ENV PATH="/opt/repoprompt/providers:${PATH}" \
     REPOPROMPT_STATE_DB="/var/lib/repoprompt/state/repoprompt.sqlite" \

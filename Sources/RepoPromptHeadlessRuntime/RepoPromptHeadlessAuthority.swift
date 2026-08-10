@@ -59,7 +59,16 @@ public actor RepoPromptHeadlessAuthority {
         let unclean = try await !(store.metadata().lastCleanShutdown)
         try await providerAdapter?.recoverProcessFamilies()
         for snapshot in try await store.allProjects() {
-            let roots = snapshot.roots.map { CanonicalRoot(snapshot: $0, filesystemIdentity: "persisted") }
+            let persistedIdentities = try await store.projectRootIdentities(projectID: snapshot.projectID)
+            let roots = snapshot.roots.map { root in
+                let persisted = persistedIdentities[root.rootID]
+                let identity = if let persisted, !["pending", "legacy-import"].contains(persisted) {
+                    persisted
+                } else {
+                    (try? filesystem.canonicalizeRoot(root.canonicalPath).identity) ?? "unavailable"
+                }
+                return CanonicalRoot(snapshot: root, filesystemIdentity: identity)
+            }
             let project = ProjectAuthority(snapshot: snapshot, roots: roots)
             await projects.install(project)
             tools[snapshot.projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
@@ -114,7 +123,7 @@ public actor RepoPromptHeadlessAuthority {
         }
         let cursor = try await store.nextCursor()
         let snapshot = ProjectSnapshot(projectID: projectID, name: input.name, creator: externalActor, state: .active, roots: canonicalRoots.map(\.snapshot), revision: 1, cursor: cursor)
-        let event = try await store.persistProject(snapshot, eventType: .projectCreated, actor: externalActor, correlationID: ids.next(), idempotency: idempotency)
+        let event = try await store.persistProject(snapshot, rootIdentities: Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.snapshot.rootID, $0.filesystemIdentity) }), eventType: .projectCreated, actor: externalActor, correlationID: ids.next(), idempotency: idempotency)
         let project = ProjectAuthority(snapshot: snapshot, roots: canonicalRoots)
         await projects.install(project)
         tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
@@ -146,7 +155,7 @@ public actor RepoPromptHeadlessAuthority {
         }
         let cursor = try await store.nextCursor()
         let snapshot = ProjectSnapshot(projectID: projectID, name: input.name, creator: current.creator, state: .active, roots: canonicalRoots.map(\.snapshot), revision: current.revision + 1, cursor: cursor)
-        let event = try await store.persistProject(snapshot, eventType: .projectUpdated, actor: actor, correlationID: ids.next(), idempotency: idempotency)
+        let event = try await store.persistProject(snapshot, rootIdentities: Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.snapshot.rootID, $0.filesystemIdentity) }), eventType: .projectUpdated, actor: actor, correlationID: ids.next(), idempotency: idempotency)
         let project = ProjectAuthority(snapshot: snapshot, roots: canonicalRoots)
         await projects.install(project)
         tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
@@ -450,11 +459,13 @@ public actor RepoPromptHeadlessAuthority {
         let current = try await projectSnapshot(projectID: projectID)
         guard current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Project revision is stale", currentRevision: current.revision) }
         var roots: [CanonicalRoot] = []
+        var availableRootIdentities: [UUID: String] = [:]
         var degraded = false
         for root in current.roots {
             do {
                 let canonical = try filesystem.canonicalizeRoot(root.canonicalPath)
                 roots.append(CanonicalRoot(snapshot: root, filesystemIdentity: canonical.identity))
+                availableRootIdentities[root.rootID] = canonical.identity
             } catch {
                 degraded = true
                 roots.append(CanonicalRoot(snapshot: root, filesystemIdentity: "unavailable"))
@@ -462,7 +473,7 @@ public actor RepoPromptHeadlessAuthority {
         }
         let cursor = try await store.nextCursor()
         let snapshot = ProjectSnapshot(projectID: current.projectID, name: current.name, creator: current.creator, state: degraded ? .degraded : .active, roots: current.roots, revision: current.revision + 1, cursor: cursor)
-        let event = try await store.persistProject(snapshot, eventType: .projectRefreshed, actor: actor, correlationID: ids.next(), idempotency: idempotency)
+        let event = try await store.persistProject(snapshot, rootIdentities: availableRootIdentities, eventType: .projectRefreshed, actor: actor, correlationID: ids.next(), idempotency: idempotency)
         let project = ProjectAuthority(snapshot: snapshot, roots: roots)
         await projects.install(project)
         tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)

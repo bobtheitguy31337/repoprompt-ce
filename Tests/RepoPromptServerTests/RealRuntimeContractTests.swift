@@ -75,12 +75,14 @@ final class RealRuntimeContractTests: XCTestCase {
                 guard FileManager.default.isWritableFile(atPath: cgroup.appendingPathComponent("cgroup.kill").path) else {
                     throw XCTSkip("Delegated cgroup does not expose writable cgroup.kill")
                 }
-                await XCTAssertTrue(try port.terminateContainedFamily(leader: leader))
+                let terminated = try await port.terminateContainedFamily(leader: leader)
+                XCTAssertTrue(terminated)
                 for _ in 0 ..< 100 {
                     if try await port.inspect(pid: leader.pid) == nil { break }
                     try await Task.sleep(for: .milliseconds(20))
                 }
-                await XCTAssertNil(try port.inspect(pid: leader.pid))
+                let remainingIdentity = try await port.inspect(pid: leader.pid)
+                XCTAssertNil(remainingIdentity)
                 try await port.reap(pid: leader.pid)
             } catch {
                 try? await supervisor.cancel(runID: runID, graceScans: 5)

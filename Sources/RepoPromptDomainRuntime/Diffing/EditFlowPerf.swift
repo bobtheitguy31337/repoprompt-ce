@@ -3,7 +3,7 @@ import RepoPromptShared
 #if DEBUG
     import Synchronization
 #endif
-#if DEBUG || EDIT_FLOW_PERF
+#if (DEBUG || EDIT_FLOW_PERF) && canImport(os)
     import os
 #endif
 
@@ -26,7 +26,7 @@ package enum EditFlowPerf {
     @TaskLocal
     package static var currentFileSystemPublicationCorrelation: LifecycleCorrelation?
 
-    #if DEBUG || EDIT_FLOW_PERF
+    #if (DEBUG || EDIT_FLOW_PERF) && canImport(os)
         package struct IntervalState {
             let signpostState: OSSignpostIntervalState?
             #if DEBUG
@@ -1244,7 +1244,7 @@ package enum EditFlowPerf {
         }
     #endif
 
-    #if DEBUG || EDIT_FLOW_PERF
+    #if (DEBUG || EDIT_FLOW_PERF) && canImport(os)
         private static let signposter = OSSignposter(subsystem: "com.repoprompt.edit-flow", category: "perf")
         private static let logger = Logger(subsystem: "com.repoprompt.edit-flow", category: "perf")
         private static let environmentEnabled: Bool = {

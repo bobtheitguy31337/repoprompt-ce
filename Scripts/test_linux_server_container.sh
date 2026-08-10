@@ -16,7 +16,17 @@ cleanup() {
   docker volume rm -f "$state_volume" "$artifact_volume" "$project_volume" "$worktree_volume" "$cache_volume" >/dev/null 2>&1 || true
   rm -rf "$temporary"
 }
-trap cleanup EXIT
+
+finish() {
+  local status=$?
+  trap - EXIT
+  if ((status != 0)); then
+    docker logs "$container" >&2 || true
+  fi
+  cleanup
+  exit "$status"
+}
+trap finish EXIT
 
 for volume in "$state_volume" "$artifact_volume" "$project_volume" "$worktree_volume" "$cache_volume"; do
   docker volume create "$volume" >/dev/null

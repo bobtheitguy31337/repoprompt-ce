@@ -31,7 +31,7 @@ enum EventArchiveCompression {
                 while index + nextRun < bytes.count, bytes[index + nextRun] == bytes[index], nextRun < 128 {
                     nextRun += 1
                 }
-                if nextRun >= 3 { break }
+                if nextRun >= 3 || index + nextRun - literalStart > 128 { break }
                 index += nextRun
             }
             let literalCount = index - literalStart

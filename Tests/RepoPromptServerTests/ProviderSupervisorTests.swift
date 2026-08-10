@@ -267,11 +267,19 @@ final class ProviderSupervisorTests: XCTestCase {
                 await events.record(event)
             }
         }
+        var interactionObserved = false
         for _ in 0 ..< 100 {
             if await events.values().contains(where: {
                 if case .interactionRequested = $0 { true } else { false }
-            }) { break }
+            }) {
+                interactionObserved = true
+                break
+            }
             try await Task.sleep(for: .milliseconds(20))
+        }
+        guard interactionObserved else {
+            _ = try await task.value
+            return XCTFail("ACP provider completed without requesting permission")
         }
         let observedInteraction = await events.values().contains(where: {
             if case .interactionRequested = $0 { true } else { false }
@@ -345,11 +353,19 @@ final class ProviderSupervisorTests: XCTestCase {
                 await events.record(event)
             }
         }
+        var interactionObserved = false
         for _ in 0 ..< 100 {
             if await events.values().contains(where: {
                 if case .interactionRequested = $0 { true } else { false }
-            }) { break }
+            }) {
+                interactionObserved = true
+                break
+            }
             try await Task.sleep(for: .milliseconds(20))
+        }
+        guard interactionObserved else {
+            _ = try await task.value
+            return XCTFail("ACP provider completed without requesting permission")
         }
         try await adapter.deliverInteraction(runID: runID, providerRequestID: "50", answer: Data(#"{"optionId":"allow"}"#.utf8))
         try await adapter.steer(runID: runID, text: "replacement", targetTurnEpoch: 2)

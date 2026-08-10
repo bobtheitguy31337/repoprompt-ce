@@ -63,6 +63,16 @@ public actor SQLiteServiceStore {
         decoder = JSONDecoder.serviceDecoder
     }
 
+    deinit {
+        guard !closed else { return }
+        // Explicit close remains authoritative because it records clean
+        // shutdown and checkpoints WAL. This safety net prevents SQLiteNIO's
+        // deinit assertion from masking the original error when construction
+        // or an async caller unwinds before reaching that close boundary.
+        let connection = connection
+        Task { try? await connection.close() }
+    }
+
     public static func open(storage: Storage, eventSigningKey: ServiceEventSigningKey? = nil) async throws -> SQLiteServiceStore {
         let location: SQLiteConnection.Storage = switch storage { case .memory: .memory
         case let .file(path): .file(path: path) }
@@ -109,7 +119,7 @@ public actor SQLiteServiceStore {
         return ServiceCursor(storeID: value.storeID, globalSequence: value.nextGlobalSequence)
     }
 
-    public func persistProject(_ snapshot: ProjectSnapshot, eventType: EventType, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput?) async throws -> EventEnvelope {
+    public func persistProject(_ snapshot: ProjectSnapshot, rootIdentities: [UUID: String] = [:], eventType: EventType, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput?) async throws -> EventEnvelope {
         try await transaction {
             try await validateExpectedCursor(snapshot.cursor)
             if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
@@ -118,9 +128,11 @@ public actor SQLiteServiceStore {
                 "INSERT INTO projects(project_id, schema_version, name, creator_json, lifecycle_state, revision, snapshot_json, created_at, updated_at) VALUES(?,1,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(project_id) DO UPDATE SET name=excluded.name,lifecycle_state=excluded.lifecycle_state,revision=excluded.revision,snapshot_json=excluded.snapshot_json,updated_at=CURRENT_TIMESTAMP",
                 [.text(snapshot.projectID.uuidString), .text(snapshot.name), .text(encodeText(actor)), .text(snapshot.state.rawValue), .integer(Int(snapshot.revision)), .text(snapshotJSON)]
             )
+            let existingRootIdentities = try await projectRootIdentities(projectID: snapshot.projectID)
             _ = try await connection.query("DELETE FROM project_roots WHERE project_id=?", [.text(snapshot.projectID.uuidString)])
             for root in snapshot.roots {
-                _ = try await connection.query("INSERT INTO project_roots(root_id,project_id,schema_version,logical_name,canonical_path,filesystem_identity,writable,revision) VALUES(?,?,1,?,?,?,?,?) ON CONFLICT(root_id) DO UPDATE SET logical_name=excluded.logical_name,canonical_path=excluded.canonical_path,writable=excluded.writable,revision=excluded.revision", [.text(root.rootID.uuidString), .text(snapshot.projectID.uuidString), .text(root.logicalName), .text(root.canonicalPath), .text("pending"), .integer(root.writable ? 1 : 0), .integer(Int(root.revision))])
+                let identity = rootIdentities[root.rootID] ?? existingRootIdentities[root.rootID] ?? "pending"
+                _ = try await connection.query("INSERT INTO project_roots(root_id,project_id,schema_version,logical_name,canonical_path,filesystem_identity,writable,revision) VALUES(?,?,1,?,?,?,?,?) ON CONFLICT(root_id) DO UPDATE SET logical_name=excluded.logical_name,canonical_path=excluded.canonical_path,filesystem_identity=excluded.filesystem_identity,writable=excluded.writable,revision=excluded.revision", [.text(root.rootID.uuidString), .text(snapshot.projectID.uuidString), .text(root.logicalName), .text(root.canonicalPath), .text(identity), .integer(root.writable ? 1 : 0), .integer(Int(root.revision))])
             }
             let event = try await appendEvent(projectID: snapshot.projectID, sessionID: nil, rootSessionID: nil, runID: nil, sessionSequence: nil, type: eventType, generation: nil, turnEpoch: nil, actor: actor, correlationID: correlationID, payload: Data(snapshotJSON.utf8))
             if let idempotency { try await saveIdempotency(idempotency, status: 201, response: encoder.encode(snapshot)) }
@@ -231,6 +243,16 @@ public actor SQLiteServiceStore {
     public func project(id: UUID) async throws -> ProjectSnapshot? {
         guard let row = try await connection.query("SELECT snapshot_json FROM projects WHERE project_id = ?", [.text(id.uuidString)]).first, let text = row.column("snapshot_json")?.string else { return nil }
         return try decoder.decode(ProjectSnapshot.self, from: Data(text.utf8))
+    }
+
+    public func projectRootIdentities(projectID: UUID) async throws -> [UUID: String] {
+        let rows = try await connection.query(
+            "SELECT root_id, filesystem_identity FROM project_roots WHERE project_id = ?",
+            [.text(projectID.uuidString)]
+        )
+        return try Dictionary(uniqueKeysWithValues: rows.map { row in
+            try (requireUUID(row.column("root_id")?.string), row.column("filesystem_identity")?.string ?? "pending")
+        })
     }
 
     public func session(id: UUID) async throws -> SessionSnapshot? {

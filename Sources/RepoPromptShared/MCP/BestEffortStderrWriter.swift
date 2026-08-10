@@ -66,13 +66,15 @@ public enum BestEffortStderrWriter {
         guard writeLock.try() else { return false }
         defer { writeLock.unlock() }
 
-        let lockedStandardError = descriptor == STDERR_FILENO
-        if lockedStandardError, ftrylockfile(stderr) != 0 {
-            return false
-        }
-        defer {
-            if lockedStandardError { funlockfile(stderr) }
-        }
+        #if canImport(Darwin)
+            let lockedStandardError = descriptor == STDERR_FILENO
+            if lockedStandardError, ftrylockfile(stderr) != 0 {
+                return false
+            }
+            defer {
+                if lockedStandardError { funlockfile(stderr) }
+            }
+        #endif
 
         let originalFlags = fcntl(descriptor, F_GETFL)
         guard originalFlags >= 0 else { return false }

@@ -6,6 +6,12 @@ import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 final class DurabilityOperationsTests: XCTestCase {
+    func testEventArchiveCompressionBoundsLiteralBeforeTwoByteRun() throws {
+        let input = Data(Array(0 ..< 127).map(UInt8.init) + [200, 200])
+        let compressed = EventArchiveCompression.compress(input)
+        XCTAssertEqual(try EventArchiveCompression.decompress(compressed), input)
+    }
+
     func testRetentionRequiresEventsOutsideBothCountAndAgeWindows() {
         let policy = EventRetentionPolicy(
             minimumLiveEventCount: 100_000,

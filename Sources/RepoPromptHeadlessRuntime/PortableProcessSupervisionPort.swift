@@ -19,6 +19,7 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
     private var processes: [Int32: Process] = [:]
     private var identities: [Int32: ProcessIdentity] = [:]
     private var standardInputs: [Int32: FileHandle] = [:]
+    private var standardInputPipes: [Int32: Pipe] = [:]
     private var cgroupPaths: [Int32: String] = [:]
     private let bootID: String
     private let delegatedCgroupRoot: String?
@@ -81,6 +82,11 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         do {
             let identity = try await launchProcess(executable: executable, arguments: arguments, environment: environment, workingDirectory: workingDirectory, helperToken: helperToken, stdin: input, stdout: stdout, stderr: stderr)
             standardInputs[identity.pid] = input.fileHandleForWriting
+            // Foundation's Linux Process implementation does not retain the
+            // Pipe object after extracting its descriptor. Keep the complete
+            // pipe alive; retaining only its write FileHandle lets Pipe deinit
+            // close the child input and makes interactive providers exit.
+            standardInputPipes[identity.pid] = input
             return CapturedProcess(identity: identity, stdoutPath: stdoutPath, stderrPath: stderrPath)
         } catch {
             try? input.fileHandleForWriting.close()
@@ -110,6 +116,7 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
 
     public func closeInput(_ captured: CapturedProcess) {
         try? standardInputs.removeValue(forKey: captured.identity.pid)?.close()
+        standardInputPipes[captured.identity.pid] = nil
     }
 
     public func cleanupCapturedFiles(_ captured: CapturedProcess) {
@@ -159,7 +166,12 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         #if os(Linux)
             if FileManager.default.isExecutableFile(atPath: "/usr/bin/setsid") {
                 process.executableURL = URL(fileURLWithPath: "/usr/bin/setsid")
-                process.arguments = [executable] + arguments
+                // `setsid` conditionally forks when its caller is already a
+                // process-group leader. Without --wait, the PID returned by
+                // Foundation can disappear while the provider child remains,
+                // invalidating the recorded family identity before controls
+                // can be delivered. Keep the wrapper as a stable leader.
+                process.arguments = ["--wait", executable] + arguments
             } else {
                 throw ServiceAPIError(code: .dependencyUnavailable, message: "Linux setsid executable is required for isolated provider process groups")
             }
@@ -250,6 +262,7 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         processes[pid] = nil
         identities[pid] = nil
         try? standardInputs.removeValue(forKey: pid)?.close()
+        standardInputPipes[pid] = nil
         if let cgroup = cgroupPaths.removeValue(forKey: pid) { try? FileManager.default.removeItem(atPath: cgroup) }
         try reapAdoptedChildren()
     }
@@ -261,12 +274,16 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         #endif
     }
 
-    private func inspectLinux(pid: Int32, helperTokenDigest: String) async throws -> ProcessIdentity? {
+    private func inspectLinux(pid: Int32, helperTokenDigest expectedHelperTokenDigest: String) async throws -> ProcessIdentity? {
         #if os(Linux)
             guard let statLine = try? String(contentsOfFile: "/proc/\(pid)/stat", encoding: .utf8), let stat = ProcStatParser.parse(statLine) else { return nil }
             let executable = (try? FileManager.default.destinationOfSymbolicLink(atPath: "/proc/\(pid)/exe")) ?? ""
-            let actualHelperDigest = try helperTokenDigest(pid: pid)
-            guard helperTokenDigest.isEmpty || actualHelperDigest == helperTokenDigest else { return nil }
+            // `/proc` is inherently racy: a process can disappear after its
+            // stat record is read but before its environment is opened.
+            // Treat that as a vanished identity rather than leaking a raw
+            // filesystem error through provider control or recovery.
+            guard let actualHelperDigest = try? helperTokenDigest(pid: pid) else { return nil }
+            guard expectedHelperTokenDigest.isEmpty || actualHelperDigest == expectedHelperTokenDigest else { return nil }
             return ProcessIdentity(pid: stat.pid, parentPID: stat.parentPID, processGroupID: stat.processGroupID, sessionID: stat.sessionID, startTimeTicks: stat.startTimeTicks, bootID: bootID, executablePath: executable, helperTokenDigest: actualHelperDigest)
         #else
             guard let identity = identities[pid], processes[pid]?.isRunning == true else { return nil }

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptC
 import RepoPromptServiceProtocol
 
 public struct CanonicalRoot: Hashable, Sendable {
@@ -25,7 +26,15 @@ public struct LocalFilesystemAuthority: FilesystemAuthorityPort {
             throw ServiceAPIError(code: .rootUnauthorized, message: "Project root must be an existing directory")
         }
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-        let identity = [attributes[.systemNumber], attributes[.systemFileNumber]].compactMap(\.self).map(String.init(describing:)).joined(separator: ":")
+        var identityComponents = [attributes[.systemNumber], attributes[.systemFileNumber]]
+            .compactMap(\.self)
+            .map(String.init(describing:))
+        var birthSeconds: UInt64 = 0
+        var birthNanoseconds: UInt32 = 0
+        if url.path.withCString({ rp_filesystem_birth_identity($0, &birthSeconds, &birthNanoseconds) }) == 0 {
+            identityComponents.append("\(birthSeconds):\(birthNanoseconds)")
+        }
+        let identity = identityComponents.joined(separator: ":")
         return (url.path, identity, true)
     }
 
