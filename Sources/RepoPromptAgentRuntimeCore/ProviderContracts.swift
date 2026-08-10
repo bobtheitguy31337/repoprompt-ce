@@ -29,3 +29,7 @@ public protocol AgentProviderDispatcher: Sendable {
     func steer(runID: UUID, text: String, turnEpoch: Int64) async throws
     func cancel(runID: UUID, generation: Int64) async throws
 }
+
+public protocol InteractionDeliveryPort: Sendable {
+    func deliverAnswer(session: SessionSnapshot, interaction: InteractionSnapshot, answer: Data) async throws
+}

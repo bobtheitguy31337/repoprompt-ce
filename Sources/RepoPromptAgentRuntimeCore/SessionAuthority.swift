@@ -64,6 +64,17 @@ public actor SessionAuthority {
         state.gate?.binding
     }
 
+    public func archive(expectedRevision: Int64) throws {
+        guard state.activeRunID == nil else { throw ServiceAPIError(code: .runAlreadyActive, message: "An active session cannot be archived") }
+        guard expectedRevision == state.snapshot.revision else { throw ServiceAPIError(code: .staleRevision, message: "Session revision is stale", currentRevision: state.snapshot.revision) }
+        replaceSnapshot(state: .archived)
+    }
+
+    public func updateVisibility(_ visibility: Visibility, expectedRevision: Int64) throws {
+        guard expectedRevision == state.snapshot.revision else { throw ServiceAPIError(code: .staleRevision, message: "Session policy revision is stale", currentRevision: state.snapshot.revision) }
+        replaceSnapshot(visibility: visibility)
+    }
+
     public func steer(_ text: String, actor: ExternalActor, targetTurnEpoch: Int64) throws -> RunBindingIdentity {
         guard var gate = state.gate, gate.binding.turnEpoch == targetTurnEpoch else {
             throw ServiceAPIError(code: .staleRevision, message: "Turn epoch is stale", currentRevision: state.snapshot.turnEpoch)
@@ -76,8 +87,8 @@ public actor SessionAuthority {
         return gate.binding
     }
 
-    private func replaceSnapshot(state lifecycle: SessionLifecycleState? = nil, generation: Int64? = nil, epoch: Int64? = nil, transcript: [TranscriptEntry]? = nil) {
+    private func replaceSnapshot(state lifecycle: SessionLifecycleState? = nil, generation: Int64? = nil, epoch: Int64? = nil, transcript: [TranscriptEntry]? = nil, visibility: Visibility? = nil) {
         let current = state.snapshot
-        state.snapshot = SessionSnapshot(sessionID: current.sessionID, projectID: current.projectID, parentSessionID: current.parentSessionID, rootSessionID: current.rootSessionID, creator: current.creator, provider: current.provider, model: current.model, visibility: current.visibility, state: lifecycle ?? current.state, runGeneration: generation ?? current.runGeneration, turnEpoch: epoch ?? current.turnEpoch, revision: current.revision + 1, transcript: transcript ?? current.transcript, interactions: current.interactions, cursor: current.cursor)
+        state.snapshot = SessionSnapshot(sessionID: current.sessionID, projectID: current.projectID, parentSessionID: current.parentSessionID, rootSessionID: current.rootSessionID, creator: current.creator, provider: current.provider, model: current.model, visibility: visibility ?? current.visibility, state: lifecycle ?? current.state, runGeneration: generation ?? current.runGeneration, turnEpoch: epoch ?? current.turnEpoch, revision: current.revision + 1, transcript: transcript ?? current.transcript, interactions: current.interactions, cursor: current.cursor)
     }
 }

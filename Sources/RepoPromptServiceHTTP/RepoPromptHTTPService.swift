@@ -6,6 +6,11 @@ import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 
 public struct RepoPromptHTTPService: Sendable {
+    private enum SSEFrame: Sendable {
+        case event(EventEnvelope)
+        case heartbeat
+    }
+
     private let authority: RepoPromptHeadlessAuthority
     private let store: SQLiteServiceStore
     private let authenticator: InternalRequestAuthenticator
@@ -95,11 +100,26 @@ public struct RepoPromptHTTPService: Sendable {
             _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "listWorktrees", projectID: id)
             return try await HTTPResponses.json(authority.worktreeSnapshots(projectID: id))
         } }
+        router.get("/internal/v1/projects/:id/worktrees/:worktreeId") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let bindingID = try context.parameters.require("worktreeId", as: UUID.self)
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getWorktree", projectID: id)
+            return try await HTTPResponses.json(authority.worktreeSnapshot(projectID: id, bindingID: bindingID))
+        } }
         router.post("/internal/v1/projects/:id/refresh") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "refreshProject", projectID: id)
             let input = try JSONDecoder.serviceDecoder.decode(ProjectRefreshInput.self, from: data)
             return try await HTTPResponses.json(authority.refreshProject(projectID: id, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data)))
+        } }
+        router.get("/internal/v1/projects/:id/context/selection-template") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getProject", projectID: id)
+            return try await HTTPResponses.json(authority.projectSelectionTemplate(projectID: id))
+        } }
+        router.put("/internal/v1/projects/:id/context/selection-template") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "updateProject", projectID: id)
+            let input = try JSONDecoder.serviceDecoder.decode(ProjectSelectionTemplateMutationInput.self, from: data)
+            return try await HTTPResponses.json(authority.replaceProjectSelectionTemplate(projectID: id, entries: input.entries, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data)))
         } }
 
         router.get("/internal/v1/sessions") { request, context in await respond { _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "listSessions")
@@ -108,6 +128,7 @@ public struct RepoPromptHTTPService: Sendable {
         router.post("/internal/v1/sessions") { request, context in await respond { let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(CreateSessionInput.self, from: data)
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "startSession", projectID: input.projectID)
+            guard input.parentSessionID == nil else { throw ServiceAPIError(code: .invalidRequest, message: "Public session creation cannot specify parentSessionID; child agents are created by agent_manage") }
             let snapshot = try await authority.createSession(input: input, externalActor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data))
             return try HTTPResponses.json(snapshot, status: .accepted)
         } }
@@ -163,6 +184,19 @@ public struct RepoPromptHTTPService: Sendable {
             let input = try JSONDecoder.serviceDecoder.decode(ExecutionPermissionUpdateInput.self, from: data)
             return try await HTTPResponses.json(authority.updatePermissions(sessionID: id, expectedRevision: input.expectedRevision, mode: input.mode, providerSettings: input.providerSettings, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data)))
         } }
+        router.patch("/internal/v1/sessions/:id/execution-permissions") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "updateExecutionPermissions", sessionID: id)
+            let input = try JSONDecoder.serviceDecoder.decode(ExecutionPermissionUpdateInput.self, from: data)
+            return try await HTTPResponses.json(authority.updatePermissions(sessionID: id, expectedRevision: input.expectedRevision, mode: input.mode, providerSettings: input.providerSettings, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data)))
+        } }
+        router.patch("/internal/v1/sessions/:id/collaboration-metadata") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(CollaborationMetadataInput.self, from: data)
+            let command = SessionCommand.setSessionVisibility(expectedPolicyRevision: input.expectedPolicyRevision, visibility: input.visibility, collaborativeSteeringEnabled: input.collaborativeSteeringEnabled, controllerUserID: input.controllerUserID)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: command.operation, sessionID: id)
+            return try await HTTPResponses.json(authority.execute(command: command, sessionID: id, externalActor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data)), status: .accepted)
+        } }
         router.get("/internal/v1/sessions/:id/interactions") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
             _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getInteractions", sessionID: id)
             return try await HTTPResponses.json(authority.interactionSnapshots(sessionID: id))
@@ -173,6 +207,14 @@ public struct RepoPromptHTTPService: Sendable {
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(InteractionAnswerInput.self, from: data)
             return try await HTTPResponses.json(authority.answerInteraction(sessionID: id, interactionID: input.interactionID, expectedRevision: input.expectedRevision, payload: input.payload, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data)))
+        } }
+        router.post("/internal/v1/sessions/:id/interactions/:interactionId/answer") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let interactionID = try context.parameters.require("interactionId", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "answerInteraction", sessionID: id)
+            let input = try JSONDecoder.serviceDecoder.decode(InteractionAnswerInput.self, from: data)
+            guard input.interactionID == interactionID else { throw ServiceAPIError(code: .invalidRequest, message: "Interaction path and body IDs do not match") }
+            return try await HTTPResponses.json(authority.answerInteraction(sessionID: id, interactionID: interactionID, expectedRevision: input.expectedRevision, payload: input.payload, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data)))
         } }
         router.post("/internal/v1/sessions/:id/worktrees") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
@@ -188,13 +230,45 @@ public struct RepoPromptHTTPService: Sendable {
             let input = try JSONDecoder.serviceDecoder.decode(WorktreeMergeInput.self, from: data)
             return try await HTTPResponses.json(authority.mergeWorktree(sessionID: id, bindingID: input.bindingID, strategy: input.strategy, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data)))
         } }
+        router.patch("/internal/v1/sessions/:id/worktree-binding") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "bindWorktree", sessionID: id)
+            let input = try JSONDecoder.serviceDecoder.decode(WorktreeBindInput.self, from: data)
+            return try await HTTPResponses.json(authority.bindWorktree(sessionID: id, bindingID: input.bindingID, expectedRevision: input.expectedRevision, expectedSelectionBindingRevision: input.expectedSelectionBindingRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data)))
+        } }
+        router.post("/internal/v1/sessions/:id/worktrees/:worktreeId/merge") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let bindingID = try context.parameters.require("worktreeId", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "mergeWorktree", sessionID: id)
+            let input = try JSONDecoder.serviceDecoder.decode(WorktreeMergeInput.self, from: data)
+            guard input.bindingID == bindingID else { throw ServiceAPIError(code: .invalidRequest, message: "Worktree path and body IDs do not match") }
+            return try await HTTPResponses.json(authority.mergeWorktree(sessionID: id, bindingID: bindingID, strategy: input.strategy, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data)))
+        } }
         router.get("/internal/v1/sessions/:id/artifacts") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
             _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getArtifacts", sessionID: id)
             return try await HTTPResponses.json(authority.artifactSnapshots(sessionID: id))
         } }
+        router.get("/internal/v1/sessions/:id/artifacts/:artifactId/content") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let artifactID = try context.parameters.require("artifactId", as: UUID.self)
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "downloadArtifact", sessionID: id)
+            let requestedRange = try parseByteRange(request.headers[.range])
+            let result = try await authority.artifactContent(sessionID: id, artifactID: artifactID, range: requestedRange)
+            var headers = HTTPFields()
+            headers[.contentType] = "application/octet-stream"
+            headers[.cacheControl] = "no-store"
+            headers[.contentLength] = String(result.1.count)
+            let partial = result.2.lowerBound != 0 || result.2.upperBound != Int(result.0.size)
+            if partial { headers[.contentRange] = "bytes \(result.2.lowerBound)-\(max(result.2.lowerBound, result.2.upperBound - 1))/\(result.0.size)" }
+            return Response(status: partial ? .partialContent : .ok, headers: headers, body: .init(byteBuffer: ByteBuffer(bytes: result.1)))
+        } }
         router.get("/internal/v1/catalog/workflows") { request, context in await respond {
             _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "listWorkflows")
             return try await HTTPResponses.json(authority.workflowSnapshots())
+        } }
+        router.get("/internal/v1/catalog/workflows/:id") { request, context in await respond {
+            let id = try context.parameters.require("id")
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getWorkflow")
+            return try await HTTPResponses.json(authority.workflowSnapshot(workflowID: id))
         } }
         router.get("/internal/v1/catalog/providers") { request, context in await respond {
             _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "listProviders")
@@ -240,16 +314,25 @@ public struct RepoPromptHTTPService: Sendable {
             return try await HTTPResponses.json(authority.events(after: cursor, limit: limit))
         } }
         router.get("/internal/v1/events/stream") { request, context in await respond { _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinSync], operation: "eventStream")
-            let stream = try await authority.subscribe(after: parseCursor(request))
+            let stream: AsyncThrowingStream<EventEnvelope, Error>
+            do {
+                stream = try await authority.subscribe(after: parseCursor(request))
+            } catch let error as ServiceAPIError where error.code == .cursorExpired {
+                return try cursorExpiredStream(error)
+            }
             var headers = HTTPFields()
             headers[.contentType] = "text/event-stream"
             headers[.cacheControl] = "no-store"
             return Response(status: .ok, headers: headers, body: ResponseBody { writer in try await writer.write(ByteBuffer(string: ": repoprompt-stream-v1\n\n"))
-                for try await event in stream {
-                    let signed = signEvent(event)
-                    let json = try JSONEncoder.serviceEncoder.encode(signed).base64EncodedString()
-                    let frame = "id: \(signed.storeID.uuidString):\(signed.globalSequence)\nevent: \(signed.eventType.rawValue)\ndata: \(json)\n\n"
-                    try await writer.write(ByteBuffer(string: frame))
+                for try await frame in heartbeatFrames(stream) {
+                    switch frame {
+                    case let .event(event):
+                        let signed = signEvent(event)
+                        let json = try JSONEncoder.serviceEncoder.encode(signed).base64EncodedString()
+                        try await writer.write(ByteBuffer(string: "id: \(signed.storeID.uuidString):\(signed.globalSequence)\nevent: \(signed.eventType.rawValue)\ndata: \(json)\n\n"))
+                    case .heartbeat:
+                        try await writer.write(ByteBuffer(string: ": heartbeat\n\n"))
+                    }
                 }
                 try await writer.finish(nil)
             })
@@ -309,10 +392,60 @@ public struct RepoPromptHTTPService: Sendable {
     }
 
     private func parseCursor(_ request: Request) throws -> ServiceCursor? {
-        guard let after = request.uri.queryParameters["after"] else { return nil }
+        let lastEventID = request.headers[.init("Last-Event-ID")!].map { Substring($0) }
+        guard let after = request.uri.queryParameters["after"] ?? lastEventID else { return nil }
         let parts = after.split(separator: ":", maxSplits: 1)
         guard parts.count == 2, let storeID = UUID(uuidString: String(parts[0])), let sequence = Int64(parts[1]) else { throw ServiceAPIError(code: .invalidRequest, message: "Cursor must be storeId:sequence") }
         return ServiceCursor(storeID: storeID, globalSequence: sequence)
+    }
+
+    private func parseByteRange(_ value: String?) throws -> Range<Int>? {
+        guard let value else { return nil }
+        guard value.hasPrefix("bytes="), !value.contains(",") else { throw ServiceAPIError(code: .invalidRequest, message: "Only one bounded byte range is supported") }
+        let bounds = value.dropFirst("bytes=".count).split(separator: "-", omittingEmptySubsequences: false)
+        guard bounds.count == 2, let lower = Int(bounds[0]), let inclusiveUpper = Int(bounds[1]), lower >= 0, inclusiveUpper >= lower else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Byte range must be bytes=start-end")
+        }
+        return lower ..< inclusiveUpper + 1
+    }
+
+    private func heartbeatFrames(_ source: AsyncThrowingStream<EventEnvelope, Error>) -> AsyncThrowingStream<SSEFrame, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try await withThrowingTaskGroup(of: Void.self) { group in
+                        group.addTask {
+                            for try await event in source { continuation.yield(.event(event)) }
+                        }
+                        group.addTask {
+                            while !Task.isCancelled {
+                                try await Task.sleep(for: .seconds(15))
+                                continuation.yield(.heartbeat)
+                            }
+                        }
+                        _ = try await group.next()
+                        group.cancelAll()
+                    }
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private func cursorExpiredStream(_ error: ServiceAPIError) throws -> Response {
+        var headers = HTTPFields()
+        headers[.contentType] = "text/event-stream"
+        headers[.cacheControl] = "no-store"
+        let payload = try JSONEncoder.serviceEncoder.encode(error).base64EncodedString()
+        return Response(status: .ok, headers: headers, body: ResponseBody { writer in
+            try await writer.write(ByteBuffer(string: "event: cursor_expired\ndata: \(payload)\n\n"))
+            try await writer.finish(nil)
+        })
     }
 
     private func signEvent(_ event: EventEnvelope) -> EventEnvelope {

@@ -29,6 +29,28 @@ public struct SelectionSnapshot: Codable, Hashable, Sendable {
     }
 }
 
+public struct ProjectSelectionTemplateSnapshot: Codable, Hashable, Sendable {
+    public let projectID: UUID
+    public let entries: [LogicalSelectionEntry]
+    public let revision: Int64
+
+    public init(projectID: UUID, entries: [LogicalSelectionEntry], revision: Int64) {
+        self.projectID = projectID
+        self.entries = entries
+        self.revision = revision
+    }
+}
+
+public struct ProjectSelectionTemplateMutationInput: Codable, Sendable {
+    public let entries: [LogicalSelectionEntry]
+    public let expectedRevision: Int64
+
+    public init(entries: [LogicalSelectionEntry], expectedRevision: Int64) {
+        self.entries = entries
+        self.expectedRevision = expectedRevision
+    }
+}
+
 public struct SelectionMutationInput: Codable, Sendable {
     public let entries: [LogicalSelectionEntry]
     public let expectedRevision: Int64
@@ -140,6 +162,32 @@ public struct WorktreeMergeInput: Codable, Sendable {
         self.bindingID = bindingID
         self.strategy = strategy
         self.expectedRevision = expectedRevision
+    }
+}
+
+public struct WorktreeBindInput: Codable, Sendable {
+    public let bindingID: UUID
+    public let expectedRevision: Int64
+    public let expectedSelectionBindingRevision: Int64
+
+    public init(bindingID: UUID, expectedRevision: Int64, expectedSelectionBindingRevision: Int64) {
+        self.bindingID = bindingID
+        self.expectedRevision = expectedRevision
+        self.expectedSelectionBindingRevision = expectedSelectionBindingRevision
+    }
+}
+
+public struct CollaborationMetadataInput: Codable, Sendable {
+    public let expectedPolicyRevision: Int64
+    public let visibility: Visibility
+    public let collaborativeSteeringEnabled: Bool
+    public let controllerUserID: String
+
+    public init(expectedPolicyRevision: Int64, visibility: Visibility, collaborativeSteeringEnabled: Bool, controllerUserID: String) {
+        self.expectedPolicyRevision = expectedPolicyRevision
+        self.visibility = visibility
+        self.collaborativeSteeringEnabled = collaborativeSteeringEnabled
+        self.controllerUserID = controllerUserID
     }
 }
 
@@ -383,10 +431,38 @@ public struct OracleSnapshot: Codable, Hashable, Sendable {
     public let chatID: UUID
     public let response: String
     public let artifactID: UUID?
+    public let revision: Int64
 
-    public init(chatID: UUID, response: String, artifactID: UUID?) {
+    public init(chatID: UUID, response: String, artifactID: UUID?, revision: Int64 = 1) {
         self.chatID = chatID
         self.response = response
         self.artifactID = artifactID
+        self.revision = revision
+    }
+}
+
+public struct OracleChatTurn: Codable, Hashable, Sendable {
+    public let prompt: String
+    public let response: String
+    public let timestamp: Date
+
+    public init(prompt: String, response: String, timestamp: Date) {
+        self.prompt = prompt
+        self.response = response
+        self.timestamp = timestamp
+    }
+}
+
+public struct OracleChatState: Codable, Hashable, Sendable {
+    public let chatID: UUID
+    public let sessionID: UUID
+    public let turns: [OracleChatTurn]
+    public let revision: Int64
+
+    public init(chatID: UUID, sessionID: UUID, turns: [OracleChatTurn], revision: Int64) {
+        self.chatID = chatID
+        self.sessionID = sessionID
+        self.turns = turns
+        self.revision = revision
     }
 }

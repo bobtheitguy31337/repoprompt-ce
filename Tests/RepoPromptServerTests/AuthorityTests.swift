@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentRuntimeCore
 import RepoPromptHeadlessRuntime
 import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
@@ -126,6 +127,55 @@ final class AuthorityTests: XCTestCase {
         } catch let error as ServiceAPIError { XCTAssertEqual(error.code, .notFound) }
         try await store.close()
     }
+
+    func testVisibilityArchiveAndExactWorktreeRebindMutateDurableAuthority() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-transitions", requestDigest: "p-transitions")
+        let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "s-transitions", requestDigest: "s-transitions")
+        let rootID = try XCTUnwrap(project.roots.first?.rootID)
+        let binding = WorktreeBindingSnapshot(bindingID: UUID(), projectID: project.projectID, rootID: rootID, sessionID: nil, baseRef: "main", branch: "existing", physicalPath: root.path, ownershipState: .active, mergeState: .clean, revision: 1)
+        _ = try await store.persistWorktree(binding, actor: actor, correlationID: UUID())
+
+        let rebound = try await authority.bindWorktree(sessionID: session.sessionID, bindingID: binding.bindingID, expectedRevision: 1, expectedSelectionBindingRevision: 1, actor: actor, idempotencyKey: "bind", requestDigest: "bind")
+        XCTAssertEqual(rebound.sessionID, session.sessionID)
+        XCTAssertEqual(rebound.revision, 2)
+        let reboundSelection = try await authority.selectionSnapshot(sessionID: session.sessionID)
+        XCTAssertEqual(reboundSelection.bindingRevision, 2)
+
+        _ = try await authority.execute(command: .setSessionVisibility(expectedPolicyRevision: 1, visibility: .collaborative, collaborativeSteeringEnabled: false, controllerUserID: actor.goblinUserID), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "visibility", requestDigest: "visibility")
+        let visible = try await authority.sessionSnapshot(sessionID: session.sessionID)
+        XCTAssertEqual(visible.visibility, .collaborative)
+        _ = try await authority.execute(command: .archiveSession(expectedRevision: visible.revision), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "archive", requestDigest: "archive")
+        let archived = try await authority.sessionSnapshot(sessionID: session.sessionID)
+        XCTAssertEqual(archived.state, .archived)
+        try await store.close()
+    }
+
+    func testInteractionResolutionRequiresExactProviderAcknowledgement() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let delivery = RecordingInteractionDelivery()
+        let authority = RepoPromptHeadlessAuthority(store: store, interactionDelivery: delivery)
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-interaction", requestDigest: "p-interaction")
+        let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "s-interaction", requestDigest: "s-interaction")
+        let requested = try await authority.requestInteraction(sessionID: session.sessionID, kind: .approval, payload: Data("approve?".utf8))
+        let resolved = try await authority.answerInteraction(sessionID: session.sessionID, interactionID: requested.interactionID, expectedRevision: requested.revision, payload: Data("approveOnce".utf8), actor: actor, idempotencyKey: "answer", requestDigest: "answer")
+        XCTAssertEqual(resolved.state, .resolved)
+        XCTAssertEqual(resolved.revision, 3)
+        let deliveryCount = await delivery.deliveryCount()
+        let stored = try await authority.interactionSnapshots(sessionID: session.sessionID)
+        XCTAssertEqual(deliveryCount, 1)
+        XCTAssertEqual(stored.first?.state, .resolved)
+        try await store.close()
+    }
 }
 
 private actor DelayedProviderRunner: WorkspaceCommandRunning {
@@ -137,4 +187,14 @@ private actor DelayedProviderRunner: WorkspaceCommandRunning {
         try await Task.sleep(for: delay)
         return "provider:\(arguments.last ?? "")"
     }
+}
+
+private actor RecordingInteractionDelivery: InteractionDeliveryPort {
+    private var count = 0
+
+    func deliverAnswer(session _: SessionSnapshot, interaction _: InteractionSnapshot, answer _: Data) async throws {
+        count += 1
+    }
+
+    func deliveryCount() -> Int { count }
 }

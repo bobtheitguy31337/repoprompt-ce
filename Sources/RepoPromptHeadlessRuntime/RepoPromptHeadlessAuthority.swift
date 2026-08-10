@@ -13,6 +13,7 @@ public actor RepoPromptHeadlessAuthority {
     private let worktreeService: WorktreeRuntimeService?
     private let artifactService: ArtifactRuntimeService?
     private let providerAdapter: ProviderCLIAdapter?
+    private let interactionDelivery: (any InteractionDeliveryPort)?
     private let workflowCatalog = BuiltinWorkflowCatalog()
     private let projects = ProjectRuntimeSupervisor()
     private let eventHub = ServiceEventHub()
@@ -30,7 +31,8 @@ public actor RepoPromptHeadlessAuthority {
         commandRunner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(),
         worktreeService: WorktreeRuntimeService? = nil,
         artifactService: ArtifactRuntimeService? = nil,
-        providerAdapter: ProviderCLIAdapter? = nil
+        providerAdapter: ProviderCLIAdapter? = nil,
+        interactionDelivery: (any InteractionDeliveryPort)? = nil
     ) {
         self.store = store
         self.clock = clock
@@ -40,6 +42,7 @@ public actor RepoPromptHeadlessAuthority {
         self.worktreeService = worktreeService
         self.artifactService = artifactService
         self.providerAdapter = providerAdapter
+        self.interactionDelivery = interactionDelivery
     }
 
     public func recover() async throws {
@@ -111,13 +114,21 @@ public actor RepoPromptHeadlessAuthority {
         }
         let sessionID = ids.next()
         let rootSessionID = parent?.rootSessionID ?? sessionID
+        let seededSelection: SelectionSnapshot
+        if let parentID = input.parentSessionID {
+            let inherited = try await selectionSnapshot(sessionID: parentID)
+            seededSelection = SelectionSnapshot(sessionID: sessionID, entries: inherited.entries, revision: 1, bindingRevision: inherited.bindingRevision)
+        } else {
+            let template = try await store.selectionTemplate(projectID: input.projectID)
+            seededSelection = SelectionSnapshot(sessionID: sessionID, entries: template?.entries ?? [], revision: 1, bindingRevision: 1)
+        }
         let cursor = try await store.nextCursor()
         var transcript: [TranscriptEntry] = []
         if let prompt = input.initialPrompt, !prompt.isEmpty { transcript.append(TranscriptEntry(entryID: ids.next(), sessionSequence: 1, kind: .human, content: prompt, actor: externalActor, timestamp: clock.now())) }
         let snapshot = SessionSnapshot(sessionID: sessionID, projectID: input.projectID, parentSessionID: input.parentSessionID, rootSessionID: rootSessionID, creator: externalActor, provider: input.provider, model: input.model, visibility: input.visibility, state: .idle, runGeneration: 0, turnEpoch: 0, revision: 1, transcript: transcript, interactions: [], cursor: cursor)
-        let event = try await store.persistSession(snapshot, eventType: .sessionCreated, actor: externalActor, correlationID: ids.next(), idempotency: idempotency)
+        let event = try await store.persistSession(snapshot, eventType: .sessionCreated, actor: externalActor, correlationID: ids.next(), idempotency: idempotency, initialSelection: seededSelection)
         sessions[sessionID] = SessionAuthority(snapshot: snapshot, clock: clock, ids: ids)
-        selections[sessionID] = SessionSelectionAuthority(sessionID: sessionID)
+        selections[sessionID] = SessionSelectionAuthority(sessionID: sessionID, template: seededSelection.entries, revision: seededSelection.revision, bindingRevision: seededSelection.bindingRevision)
         await eventHub.publish(event)
         return snapshot
     }
@@ -144,7 +155,7 @@ public actor RepoPromptHeadlessAuthority {
         case let .steerSession(text, targetTurnEpoch):
             return try await steerProviderRun(command: command, sessionID: sessionID, session: session, text: text, targetTurnEpoch: targetTurnEpoch, actor: externalActor, idempotency: idempotency)
         case let .archiveSession(expectedRevision):
-            guard expectedRevision == before.revision else { throw ServiceAPIError(code: .staleRevision, message: "Session revision is stale", currentRevision: before.revision) }
+            try await session.archive(expectedRevision: expectedRevision)
             eventType = .sessionArchived
         case let .answerInteraction(interactionID, expectedRevision, payload):
             _ = try await answerInteraction(sessionID: sessionID, interactionID: interactionID, expectedRevision: expectedRevision, payload: payload, actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
@@ -152,7 +163,9 @@ public actor RepoPromptHeadlessAuthority {
         case let .updateExecutionPermissions(expectedRevision, executionMode, providerSettings):
             _ = try await updatePermissions(sessionID: sessionID, expectedRevision: expectedRevision, mode: executionMode, providerSettings: providerSettings, actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
             return try await commandReceipt(command: command, sessionID: sessionID)
-        case .setSessionVisibility: eventType = .visibilityUpdated
+        case let .setSessionVisibility(expectedPolicyRevision, visibility, _, _):
+            try await session.updateVisibility(visibility, expectedRevision: expectedPolicyRevision)
+            eventType = .visibilityUpdated
         case let .updateSelection(mode, expectedRevision, operations):
             guard mode == "remove" else { throw ServiceAPIError(code: .invalidRequest, message: "Selection commands with structured entries must use the selection endpoints") }
             let snapshot = try await selectionSnapshot(sessionID: sessionID)
@@ -173,8 +186,9 @@ public actor RepoPromptHeadlessAuthority {
         case let .createWorktree(rootID, baseRef, branchName):
             _ = try await createWorktree(sessionID: sessionID, rootID: rootID, baseRef: baseRef, branch: branchName, actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
             return try await commandReceipt(command: command, sessionID: sessionID)
-        case .bindWorktree:
-            throw ServiceAPIError(code: .capabilityMissing, message: "Explicit worktree rebinding is not available")
+        case let .bindWorktree(bindingID, expectedRevision):
+            _ = try await bindWorktree(sessionID: sessionID, bindingID: bindingID, expectedRevision: expectedRevision, expectedSelectionBindingRevision: (try await selectionSnapshot(sessionID: sessionID)).bindingRevision, actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
+            return try await commandReceipt(command: command, sessionID: sessionID)
         case let .mergeWorktree(bindingID, strategy, expectedRevision):
             _ = try await mergeWorktree(sessionID: sessionID, bindingID: bindingID, strategy: strategy, expectedRevision: expectedRevision, actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
             return try await commandReceipt(command: command, sessionID: sessionID)
@@ -257,6 +271,13 @@ public actor RepoPromptHeadlessAuthority {
         try await store.workflows()
     }
 
+    public func workflowSnapshot(workflowID: String) async throws -> WorkflowSnapshot {
+        guard let workflow = try await workflowSnapshots().first(where: { $0.workflowID == workflowID }) else {
+            throw ServiceAPIError(code: .notFound, message: "Workflow not found")
+        }
+        return workflow
+    }
+
     public func providerCapabilities(preflight: Bool = false) async -> [ProviderCapability] {
         guard let providerAdapter else { return ProviderKind.allCases.map { ProviderCapability(kind: $0, enabled: false, executable: nil, supportsResume: false, supportsSteering: false, reasonUnavailable: "provider runtime not configured") } }
         return preflight ? await providerAdapter.preflight() : await providerAdapter.capabilities()
@@ -265,6 +286,26 @@ public actor RepoPromptHeadlessAuthority {
     public func selectionSnapshot(sessionID: UUID) async throws -> SelectionSnapshot {
         guard let selection = selections[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
         return await selection.snapshot()
+    }
+
+    public func projectSelectionTemplate(projectID: UUID) async throws -> ProjectSelectionTemplateSnapshot {
+        _ = try await projects.authority(projectID: projectID)
+        return try await store.selectionTemplate(projectID: projectID) ?? ProjectSelectionTemplateSnapshot(projectID: projectID, entries: [], revision: 1)
+    }
+
+    public func replaceProjectSelectionTemplate(projectID: UUID, entries: [LogicalSelectionEntry], expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> ProjectSelectionTemplateSnapshot {
+        try ensureWritable()
+        let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "replaceProjectSelectionTemplate", key: idempotencyKey, requestDigest: requestDigest)
+        if let existing = try await store.idempotencyResult(idempotency) { return try JSONDecoder.serviceDecoder.decode(ProjectSelectionTemplateSnapshot.self, from: existing.response) }
+        let project = try await projectSnapshot(projectID: projectID)
+        let current = try await projectSelectionTemplate(projectID: projectID)
+        guard current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Project selection template revision is stale", currentRevision: current.revision) }
+        let allowedRoots = Set(project.roots.map(\.rootID))
+        guard entries.allSatisfy({ allowedRoots.contains($0.rootID) }) else { throw ServiceAPIError(code: .rootUnauthorized, message: "Selection template contains an unauthorized root") }
+        let next = ProjectSelectionTemplateSnapshot(projectID: projectID, entries: entries, revision: current.revision + 1)
+        let event = try await store.persistSelectionTemplate(next, actor: actor, correlationID: ids.next(), idempotency: idempotency)
+        await eventHub.publish(event)
+        return next
     }
 
     public func replaceSelection(sessionID: UUID, entries: [LogicalSelectionEntry], expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> SelectionSnapshot {
@@ -312,13 +353,33 @@ public actor RepoPromptHeadlessAuthority {
         return try await store.interactions(sessionID: sessionID)
     }
 
+    public func requestInteraction(sessionID: UUID, kind: InteractionSnapshot.Kind, payload: Data, expiresAt: Date? = nil) async throws -> InteractionSnapshot {
+        guard let sessionAuthority = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
+        let session = await sessionAuthority.snapshot()
+        let interaction = InteractionSnapshot(interactionID: ids.next(), runID: await sessionAuthority.activeBinding()?.runID, kind: kind, state: .pending, payload: payload, revision: 1, expiresAt: expiresAt)
+        let event = try await store.persistInteraction(interaction, session: session, actor: nil, correlationID: ids.next())
+        await eventHub.publish(event)
+        return interaction
+    }
+
     public func answerInteraction(sessionID: UUID, interactionID: UUID, expectedRevision: Int64, payload: Data, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> InteractionSnapshot {
         let idempotency = try mutationIdempotency(actor: actor, operation: "answerInteraction", key: idempotencyKey, digest: requestDigest)
         if let idempotency, let prior: InteractionSnapshot = try await priorResult(idempotency) { return prior }
         let session = try await sessionSnapshot(sessionID: sessionID)
         guard let current = try await store.interactions(sessionID: sessionID).first(where: { $0.interactionID == interactionID }) else { throw ServiceAPIError(code: .notFound, message: "Interaction not found") }
         guard current.state == .pending, current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Interaction revision is stale", currentRevision: current.revision) }
-        let resolved = InteractionSnapshot(interactionID: current.interactionID, kind: current.kind, state: .resolved, payload: payload, revision: current.revision + 1, expiresAt: current.expiresAt)
+        if let expiresAt = current.expiresAt, expiresAt <= clock.now() { throw ServiceAPIError(code: .interactionSettled, message: "Interaction expired") }
+        guard let interactionDelivery else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider interaction delivery is unavailable") }
+        let intent = InteractionSnapshot(interactionID: current.interactionID, runID: current.runID, agentID: current.agentID, kind: current.kind, state: .deliveryIntent, payload: payload, revision: current.revision + 1, expiresAt: current.expiresAt)
+        try await store.persistInteractionDeliveryState(intent, sessionID: sessionID, actor: actor)
+        do {
+            try await interactionDelivery.deliverAnswer(session: session, interaction: intent, answer: payload)
+        } catch {
+            let interrupted = InteractionSnapshot(interactionID: current.interactionID, runID: current.runID, agentID: current.agentID, kind: current.kind, state: .interrupted, payload: payload, revision: intent.revision + 1, expiresAt: current.expiresAt)
+            try await store.persistInteractionDeliveryState(interrupted, sessionID: sessionID, actor: actor)
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider interaction delivery was not acknowledged", retryable: false)
+        }
+        let resolved = InteractionSnapshot(interactionID: current.interactionID, runID: current.runID, agentID: current.agentID, kind: current.kind, state: .resolved, payload: payload, revision: intent.revision + 1, expiresAt: current.expiresAt)
         let event = try await store.persistInteraction(resolved, session: session, actor: actor, correlationID: ids.next(), idempotency: idempotency)
         await eventHub.publish(event)
         return resolved
@@ -327,6 +388,14 @@ public actor RepoPromptHeadlessAuthority {
     public func worktreeSnapshots(projectID: UUID) async throws -> [WorktreeBindingSnapshot] {
         _ = try await projects.authority(projectID: projectID)
         return try await store.worktrees(projectID: projectID)
+    }
+
+    public func worktreeSnapshot(projectID: UUID, bindingID: UUID) async throws -> WorktreeBindingSnapshot {
+        _ = try await projects.authority(projectID: projectID)
+        guard let binding = try await store.worktree(bindingID: bindingID), binding.projectID == projectID else {
+            throw ServiceAPIError(code: .notFound, message: "Worktree binding not found")
+        }
+        return binding
     }
 
     public func createWorktree(sessionID: UUID, rootID: UUID, baseRef: String, branch: String, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> WorktreeBindingSnapshot {
@@ -340,6 +409,29 @@ public actor RepoPromptHeadlessAuthority {
         let event = try await store.persistWorktree(snapshot, actor: actor, correlationID: ids.next(), idempotency: idempotency)
         await eventHub.publish(event)
         return snapshot
+    }
+
+    public func bindWorktree(sessionID: UUID, bindingID: UUID, expectedRevision: Int64, expectedSelectionBindingRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> WorktreeBindingSnapshot {
+        let idempotency = try mutationIdempotency(actor: actor, operation: "bindWorktree", key: idempotencyKey, digest: requestDigest)
+        if let idempotency, let prior: WorktreeBindingSnapshot = try await priorResult(idempotency) { return prior }
+        guard let sessionAuthority = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
+        guard await sessionAuthority.activeBinding() == nil else { throw ServiceAPIError(code: .runAlreadyActive, message: "A worktree cannot be rebound while a run is active") }
+        let session = await sessionAuthority.snapshot()
+        guard let current = try await store.worktree(bindingID: bindingID), current.projectID == session.projectID else { throw ServiceAPIError(code: .notFound, message: "Worktree binding not found") }
+        guard current.sessionID == nil || current.sessionID == sessionID else { throw ServiceAPIError(code: .worktreeConflict, message: "Worktree is owned by another session") }
+        guard current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Worktree revision is stale", currentRevision: current.revision) }
+        guard current.ownershipState == .active else { throw ServiceAPIError(code: .worktreeConflict, message: "Worktree is not active") }
+        guard let selection = selections[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Selection not found") }
+        let currentSelection = await selection.snapshot()
+        guard currentSelection.bindingRevision == expectedSelectionBindingRevision else { throw ServiceAPIError(code: .staleRevision, message: "Selection binding revision is stale", currentRevision: currentSelection.bindingRevision) }
+        let reboundSelection = SelectionSnapshot(sessionID: sessionID, entries: currentSelection.entries, revision: currentSelection.revision, bindingRevision: currentSelection.bindingRevision + 1)
+        let rebound = WorktreeBindingSnapshot(bindingID: current.bindingID, projectID: current.projectID, rootID: current.rootID, sessionID: sessionID, baseRef: current.baseRef, branch: current.branch, physicalPath: current.physicalPath, ownershipState: current.ownershipState, mergeState: current.mergeState, revision: current.revision + 1)
+        guard let idempotency else { throw ServiceAPIError(code: .invalidRequest, message: "Idempotency is required for worktree binding") }
+        let events = try await store.persistWorktreeBinding(rebound, selection: reboundSelection, session: session, actor: actor, correlationID: ids.next(), idempotency: idempotency)
+        _ = try await selection.rebind(expectedBindingRevision: expectedSelectionBindingRevision)
+        await eventHub.publish(events.worktree)
+        await eventHub.publish(events.selection)
+        return rebound
     }
 
     public func mergeWorktree(sessionID: UUID, bindingID: UUID, strategy: String, expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> WorktreeBindingSnapshot {
@@ -366,6 +458,19 @@ public actor RepoPromptHeadlessAuthority {
         guard let artifactService else { throw ServiceAPIError(code: .capabilityMissing, message: "Artifact storage is not configured") }
         guard let artifact = try await store.artifact(id: artifactID) else { throw ServiceAPIError(code: .notFound, message: "Artifact not found") }
         return try await artifactService.content(storageReference: artifact.storageReference, maximumBytes: maximumBytes)
+    }
+
+    public func artifactContent(sessionID: UUID, artifactID: UUID, range: Range<Int>?) async throws -> (ArtifactSnapshot, Data, Range<Int>) {
+        guard let artifactService else { throw ServiceAPIError(code: .capabilityMissing, message: "Artifact storage is not configured") }
+        guard let artifact = try await store.artifact(id: artifactID), artifact.snapshot.sessionID == sessionID else { throw ServiceAPIError(code: .notFound, message: "Artifact not found") }
+        guard artifact.snapshot.retentionState == "active" else { throw ServiceAPIError(code: .resourceDeleted, message: "Artifact is no longer retained") }
+        let size = Int(artifact.snapshot.size)
+        let requested = range ?? 0 ..< size
+        guard requested.lowerBound >= 0, requested.lowerBound < size || (size == 0 && requested.lowerBound == 0), requested.upperBound <= size, requested.lowerBound <= requested.upperBound, requested.count <= 8_388_608 else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Artifact byte range is invalid or exceeds 8 MiB")
+        }
+        let complete = try await artifactService.content(storageReference: artifact.storageReference, maximumBytes: size)
+        return (artifact.snapshot, Data(complete[requested]), requested)
     }
 
     public func buildContext(sessionID: UUID, expectedSelectionRevision: Int64, include: [String], actor: ExternalActor) async throws -> ArtifactSnapshot {
@@ -408,16 +513,30 @@ public actor RepoPromptHeadlessAuthority {
         guard let workingRoot = project.roots.first else { throw ServiceAPIError(code: .rootUnauthorized, message: "Project has no roots") }
         let selection = try await selectionSnapshot(sessionID: sessionID)
         let context = try await materializedContext(projectID: project.projectID, selection: selection, include: ["files"])
+        let chatID = input.chatID ?? ids.next()
+        let priorChat: OracleChatState
+        if let inputChatID = input.chatID {
+            guard let stored = try await store.oracleChat(chatID: inputChatID), stored.sessionID == sessionID else { throw ServiceAPIError(code: .notFound, message: "Oracle chat not found for this session") }
+            priorChat = stored
+        } else {
+            priorChat = OracleChatState(chatID: chatID, sessionID: sessionID, turns: [], revision: 0)
+        }
+        let history = priorChat.turns.suffix(20).map { "Human: \($0.prompt)\nOracle: \($0.response)" }.joined(separator: "\n\n")
         let prompt = """
         You are the RepoPrompt Oracle. Answer the request using the authoritative selected context. Clearly identify uncertainty.
         Request: \(input.prompt)
         Context mode: \(input.contextMode)
 
+        Prior Oracle conversation:
+        \(history.isEmpty ? "(new chat)" : history)
+
         \(context)
         """
         let response = try await providerAdapter.complete(kind: session.provider, model: session.model, prompt: prompt, workingDirectory: workingRoot.canonicalPath)
-        let artifact = try await createArtifact(projectID: project.projectID, sessionID: sessionID, kind: "oracle", logicalName: "oracle-\(input.chatID?.uuidString ?? "new").md", content: Data(response.utf8), actor: actor)
-        return OracleSnapshot(chatID: input.chatID ?? ids.next(), response: response, artifactID: artifact.artifactID)
+        let nextChat = OracleChatState(chatID: chatID, sessionID: sessionID, turns: priorChat.turns + [OracleChatTurn(prompt: input.prompt, response: response, timestamp: clock.now())], revision: priorChat.revision + 1)
+        try await store.persistOracleChat(nextChat)
+        let artifact = try await createArtifact(projectID: project.projectID, sessionID: sessionID, kind: "oracle", logicalName: "oracle-\(chatID.uuidString)-r\(nextChat.revision).md", content: Data(response.utf8), actor: actor)
+        return OracleSnapshot(chatID: chatID, response: response, artifactID: artifact.artifactID, revision: nextChat.revision)
     }
 
     public func sessionSnapshot(sessionID: UUID) async throws -> SessionSnapshot {

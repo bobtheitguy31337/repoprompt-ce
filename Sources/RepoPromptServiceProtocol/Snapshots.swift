@@ -42,14 +42,18 @@ public struct InteractionSnapshot: Codable, Hashable, Sendable {
     public enum Kind: String, Codable, Sendable { case question, approval }
     public enum State: String, Codable, Sendable { case pending, deliveryIntent, resolved, expired, interrupted }
     public let interactionID: UUID
+    public let runID: UUID?
+    public let agentID: UUID?
     public let kind: Kind
     public let state: State
     public let payload: Data
     public let revision: Int64
     public let expiresAt: Date?
 
-    public init(interactionID: UUID, kind: Kind, state: State, payload: Data, revision: Int64, expiresAt: Date?) {
+    public init(interactionID: UUID, runID: UUID? = nil, agentID: UUID? = nil, kind: Kind, state: State, payload: Data, revision: Int64, expiresAt: Date?) {
         self.interactionID = interactionID
+        self.runID = runID
+        self.agentID = agentID
         self.kind = kind
         self.state = state
         self.payload = payload

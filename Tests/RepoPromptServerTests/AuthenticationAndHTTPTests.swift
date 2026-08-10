@@ -96,4 +96,43 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         XCTAssertEqual(snapshot.degradedProjectIDs, [project.projectID])
         try await store.close()
     }
+
+    func testSSELastEventIDBelowReplayFloorReturnsControlFrame() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "project-sse", requestDigest: "project-sse")
+        let metadata = try await store.metadata()
+        _ = try await store.archiveEvents(through: 1)
+
+        let instant = Date(timeIntervalSince1970: 1000)
+        let key = InternalSigningKey(keyID: "sync-v1", role: .goblinSync, direction: "goblin-sync-to-repoprompt-v1", secret: Data("secret".utf8))
+        let auth = InternalRequestAuthenticator(keys: [key], store: store, now: { instant })
+        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth)
+        let app = Application(router: service.internalRouter())
+        let path = "/internal/v1/events/stream"
+        let timestamp = String(instant.timeIntervalSince1970)
+        let nonce = "expiredcursor0001"
+        let canonical = CanonicalSigning.requestString(method: "GET", pathAndQuery: path, timestamp: timestamp, nonce: nonce, bodyDigest: CanonicalSigning.bodyDigest(Data()), authorizationDecisionDigest: CanonicalSigning.bodyDigest(Data()), keyID: key.keyID)
+        let requestHeaders: HTTPFields = {
+            var headers = HTTPFields()
+            headers[.init("X-RepoPrompt-Key-Id")!] = key.keyID
+            headers[.init("X-RepoPrompt-Timestamp")!] = timestamp
+            headers[.init("X-RepoPrompt-Nonce")!] = nonce
+            headers[.init("X-RepoPrompt-Signature")!] = CanonicalSigning.hmacSHA256(message: canonical, key: key.secret)
+            headers[.init("Last-Event-ID")!] = "\(metadata.storeID.uuidString):0"
+            return headers
+        }()
+
+        try await app.test(.router) { client in
+            try await client.execute(uri: path, method: .get, headers: requestHeaders) { response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertTrue(String(decoding: response.body.readableBytesView, as: UTF8.self).contains("event: cursor_expired"))
+            }
+        }
+        try await store.close()
+    }
 }
