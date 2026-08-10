@@ -52,10 +52,21 @@ public actor ProjectAuthority {
         snapshotValue
     }
 
+    public func root(rootID: UUID) throws -> CanonicalRoot {
+        guard let root = rootsByID[rootID] else { throw ServiceAPIError(code: .rootUnauthorized, message: "Unknown project root") }
+        return root
+    }
+
+    public func roots() -> [CanonicalRoot] {
+        rootsByID.values.sorted { $0.snapshot.logicalName < $1.snapshot.logicalName }
+    }
+
     public func authorize(rootID: UUID, logicalPath: String, filesystem: any FilesystemAuthorityPort) throws -> String {
         guard let root = rootsByID[rootID] else { throw ServiceAPIError(code: .rootUnauthorized, message: "Unknown project root") }
         guard !logicalPath.hasPrefix("/") else { throw ServiceAPIError(code: .rootUnauthorized, message: "Logical paths must be relative") }
-        let candidate = URL(fileURLWithPath: root.snapshot.canonicalPath).appendingPathComponent(logicalPath).path
+        let candidate = logicalPath.isEmpty
+            ? root.snapshot.canonicalPath
+            : URL(fileURLWithPath: root.snapshot.canonicalPath).appendingPathComponent(logicalPath).path
         guard try filesystem.contains(root: root.snapshot.canonicalPath, candidate: candidate) else { throw ServiceAPIError(code: .rootUnauthorized, message: "Path escapes the authorized root") }
         return URL(fileURLWithPath: candidate).standardizedFileURL.resolvingSymlinksInPath().path
     }

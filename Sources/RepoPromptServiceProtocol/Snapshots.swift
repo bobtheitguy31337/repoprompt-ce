@@ -47,6 +47,15 @@ public struct InteractionSnapshot: Codable, Hashable, Sendable {
     public let payload: Data
     public let revision: Int64
     public let expiresAt: Date?
+
+    public init(interactionID: UUID, kind: Kind, state: State, payload: Data, revision: Int64, expiresAt: Date?) {
+        self.interactionID = interactionID
+        self.kind = kind
+        self.state = state
+        self.payload = payload
+        self.revision = revision
+        self.expiresAt = expiresAt
+    }
 }
 
 public struct TranscriptEntry: Codable, Hashable, Sendable {

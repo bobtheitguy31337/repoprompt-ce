@@ -3,9 +3,12 @@ import Hummingbird
 import HummingbirdTLS
 import RepoPromptHeadlessRuntime
 import RepoPromptServicePersistence
+import RepoPromptWorkspaceRuntimeCore
 
 public struct RepoPromptServerConfiguration: Sendable {
     public let stateDatabasePath: String
+    public let worktreeDirectory: String
+    public let artifactDirectory: String
     public let bindHost: String
     public let bindPort: Int
     public let healthHost: String
@@ -32,6 +35,8 @@ public struct RepoPromptServerConfiguration: Sendable {
         let event = try InternalSigningKey(keyID: environment["REPOPROMPT_EVENT_KEY_ID"] ?? "repoprompt-event-v1", role: .goblinSync, direction: "repoprompt-to-goblin-v1", secret: secret("REPOPROMPT_EVENT_HMAC_FILE"))
         return try Self(
             stateDatabasePath: environment["REPOPROMPT_STATE_DB"] ?? "/var/lib/repoprompt/state/repoprompt.sqlite",
+            worktreeDirectory: environment["REPOPROMPT_WORKTREE_DIR"] ?? "/var/lib/repoprompt/worktrees",
+            artifactDirectory: environment["REPOPROMPT_ARTIFACT_DIR"] ?? "/var/lib/repoprompt/artifacts",
             bindHost: environment["REPOPROMPT_BIND_HOST"] ?? "0.0.0.0", bindPort: Int(environment["REPOPROMPT_BIND_PORT"] ?? "9443") ?? 9443,
             healthHost: "127.0.0.1", healthPort: Int(environment["REPOPROMPT_HEALTH_PORT"] ?? "9080") ?? 9080,
             certificatePath: required("REPOPROMPT_TLS_CERT_FILE"), privateKeyPath: required("REPOPROMPT_TLS_KEY_FILE"), clientCAPath: required("REPOPROMPT_TLS_CLIENT_CA_FILE"),
@@ -50,7 +55,9 @@ public enum RepoPromptServerRunner {
     public static func run(configuration: RepoPromptServerConfiguration) async throws {
         try FileManager.default.createDirectory(at: URL(fileURLWithPath: configuration.stateDatabasePath).deletingLastPathComponent(), withIntermediateDirectories: true)
         let store = try await SQLiteServiceStore.open(storage: .file(configuration.stateDatabasePath))
-        let authority = RepoPromptHeadlessAuthority(store: store)
+        let worktrees = try WorktreeRuntimeService(baseDirectory: configuration.worktreeDirectory)
+        let artifacts = try ArtifactRuntimeService(baseDirectory: configuration.artifactDirectory)
+        let authority = RepoPromptHeadlessAuthority(store: store, worktreeService: worktrees, artifactService: artifacts)
         try await authority.recover()
         let authenticator = InternalRequestAuthenticator(keys: configuration.signingKeys, store: store)
         let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: authenticator, eventSigningKey: configuration.eventSigningKey)

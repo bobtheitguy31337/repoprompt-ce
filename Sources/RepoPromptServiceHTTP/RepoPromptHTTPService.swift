@@ -56,6 +56,32 @@ public struct RepoPromptHTTPService: Sendable {
             _ = try await authenticate(request, body: Data(), roles: [.goblinApp], operation: "getProject", projectID: id)
             return try await HTTPResponses.json(authority.projectSnapshot(projectID: id))
         } }
+        router.get("/internal/v1/projects/:id/tree") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            _ = try await authenticate(request, body: Data(), roles: [.goblinApp], operation: "getProjectTree", projectID: id)
+            let rootID = try requireQueryUUID(request, name: "rootId")
+            let path = String(request.uri.queryParameters["path"] ?? "")
+            let depth = request.uri.queryParameters.get("depth", as: Int.self) ?? 4
+            return try await HTTPResponses.json(authority.projectTree(projectID: id, request: ProjectTreeRequest(rootID: rootID, logicalPath: path, maximumDepth: depth)))
+        } }
+        router.post("/internal/v1/projects/:id/search") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            _ = try await authenticate(request, body: data, roles: [.goblinApp], operation: "searchProject", projectID: id)
+            return try await HTTPResponses.json(authority.projectSearch(projectID: id, request: JSONDecoder.serviceDecoder.decode(ProjectSearchRequest.self, from: data)))
+        } }
+        router.post("/internal/v1/projects/:id/file") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            _ = try await authenticate(request, body: data, roles: [.goblinApp], operation: "getFile", projectID: id)
+            return try await HTTPResponses.json(authority.projectFile(projectID: id, request: JSONDecoder.serviceDecoder.decode(ProjectFileRequest.self, from: data)))
+        } }
+        router.post("/internal/v1/projects/:id/diff") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            _ = try await authenticate(request, body: data, roles: [.goblinApp], operation: "getDiff", projectID: id)
+            return try await HTTPResponses.json(authority.projectDiff(projectID: id, request: JSONDecoder.serviceDecoder.decode(ProjectDiffRequest.self, from: data)))
+        } }
+        router.get("/internal/v1/projects/:id/worktrees") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            _ = try await authenticate(request, body: Data(), roles: [.goblinApp], operation: "listWorktrees", projectID: id)
+            return try await HTTPResponses.json(authority.worktreeSnapshots(projectID: id))
+        } }
 
         router.get("/internal/v1/sessions") { request, _ in await respond { _ = try await authenticate(request, body: Data(), roles: [.goblinApp], operation: "listSessions")
             return try await HTTPResponses.json(authority.sessionSnapshots())
@@ -80,6 +106,76 @@ public struct RepoPromptHTTPService: Sendable {
             let auth = try await authenticate(request, body: data, roles: [.goblinApp], operation: command.operation, sessionID: id)
             let receipt = try await authority.execute(command: command, sessionID: id, externalActor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data))
             return try HTTPResponses.json(receipt, status: .accepted)
+        } }
+        router.get("/internal/v1/sessions/:id/context/selection") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            _ = try await authenticate(request, body: Data(), roles: [.goblinApp], operation: "getSelection", sessionID: id)
+            return try await HTTPResponses.json(authority.selectionSnapshot(sessionID: id))
+        } }
+        router.put("/internal/v1/sessions/:id/context/selection") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, body: data, roles: [.goblinApp], operation: "replaceSelection", sessionID: id)
+            let key = try requireIdempotency(request)
+            let input = try JSONDecoder.serviceDecoder.decode(SelectionMutationInput.self, from: data)
+            return try await HTTPResponses.json(authority.replaceSelection(sessionID: id, entries: input.entries, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data)))
+        } }
+        router.post("/internal/v1/sessions/:id/context/selection/add") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, body: data, roles: [.goblinApp], operation: "addToSelection", sessionID: id)
+            let key = try requireIdempotency(request)
+            let input = try JSONDecoder.serviceDecoder.decode(SelectionMutationInput.self, from: data)
+            return try await HTTPResponses.json(authority.addSelection(sessionID: id, entries: input.entries, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data)))
+        } }
+        router.post("/internal/v1/sessions/:id/context/selection/remove") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, body: data, roles: [.goblinApp], operation: "removeFromSelection", sessionID: id)
+            let key = try requireIdempotency(request)
+            let input = try JSONDecoder.serviceDecoder.decode(SelectionRemovalInput.self, from: data)
+            return try await HTTPResponses.json(authority.removeSelection(sessionID: id, rootID: input.rootID, logicalPaths: input.logicalPaths, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data)))
+        } }
+        router.get("/internal/v1/sessions/:id/permissions") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            _ = try await authenticate(request, body: Data(), roles: [.goblinApp], operation: "getExecutionPermissions", sessionID: id)
+            guard let snapshot = try await authority.permissionSnapshot(sessionID: id) else { return Response(status: .noContent) }
+            return try HTTPResponses.json(snapshot)
+        } }
+        router.patch("/internal/v1/sessions/:id/permissions") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, body: data, roles: [.goblinApp], operation: "updateExecutionPermissions", sessionID: id)
+            let key = try requireIdempotency(request)
+            let input = try JSONDecoder.serviceDecoder.decode(ExecutionPermissionUpdateInput.self, from: data)
+            return try await HTTPResponses.json(authority.updatePermissions(sessionID: id, expectedRevision: input.expectedRevision, mode: input.mode, providerSettings: input.providerSettings, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data)))
+        } }
+        router.get("/internal/v1/sessions/:id/interactions") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            _ = try await authenticate(request, body: Data(), roles: [.goblinApp], operation: "getInteractions", sessionID: id)
+            return try await HTTPResponses.json(authority.interactionSnapshots(sessionID: id))
+        } }
+        router.post("/internal/v1/sessions/:id/interactions/answer") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, body: data, roles: [.goblinApp], operation: "answerInteraction", sessionID: id)
+            let key = try requireIdempotency(request)
+            let input = try JSONDecoder.serviceDecoder.decode(InteractionAnswerInput.self, from: data)
+            return try await HTTPResponses.json(authority.answerInteraction(sessionID: id, interactionID: input.interactionID, expectedRevision: input.expectedRevision, payload: input.payload, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data)))
+        } }
+        router.post("/internal/v1/sessions/:id/worktrees") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, body: data, roles: [.goblinApp], operation: "createWorktree", sessionID: id)
+            let key = try requireIdempotency(request)
+            let input = try JSONDecoder.serviceDecoder.decode(WorktreeCreateInput.self, from: data)
+            return try await HTTPResponses.json(authority.createWorktree(sessionID: id, rootID: input.rootID, baseRef: input.baseRef, branch: input.branch, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data)), status: .created)
+        } }
+        router.post("/internal/v1/sessions/:id/worktrees/merge") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, body: data, roles: [.goblinApp], operation: "mergeWorktree", sessionID: id)
+            let key = try requireIdempotency(request)
+            let input = try JSONDecoder.serviceDecoder.decode(WorktreeMergeInput.self, from: data)
+            return try await HTTPResponses.json(authority.mergeWorktree(sessionID: id, bindingID: input.bindingID, strategy: input.strategy, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data)))
+        } }
+        router.get("/internal/v1/sessions/:id/artifacts") { request, context in await respond { let id = try context.parameters.require("id", as: UUID.self)
+            _ = try await authenticate(request, body: Data(), roles: [.goblinApp], operation: "getArtifacts", sessionID: id)
+            return try await HTTPResponses.json(authority.artifactSnapshots(sessionID: id))
+        } }
+        router.get("/internal/v1/catalog/workflows") { request, _ in await respond {
+            _ = try await authenticate(request, body: Data(), roles: [.goblinApp], operation: "listWorkflows")
+            return try await HTTPResponses.json(authority.workflowSnapshots())
         } }
 
         router.get("/internal/v1/events") { request, _ in await respond { _ = try await authenticate(request, body: Data(), roles: [.goblinSync], operation: "events")
@@ -124,13 +220,8 @@ public struct RepoPromptHTTPService: Sendable {
         let gets: [(path: String, operation: String, projectTarget: Bool, sessionTarget: Bool)] = [
             ("/internal/v1/catalog/providers", "listProviders", false, false),
             ("/internal/v1/catalog/models", "listModels", false, false),
-            ("/internal/v1/catalog/workflows", "listWorkflows", false, false),
             ("/internal/v1/catalog/execution-modes", "listExecutionModes", false, false),
-            ("/internal/v1/projects/:id/tree", "getProjectTree", true, false),
-            ("/internal/v1/projects/:id/worktrees", "listWorktrees", true, false),
-            ("/internal/v1/sessions/:id/children", "listSessionChildren", false, true),
-            ("/internal/v1/sessions/:id/artifacts", "getArtifacts", false, true),
-            ("/internal/v1/sessions/:id/context/selection", "getSelection", false, true)
+            ("/internal/v1/sessions/:id/children", "listSessionChildren", false, true)
         ]
         for route in gets {
             router.get(RouterPath(route.path)) { request, context in
@@ -151,12 +242,6 @@ public struct RepoPromptHTTPService: Sendable {
 
         let posts: [(path: String, operation: String, projectTarget: Bool, sessionTarget: Bool)] = [
             ("/internal/v1/projects/:id/refresh", "refreshProject", true, false),
-            ("/internal/v1/projects/:id/search", "searchProject", true, false),
-            ("/internal/v1/projects/:id/file", "getFile", true, false),
-            ("/internal/v1/projects/:id/diff", "getDiff", true, false),
-            ("/internal/v1/sessions/:id/worktrees", "createWorktree", false, true),
-            ("/internal/v1/sessions/:id/context/selection/add", "addToSelection", false, true),
-            ("/internal/v1/sessions/:id/context/selection/remove", "removeFromSelection", false, true),
             ("/internal/v1/sessions/:id/context/build", "buildContext", false, true),
             ("/internal/v1/sessions/:id/context/context-builder", "runContextBuilder", false, true),
             ("/internal/v1/sessions/:id/context/oracle", "askOracle", false, true)
@@ -203,6 +288,13 @@ public struct RepoPromptHTTPService: Sendable {
     private func requireIdempotency(_ request: Request) throws -> String {
         guard let value = request.headers[.idempotencyKey], !value.isEmpty else { throw ServiceAPIError(code: .invalidRequest, message: "Idempotency-Key is required") }
         return value
+    }
+
+    private func requireQueryUUID(_ request: Request, name: String) throws -> UUID {
+        guard let value = request.uri.queryParameters[Substring(name)], let id = UUID(uuidString: String(value)) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Query parameter \(name) must be a UUID")
+        }
+        return id
     }
 
     private func parseCursor(_ request: Request) throws -> ServiceCursor? {
