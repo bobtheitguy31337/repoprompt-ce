@@ -122,6 +122,29 @@ public actor SQLiteServiceStore {
         return ServiceCursor(storeID: value.storeID, globalSequence: value.nextGlobalSequence)
     }
 
+    public func persistServiceDiagnostic(
+        projectID: UUID,
+        actor: ExternalActor?,
+        correlationID: UUID,
+        payload: Data
+    ) async throws -> EventEnvelope {
+        try await transaction {
+            try await appendEvent(
+                projectID: projectID,
+                sessionID: nil,
+                rootSessionID: nil,
+                runID: nil,
+                sessionSequence: nil,
+                type: .serviceDiagnostic,
+                generation: nil,
+                turnEpoch: nil,
+                actor: actor,
+                correlationID: correlationID,
+                payload: payload
+            )
+        }
+    }
+
     public func persistProject(_ snapshot: ProjectSnapshot, rootIdentities: [UUID: String] = [:], eventType: EventType, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput?) async throws -> EventEnvelope {
         try await transaction {
             try await validateExpectedCursor(snapshot.cursor)
@@ -137,7 +160,15 @@ public actor SQLiteServiceStore {
                 let identity = rootIdentities[root.rootID] ?? existingRootIdentities[root.rootID] ?? "pending"
                 _ = try await connection.query("INSERT INTO project_roots(root_id,project_id,schema_version,logical_name,canonical_path,filesystem_identity,writable,revision) VALUES(?,?,1,?,?,?,?,?) ON CONFLICT(root_id) DO UPDATE SET logical_name=excluded.logical_name,canonical_path=excluded.canonical_path,filesystem_identity=excluded.filesystem_identity,writable=excluded.writable,revision=excluded.revision", [.text(root.rootID.uuidString), .text(snapshot.projectID.uuidString), .text(root.logicalName), .text(root.canonicalPath), .text(identity), .integer(root.writable ? 1 : 0), .integer(Int(root.revision))])
             }
-            let event = try await appendEvent(projectID: snapshot.projectID, sessionID: nil, rootSessionID: nil, runID: nil, sessionSequence: nil, type: eventType, generation: nil, turnEpoch: nil, actor: actor, correlationID: correlationID, payload: Data(snapshotJSON.utf8))
+            if let sourceRoot = snapshot.roots.first {
+                try await activatePreparedOwnedResourceIfPresent(
+                    externalID: snapshot.projectID,
+                    kind: .cloneStaging,
+                    path: sourceRoot.canonicalPath
+                )
+            }
+            let eventPayload = try encoder.encode(ProjectEventWirePayload(snapshot))
+            let event = try await appendEvent(projectID: snapshot.projectID, sessionID: nil, rootSessionID: nil, runID: nil, sessionSequence: nil, type: eventType, generation: nil, turnEpoch: nil, actor: actor, correlationID: correlationID, payload: eventPayload)
             if let idempotency { try await saveIdempotency(idempotency, status: 201, response: encoder.encode(snapshot)) }
             return event
         }

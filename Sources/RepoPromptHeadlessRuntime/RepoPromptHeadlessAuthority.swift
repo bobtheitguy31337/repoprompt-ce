@@ -16,6 +16,7 @@ public actor RepoPromptHeadlessAuthority {
     private let interactionDelivery: (any InteractionDeliveryPort)?
     private let contextBuilderRuntime: (any ContextBuilderRuntimeService)?
     private let oracleRuntime: (any OracleRuntimeService)?
+    private let projectSourceService: ProjectSourceProvisioningService?
     private let workflowCatalog = BuiltinWorkflowCatalog()
     private let projects = ProjectRuntimeSupervisor()
     private let eventHub = ServiceEventHub()
@@ -40,7 +41,8 @@ public actor RepoPromptHeadlessAuthority {
         providerAdapter: (any AgentProviderDispatcher)? = nil,
         interactionDelivery: (any InteractionDeliveryPort)? = nil,
         contextBuilderRuntime: (any ContextBuilderRuntimeService)? = nil,
-        oracleRuntime: (any OracleRuntimeService)? = nil
+        oracleRuntime: (any OracleRuntimeService)? = nil,
+        projectSourceService: ProjectSourceProvisioningService? = nil
     ) {
         self.store = store
         self.clock = clock
@@ -53,6 +55,7 @@ public actor RepoPromptHeadlessAuthority {
         self.interactionDelivery = interactionDelivery ?? (providerAdapter as? any InteractionDeliveryPort)
         self.contextBuilderRuntime = contextBuilderRuntime ?? providerAdapter.map { ProviderContextBuilderRuntimeService(providers: $0) }
         self.oracleRuntime = oracleRuntime ?? providerAdapter.map { ProviderOracleRuntimeService(providers: $0) }
+        self.projectSourceService = projectSourceService
     }
 
     public func recover() async throws {
@@ -129,6 +132,109 @@ public actor RepoPromptHeadlessAuthority {
         tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
         await eventHub.publish(event)
         return snapshot
+    }
+
+    public func projectSourceCapabilities() async -> ProjectSourceCapabilities? {
+        await projectSourceService?.capabilities()
+    }
+
+    public func createProjectFromSource(
+        input: ProjectSourceOperationInput,
+        externalActor: ExternalActor,
+        idempotencyKey: String,
+        requestDigest: String
+    ) async throws -> ProjectSourceOperationWireSnapshot {
+        try ensureWritable()
+        guard let projectSourceService else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Project source operations are not configured")
+        }
+        let idempotency = IdempotencyInput(
+            actorID: externalActor.goblinUserID,
+            operation: "createProjectFromSource",
+            key: idempotencyKey,
+            requestDigest: requestDigest
+        )
+        if let existing = try await store.idempotencyResult(idempotency) {
+            let snapshot = try JSONDecoder.serviceDecoder.decode(ProjectSnapshot.self, from: existing.response)
+            return ProjectSourceOperationWireSnapshot(
+                operationID: input.operationID,
+                projectID: snapshot.projectID,
+                state: .completed,
+                progressRevision: 4,
+                messageCode: "project_source_completed",
+                project: ProjectWireSnapshot(snapshot)
+            )
+        }
+
+        let projectID = ids.next()
+        let rootID = ids.next()
+        func progress(_ state: ProjectSourceOperationState, revision: Int64, code: String, error: ServiceErrorCode? = nil) async {
+            let snapshot = ProjectSourceOperationWireSnapshot(
+                operationID: input.operationID,
+                projectID: projectID,
+                state: state,
+                progressRevision: revision,
+                messageCode: code,
+                errorCode: error
+            )
+            guard let payload = try? JSONEncoder.serviceEncoder.encode(snapshot),
+                  let event = try? await store.persistServiceDiagnostic(
+                      projectID: projectID,
+                      actor: externalActor,
+                      correlationID: input.operationID,
+                      payload: payload
+                  )
+            else { return }
+            await eventHub.publish(event)
+        }
+
+        await progress(.validating, revision: 1, code: "project_source_validating")
+        do {
+            switch input.source {
+            case .configuredRoot:
+                await progress(.validating, revision: 2, code: "project_source_connecting")
+            case .gitClone:
+                await progress(.cloning, revision: 2, code: "project_source_cloning")
+            }
+            let root = try await projectSourceService.provision(input: input, projectID: projectID, rootID: rootID)
+            await progress(.promoting, revision: 3, code: "project_source_promoting")
+            let cursor = try await store.nextCursor()
+            let snapshot = ProjectSnapshot(
+                projectID: projectID,
+                name: input.name.trimmingCharacters(in: .whitespacesAndNewlines),
+                creator: externalActor,
+                state: .active,
+                roots: [root.snapshot],
+                revision: 1,
+                cursor: cursor
+            )
+            let event = try await store.persistProject(
+                snapshot,
+                rootIdentities: [root.snapshot.rootID: root.filesystemIdentity],
+                eventType: .projectCreated,
+                actor: externalActor,
+                correlationID: input.operationID,
+                idempotency: idempotency
+            )
+            let project = ProjectAuthority(snapshot: snapshot, roots: [root])
+            await projects.install(project)
+            tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
+            await eventHub.publish(event)
+            await progress(.completed, revision: 4, code: "project_source_completed")
+            return ProjectSourceOperationWireSnapshot(
+                operationID: input.operationID,
+                projectID: projectID,
+                state: .completed,
+                progressRevision: 4,
+                messageCode: "project_source_completed",
+                project: ProjectWireSnapshot(snapshot)
+            )
+        } catch {
+            await projectSourceService.abandonProvisionedClone(projectID: projectID)
+            let code = (error as? ServiceAPIError)?.code ?? .dependencyUnavailable
+            await progress(.failed, revision: 4, code: "project_source_failed", error: code)
+            throw error
+        }
     }
 
     public func updateProject(projectID: UUID, input: UpdateProjectInput, actor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> ProjectSnapshot {

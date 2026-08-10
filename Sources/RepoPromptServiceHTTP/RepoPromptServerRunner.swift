@@ -30,6 +30,8 @@ public struct RepoPromptServerConfiguration: Sendable {
     public let minimumFreeNodes: Int64
     public let maximumActiveSessions: Int
     public let restoreActivationTokenPath: String?
+    public let projectSourcePolicy: ProjectSourcePolicy
+    public let projectSourceGitCredentials: ProjectSourceGitCredentials
 
     public static func environment(_ environment: [String: String] = ProcessInfo.processInfo.environment) throws -> Self {
         func required(_ name: String) throws -> String {
@@ -80,6 +82,18 @@ public struct RepoPromptServerConfiguration: Sendable {
             (.cursorACP, environment["REPOPROMPT_CURSOR_CREDENTIAL_HOME"])
         ].reduce(into: [ProviderKind: String]()) { result, value in if let path = value.1, !path.isEmpty { result[value.0] = path } }
         let stateDatabase = environment["REPOPROMPT_STATE_DB"] ?? "/var/lib/repoprompt/state/repoprompt.sqlite"
+        let projectSourcePolicy: ProjectSourcePolicy
+        if let path = environment["REPOPROMPT_PROJECT_SOURCE_POLICY_FILE"], !path.isEmpty {
+            guard path.hasPrefix("/") else { throw ConfigurationError.invalid("Project source policy path must be absolute") }
+            projectSourcePolicy = try ProjectSourcePolicy.decode(Data(contentsOf: URL(fileURLWithPath: path)))
+        } else {
+            projectSourcePolicy = .disabled
+        }
+        let projectSourceGitCredentials = try ProjectSourceGitCredentials(
+            globalConfigPath: environment["REPOPROMPT_GIT_CONFIG_FILE"],
+            sshPrivateKeyPath: environment["REPOPROMPT_GIT_SSH_KEY_FILE"],
+            sshKnownHostsPath: environment["REPOPROMPT_GIT_KNOWN_HOSTS_FILE"]
+        )
         return try Self(
             stateDatabasePath: stateDatabase,
             worktreeDirectory: environment["REPOPROMPT_WORKTREE_DIR"] ?? "/srv/repoprompt/worktrees",
@@ -98,7 +112,9 @@ public struct RepoPromptServerConfiguration: Sendable {
             minimumFreeBytes: Int64(environment["REPOPROMPT_MINIMUM_FREE_BYTES"] ?? "268435456") ?? 268_435_456,
             minimumFreeNodes: Int64(environment["REPOPROMPT_MINIMUM_FREE_NODES"] ?? "1024") ?? 1024,
             maximumActiveSessions: Int(environment["REPOPROMPT_MAX_ACTIVE_SESSIONS"] ?? "64") ?? 64,
-            restoreActivationTokenPath: environment["REPOPROMPT_RESTORE_ACTIVATION_TOKEN_FILE"]
+            restoreActivationTokenPath: environment["REPOPROMPT_RESTORE_ACTIVATION_TOKEN_FILE"],
+            projectSourcePolicy: projectSourcePolicy,
+            projectSourceGitCredentials: projectSourceGitCredentials
         )
     }
 }
@@ -208,7 +224,8 @@ public enum RepoPromptServerRunner {
             artifactRoot: configuration.artifactDirectory,
             worktreeRoot: configuration.worktreeDirectory,
             providerHomeRoot: configuration.providerHomeDirectory,
-            providerOutputRoot: processOutput
+            providerOutputRoot: processOutput,
+            projectRoot: configuration.projectDirectory
         )
         _ = await reconciler.reconcileStartup()
         let durabilityOperations = DurabilityOperationsService(store: store, reconciler: reconciler)
@@ -231,11 +248,18 @@ public enum RepoPromptServerRunner {
             outputDirectory: processOutput,
             ephemeralHomeRoot: configuration.providerHomeDirectory
         )
+        let projectSources = try ProjectSourceProvisioningService(
+            cloneRoot: configuration.projectDirectory,
+            policy: configuration.projectSourcePolicy,
+            credentials: configuration.projectSourceGitCredentials,
+            resources: store
+        )
         let authority = RepoPromptHeadlessAuthority(
             store: store,
             worktreeService: worktrees,
             artifactService: artifacts,
-            providerAdapter: providers
+            providerAdapter: providers,
+            projectSourceService: projectSources
         )
         try await authority.recover()
 

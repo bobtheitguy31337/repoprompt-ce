@@ -63,6 +63,119 @@ public struct ProjectWireSnapshot: Codable, Hashable, Sendable {
     }
 }
 
+/// Bounded project event payload consumed by Goblin projections. Physical
+/// roots remain in RepoPrompt persistence and never enter the event stream.
+public struct ProjectEventWirePayload: Codable, Hashable, Sendable {
+    public let schemaVersion: Int
+    public let projectID: UUID
+    public let name: String
+    public let state: ProjectLifecycleState
+    public let revision: Int64
+    public let rootCount: Int
+
+    public init(_ value: ProjectSnapshot) {
+        schemaVersion = 1
+        projectID = value.projectID
+        name = value.name
+        state = value.state
+        revision = value.revision
+        rootCount = value.roots.count
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case projectID = "projectId"
+        case name, state, revision, rootCount
+    }
+}
+
+public enum ProjectSourceOperationState: String, Codable, Hashable, Sendable {
+    case validating
+    case cloning
+    case promoting
+    case completed
+    case failed
+}
+
+/// Safe progress/result payload. It deliberately excludes the submitted
+/// remote, configured physical path, staging path, and credential profile.
+public struct ProjectSourceOperationWireSnapshot: Codable, Hashable, Sendable {
+    public let schemaVersion: Int
+    public let operationID: UUID
+    public let projectID: UUID
+    public let state: ProjectSourceOperationState
+    public let progressRevision: Int64
+    public let messageCode: String
+    public let project: ProjectWireSnapshot?
+    public let errorCode: ServiceErrorCode?
+
+    public init(
+        schemaVersion: Int = 1,
+        operationID: UUID,
+        projectID: UUID,
+        state: ProjectSourceOperationState,
+        progressRevision: Int64,
+        messageCode: String,
+        project: ProjectWireSnapshot? = nil,
+        errorCode: ServiceErrorCode? = nil
+    ) {
+        self.schemaVersion = schemaVersion
+        self.operationID = operationID
+        self.projectID = projectID
+        self.state = state
+        self.progressRevision = progressRevision
+        self.messageCode = messageCode
+        self.project = project
+        self.errorCode = errorCode
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case operationID = "operationId"
+        case projectID = "projectId"
+        case state, progressRevision, messageCode, project, errorCode
+    }
+}
+
+public struct ProjectSourceCapabilities: Codable, Hashable, Sendable {
+    public struct GitRemoteRule: Codable, Hashable, Sendable {
+        public let scheme: String
+        public let host: String
+        public let pathPrefix: String
+
+        public init(scheme: String, host: String, pathPrefix: String) {
+            self.scheme = scheme
+            self.host = host
+            self.pathPrefix = pathPrefix
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case scheme, host, pathPrefix
+        }
+    }
+
+    public let schemaVersion: Int
+    public let configuredRootAliases: [String]
+    public let gitRemoteRules: [GitRemoteRule]
+    public let gitCloneEnabled: Bool
+
+    public init(
+        schemaVersion: Int = 1,
+        configuredRootAliases: [String],
+        gitRemoteRules: [GitRemoteRule],
+        gitCloneEnabled: Bool
+    ) {
+        self.schemaVersion = schemaVersion
+        self.configuredRootAliases = configuredRootAliases
+        self.gitRemoteRules = gitRemoteRules
+        self.gitCloneEnabled = gitCloneEnabled
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, configuredRootAliases, gitRemoteRules, gitCloneEnabled
+    }
+}
+
 public struct WorktreeWireSnapshot: Codable, Hashable, Sendable {
     public let bindingID: UUID
     public let projectID: UUID
@@ -199,8 +312,9 @@ public struct ServiceCapabilitiesResponse: Codable, Sendable {
     public let workflows: [WorkflowSnapshot]
     public let executionModes: [ExecutionModeCatalogItem]
     public let eventTypes: [EventType]
+    public let projectSources: ProjectSourceCapabilities?
 
-    public init(protocolVersion: Int = 1, protocolRange: ProtocolVersionRange, schemaVersion: Int, storeID: UUID, replayFloor: Int64, providers: [ProviderCatalogItem], models: [ModelCatalogItem], workflows: [WorkflowSnapshot], executionModes: [ExecutionModeCatalogItem], eventTypes: [EventType]) {
+    public init(protocolVersion: Int = 1, protocolRange: ProtocolVersionRange, schemaVersion: Int, storeID: UUID, replayFloor: Int64, providers: [ProviderCatalogItem], models: [ModelCatalogItem], workflows: [WorkflowSnapshot], executionModes: [ExecutionModeCatalogItem], eventTypes: [EventType], projectSources: ProjectSourceCapabilities? = nil) {
         self.protocolVersion = protocolVersion
         self.protocolRange = protocolRange
         self.schemaVersion = schemaVersion
@@ -211,6 +325,7 @@ public struct ServiceCapabilitiesResponse: Codable, Sendable {
         self.workflows = workflows
         self.executionModes = executionModes
         self.eventTypes = eventTypes
+        self.projectSources = projectSources
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -218,6 +333,6 @@ public struct ServiceCapabilitiesResponse: Codable, Sendable {
         case protocolRange = "protocol"
         case schemaVersion
         case storeID = "storeId"
-        case replayFloor, providers, models, workflows, executionModes, eventTypes
+        case replayFloor, providers, models, workflows, executionModes, eventTypes, projectSources
     }
 }

@@ -12,11 +12,13 @@ final class ResourceReconciliationTests: XCTestCase {
         let source = directory.appendingPathComponent("source", isDirectory: true)
         let providerHomes = directory.appendingPathComponent("provider-homes", isDirectory: true)
         let providerOutput = directory.appendingPathComponent("provider-output", isDirectory: true)
+        let projects = directory.appendingPathComponent("projects", isDirectory: true)
         try FileManager.default.createDirectory(at: artifacts, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: worktrees, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: providerHomes, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: providerOutput, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: projects, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let artifactPath = artifacts.appendingPathComponent("owned.bin")
@@ -32,6 +34,12 @@ final class ResourceReconciliationTests: XCTestCase {
         let providerStderr = providerOutput.appendingPathComponent("expired.stderr")
         try Data("out".utf8).write(to: providerStdout)
         try Data("err".utf8).write(to: providerStderr)
+        let cloneOperation = projects.appendingPathComponent(".source-staging/operation", isDirectory: true)
+        let cloneFinal = projects.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let unknownProject = projects.appendingPathComponent("not-owned", isDirectory: true)
+        try FileManager.default.createDirectory(at: cloneOperation, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: cloneFinal, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: unknownProject, withIntermediateDirectories: true)
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let deadline = Date().addingTimeInterval(15 * 60)
@@ -67,26 +75,40 @@ final class ResourceReconciliationTests: XCTestCase {
             lifecycleState: .cleanupPending,
             retentionDeadline: deadline
         )
+        let interruptedClone = OwnedResourceRecord(
+            kind: .cloneStaging,
+            projectID: UUID(),
+            externalID: UUID(),
+            internalPathIdentity: cloneFinal.path,
+            temporaryPathIdentity: cloneOperation.path,
+            lifecycleState: .preparing,
+            retentionDeadline: deadline
+        )
         try await store.reserveOwnedResource(artifact)
         try await store.reserveOwnedResource(worktree)
         try await store.reserveOwnedResource(providerHome)
         try await store.reserveOwnedResource(providerCapture)
+        try await store.reserveOwnedResource(interruptedClone)
         let reconciler = OwnedResourceReconciliationService(
             repository: store,
             artifactRoot: artifacts.path,
             worktreeRoot: worktrees.path,
             providerHomeRoot: providerHomes.path,
             providerOutputRoot: providerOutput.path,
+            projectRoot: projects.path,
             runner: DirtyWorktreeRunner()
         )
         let report = await reconciler.reconcileStartup()
-        XCTAssertEqual(report.deleted, 3)
+        XCTAssertEqual(report.deleted, 4)
         XCTAssertFalse(FileManager.default.fileExists(atPath: artifactPath.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: unknownPath.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: worktreePath.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: providerHomePath.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: providerStdout.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: providerStderr.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cloneOperation.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cloneFinal.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unknownProject.path))
         let persistedWorktree = try await store.ownedResource(externalID: XCTUnwrap(worktree.externalID), kind: .worktree)
         XCTAssertEqual(persistedWorktree?.lifecycleState, .quarantined)
         try await store.close()

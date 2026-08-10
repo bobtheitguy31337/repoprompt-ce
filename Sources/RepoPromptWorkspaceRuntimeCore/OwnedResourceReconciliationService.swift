@@ -29,6 +29,7 @@ public actor OwnedResourceReconciliationService {
     private let worktreeRoot: String
     private let providerHomeRoot: String?
     private let providerOutputRoot: String?
+    private let projectRoot: String?
     private let runner: any WorkspaceCommandRunning
     private let gitExecutable: String
 
@@ -38,6 +39,7 @@ public actor OwnedResourceReconciliationService {
         worktreeRoot: String,
         providerHomeRoot: String? = nil,
         providerOutputRoot: String? = nil,
+        projectRoot: String? = nil,
         runner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(),
         gitExecutable: String = "/usr/bin/git"
     ) {
@@ -46,6 +48,7 @@ public actor OwnedResourceReconciliationService {
         self.worktreeRoot = URL(fileURLWithPath: worktreeRoot).standardizedFileURL.path
         self.providerHomeRoot = providerHomeRoot.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
         self.providerOutputRoot = providerOutputRoot.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        self.projectRoot = projectRoot.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
         self.runner = runner
         self.gitExecutable = gitExecutable
     }
@@ -135,6 +138,13 @@ public actor OwnedResourceReconciliationService {
                 if record.kind == .artifact, artifactMatches(record) { return .prepared }
                 if record.kind == .worktree, try await worktreeMatches(record) { return .prepared }
                 if isProviderResource(record), providerResourceIsSafe(record) { return .prepared }
+                if record.kind == .cloneStaging, cloneResourceIsSafe(record) {
+                    if recoverInterruptedPreparation {
+                        try removeCloneResource(record)
+                        return .deleted
+                    }
+                    return .quarantined
+                }
                 return .quarantined
             }
             if recoverInterruptedPreparation || record.retentionDeadline.map({ $0 <= now }) == true { return .failed }
@@ -153,6 +163,10 @@ public actor OwnedResourceReconciliationService {
                 try removeProviderResource(record)
                 return .deleted
             }
+            if record.kind == .cloneStaging {
+                try removeCloneResource(record)
+                return .deleted
+            }
             return record.lifecycleState
         case .active:
             guard exists else { return .missing }
@@ -163,6 +177,7 @@ public actor OwnedResourceReconciliationService {
             }
             if record.kind == .artifact, !artifactMatches(record) { return .corrupt }
             if record.kind == .worktree, try await !worktreeMatches(record) { return .corrupt }
+            if record.kind == .cloneStaging, !cloneResourceIsSafe(record) { return .corrupt }
             return .active
         case .missing, .corrupt, .conflicted:
             return record.lifecycleState
@@ -213,6 +228,23 @@ public actor OwnedResourceReconciliationService {
     private func removeProviderResource(_ record: OwnedResourceRecord) throws {
         guard providerResourceIsSafe(record) else {
             throw ServiceAPIError(code: .rootUnauthorized, message: "Provider-home cleanup path is unsafe")
+        }
+        for path in resourcePaths(record) where FileManager.default.fileExists(atPath: path) {
+            try FileManager.default.removeItem(atPath: path)
+            try DurableFilesystem.fsyncDirectory(URL(fileURLWithPath: path).deletingLastPathComponent().path)
+        }
+    }
+
+    private func cloneResourceIsSafe(_ record: OwnedResourceRecord) -> Bool {
+        guard let projectRoot else { return false }
+        return resourcePaths(record).allSatisfy {
+            isContained($0, root: projectRoot) && !isSymbolicLink($0)
+        }
+    }
+
+    private func removeCloneResource(_ record: OwnedResourceRecord) throws {
+        guard cloneResourceIsSafe(record) else {
+            throw ServiceAPIError(code: .rootUnauthorized, message: "Project clone cleanup path is unsafe")
         }
         for path in resourcePaths(record) where FileManager.default.fileExists(atPath: path) {
             try FileManager.default.removeItem(atPath: path)
