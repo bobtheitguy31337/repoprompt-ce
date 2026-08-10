@@ -280,24 +280,6 @@ final class ProjectSourceProvisioningTests: XCTestCase {
         XCTAssertTrue(gone)
     }
 
-    func testLinuxSupervisorSourceKeepsParentDeathAndDescriptorFallbackContracts() throws {
-        let repository = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let source = try String(
-            contentsOf: repository.appendingPathComponent("Sources/RepoPromptC/src/Utils/anchored_process_supervisor.c"),
-            encoding: .utf8
-        )
-
-        XCTAssertTrue(source.contains("prctl(PR_SET_PDEATHSIG, SIGCONT)"))
-        XCTAssertTrue(source.contains("getppid() != expected_parent"))
-        XCTAssertTrue(source.contains("opendir(\"/proc/self/fd\")"))
-        XCTAssertTrue(source.contains("readdir(directory)"))
-        XCTAssertTrue(source.contains("limit.rlim_cur != RLIM_INFINITY"))
-        XCTAssertFalse(source.contains("65535U"), "The exhaustive fallback must not retain the old descriptor cap")
-    }
-
     #if os(Linux)
     func testLinuxSupervisorAnchorsFinalValidationThenSuccessReleasesWithoutLaterSignal() async throws {
         let fixture = try RealRunnerFixture(script: "#!/bin/sh\nexit 23\n")
@@ -339,11 +321,18 @@ final class ProjectSourceProvisioningTests: XCTestCase {
             outputDescriptor: output.fileDescriptor,
             lifecycle: lifecycle
         )
+        defer { lifecycle.signal(SIGKILL) }
 
         XCTAssertEqual(await waitForGitStatus(lifecycle), 0)
         let anchorPID = lifecycle.testSupervisorProcessID
-        XCTAssertEqual(kill(anchorPID, SIGSTOP), 0)
-        try await Task.sleep(for: .milliseconds(50))
+        guard kill(anchorPID, SIGSTOP) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        var stoppedStatus: Int32 = 0
+        guard waitpid(anchorPID, &stoppedStatus, WUNTRACED) == anchorPID else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        XCTAssertTrue(WIFSTOPPED(stoppedStatus))
         XCTAssertTrue(lifecycle.releaseSupervisor())
         try await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(kill(anchorPID, 0), 0, "A stopped anchor cannot consume release yet")
@@ -382,7 +371,12 @@ final class ProjectSourceProvisioningTests: XCTestCase {
                     usleep(10_000)
                 }
                 var supervisorPID = lifecycle.testSupervisorProcessID
-                if readyPath.withCString({ access($0, F_OK) }) != 0 || kill(supervisorPID, SIGSTOP) != 0 {
+                var stoppedStatus: Int32 = 0
+                if readyPath.withCString({ access($0, F_OK) }) != 0
+                    || kill(supervisorPID, SIGSTOP) != 0
+                    || waitpid(supervisorPID, &stoppedStatus, WUNTRACED) != supervisorPID
+                    || !WIFSTOPPED(stoppedStatus)
+                {
                     supervisorPID = -1
                 }
                 _ = withUnsafeBytes(of: &supervisorPID) { bytes in
@@ -404,9 +398,19 @@ final class ProjectSourceProvisioningTests: XCTestCase {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(forkError))
         }
 
+        var supervisorPID = pid_t(-1)
+        var descendantPID = pid_t(-1)
+        defer {
+            if helperPID > 1 { _ = kill(helperPID, SIGKILL) }
+            if supervisorPID > 1 {
+                _ = kill(supervisorPID, SIGCONT)
+                _ = kill(supervisorPID, SIGKILL)
+            }
+            if descendantPID > 1 { _ = kill(descendantPID, SIGKILL) }
+        }
+
         close(reportPipe[1])
         reportPipe[1] = -1
-        var supervisorPID = pid_t(-1)
         let reportCount = withUnsafeMutableBytes(of: &supervisorPID) { bytes in
             read(reportPipe[0], bytes.baseAddress, bytes.count)
         }
@@ -417,12 +421,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
         guard reportCount == MemoryLayout<pid_t>.size, supervisorPID > 1 else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(ECHILD))
         }
-        let descendantPID = try fixture.processID(named: "child.pid")
-        defer {
-            _ = kill(supervisorPID, SIGCONT)
-            _ = kill(supervisorPID, SIGKILL)
-            _ = kill(descendantPID, SIGKILL)
-        }
+        descendantPID = try fixture.processID(named: "child.pid")
 
         XCTAssertTrue(
             processIsGoneSynchronously(supervisorPID),
@@ -445,6 +444,21 @@ final class ProjectSourceProvisioningTests: XCTestCase {
         }
         defer { if inheritedDescriptor >= 0 { close(inheritedDescriptor) } }
 
+        let noFileResource = __rlimit_resource_t(RLIMIT_NOFILE.rawValue)
+        var originalLimit = rlimit()
+        guard getrlimit(noFileResource, &originalLimit) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        var loweredLimit = originalLimit
+        loweredLimit.rlim_cur = min(originalLimit.rlim_cur, rlim_t(1_024))
+        guard setrlimit(noFileResource, &loweredLimit) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        var limitIsLowered = true
+        defer {
+            if limitIsLowered { _ = setrlimit(noFileResource, &originalLimit) }
+        }
+
         let fixture = try RealRunnerFixture(
             script: "#!/bin/sh\nif [ -e /proc/self/fd/\(inheritedDescriptor) ]; then touch inherited-fd.marker; exit 91; fi\nexit 0\n"
         )
@@ -462,6 +476,11 @@ final class ProjectSourceProvisioningTests: XCTestCase {
             outputDescriptor: output.fileDescriptor,
             lifecycle: lifecycle
         )
+        defer { lifecycle.signal(SIGKILL) }
+        guard setrlimit(noFileResource, &originalLimit) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        limitIsLowered = false
         close(inheritedDescriptor)
         inheritedDescriptor = -1
 
@@ -471,6 +490,42 @@ final class ProjectSourceProvisioningTests: XCTestCase {
         ))
         XCTAssertTrue(lifecycle.releaseSupervisor())
         XCTAssertTrue(await waitForSupervisorExit(lifecycle))
+    }
+
+    func testLinuxCloseRangeFallbackFailsClosedWhenProcFDOpenFails() async throws {
+        try await assertLinuxProcFDFaultFailsClosed("open")
+    }
+
+    func testLinuxCloseRangeFallbackFailsClosedWhenProcFDEnumerationFails() async throws {
+        try await assertLinuxProcFDFaultFailsClosed("readdir")
+    }
+
+    private func assertLinuxProcFDFaultFailsClosed(_ fault: String) async throws {
+        let fixture = try RealRunnerFixture(script: "#!/bin/sh\ntouch exec.marker\nexit 0\n")
+        defer { fixture.cleanup() }
+        let invocation = fixture.invocation(
+            timeoutSeconds: 5,
+            environmentOverrides: [
+                "REPOPROMPT_TEST_FORCE_CLOSE_RANGE_FALLBACK": "1",
+                "REPOPROMPT_TEST_PROC_FD_FAULT": fault,
+            ]
+        )
+        XCTAssertTrue(FileManager.default.createFile(atPath: invocation.outputPath, contents: nil))
+        let output = try FileHandle(forWritingTo: URL(fileURLWithPath: invocation.outputPath))
+        defer { try? output.close() }
+        let lifecycle = ManagedProjectSourceProcess()
+        try LocalProjectSourceGitRunner.spawnLinuxSupervisor(
+            invocation,
+            outputDescriptor: output.fileDescriptor,
+            lifecycle: lifecycle
+        )
+        defer { lifecycle.signal(SIGKILL) }
+
+        XCTAssertEqual(await waitForGitStatus(lifecycle), 127)
+        XCTAssertTrue(await waitForSupervisorExit(lifecycle))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.directory.appendingPathComponent("exec.marker").path
+        ))
     }
 
     func testLinuxSupervisorFailureSignalsFamilyWhileAnchorIsOwned() async throws {
