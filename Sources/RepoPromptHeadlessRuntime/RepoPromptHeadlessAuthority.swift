@@ -194,6 +194,15 @@ public actor RepoPromptHeadlessAuthority {
         selections[sessionID] = SessionSelectionAuthority(sessionID: sessionID, template: seededSelection.entries, revision: seededSelection.revision, bindingRevision: seededSelection.bindingRevision)
         await eventHub.publish(events.session)
         await eventHub.publish(events.agent)
+        if input.parentSessionID == nil, let worktreeService {
+            let project = try await projectSnapshot(projectID: input.projectID)
+            if let root = project.roots.first(where: \.writable) {
+                let branch = "repoprompt/session-\(sessionID.uuidString.lowercased().prefix(12))"
+                let binding = try await worktreeService.create(project: project, root: root, sessionID: sessionID, baseRef: "HEAD", branch: branch)
+                let worktreeEvent = try await store.persistWorktree(binding, actor: externalActor, correlationID: ids.next())
+                await eventHub.publish(worktreeEvent)
+            }
+        }
         return snapshot
     }
 
@@ -570,10 +579,11 @@ public actor RepoPromptHeadlessAuthority {
         let current = try await selectionSnapshot(sessionID: sessionID)
         guard current.revision == input.expectedSelectionRevision else { throw ServiceAPIError(code: .staleRevision, message: "Selection revision is stale", currentRevision: current.revision) }
         let project = try await projectSnapshot(projectID: session.projectID)
-        guard let workingRoot = project.roots.first else { throw ServiceAPIError(code: .rootUnauthorized, message: "Project has no roots") }
+        let tool = try await sessionToolAuthority(session: session)
+        let workingDirectory = try await workingDirectory(session: session)
         var inventory: [String] = []
         for root in project.roots {
-            let entries = try await projectTree(projectID: project.projectID, request: .init(rootID: root.rootID, maximumDepth: 12, maximumEntries: min(max(input.budget, 100), 10000)))
+            let entries = try await tool.tree(.init(rootID: root.rootID, maximumDepth: 12, maximumEntries: min(max(input.budget, 100), 10000)))
             inventory.append(contentsOf: entries.filter { !$0.isDirectory }.map { "\(root.rootID.uuidString)\t\($0.logicalPath)" })
         }
         let prompt = """
@@ -583,7 +593,7 @@ public actor RepoPromptHeadlessAuthority {
         Repository inventory:
         \(inventory.joined(separator: "\n"))
         """
-        let output = try await providerAdapter.complete(kind: session.provider, model: session.model, prompt: prompt, workingDirectory: workingRoot.canonicalPath)
+        let output = try await providerAdapter.complete(kind: session.provider, model: session.model, prompt: prompt, workingDirectory: workingDirectory)
         let proposals = try decodeContextBuilderOutput(output)
         let entries = proposals.map { LogicalSelectionEntry(rootID: $0.rootID, logicalPath: $0.path, mode: .full) }
         return try await replaceSelection(sessionID: sessionID, entries: entries, expectedRevision: input.expectedSelectionRevision, actor: actor)
@@ -593,7 +603,7 @@ public actor RepoPromptHeadlessAuthority {
         guard let providerAdapter else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider runtime is not configured") }
         let session = try await sessionSnapshot(sessionID: sessionID)
         let project = try await projectSnapshot(projectID: session.projectID)
-        guard let workingRoot = project.roots.first else { throw ServiceAPIError(code: .rootUnauthorized, message: "Project has no roots") }
+        let workingDirectory = try await workingDirectory(session: session)
         let selection = try await selectionSnapshot(sessionID: sessionID)
         let context = try await materializedContext(projectID: project.projectID, selection: selection, include: ["files"])
         let chatID = input.chatID ?? ids.next()
@@ -615,7 +625,7 @@ public actor RepoPromptHeadlessAuthority {
 
         \(context)
         """
-        let response = try await providerAdapter.complete(kind: session.provider, model: session.model, prompt: prompt, workingDirectory: workingRoot.canonicalPath)
+        let response = try await providerAdapter.complete(kind: session.provider, model: session.model, prompt: prompt, workingDirectory: workingDirectory)
         let nextChat = OracleChatState(chatID: chatID, sessionID: sessionID, turns: priorChat.turns + [OracleChatTurn(prompt: input.prompt, response: response, timestamp: clock.now())], revision: priorChat.revision + 1)
         try await store.persistOracleChat(nextChat)
         let artifact = try await createArtifact(projectID: project.projectID, sessionID: sessionID, kind: "oracle", logicalName: "oracle-\(chatID.uuidString)-r\(nextChat.revision).md", content: Data(response.utf8), actor: actor)
@@ -765,13 +775,16 @@ public actor RepoPromptHeadlessAuthority {
 
     private func materializedContext(projectID: UUID, selection: SelectionSnapshot, include: [String]) async throws -> String {
         var sections = ["# RepoPrompt Context", "selection-revision: \(selection.revision)"]
+        let session = try await sessionSnapshot(sessionID: selection.sessionID)
+        guard session.projectID == projectID else { throw ServiceAPIError(code: .rootUnauthorized, message: "Selection does not belong to the project") }
+        let tool = try await sessionToolAuthority(session: session)
         for entry in selection.entries {
             if entry.mode == .codeMap {
-                let codeMap = try await projectCodeMap(projectID: projectID, request: .init(rootID: entry.rootID, logicalPath: entry.logicalPath))
+                let codeMap = try await tool.codeMap(.init(rootID: entry.rootID, logicalPath: entry.logicalPath))
                 sections.append("## \(entry.logicalPath) [codemap:\(codeMap.status)]\n```\n\(codeMap.content)\n```")
                 continue
             }
-            let file = try await projectFile(projectID: projectID, request: .init(rootID: entry.rootID, logicalPath: entry.logicalPath, maximumBytes: 1_048_576))
+            let file = try await tool.readFile(.init(rootID: entry.rootID, logicalPath: entry.logicalPath, maximumBytes: 1_048_576))
             let content: String
             if entry.mode == .slices, !entry.ranges.isEmpty {
                 let lines = file.content.split(separator: "\n", omittingEmptySubsequences: false)
@@ -818,8 +831,7 @@ public actor RepoPromptHeadlessAuthority {
         try await updateAgentLifecycle(sessionID: sessionID, state: .running, eventType: .agentUpdated, actor: actor)
         let run = ProviderRunSnapshot(runID: binding.runID, sessionID: sessionID, provider: snapshot.provider, providerSessionID: resumeIdentity, state: "running", generation: binding.generation, turnEpoch: binding.turnEpoch, startReason: resumeIdentity == nil ? "fresh" : "resume", startedAt: clock.now())
         try await store.persistRun(run)
-        let project = try await projectSnapshot(projectID: snapshot.projectID)
-        guard let workingDirectory = project.roots.first?.canonicalPath else { throw ServiceAPIError(code: .rootUnauthorized, message: "Project has no roots") }
+        let workingDirectory = try await workingDirectory(session: snapshot)
         let prompt = snapshot.transcript.last(where: { $0.kind == .human })?.content ?? "Continue the repository task."
         providerTasks[binding.runID] = Task { await self.performProviderRun(sessionID: sessionID, binding: binding, run: run, prompt: prompt, workingDirectory: workingDirectory) }
         return receipt
@@ -834,8 +846,7 @@ public actor RepoPromptHeadlessAuthority {
         let receipt = CommandReceipt(commandID: ids.next(), sessionID: sessionID, operation: command.operation, acceptedCursor: cursor, status: "accepted")
         let event = try await store.persistSession(replacingCursor(current, cursor: cursor), eventType: .sessionUpdated, actor: actor, correlationID: ids.next(), idempotency: idempotency, idempotencyResponse: JSONEncoder.serviceEncoder.encode(receipt))
         await eventHub.publish(event)
-        let project = try await projectSnapshot(projectID: current.projectID)
-        guard let workingDirectory = project.roots.first?.canonicalPath else { throw ServiceAPIError(code: .rootUnauthorized, message: "Project has no roots") }
+        let workingDirectory = try await workingDirectory(session: current)
         let run = await (try? store.latestRun(sessionID: sessionID)) ?? ProviderRunSnapshot(runID: binding.runID, sessionID: sessionID, provider: current.provider, state: "running", generation: binding.generation, turnEpoch: binding.turnEpoch, startReason: "steer", startedAt: clock.now())
         providerTasks[binding.runID] = Task { await self.performProviderRun(sessionID: sessionID, binding: binding, run: run, prompt: text, workingDirectory: workingDirectory) }
         return receipt
@@ -944,6 +955,32 @@ public actor RepoPromptHeadlessAuthority {
     private func finishPersistedRun(sessionID: UUID, binding: RunBindingIdentity, state: String, reason: String) async throws {
         guard let run = try await store.latestRun(sessionID: sessionID), run.runID == binding.runID else { return }
         try await store.persistRun(ProviderRunSnapshot(runID: run.runID, sessionID: run.sessionID, provider: run.provider, providerSessionID: run.providerSessionID, state: state, generation: run.generation, turnEpoch: binding.turnEpoch, startReason: run.startReason, endReason: reason, startedAt: run.startedAt, endedAt: clock.now()))
+    }
+
+    private func sessionWorktreeBinding(session: SessionSnapshot) async throws -> WorktreeBindingSnapshot? {
+        try await store.worktrees(projectID: session.projectID).first {
+            $0.sessionID == session.sessionID || $0.sessionID == session.rootSessionID
+        }
+    }
+
+    private func workingDirectory(session: SessionSnapshot) async throws -> String {
+        if let binding = try await sessionWorktreeBinding(session: session) { return binding.physicalPath }
+        let project = try await projectSnapshot(projectID: session.projectID)
+        guard let root = project.roots.first else { throw ServiceAPIError(code: .rootUnauthorized, message: "Project has no roots") }
+        return root.canonicalPath
+    }
+
+    private func sessionToolAuthority(session: SessionSnapshot) async throws -> ProjectToolAuthority {
+        let snapshot = try await projectSnapshot(projectID: session.projectID)
+        let binding = try await sessionWorktreeBinding(session: session)
+        let roots = try snapshot.roots.map { root -> CanonicalRoot in
+            let path = binding?.rootID == root.rootID ? binding?.physicalPath ?? root.canonicalPath : root.canonicalPath
+            let canonical = try filesystem.canonicalizeRoot(path)
+            let routed = ProjectRootSnapshot(rootID: root.rootID, logicalName: root.logicalName, canonicalPath: canonical.path, writable: root.writable)
+            return CanonicalRoot(snapshot: routed, filesystemIdentity: canonical.identity)
+        }
+        let routedSnapshot = ProjectSnapshot(projectID: snapshot.projectID, name: snapshot.name, creator: snapshot.creator, state: snapshot.state, roots: roots.map(\.snapshot), revision: snapshot.revision, cursor: snapshot.cursor)
+        return ProjectToolAuthority(project: ProjectAuthority(snapshot: routedSnapshot, roots: roots), filesystem: filesystem, commandRunner: commandRunner)
     }
 
     private func replacingCursor(_ value: SessionSnapshot, cursor: ServiceCursor) -> SessionSnapshot {

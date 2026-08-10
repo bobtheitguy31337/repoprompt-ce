@@ -167,10 +167,45 @@ final class WorkspaceAuthorityTests: XCTestCase {
         XCTAssertEqual(enabledProviders, [.codex])
         try await store.close()
     }
+
+    func testDefaultWorktreeRoutesRootAndChildContextByExactBinding() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let root = base.appendingPathComponent("source", isDirectory: true)
+        let worktrees = base.appendingPathComponent("worktrees", isDirectory: true)
+        let artifacts = base.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try "source checkout".write(to: root.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        let command = LocalWorkspaceCommandRunner()
+        _ = try await command.run(executable: "/usr/bin/git", arguments: ["init", "-b", "main", root.path], workingDirectory: base.path, maximumBytes: 65536)
+        _ = try await command.run(executable: "/usr/bin/git", arguments: ["-C", root.path, "add", "README.md"], workingDirectory: root.path, maximumBytes: 65536)
+        _ = try await command.run(executable: "/usr/bin/git", arguments: ["-C", root.path, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial"], workingDirectory: root.path, maximumBytes: 65536)
+
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = try RepoPromptHeadlessAuthority(store: store, worktreeService: WorktreeRuntimeService(baseDirectory: worktrees.path), artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path))
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-default-wt", requestDigest: "p-default-wt")
+        let rootID = try XCTUnwrap(project.roots.first?.rootID)
+        _ = try await authority.replaceProjectSelectionTemplate(projectID: project.projectID, entries: [.init(rootID: rootID, logicalPath: "README.md", mode: .full)], expectedRevision: 1, actor: actor, idempotencyKey: "template-default-wt", requestDigest: "template-default-wt")
+        let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "s-default-wt", requestDigest: "s-default-wt")
+        let bindings = try await authority.worktreeSnapshots(projectID: project.projectID)
+        let binding = try XCTUnwrap(bindings.first(where: { $0.sessionID == session.sessionID }))
+        XCTAssertTrue(binding.physicalPath.hasPrefix(worktrees.path))
+        try "isolated worktree".write(to: URL(fileURLWithPath: binding.physicalPath).appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+
+        let rootArtifact = try await authority.buildContext(sessionID: session.sessionID, expectedSelectionRevision: 1, include: ["files"], actor: actor)
+        let child = try await authority.spawnChildSession(parentSessionID: session.sessionID, initialPrompt: "inspect")
+        let childArtifact = try await authority.buildContext(sessionID: child.sessionID, expectedSelectionRevision: 1, include: ["files"], actor: actor)
+        let rootContent = try await authority.artifactContent(artifactID: rootArtifact.artifactID, maximumBytes: 1024)
+        let childContent = try await authority.artifactContent(artifactID: childArtifact.artifactID, maximumBytes: 1024)
+        XCTAssertTrue(String(decoding: rootContent, as: UTF8.self).contains("isolated worktree"))
+        XCTAssertTrue(String(decoding: childContent, as: UTF8.self).contains("isolated worktree"))
+        try await store.close()
+    }
 }
 
 private actor RecordingWorkspaceRunner: WorkspaceCommandRunning {
-    struct Call: Sendable {
+    struct Call {
         let executable: String
         let arguments: [String]
         let workingDirectory: String
@@ -183,14 +218,18 @@ private actor RecordingWorkspaceRunner: WorkspaceCommandRunning {
         return ""
     }
 
-    func calls() -> [Call] { recorded }
+    func calls() -> [Call] {
+        recorded
+    }
 }
 
 private actor WorkflowWorkspaceRunner: WorkspaceCommandRunning {
     private var contextBuilderResponse = "[]"
     private var recordedOraclePrompts: [String] = []
 
-    func setContextBuilderResponse(_ value: String) { contextBuilderResponse = value }
+    func setContextBuilderResponse(_ value: String) {
+        contextBuilderResponse = value
+    }
 
     func run(executable _: String, arguments: [String], workingDirectory _: String, maximumBytes _: Int) async throws -> String {
         let prompt = arguments.last ?? ""
@@ -202,5 +241,7 @@ private actor WorkflowWorkspaceRunner: WorkspaceCommandRunning {
         return "provider 1.0"
     }
 
-    func oraclePrompts() -> [String] { recordedOraclePrompts }
+    func oraclePrompts() -> [String] {
+        recordedOraclePrompts
+    }
 }
