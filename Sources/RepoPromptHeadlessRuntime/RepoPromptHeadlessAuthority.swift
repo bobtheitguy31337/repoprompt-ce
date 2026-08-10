@@ -72,6 +72,10 @@ public actor RepoPromptHeadlessAuthority {
                 revision: persistedSelection?.revision ?? 1,
                 bindingRevision: persistedSelection?.bindingRevision ?? 1
             )
+            try await store.installInitialPolicies(
+                permissions: ExecutionPermissionSnapshot(sessionID: snapshot.sessionID, mode: "workspaceWrite", providerSettings: [:], revision: 1, updatedActor: snapshot.creator),
+                collaboration: CollaborationMetadataSnapshot(sessionID: snapshot.sessionID, visibility: snapshot.visibility, collaborativeSteeringEnabled: false, controllerUserID: snapshot.creator.goblinUserID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
+            )
         }
         for agent in try await store.agents() {
             agents[agent.sessionID] = agent
@@ -188,7 +192,9 @@ public actor RepoPromptHeadlessAuthority {
         if let prompt = input.initialPrompt, !prompt.isEmpty { transcript.append(TranscriptEntry(entryID: ids.next(), sessionSequence: 1, kind: .human, content: prompt, actor: externalActor, timestamp: clock.now())) }
         let snapshot = SessionSnapshot(sessionID: sessionID, projectID: input.projectID, parentSessionID: input.parentSessionID, rootSessionID: rootSessionID, creator: externalActor, provider: input.provider, model: input.model, visibility: input.visibility, state: .idle, runGeneration: 0, turnEpoch: 0, revision: 1, transcript: transcript, interactions: [], cursor: cursor)
         let agent = AgentSnapshot(agentID: sessionID, sessionID: sessionID, rootSessionID: rootSessionID, parentAgentID: input.parentSessionID, role: input.parentSessionID == nil ? "root" : "child", state: snapshot.state, revision: 1)
-        let events = try await store.persistNewSession(snapshot, agent: agent, actor: externalActor, correlationID: ids.next(), agentCorrelationID: ids.next(), idempotency: idempotency, initialSelection: seededSelection)
+        let permissions = ExecutionPermissionSnapshot(sessionID: sessionID, mode: "workspaceWrite", providerSettings: [:], revision: 1, updatedActor: externalActor)
+        let collaboration = CollaborationMetadataSnapshot(sessionID: sessionID, visibility: input.visibility, collaborativeSteeringEnabled: false, controllerUserID: externalActor.goblinUserID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
+        let events = try await store.persistNewSession(snapshot, agent: agent, actor: externalActor, correlationID: ids.next(), agentCorrelationID: ids.next(), idempotency: idempotency, initialSelection: seededSelection, initialPermissions: permissions, initialCollaboration: collaboration)
         sessions[sessionID] = SessionAuthority(snapshot: snapshot, clock: clock, ids: ids)
         agents[sessionID] = agent
         selections[sessionID] = SessionSelectionAuthority(sessionID: sessionID, template: seededSelection.entries, revision: seededSelection.revision, bindingRevision: seededSelection.bindingRevision)
@@ -299,6 +305,7 @@ public actor RepoPromptHeadlessAuthority {
         guard let session = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
         let before = await session.snapshot()
         guard before.parentSessionID == nil else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "External commands may target only root sessions") }
+        try await authorizeExternalCommand(command, session: before, actor: externalActor)
         let eventType: EventType
         switch command {
         case let .sendFollowup(text, expectedRevision):
@@ -320,9 +327,10 @@ public actor RepoPromptHeadlessAuthority {
         case let .updateExecutionPermissions(expectedRevision, executionMode, providerSettings):
             _ = try await updatePermissions(sessionID: sessionID, expectedRevision: expectedRevision, mode: executionMode, providerSettings: providerSettings, actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
             return try await commandReceipt(command: command, sessionID: sessionID)
-        case let .setSessionVisibility(expectedPolicyRevision, visibility, _, _):
-            try await session.updateVisibility(visibility, expectedRevision: expectedPolicyRevision)
-            eventType = .visibilityUpdated
+        case let .setSessionVisibility(expectedPolicyRevision, visibility, collaborativeSteeringEnabled, controllerUserID):
+            let receipt = try await CommandReceipt(commandID: ids.next(), sessionID: sessionID, operation: command.operation, acceptedCursor: store.nextCursor(), status: "accepted")
+            _ = try await updateCollaborationMetadata(sessionID: sessionID, input: .init(expectedPolicyRevision: expectedPolicyRevision, visibility: visibility, collaborativeSteeringEnabled: collaborativeSteeringEnabled, controllerUserID: controllerUserID), actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest, idempotencyResponse: JSONEncoder.serviceEncoder.encode(receipt))
+            return receipt
         case let .updateSelection(mode, expectedRevision, operations):
             guard mode == "remove" else { throw ServiceAPIError(code: .invalidRequest, message: "Selection commands with structured entries must use the selection endpoints") }
             let snapshot = try await selectionSnapshot(sessionID: sessionID)
@@ -597,6 +605,41 @@ public actor RepoPromptHeadlessAuthority {
         return try await store.permissions(sessionID: sessionID)
     }
 
+    public func collaborationMetadata(sessionID: UUID) async throws -> CollaborationMetadataSnapshot {
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        return try await store.collaboration(sessionID: sessionID)
+            ?? CollaborationMetadataSnapshot(sessionID: sessionID, visibility: session.visibility, collaborativeSteeringEnabled: false, controllerUserID: session.creator.goblinUserID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
+    }
+
+    public func updateCollaborationMetadata(sessionID: UUID, input: CollaborationMetadataInput, actor: ExternalActor, idempotencyKey: String, requestDigest: String, idempotencyResponse: Data? = nil) async throws -> CollaborationMetadataSnapshot {
+        try ensureWritable()
+        let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "setSessionVisibility", key: idempotencyKey, requestDigest: requestDigest)
+        if let prior: CollaborationMetadataSnapshot = try await priorResult(idempotency) { return prior }
+        guard let session = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
+        let current = try await collaborationMetadata(sessionID: sessionID)
+        guard current.policyRevision == input.expectedPolicyRevision else { throw ServiceAPIError(code: .staleRevision, message: "Collaboration policy revision is stale", currentRevision: current.policyRevision) }
+        if let expected = input.expectedControllerRevision, expected != current.controllerRevision { throw ServiceAPIError(code: .staleRevision, message: "Controller revision is stale", currentRevision: current.controllerRevision) }
+        if let expected = input.expectedMembershipRevision, expected != current.membershipRevision { throw ServiceAPIError(code: .staleRevision, message: "Membership revision is stale", currentRevision: current.membershipRevision) }
+        guard !input.controllerUserID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw ServiceAPIError(code: .invalidRequest, message: "Controller user ID is required") }
+        let controllerChanged = current.controllerUserID != input.controllerUserID
+        let membershipChanged = current.visibility != input.visibility
+        let next = CollaborationMetadataSnapshot(
+            sessionID: sessionID,
+            visibility: input.visibility,
+            collaborativeSteeringEnabled: input.collaborativeSteeringEnabled,
+            controllerUserID: input.controllerUserID,
+            policyRevision: current.policyRevision + 1,
+            controllerRevision: current.controllerRevision + (controllerChanged ? 1 : 0),
+            membershipRevision: current.membershipRevision + (membershipChanged ? 1 : 0)
+        )
+        try await session.updateVisibility(input.visibility, expectedRevision: (session.snapshot()).revision)
+        let snapshot = await session.snapshot()
+        let cursor = try await store.nextCursor()
+        let event = try await store.persistCollaboration(next, session: replacingCursor(snapshot, cursor: cursor), actor: actor, correlationID: ids.next(), idempotency: idempotency, idempotencyResponse: idempotencyResponse)
+        await eventHub.publish(event)
+        return next
+    }
+
     public func updatePermissions(sessionID: UUID, expectedRevision: Int64, mode: String, providerSettings: [String: String], actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> ExecutionPermissionSnapshot {
         let idempotency = try mutationIdempotency(actor: actor, operation: "updateExecutionPermissions", key: idempotencyKey, digest: requestDigest)
         if let idempotency, let prior: ExecutionPermissionSnapshot = try await priorResult(idempotency) { return prior }
@@ -604,6 +647,7 @@ public actor RepoPromptHeadlessAuthority {
         let current = try await store.permissions(sessionID: sessionID)
         let revision = current?.revision ?? 0
         guard revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Permission revision is stale", currentRevision: revision) }
+        guard ["readOnly", "workspaceWrite", "fullAccess", "disabled"].contains(mode) else { throw ServiceAPIError(code: .invalidRequest, message: "Unsupported execution permission mode") }
         let snapshot = ExecutionPermissionSnapshot(sessionID: sessionID, mode: mode, providerSettings: providerSettings, revision: revision + 1, updatedActor: actor)
         let event = try await store.persistPermissions(snapshot, projectID: session.projectID, rootSessionID: session.rootSessionID, correlationID: ids.next(), idempotency: idempotency)
         await eventHub.publish(event)
@@ -1008,6 +1052,9 @@ public actor RepoPromptHeadlessAuthority {
     private func startProviderRun(command: SessionCommand, sessionID: UUID, session: SessionAuthority, actor: ExternalActor, idempotency: IdempotencyInput) async throws -> CommandReceipt {
         guard let providerAdapter else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider runtime is not configured") }
         let snapshot = await session.snapshot()
+        guard let permissions = try await store.permissions(sessionID: sessionID) else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Execution permissions are not configured") }
+        guard permissions.mode != "disabled" else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Provider execution is disabled by session policy") }
+        guard ["readOnly", "workspaceWrite", "fullAccess"].contains(permissions.mode) else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Execution permission mode is invalid") }
         guard let capability = await providerAdapter.capabilities().first(where: { $0.kind == snapshot.provider && $0.enabled }) else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Session provider is unavailable") }
         let resumeMode: String = switch command {
         case let .resumeSession(_, mode): mode
@@ -1033,6 +1080,18 @@ public actor RepoPromptHeadlessAuthority {
         let prompt = snapshot.transcript.last(where: { $0.kind == .human })?.content ?? "Continue the repository task."
         providerTasks[binding.runID] = Task { await self.performProviderRun(sessionID: sessionID, binding: binding, run: run, prompt: prompt, workingDirectory: workingDirectory) }
         return receipt
+    }
+
+    private func authorizeExternalCommand(_ command: SessionCommand, session: SessionSnapshot, actor: ExternalActor) async throws {
+        let metadata = try await collaborationMetadata(sessionID: session.sessionID)
+        if actor.goblinUserID == metadata.controllerUserID { return }
+        let collaborativelySteerable = switch command {
+        case .sendFollowup, .steerSession, .answerInteraction, .buildContext, .runContextBuilder, .askOracle: true
+        default: false
+        }
+        guard session.visibility == .collaborative, metadata.collaborativeSteeringEnabled, collaborativelySteerable else {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Only the current collaboration controller may perform this operation")
+        }
     }
 
     private func steerProviderRun(command: SessionCommand, sessionID: UUID, session: SessionAuthority, text: String, targetTurnEpoch: Int64, actor: ExternalActor, idempotency: IdempotencyInput) async throws -> CommandReceipt {

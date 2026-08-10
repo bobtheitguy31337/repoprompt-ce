@@ -7,6 +7,46 @@ import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 final class AuthorityTests: XCTestCase {
+    func testCollaborationRevisionsAndExecutionPermissionsAreOperational() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let provider = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: "/usr/bin/true")], runner: DelayedProviderRunner())
+        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
+        let owner = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let controller = ExternalActor(goblinUserID: "u2", username: "bob", displayName: "Bob")
+        let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: owner, idempotencyKey: "policy-project", requestDigest: "policy-project")
+        let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "hello"), externalActor: owner, idempotencyKey: "policy-session", requestDigest: "policy-session")
+
+        let initialPermission = try await authority.permissionSnapshot(sessionID: session.sessionID)
+        XCTAssertEqual(initialPermission?.mode, "workspaceWrite")
+        let initial = try await authority.collaborationMetadata(sessionID: session.sessionID)
+        XCTAssertEqual(initial.controllerUserID, owner.goblinUserID)
+        XCTAssertEqual(initial.policyRevision, 1)
+
+        let transferred = try await authority.updateCollaborationMetadata(
+            sessionID: session.sessionID,
+            input: .init(expectedPolicyRevision: 1, expectedControllerRevision: 1, expectedMembershipRevision: 1, visibility: .collaborative, collaborativeSteeringEnabled: true, controllerUserID: controller.goblinUserID),
+            actor: owner,
+            idempotencyKey: "policy-transfer",
+            requestDigest: "policy-transfer"
+        )
+        XCTAssertEqual(transferred.policyRevision, 2)
+        XCTAssertEqual(transferred.controllerRevision, 2)
+        XCTAssertEqual(transferred.membershipRevision, 2)
+
+        _ = try await authority.execute(command: .sendFollowup(text: "collaborator", expectedSessionRevision: 2), sessionID: session.sessionID, externalActor: owner, idempotencyKey: "collaborator-followup", requestDigest: "collaborator-followup")
+        _ = try await authority.updatePermissions(sessionID: session.sessionID, expectedRevision: 1, mode: "disabled", providerSettings: [:], actor: controller, idempotencyKey: "disable-provider", requestDigest: "disable-provider")
+        do {
+            _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: "fresh"), sessionID: session.sessionID, externalActor: controller, idempotencyKey: "disabled-run", requestDigest: "disabled-run")
+            XCTFail("expected execution policy rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .authorizationDecisionRejected)
+        }
+        try await store.close()
+    }
+
     func testProviderRunSupportsSteeringCompletionAndCancellation() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

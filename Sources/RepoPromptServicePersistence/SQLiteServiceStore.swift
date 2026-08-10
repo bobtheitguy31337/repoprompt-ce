@@ -132,10 +132,14 @@ public actor SQLiteServiceStore {
         correlationID: UUID,
         agentCorrelationID: UUID,
         idempotency: IdempotencyInput,
-        initialSelection: SelectionSnapshot
+        initialSelection: SelectionSnapshot,
+        initialPermissions: ExecutionPermissionSnapshot,
+        initialCollaboration: CollaborationMetadataSnapshot
     ) async throws -> (session: EventEnvelope, agent: EventEnvelope) {
         try await transaction {
             let sessionEvent = try await persistSessionInTransaction(snapshot, eventType: .sessionCreated, actor: actor, correlationID: correlationID, idempotency: idempotency, idempotencyResponse: nil, initialSelection: initialSelection)
+            try await upsertPermissions(initialPermissions)
+            try await upsertCollaboration(initialCollaboration)
             let agentEvent = try await persistAgentInTransaction(agent, projectID: snapshot.projectID, actor: snapshot.parentSessionID == nil ? actor : nil, correlationID: agentCorrelationID, eventType: .agentStarted)
             return (sessionEvent, agentEvent)
         }
@@ -398,10 +402,7 @@ public actor SQLiteServiceStore {
     public func persistPermissions(_ snapshot: ExecutionPermissionSnapshot, projectID: UUID, rootSessionID: UUID, correlationID: UUID, idempotency: IdempotencyInput? = nil) async throws -> EventEnvelope {
         try await transaction {
             if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
-            _ = try await connection.query(
-                "INSERT INTO execution_permissions(session_id,schema_version,mode,provider_settings_json,revision,updated_actor_json,updated_at) VALUES(?,1,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET mode=excluded.mode,provider_settings_json=excluded.provider_settings_json,revision=excluded.revision,updated_actor_json=excluded.updated_actor_json,updated_at=CURRENT_TIMESTAMP",
-                [.text(snapshot.sessionID.uuidString), .text(snapshot.mode), .text(encodeText(snapshot.providerSettings)), .integer(Int(snapshot.revision)), .text(encodeText(snapshot.updatedActor))]
-            )
+            try await upsertPermissions(snapshot)
             let event = try await appendEvent(projectID: projectID, sessionID: snapshot.sessionID, rootSessionID: rootSessionID, runID: nil, sessionSequence: nil, type: .permissionUpdated, generation: nil, turnEpoch: nil, actor: snapshot.updatedActor, correlationID: correlationID, payload: encoder.encode(snapshot))
             if let idempotency { try await saveIdempotency(idempotency, status: 200, response: encoder.encode(snapshot)) }
             return event
@@ -415,6 +416,29 @@ public actor SQLiteServiceStore {
               let actor = row.column("updated_actor_json")?.string
         else { return nil }
         return try ExecutionPermissionSnapshot(sessionID: sessionID, mode: mode, providerSettings: decoder.decode([String: String].self, from: Data(settings.utf8)), revision: Int64(row.column("revision")?.integer ?? 1), updatedActor: decoder.decode(ExternalActor.self, from: Data(actor.utf8)))
+    }
+
+    public func collaboration(sessionID: UUID) async throws -> CollaborationMetadataSnapshot? {
+        guard let row = try await connection.query("SELECT visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision FROM collaboration_metadata WHERE session_id=?", [.text(sessionID.uuidString)]).first,
+              let visibility = Visibility(rawValue: row.column("visibility")?.string ?? ""),
+              let controllerUserID = row.column("controller_user_id")?.string
+        else { return nil }
+        return CollaborationMetadataSnapshot(sessionID: sessionID, visibility: visibility, collaborativeSteeringEnabled: row.column("collaborative_steering_enabled")?.integer == 1, controllerUserID: controllerUserID, policyRevision: Int64(row.column("policy_revision")?.integer ?? 1), controllerRevision: Int64(row.column("controller_revision")?.integer ?? 1), membershipRevision: Int64(row.column("membership_revision")?.integer ?? 1))
+    }
+
+    public func installInitialPolicies(permissions: ExecutionPermissionSnapshot, collaboration: CollaborationMetadataSnapshot) async throws {
+        try await transaction {
+            if try await self.permissions(sessionID: permissions.sessionID) == nil { try await upsertPermissions(permissions) }
+            if try await self.collaboration(sessionID: collaboration.sessionID) == nil { try await upsertCollaboration(collaboration) }
+        }
+    }
+
+    public func persistCollaboration(_ metadata: CollaborationMetadataSnapshot, session: SessionSnapshot, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput, idempotencyResponse: Data? = nil) async throws -> EventEnvelope {
+        try await transaction {
+            if let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
+            try await upsertCollaboration(metadata)
+            return try await persistSessionInTransaction(session, eventType: .controllerUpdated, actor: actor, correlationID: correlationID, idempotency: idempotency, idempotencyResponse: idempotencyResponse ?? encoder.encode(metadata), initialSelection: nil)
+        }
     }
 
     public func persistInteraction(_ snapshot: InteractionSnapshot, session: SessionSnapshot, actor: ExternalActor?, correlationID: UUID, idempotency: IdempotencyInput? = nil) async throws -> EventEnvelope {
@@ -738,6 +762,20 @@ public actor SQLiteServiceStore {
             [.text(snapshot.agentID.uuidString), .text(snapshot.sessionID.uuidString), .text(snapshot.rootSessionID.uuidString), snapshot.parentAgentID.map { .text($0.uuidString) } ?? .null, snapshot.providerNativeIdentity.map(SQLiteData.text) ?? .null, .text(snapshot.role), snapshot.label.map(SQLiteData.text) ?? .null, .text(snapshot.state.rawValue), .integer(Int(snapshot.revision))]
         )
         return try await appendEvent(projectID: projectID, sessionID: snapshot.sessionID, agentID: snapshot.agentID, parentAgentID: snapshot.parentAgentID, rootSessionID: snapshot.rootSessionID, runID: nil, sessionSequence: nil, type: eventType, generation: nil, turnEpoch: nil, actor: actor, correlationID: correlationID, payload: encoder.encode(snapshot))
+    }
+
+    private func upsertPermissions(_ snapshot: ExecutionPermissionSnapshot) async throws {
+        _ = try await connection.query(
+            "INSERT INTO execution_permissions(session_id,schema_version,mode,provider_settings_json,revision,updated_actor_json,updated_at) VALUES(?,1,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET mode=excluded.mode,provider_settings_json=excluded.provider_settings_json,revision=excluded.revision,updated_actor_json=excluded.updated_actor_json,updated_at=CURRENT_TIMESTAMP",
+            [.text(snapshot.sessionID.uuidString), .text(snapshot.mode), .text(encodeText(snapshot.providerSettings)), .integer(Int(snapshot.revision)), .text(encodeText(snapshot.updatedActor))]
+        )
+    }
+
+    private func upsertCollaboration(_ metadata: CollaborationMetadataSnapshot) async throws {
+        _ = try await connection.query(
+            "INSERT INTO collaboration_metadata(session_id,schema_version,visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision,updated_at) VALUES(?,1,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET visibility=excluded.visibility,collaborative_steering_enabled=excluded.collaborative_steering_enabled,controller_user_id=excluded.controller_user_id,policy_revision=excluded.policy_revision,controller_revision=excluded.controller_revision,membership_revision=excluded.membership_revision,updated_at=CURRENT_TIMESTAMP",
+            [.text(metadata.sessionID.uuidString), .text(metadata.visibility.rawValue), .integer(metadata.collaborativeSteeringEnabled ? 1 : 0), .text(metadata.controllerUserID), .integer(Int(metadata.policyRevision)), .integer(Int(metadata.controllerRevision)), .integer(Int(metadata.membershipRevision))]
+        )
     }
 
     private func migrate() async throws {

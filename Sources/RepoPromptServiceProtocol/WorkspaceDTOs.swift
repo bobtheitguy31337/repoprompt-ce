@@ -138,6 +138,26 @@ public struct ExecutionPermissionUpdateInput: Codable, Sendable {
     }
 }
 
+public struct CollaborationMetadataSnapshot: Codable, Hashable, Sendable {
+    public let sessionID: UUID
+    public let visibility: Visibility
+    public let collaborativeSteeringEnabled: Bool
+    public let controllerUserID: String
+    public let policyRevision: Int64
+    public let controllerRevision: Int64
+    public let membershipRevision: Int64
+
+    public init(sessionID: UUID, visibility: Visibility, collaborativeSteeringEnabled: Bool, controllerUserID: String, policyRevision: Int64, controllerRevision: Int64, membershipRevision: Int64) {
+        self.sessionID = sessionID
+        self.visibility = visibility
+        self.collaborativeSteeringEnabled = collaborativeSteeringEnabled
+        self.controllerUserID = controllerUserID
+        self.policyRevision = policyRevision
+        self.controllerRevision = controllerRevision
+        self.membershipRevision = membershipRevision
+    }
+}
+
 public struct InteractionAnswerInput: Codable, Sendable {
     public let interactionID: UUID
     public let expectedRevision: Int64
@@ -216,12 +236,16 @@ public struct WorktreeBindInput: Codable, Sendable {
 
 public struct CollaborationMetadataInput: Codable, Sendable {
     public let expectedPolicyRevision: Int64
+    public let expectedControllerRevision: Int64?
+    public let expectedMembershipRevision: Int64?
     public let visibility: Visibility
     public let collaborativeSteeringEnabled: Bool
     public let controllerUserID: String
 
-    public init(expectedPolicyRevision: Int64, visibility: Visibility, collaborativeSteeringEnabled: Bool, controllerUserID: String) {
+    public init(expectedPolicyRevision: Int64, expectedControllerRevision: Int64? = nil, expectedMembershipRevision: Int64? = nil, visibility: Visibility, collaborativeSteeringEnabled: Bool, controllerUserID: String) {
         self.expectedPolicyRevision = expectedPolicyRevision
+        self.expectedControllerRevision = expectedControllerRevision
+        self.expectedMembershipRevision = expectedMembershipRevision
         self.visibility = visibility
         self.collaborativeSteeringEnabled = collaborativeSteeringEnabled
         self.controllerUserID = controllerUserID
