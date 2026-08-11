@@ -26,7 +26,8 @@ RUN --mount=type=cache,target=/root/.cache/org.swift.swiftpm \
     bin_path="$(swift build -c release --show-bin-path)" && \
     install -D -m 0755 "$bin_path/RepoPromptServer" /out/usr/local/bin/RepoPromptServer && \
     cp -a "$bin_path/RepoPromptCE_RepoPromptWorkspaceRuntimeCore.resources" /out/usr/local/bin/ && \
-    cp -a "$bin_path/RepoPromptCE_RepoPromptServiceHTTP.resources" /out/usr/local/bin/
+    install -d -m 0755 /out/usr/local/bin/RepoPromptCE_RepoPromptServiceHTTP.resources && \
+    install -m 0644 "$bin_path/RepoPromptCE_RepoPromptServiceHTTP.resources/"* /out/usr/local/bin/RepoPromptCE_RepoPromptServiceHTTP.resources/
 
 FROM ubuntu:noble AS providers
 ARG TARGETARCH

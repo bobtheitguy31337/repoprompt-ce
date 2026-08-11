@@ -102,6 +102,22 @@ test "$(docker image inspect "$image" --format '{{json .Config.ExposedPorts}}')"
 test "$(docker image inspect "$image" --format '{{index .Config.Labels "io.degentlemen.repoprompt.port.internal-api"}}')" = '9443/tcp;mtls'
 test "$(docker image inspect "$image" --format '{{index .Config.Labels "io.degentlemen.repoprompt.port.health"}}')" = '9080/tcp;loopback-only'
 
+# Portal resources must be readable and their directory traversable by the
+# image's non-root runtime user. SwiftPM build output may otherwise preserve
+# owner-only source modes when copied into the image.
+docker run --rm --entrypoint /bin/sh "$image" -c '
+  set -eu
+  resources=/usr/local/bin/RepoPromptCE_RepoPromptServiceHTTP.resources
+  test "$(id -u)" = 65532
+  test "$(stat -c %a "$resources")" = 755
+  test -r "$resources"
+  test -x "$resources"
+  for resource in index.html portal.css portal.js repoprompt-icon.png; do
+    test "$(stat -c %a "$resources/$resource")" = 644
+    test -r "$resources/$resource"
+  done
+'
+
 # Exercise the shipped provider binaries as the runtime UID, then prove that a
 # persisted family with an escaped descendant is reconstructed and reaped by a
 # fresh Linux supervision port.
