@@ -1,15 +1,24 @@
 # RepoPrompt CE contribution validation matrix
 
-Use this after the mandatory safety preflight when the touched boundary needs focused, PR-ready, release, or live-app evidence.
+This matrix is for upstream, production, release, and PR-ready work. Degentlemen sandbox delivery uses one focused pre-integration batch plus the lightweight `sandbox-commit` / `sandbox-push` safety modes described below.
 
-## Mandatory safety gates
+## Degentlemen sandbox safety gates
+
+| Gate | Required command / evidence |
+| --- | --- |
+| Before a sandbox feature commit | `.agents/skills/rpce-contribution-check/scripts/preflight.sh sandbox-commit` runs whitespace checks and a redacted staged-index secret scan. It intentionally skips guardrails and lint/test/build lanes. |
+| Before pushing the integrated sandbox branch | `.agents/skills/rpce-contribution-check/scripts/preflight.sh sandbox-push` requires a clean local `sandbox` tracking `origin/sandbox`, prints/scans the outgoing range, and intentionally skips duplicate validation. |
+
+Run one focused conductor-coordinated batch for the completed feature immediately before integration. A clean cherry-pick/merge does not invalidate it; rerun only tests whose covered code was changed during integration. Do not run `pr-ready`, full suites, release validation, live-app smoke, or test-ledger ceremony merely because the destination is sandbox.
+
+## Upstream/production mandatory safety gates
 
 | Gate | Required command / evidence |
 | --- | --- |
 | Before every commit | `.agents/skills/rpce-contribution-check/scripts/preflight.sh commit` runs whitespace checks, a redacted staged-index secret scan, and `make guardrails`. Rerun after any staging change. |
 | Before every push | `.agents/skills/rpce-contribution-check/scripts/preflight.sh push` reruns commit safety, requires a clean working tree, prints the current-branch outgoing range, and runs a redacted outgoing-range secret scan. |
 
-Default `push` is a safety gate. It does not run heavyweight lint, test, provider, conductor, product-build, or full Xcode workspace validation lanes. Run focused commands during iteration, and run `.agents/skills/rpce-contribution-check/scripts/preflight.sh pr-ready` when a computed-outgoing-range path-selected local PR-ready pass is required. Conductor-coordinated Swift/Xcode-heavy lanes may report `global-wait` while another worktree holds the per-user heavy slot; wait on the conductor ticket instead of bypassing the daemon or starting redundant heavy jobs.
+Default `push` is an upstream/production safety gate. It does not run heavyweight lint, test, provider, conductor, product-build, or full Xcode workspace validation lanes. Run focused commands during iteration, and run `.agents/skills/rpce-contribution-check/scripts/preflight.sh pr-ready` when a computed-outgoing-range path-selected local PR-ready pass is required. Conductor-coordinated Swift/Xcode-heavy lanes may report `global-wait` while another worktree holds the per-user heavy slot; wait on the conductor ticket instead of bypassing the daemon or starting redundant heavy jobs.
 
 After timing initialization, `pr-ready` makes a best-effort attempt to write a local schema-v1 timing receipt under `.build/validation-artifacts/pr-ready/` and print its path on normal success or ordinary failure. The ignored receipt is measurement-only and non-gating: initialization, state-transition, collision, or publication failure is warning-only and cannot change the validation result. Receipt status is authoritative only for normal process completion; signal termination is deliberately not inferred from an exit code, and a receipt produced around HUP/INT/TERM is non-authoritative and may be absent. No receipt is promised for pre-initialization failure, any signal (including SIGKILL), process crash, or power loss. Receipts record UTC timestamps, monotonic elapsed durations, safe commit/range provenance, selection counts and lane IDs, and ordered phase outcomes; the schema-v1 `signal` field remains null. They deliberately exclude repository paths, usernames, remote URLs, changed filenames/path lists, raw commands or output, secret-scan findings, conductor tickets/logs, environment variables, and signing or credential data. `commit` and `push` do not emit timing receipts, and measurement does not alter validation command execution or the existing HUP/INT/TERM exit traps.
 

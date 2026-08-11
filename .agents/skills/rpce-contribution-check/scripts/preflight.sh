@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-usage() { echo "usage: $0 [commit|push|pr-ready]" >&2; }
+usage() { echo "usage: $0 [commit|push|pr-ready|sandbox-commit|sandbox-push]" >&2; }
 
 if (( $# > 1 )); then
   usage
@@ -9,8 +9,10 @@ if (( $# > 1 )); then
 fi
 
 mode="${1:-commit}"
+sandbox_mode=0
 case "$mode" in
   commit|push|pr-ready) ;;
+  sandbox-commit|sandbox-push) sandbox_mode=1 ;;
   *)
     usage
     exit 2
@@ -187,6 +189,22 @@ resolve_outgoing_base() {
   range_spec="$base_ref..HEAD"
 }
 
+resolve_sandbox_outgoing_base() {
+  current_branch="$(git symbolic-ref --quiet --short HEAD)" \
+    || fail "sandbox-push requires a current branch; detached HEAD is not supported"
+  [[ "$current_branch" == "sandbox" ]] \
+    || fail "sandbox-push is allowed only from the local sandbox branch"
+  upstream_ref="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+  [[ "$upstream_ref" == "origin/sandbox" ]] \
+    || fail "sandbox-push requires the local sandbox branch to track origin/sandbox"
+  base_ref="refs/remotes/origin/sandbox"
+  git rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null \
+    || fail "sandbox-push requires a fetched origin/sandbox commit"
+  base_reason="required sandbox upstream"
+  base_kind="origin_sandbox"
+  range_spec="$base_ref..HEAD"
+}
+
 write_range_files() {
   local output="$1"
   git diff --name-only -z "$base_ref"...HEAD -- > "$output"
@@ -316,6 +334,15 @@ Push mode validated only the current branch against the computed range above. It
 EOF
 }
 
+sandbox_push_success() {
+  cat <<'EOF'
+
+Sandbox push safety preflight passed.
+The local sandbox branch tracks origin/sandbox, the tree is clean, and the outgoing range received a redacted secret scan.
+Repository guardrails and lint/test/build lanes were intentionally skipped; use the single recorded focused sandbox batch instead of rerunning validation here.
+EOF
+}
+
 pr_ready_success() {
   cat <<'EOF'
 
@@ -341,18 +368,28 @@ log "Scan staged index blobs for secrets"
 scan_staged_index_blobs
 timing_phase_pass staged_index_secret_scan
 
-timing_phase_start repository_guardrails
-log "Run repository guardrails"
-make guardrails
-timing_phase_pass repository_guardrails
+if (( sandbox_mode == 0 )); then
+  timing_phase_start repository_guardrails
+  log "Run repository guardrails"
+  make guardrails
+  timing_phase_pass repository_guardrails
+fi
 
-if [[ "$mode" == "commit" ]]; then
-  cat <<'EOF'
+if [[ "$mode" == "commit" || "$mode" == "sandbox-commit" ]]; then
+  if [[ "$mode" == "sandbox-commit" ]]; then
+    cat <<'EOF'
+
+Sandbox commit safety preflight passed.
+Review the staged diff before committing. Repository guardrails and lint/test/build lanes were intentionally skipped; do not duplicate the recorded focused sandbox batch.
+EOF
+  else
+    cat <<'EOF'
 
 Commit preflight passed.
 Before committing, review `git status --short`, `git diff --cached --stat`, and `git diff --cached`.
 Rerun commit preflight after any staging change. Use `push` mode before pushing committed work.
 EOF
+  fi
   exit 0
 fi
 
@@ -362,7 +399,11 @@ require_clean_worktree
 timing_phase_pass clean_worktree_check
 
 timing_phase_start outgoing_range_resolution
-resolve_outgoing_base
+if [[ "$mode" == "sandbox-push" ]]; then
+  resolve_sandbox_outgoing_base
+else
+  resolve_outgoing_base
+fi
 log "Review current-branch outgoing range"
 printf 'Current branch: %s\nComparison base (%s): %s\nComputed outgoing range: %s\n' \
   "$current_branch" "$base_reason" "$base_ref" "$range_spec"
@@ -375,6 +416,8 @@ if [[ "$outgoing_count" == "0" ]]; then
   echo "No outgoing commits in $range_spec."
   if [[ "$mode" == "pr-ready" ]]; then
     pr_ready_success
+  elif [[ "$mode" == "sandbox-push" ]]; then
+    sandbox_push_success
   else
     push_success
   fi
@@ -388,6 +431,9 @@ timing_phase_pass outgoing_range_secret_scan
 
 if [[ "$mode" == "push" ]]; then
   push_success
+  exit 0
+elif [[ "$mode" == "sandbox-push" ]]; then
+  sandbox_push_success
   exit 0
 fi
 

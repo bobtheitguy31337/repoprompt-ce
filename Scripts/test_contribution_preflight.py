@@ -665,6 +665,48 @@ class ContributionPreflightTests(unittest.TestCase):
             self.assertNotIn("PR-ready timing receipt:", result.stdout)
             self.assertEqual(self.receipt_paths(repo), [])
 
+    def test_sandbox_commit_keeps_secret_scan_and_skips_guardrails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, preflight, env = self.create_repo(Path(tmp))
+            staged = repo / "sandbox-change.txt"
+            staged.write_text("fixture\n", encoding="utf-8")
+            self.run_git(repo, "add", staged.name)
+
+            result = self.run_preflight(repo, preflight, env, "sandbox-commit")
+
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertEqual(self.make_lines(env), [])
+            self.assertTrue(any(line.startswith("dir ") for line in self.gitleaks_lines(env)))
+            self.assertIn("Sandbox commit safety preflight passed", result.stdout)
+
+    def test_sandbox_push_requires_exact_branch_and_skips_validation_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, preflight, env = self.create_repo(Path(tmp), outgoing_path="Sources/RepoPrompt/Example.swift")
+            origin_main = self.git_output(repo, "rev-parse", "refs/remotes/origin/main")
+            self.run_git(repo, "remote", "add", "origin", "https://example.invalid/repoprompt-ce.git")
+            self.run_git(repo, "update-ref", "refs/remotes/origin/sandbox", origin_main)
+            self.run_git(repo, "branch", "-m", "sandbox")
+            self.run_git(repo, "branch", "--set-upstream-to=origin/sandbox", "sandbox")
+
+            result = self.run_preflight(repo, preflight, env, "sandbox-push")
+
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertEqual(self.make_lines(env), [])
+            self.assertTrue(any(line.startswith("git ") for line in self.gitleaks_lines(env)))
+            self.assertIn("Sandbox push safety preflight passed", result.stdout)
+            self.assertIn("origin/sandbox", result.stdout)
+
+    def test_sandbox_push_rejects_feature_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, preflight, env = self.create_repo(Path(tmp), outgoing_path="Sources/RepoPrompt/Example.swift")
+
+            result = self.run_preflight(repo, preflight, env, "sandbox-push")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("only from the local sandbox branch", result.stderr)
+            self.assertEqual(self.make_lines(env), [])
+            self.assertFalse(any(line.startswith("git ") for line in self.gitleaks_lines(env)))
+
     def test_extra_arguments_fail_instead_of_silently_ignoring_full_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, preflight, env = self.create_repo(

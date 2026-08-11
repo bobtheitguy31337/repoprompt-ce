@@ -4,57 +4,41 @@ This is a Swift Package macOS app for RepoPrompt CE.
 
 Prefer the coordinated developer daemon (`make dev-*`, see "Developer daemon / coordinated validation" below) for builds, runs, and tests. It runs every job through a lane-serialized queue so concurrent agents do not build, launch, or test over each other, and it returns a ticket for each job so long builds can be detached and checked on later instead of blocking. The plain `make` / `swift` / `./Scripts` commands shown below are the uncoordinated fallback for when the daemon is unavailable.
 
-## Degentlemen sandbox continuous delivery
+## Degentlemen sandbox fast path
 
-- Implementation may happen on focused branches, but every deployable change must be reviewed and integrated into this repository's common `sandbox` branch.
-- Update RepoPrompt and chat-server `sandbox` first. Push chat-ops `sandbox` last; it is the single normal trigger for the GitHub Actions `Deploy sandbox` workflow, the sole normal deployment path.
-- Do not manually SSH-deploy, invoke `deploy-from-git.sh` directly, deploy feature branches or detached commits, or invent alternate preflight or activation methods. Manual SSH deployment is break-glass only after workflow unavailability is proven and the owner explicitly instructs it.
-- GitHub and the server resolve immutable revisions internally. Discuss branches and workflow/deployment status, not owner-managed SHA choreography.
-- Docker builds stay on the remote server. Preserve persistent caches; do not upload artifacts or caches. Keep automatic backups, media deployment, and maintenance off unless explicitly requested.
-- A release is complete only after the workflow succeeds and ordinary health/readiness verification passes. Provider/UI work currently underway must be integrated into the relevant `sandbox` branches and released through this workflow.
+For work delivered through the Degentlemen `sandbox` branches, also read `/Users/jared/Projects/degentlemen-chat/AGENTS.md`.
 
-## Contribution preflight
+- Work in an isolated worktree based on `sandbox` and implement a coherent feature slice before integration.
+- Run one focused daemon-coordinated batch after the slice is complete and before integration. Record the exact commands/results. Do not automatically run full root/provider suites, `pr-ready`, release lanes, test ledgers, or live app smoke.
+- A clean cherry-pick or merge into `sandbox` does not require another test run. Rerun only tests whose covered code changed during conflict resolution or an intentional integration edit.
+- Ordinary sandbox work does not require Context Builder, Oracle, a design review, or a review agent. Reserve them for genuine ambiguity, high-risk security/data migration design, or an explicit owner request.
+- Push RepoPrompt and chat-server `sandbox` before the single final `chat-ops/sandbox` deployment trigger. Never deploy directly or over SSH.
+- After successful delivery, remove the completed worktree, prune, and verify the worktree list. Preserve any dirty, unmerged, active, or shared worktree and report the blocker.
 
-Before every commit or push, read and run the repository-local `$rpce-contribution-check` skill:
+### Sandbox contribution safety
+
+Stage only intended files. Sandbox commits and pushes use the lightweight modes:
+
+```bash
+.agents/skills/rpce-contribution-check/scripts/preflight.sh sandbox-commit
+.agents/skills/rpce-contribution-check/scripts/preflight.sh sandbox-push
+```
+
+These retain whitespace checks, redacted staged/outgoing secret scans, a clean push boundary, and exact `sandbox` branch/upstream correctness. They intentionally skip repository guardrails and all lint/test/build lanes because the coherent slice already has one recorded focused batch.
+
+### Upstream, production, and release contribution safety
+
+For upstream pull requests, production/public releases, release candidates, or non-sandbox branches, use the full repository-local contribution modes:
 
 ```bash
 .agents/skills/rpce-contribution-check/scripts/preflight.sh commit
 .agents/skills/rpce-contribution-check/scripts/preflight.sh push
+.agents/skills/rpce-contribution-check/scripts/preflight.sh pr-ready   # when PR-ready evidence is required
 ```
 
-Stage only the intended changes, then use `commit` mode before creating a commit; rerun it after any staging change, including partial-staging updates. Use `push` mode after committing but before pushing the intended current branch. These default modes are mandatory safety gates: they enforce redacted staged-index and outgoing-range secret scanning, repository guardrails, and clean push boundaries. Default `push` does not run heavyweight lint/test/build lanes; use the explicit `pr-ready` lane when you need the computed-outgoing-range path-selected local PR-ready pass:
+Those modes retain repository guardrails and the validation matrix. Release validation remains explicit through commands such as `make dev-release-preflight` / `make dev-release-artifact`. Obtain explicit approval immediately before force-push, history rewrite, branch/fork deletion, credential rotation, other destructive GitHub mutation, or visible app launch/relaunch/stop.
 
-```bash
-.agents/skills/rpce-contribution-check/scripts/preflight.sh pr-ready
-```
-
-Focused validation and release validation remain explicit; use the validation matrix plus commands such as `make dev-release-preflight` / `make dev-release-artifact` when the changed boundary requires them. Obtain explicit user approval immediately before any force-push, history rewrite, branch deletion, fork deletion, credential rotation, other GitHub-visible destructive mutation, visible app launch/relaunch, or stopping a visible app.
-
-Local `docs/investigations/*.md` reports are intentionally left unignored so RepoPrompt tooling can read them. Do not stage or merge these local investigation artifacts unless intentionally requested.
-
-## Degentlemen sandbox delivery
-
-For Degentlemen provider or deployment work, also read `/Users/jared/Projects/degentlemen-chat/AGENTS.md` and preserve its credential and host-safety rules.
-
-- Work in an isolated worktree and do not overwrite another agent's checkout or provider/deployment changes.
-- Commit completed changes. Do not stop at the feature/worktree commit: merge or cherry-pick it into this repository's existing `sandbox` branch and push `sandbox`.
-- For a cross-repository deployment, update and push `chat-server` and `repoprompt-ce` `sandbox` first. Push `chat-ops` `sandbox` last; that push is the sole normal trigger for the GitHub Actions `Deploy sandbox` workflow.
-- Do not create a new sandbox ownership model, use an alternate deployment pipeline, invoke the chat-ops deployment script directly, or manually deploy over SSH.
-- Monitor the `Deploy sandbox` workflow and verify ordinary live health/readiness before reporting delivery complete.
-
-### Required completed-worktree cleanup
-
-Delivery is not complete until the agent has cleaned its own disposable local state. After validation, complete these steps in order:
-
-1. Commit the completed change in its isolated worktree.
-2. Merge or cherry-pick that commit into this repository's existing `sandbox` branch.
-3. Push `sandbox` and verify that the remote branch includes the integrated commit.
-4. From the owning repository, remove the completed isolated worktree with `git worktree remove <worktree-path>`.
-5. Remove any disposable integration clone or temporary directory created for the task.
-6. Run `git worktree prune` in the owning repository.
-7. Verify `git worktree list` and disk state confirm the disposable worktree and temporary state are gone.
-
-Agents must perform this cleanup automatically; it is not deferred to the workspace owner. Never remove an active, unmerged, or dirty worktree, a shared source checkout, credentials, or an intentional shared cache. If a worktree is not safely removable, preserve it and report the blocker instead of forcing removal.
+Local `docs/investigations/*.md` reports remain unignored for RepoPrompt tooling. Do not stage them unless intentionally requested.
 
 ## Run
 
@@ -264,73 +248,23 @@ See `docs/architecture/source-layout.md` for the full ownership map and document
 - Do not put directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt`.
 - Keep `MCPControlMessages.swift` single-sourced in `Sources/RepoPromptShared/MCP`.
 
-## Swift style workflow
+## Swift style and test workflow
 
-For Swift edits, run the formatter before handoff. Prefer the coordinated daemon alias so the mutating job is serialized with other daemon work:
-
-```bash
-make dev-format
-# uncoordinated equivalent:
-make format
-```
-
-Run the combined style check before handoff when style tooling is relevant or Swift files changed:
+Prefer conductor-coordinated commands so multiple worktrees do not contend for Swift/Xcode state. For a Degentlemen sandbox slice, choose the smallest commands that cover the completed behavior and run that exact batch once immediately before integration. Examples:
 
 ```bash
-make dev-lint
-# uncoordinated equivalent:
-make lint
-```
-
-For a non-mutating formatter-only check, use `make dev-format-check` (or uncoordinated `make format-check`).
-
-If SwiftFormat or SwiftLint is missing, install them through the repo entrypoint:
-
-```bash
-make install-format-tools
-# or inspect first:
-make format-tools-status
-# daemon equivalents:
-make dev-install-format-tools
-make dev-format-tools-status
-```
-
-`make lint` and `make dev-lint` run `format-check` followed by `swiftlint lint --strict`. Do not perform a full repository formatting baseline unless the task explicitly asks for it; do not run `make dev-format` unless formatting mutation is intended.
-
-## Test
-
-Prefer the coordinated daemon so concurrent agents do not test over each other:
-
-```bash
-make dev-test                                        # full coordinated suite
-make dev-test FILTER=WorkspaceFileContextStoreTests   # focused coordinated run
-```
-
-Focused validation commands commonly used for this tree (all daemon-coordinated):
-
-```bash
-make dev-format-check
-make dev-lint
-make dev-test FILTER=CodexIntegrationConfigurationTests
+make dev-format-check                              # only when touched Swift formatting needs checking
+make dev-lint                                      # only when lint protects the touched boundary
 make dev-test FILTER=WorkspaceFileContextStoreTests
-make dev-swift-build PRODUCT=RepoPrompt
-make dev-swift-build PRODUCT=repoprompt-mcp
-make dev-provider-test
-make dev-codex-schema-check
-make guardrails
-make doctor
-make dev-build
+make dev-provider-test FILTER=ProviderSuiteName
+make dev-swift-build PRODUCT=RepoPromptServer
 ```
 
-Run the smallest relevant daemon build/test command above to validate a change. If the change affects packaging, the MCP server, the MCP CLI, Agent Mode, or any feature that depends on the running app, follow it with the live CE MCP smoke flow above.
+Do not mutate the entire tree with `make dev-format`; use it only when formatting mutation is intended. Do not install missing format tools merely to satisfy sandbox ceremony unless the touched change actually needs that check.
 
-Direct `swift test --filter <name>` and `swift build --product <name>` still work and produce the same result, but they are uncoordinated — use them only when the daemon is unavailable (for example, no `python3`), and avoid them when other agents may be building.
+A sandbox batch does not automatically include full `make dev-test`, full provider tests, both product builds, `make guardrails`, `pr-ready`, release checks, live app launch/smoke, or test-ledger work. Do not rerun the batch after a clean commit/cherry-pick/merge. Conflict resolution or an integration edit requires only the affected test to be rerun.
 
-Use `make dev-run` (or `make run`) only when it is safe to stop any existing RepoPrompt instance and launch the local debug app.
-
-### XCTest optimization inventory and timing
-
-See [`docs/testing.md`](docs/testing.md) for the contributor workflow, test-quality guidance, exact focused-filter examples, and handoff checklist. Routine executable adds, renames, consolidations, and removals require the affected focused test plus broader target or full-suite validation when the changed boundary warrants it.
+For upstream, production, release, public-artifact, or broad repository changes, use the full validation matrix and [`docs/testing.md`](docs/testing.md). Direct `swift test` / `swift build` remain uncoordinated fallbacks only when conductor is unavailable. Obtain approval before any command that launches, relaunches, or stops the visible app.
 
 ## Cleanup
 

@@ -1,13 +1,24 @@
 ---
 name: rpce-contribution-check
-description: Validate RepoPrompt CE contributions before committing or pushing. Use whenever an agent is about to create a commit, push the current branch, rewrite history, delete a branch or fork, or change GitHub-visible repository state. Enforces staged-index and outgoing-range secret scanning, repository guardrails, clean push boundaries, an explicit PR-ready lane for path-selected heavyweight validation, and explicit approval for destructive Git or visible live-app operations.
+description: Validate RepoPrompt CE commits and pushes. Degentlemen sandbox delivery uses lightweight sandbox-commit/sandbox-push modes; upstream, production, release, and PR-ready work retains repository guardrails and heavyweight lanes. All paths preserve staged/outgoing redacted secret scanning, clean push boundaries, and destructive-operation approval.
 ---
 
 # RepoPrompt CE Contribution Check
 
-Run the repository-local safety preflight before every commit and push. Read `AGENTS.md` first and use daemon-coordinated validation where available. Use the explicit `pr-ready` lane when computed-outgoing-range path-selected local validation evidence is required.
+Read `AGENTS.md` first and choose the lane for the actual destination.
 
-## Before committing
+## Degentlemen sandbox lane
+
+After the coherent feature's single focused batch, use:
+
+```bash
+.agents/skills/rpce-contribution-check/scripts/preflight.sh sandbox-commit
+.agents/skills/rpce-contribution-check/scripts/preflight.sh sandbox-push
+```
+
+`sandbox-commit` keeps whitespace and staged-index secret scanning but skips repository guardrails and validation lanes. `sandbox-push` additionally requires a clean local `sandbox` branch tracking `origin/sandbox` and scans its outgoing range. Do not use these modes for upstream, production, releases, public artifacts, or another branch.
+
+## Upstream/production before committing
 
 1. Review `git status --short` and inspect the intended diff.
 2. Stage only intended files. Review `git diff --cached --stat` and `git diff --cached`.
@@ -20,7 +31,7 @@ Run the repository-local safety preflight before every commit and push. Read `AG
 4. Rerun commit preflight after any staging change, including partial-staging updates. Commit mode scans materialized staged index blobs, not merely working-tree copies.
 5. Keep secret values redacted in terminal output and summaries.
 
-## Before pushing
+## Upstream/production before pushing
 
 1. Ensure the working tree is clean.
 2. Run the immediate push safety gate:
