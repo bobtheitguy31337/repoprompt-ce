@@ -6,6 +6,7 @@ import Glibc
 #endif
 import RepoPromptServiceProtocol
 import RepoPromptWorkspaceRuntimeCore
+import RepoPromptC
 
 public struct ProjectSourcePolicy: Sendable {
     public struct ConfiguredRoot: Codable, Hashable, Sendable {
