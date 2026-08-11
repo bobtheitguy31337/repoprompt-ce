@@ -67,6 +67,7 @@ public actor RepoPromptReadinessService {
     private let cacheDuration: TimeInterval
     private let drainController: MutationDrainController
     private let trustConfigurationValid: Bool
+    private let providerSettings: ProviderSettingsService?
     private var cached: RepoPromptReadinessSnapshot?
 
     public init(
@@ -80,7 +81,8 @@ public actor RepoPromptReadinessService {
         maximumActiveSessions: Int = 64,
         cacheDuration: TimeInterval = 15,
         drainController: MutationDrainController = MutationDrainController(),
-        trustConfigurationValid: Bool = true
+        trustConfigurationValid: Bool = true,
+        providerSettings: ProviderSettingsService? = nil
     ) {
         self.authority = authority
         self.store = store
@@ -93,6 +95,7 @@ public actor RepoPromptReadinessService {
         self.cacheDuration = cacheDuration
         self.drainController = drainController
         self.trustConfigurationValid = trustConfigurationValid
+        self.providerSettings = providerSettings
     }
 
     public func snapshot(forceRefresh: Bool = false) async -> RepoPromptReadinessSnapshot {
@@ -111,7 +114,7 @@ public actor RepoPromptReadinessService {
             let snapshot = try await store.operationalSnapshot()
             operational = snapshot
             checks.append(.init(name: "sqlite-integrity", ready: snapshot.integrityValid, detail: snapshot.integrityValid ? "ok" : "failed"))
-            checks.append(.init(name: "migrations", ready: snapshot.migrationsValid, detail: snapshot.migrationsValid ? "schema-v2" : "mismatch"))
+            checks.append(.init(name: "migrations", ready: snapshot.migrationsValid, detail: snapshot.migrationsValid ? "schema-v4" : "mismatch"))
             checks.append(.init(name: "activation", ready: snapshot.activationState == "active", detail: snapshot.activationState))
             // Startup reconstruction is completed by authority.recover() before this
             // service exists. Families observed here are verified live work, not an
@@ -135,18 +138,27 @@ public actor RepoPromptReadinessService {
         }
 
         let capabilities = await authority.providerCapabilities(preflight: true)
+        // The authority and settings projections maintain independent preflight
+        // state, so refresh both before combining them into readiness.
+        let settingsCatalog = try? await providerSettings?.catalog(refreshRuntime: true)
+        let settingsByKind = Dictionary(uniqueKeysWithValues: (settingsCatalog?.providers ?? []).compactMap { snapshot in
+            snapshot.providerID.runtimeKind.map { ($0, snapshot) }
+        })
         let providers = capabilities.map { capability in
             let required = requiredProviders.contains(capability.kind)
             let expectedProtocol = expectedProviderProtocols[capability.kind]
             let protocolMatches = expectedProtocol == nil || capability.protocolVersion == expectedProtocol
-            let ready = !required || (capability.enabled && protocolMatches)
-            let detail: String
-            if !capability.enabled {
-                detail = capability.reasonUnavailable ?? "disabled"
+            let providerPreflight = settingsByKind[capability.kind]?.preflight
+            let runtimeReady = capability.enabled && protocolMatches && (providerPreflight?.ready ?? true)
+            let ready = !required || runtimeReady
+            let detail: String = if let providerPreflight, !providerPreflight.ready {
+                providerPreflight.reason.rawValue
+            } else if !capability.enabled {
+                capability.reasonUnavailable ?? "disabled"
             } else if !protocolMatches {
-                detail = "protocol-mismatch"
+                "protocol-mismatch"
             } else {
-                detail = "ready"
+                "ready"
             }
             return ProviderReadiness(
                 kind: capability.kind,

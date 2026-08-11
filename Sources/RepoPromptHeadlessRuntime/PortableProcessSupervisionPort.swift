@@ -42,12 +42,15 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
     }
 
     public func launchCaptured(executable: String, arguments: [String], environment: [String: String], workingDirectory: String, helperToken: String, outputDirectory: String) async throws -> CapturedProcess {
-        try FileManager.default.createDirectory(atPath: outputDirectory, withIntermediateDirectories: true)
+        try Self.prepareOutputDirectory(outputDirectory)
         let id = UUID().uuidString
         let stdoutPath = URL(fileURLWithPath: outputDirectory).appendingPathComponent("\(id).stdout").path
         let stderrPath = URL(fileURLWithPath: outputDirectory).appendingPathComponent("\(id).stderr").path
-        FileManager.default.createFile(atPath: stdoutPath, contents: nil)
-        FileManager.default.createFile(atPath: stderrPath, contents: nil)
+        guard FileManager.default.createFile(atPath: stdoutPath, contents: nil, attributes: [.posixPermissions: 0o600]),
+              FileManager.default.createFile(atPath: stderrPath, contents: nil, attributes: [.posixPermissions: 0o600])
+        else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider output files could not be created")
+        }
         let stdout = try FileHandle(forWritingTo: URL(fileURLWithPath: stdoutPath))
         let stderr = try FileHandle(forWritingTo: URL(fileURLWithPath: stderrPath))
         do {
@@ -65,12 +68,15 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
     /// Launches a bidirectional provider protocol while retaining the same
     /// subreaper/process-family identity and captured-output guarantees.
     public func launchInteractiveCaptured(executable: String, arguments: [String], environment: [String: String], workingDirectory: String, helperToken: String, outputDirectory: String, captureID: UUID = UUID(), launchValidation: @escaping @Sendable () throws -> Void = {}) async throws -> CapturedProcess {
-        try FileManager.default.createDirectory(atPath: outputDirectory, withIntermediateDirectories: true)
+        try Self.prepareOutputDirectory(outputDirectory)
         let id = captureID.uuidString
         let stdoutPath = URL(fileURLWithPath: outputDirectory).appendingPathComponent("\(id).stdout").path
         let stderrPath = URL(fileURLWithPath: outputDirectory).appendingPathComponent("\(id).stderr").path
-        FileManager.default.createFile(atPath: stdoutPath, contents: nil)
-        FileManager.default.createFile(atPath: stderrPath, contents: nil)
+        guard FileManager.default.createFile(atPath: stdoutPath, contents: nil, attributes: [.posixPermissions: 0o600]),
+              FileManager.default.createFile(atPath: stderrPath, contents: nil, attributes: [.posixPermissions: 0o600])
+        else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider output files could not be created")
+        }
         let stdout = try FileHandle(forWritingTo: URL(fileURLWithPath: stdoutPath))
         let stderr = try FileHandle(forWritingTo: URL(fileURLWithPath: stderrPath))
         let input = Pipe()
@@ -158,6 +164,21 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider command failed: \(String(decoding: stderr.prefix(8192), as: UTF8.self))")
         }
         return String(decoding: stdout.prefix(max(1, maximumBytes)), as: UTF8.self)
+    }
+
+    private nonisolated static func prepareOutputDirectory(_ path: String) throws {
+        try FileManager.default.createDirectory(
+            atPath: path,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: path)
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        guard attributes[.type] as? FileAttributeType == .typeDirectory,
+              (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700
+        else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider output directory is not private")
+        }
     }
 
     private func launchProcess(executable: String, arguments: [String], environment: [String: String], workingDirectory: String, helperToken: String, stdin: Any, stdout: FileHandle, stderr: FileHandle, launchValidation: @escaping @Sendable () throws -> Void = {}) async throws -> ProcessIdentity {
@@ -355,7 +376,7 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
     private func cgroupPath(helperTokenDigest: String) -> String? {
         guard let delegatedCgroupRoot,
               helperTokenDigest.count == 64,
-              helperTokenDigest.allSatisfy({ $0.isHexDigit })
+              helperTokenDigest.allSatisfy(\.isHexDigit)
         else { return nil }
         return URL(fileURLWithPath: delegatedCgroupRoot, isDirectory: true)
             .appendingPathComponent("run-\(helperTokenDigest.lowercased())", isDirectory: true)

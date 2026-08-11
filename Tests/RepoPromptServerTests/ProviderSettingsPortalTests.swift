@@ -26,7 +26,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
         let persisted = try await store.providerSettings()
         let metadata = try await store.metadata()
         XCTAssertEqual(persisted, [initial])
-        XCTAssertEqual(metadata.schemaVersion, 3)
+        XCTAssertEqual(metadata.schemaVersion, 4)
 
         do {
             _ = try await store.upsertProviderSettings(initial, expectedRevision: 0)
@@ -100,7 +100,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertTrue(codex.authentication.authenticated)
         XCTAssertNil(codex.authentication.accountLabel)
         XCTAssertEqual(codex.authentication.detail, "Authenticated")
-        let encodedCatalog = String(decoding: try JSONEncoder.serviceEncoder.encode(catalog), as: UTF8.self)
+        let encodedCatalog = try String(decoding: JSONEncoder.serviceEncoder.encode(catalog), as: UTF8.self)
         XCTAssertFalse(encodedCatalog.contains("/run/secrets"))
         XCTAssertFalse(encodedCatalog.contains("raw helper output"))
         XCTAssertEqual(codex.models.first?.id, "gpt-5.6-sol")
@@ -151,9 +151,9 @@ final class ProviderSettingsPortalTests: XCTestCase {
     }
 
     func testPortalAssetsPreserveDesktopHierarchyAndNeverPersistBrowserState() throws {
-        let html = String(decoding: try RepoPromptPortalAssets.data(for: .index), as: UTF8.self)
-        let css = String(decoding: try RepoPromptPortalAssets.data(for: .stylesheet), as: UTF8.self)
-        let script = String(decoding: try RepoPromptPortalAssets.data(for: .script), as: UTF8.self)
+        let html = try String(decoding: RepoPromptPortalAssets.data(for: .index), as: UTF8.self)
+        let css = try String(decoding: RepoPromptPortalAssets.data(for: .stylesheet), as: UTF8.self)
+        let script = try String(decoding: RepoPromptPortalAssets.data(for: .script), as: UTF8.self)
 
         for term in ["What are we building?", "Models &amp; Providers", "Copy &amp; Chat", "Runtime"] {
             XCTAssertTrue(html.contains(term), "missing desktop term: \(term)")
@@ -226,7 +226,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
         let codex = try XCTUnwrap(catalog.providers.first { $0.providerID == .codex })
         XCTAssertTrue(codex.cli?.healthy == true)
         XCTAssertEqual(codex.cli?.version, "9.9.9")
-        let encoded = String(decoding: try JSONEncoder.serviceEncoder.encode(catalog), as: UTF8.self)
+        let encoded = try String(decoding: JSONEncoder.serviceEncoder.encode(catalog), as: UTF8.self)
         XCTAssertFalse(encoded.contains("/run/secrets"))
         XCTAssertFalse(encoded.contains("raw-token"))
         try await store.close()

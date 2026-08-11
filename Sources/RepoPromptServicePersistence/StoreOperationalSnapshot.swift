@@ -50,14 +50,15 @@ public extension SQLiteServiceStore {
             return (version, digest)
         })
         let metadata = try await metadata()
-        let migrationsValid = metadata.schemaVersion == SchemaV3.version
+        let migrationsValid = metadata.schemaVersion == SchemaV4.version
             && migrationMap[1] == "v1"
             && migrationMap[SchemaV2.version] == SchemaV2.digest
             && migrationMap[SchemaV3.version] == SchemaV3.digest
+            && migrationMap[SchemaV4.version] == SchemaV4.digest
         let liveEventCount = try await scalarInt("SELECT COUNT(*) AS value FROM events")
         let archiveSegmentCount = try await scalarInt("SELECT COUNT(*) AS value FROM event_archive_blobs")
         let archivedEventCount = try await scalarInt("SELECT COALESCE(SUM(event_count),0) AS value FROM event_archive_blobs")
-        let compressedArchiveBytes = Int64(try await scalarInt("SELECT COALESCE(SUM((LENGTH(compressed_events_base64) * 3) / 4),0) AS value FROM event_archive_blobs"))
+        let compressedArchiveBytes = try await Int64(scalarInt("SELECT COALESCE(SUM((LENGTH(compressed_events_base64) * 3) / 4),0) AS value FROM event_archive_blobs"))
         let checkpointCounts = try await connection.query("SELECT retention_class,COUNT(*) AS count FROM snapshot_checkpoints GROUP BY retention_class ORDER BY retention_class").map {
             CheckpointRetentionCount(
                 retentionClass: $0.column("retention_class")?.string ?? "unknown",
