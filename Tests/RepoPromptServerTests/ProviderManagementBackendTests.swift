@@ -59,9 +59,7 @@ final class ProviderManagementBackendTests: XCTestCase {
         )
         let snapshot = await readiness.snapshot(forceRefresh: true)
         XCTAssertTrue(snapshot.ready)
-        let codexReadiness = try XCTUnwrap(snapshot.providers.first { $0.kind == .codex })
-        XCTAssertTrue(codexReadiness.ready)
-        XCTAssertEqual(codexReadiness.detail, "ready")
+        XCTAssertTrue(snapshot.providers.isEmpty)
         try await store.close()
     }
 

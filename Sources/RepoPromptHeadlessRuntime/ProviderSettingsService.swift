@@ -62,6 +62,9 @@ public actor ProviderSettingsService {
     private var managedAuthFlowDescriptors: [ProviderSettingsID: [ProviderAuthFlowDescriptor]] = [:]
     private var managedAccountSummaries: [ProviderSettingsID: ProviderManagedAccountSummary] = [:]
     private var authFlowContexts: [UUID: AuthFlowContext] = [:]
+    private var statusRefreshTask: Task<Void, Never>?
+    private var statusRefreshedAt: Date?
+    private let statusRefreshTTL: TimeInterval = 15
 
     public init(
         store: SQLiteServiceStore,
@@ -144,19 +147,13 @@ public actor ProviderSettingsService {
             }
             try await applyRuntimePreference(providerID)
         }
-        await refreshCLIHealth()
-        await refreshManagedAuthenticationCapabilities(forceRefresh: true)
-        try await reconcileManagedAuthentication(attribution: Self.lifecycleAttribution)
-        await refreshRuntimePreflight()
+        requestProviderStatusRefresh(force: true)
     }
 
-    public func catalog(refreshCLI: Bool = false, refreshRuntime: Bool = true) async throws -> ProviderSettingsCatalogResponse {
-        if refreshCLI {
-            await refreshCLIHealth()
-            await refreshManagedAuthenticationCapabilities(forceRefresh: true)
+    public func catalog(refreshCLI: Bool = false, refreshRuntime: Bool = false) async throws -> ProviderSettingsCatalogResponse {
+        if refreshCLI || refreshRuntime {
+            requestProviderStatusRefresh()
         }
-        try await reconcileManagedAuthentication(attribution: Self.lifecycleAttribution)
-        if refreshRuntime { await refreshRuntimePreflight() }
         let snapshots = try ProviderSettingsID.allCases.map { try snapshot(for: $0) }
         return ProviderSettingsCatalogResponse(providers: snapshots)
     }
@@ -200,7 +197,6 @@ public actor ProviderSettingsService {
         }
         preferences[providerID] = try await store.upsertProviderSettings(next, expectedRevision: current.revision, audit: audit)
         try await applyRuntimePreference(providerID)
-        await refreshRuntimePreflight()
         return try snapshot(for: providerID)
     }
 
@@ -643,6 +639,23 @@ public actor ProviderSettingsService {
                 serviceTier: preference.serviceTier
             )
         )
+    }
+
+    private func requestProviderStatusRefresh(force: Bool = false) {
+        if statusRefreshTask != nil { return }
+        if !force, let statusRefreshedAt, Date().timeIntervalSince(statusRefreshedAt) < statusRefreshTTL { return }
+        statusRefreshTask = Task { [weak self] in
+            await self?.performProviderStatusRefresh()
+        }
+    }
+
+    private func performProviderStatusRefresh() async {
+        await refreshCLIHealth()
+        await refreshManagedAuthenticationCapabilities(forceRefresh: true)
+        try? await reconcileManagedAuthentication(attribution: Self.lifecycleAttribution)
+        await refreshRuntimePreflight()
+        statusRefreshedAt = Date()
+        statusRefreshTask = nil
     }
 
     private func refreshCLIHealth() async {

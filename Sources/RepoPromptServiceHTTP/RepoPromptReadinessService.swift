@@ -137,44 +137,9 @@ public actor RepoPromptReadinessService {
             checks.append(volumeCheck(volume))
         }
 
-        let capabilities = await authority.providerCapabilities(preflight: true)
-        // The authority and settings projections maintain independent preflight
-        // state, so refresh both before combining them into readiness.
-        let settingsCatalog = try? await providerSettings?.catalog(refreshRuntime: true)
-        let settingsByKind: [ProviderKind: ProviderSettingsSnapshot] = Dictionary(uniqueKeysWithValues: (settingsCatalog?.providers ?? []).compactMap { snapshot in
-            guard snapshot.providerID.ownsRuntimeAdmission else { return nil }
-            return snapshot.providerID.runtimeKind.map { ($0, snapshot) }
-        })
-        let providers = capabilities.map { capability in
-            let required = requiredProviders.contains(capability.kind)
-            let expectedProtocol = expectedProviderProtocols[capability.kind]
-            let protocolMatches = expectedProtocol == nil || capability.protocolVersion == expectedProtocol
-            let providerSettings = settingsByKind[capability.kind]
-            let runtimeReady = capability.enabled && protocolMatches && (providerSettings?.runtimePreflightVerified ?? true)
-            let ready = !required || runtimeReady
-            let detail: String = if !capability.enabled {
-                capability.reasonUnavailable ?? "disabled"
-            } else if !protocolMatches {
-                "protocol-mismatch"
-            } else if let providerSettings, !providerSettings.runtimePreflightVerified {
-                providerSettings.cli?.detail ?? "runtime-unavailable"
-            } else {
-                "ready"
-            }
-            return ProviderReadiness(
-                kind: capability.kind,
-                required: required,
-                ready: ready,
-                version: capability.version,
-                protocolVersion: capability.protocolVersion,
-                detail: detail
-            )
-        }
-        let representedProviders = Set(providers.map(\.kind))
-        let missingProviders = requiredProviders.subtracting(representedProviders).map {
-            ProviderReadiness(kind: $0, required: true, ready: false, version: nil, protocolVersion: nil, detail: "missing")
-        }
-        let completeProviders = (providers + missingProviders).sorted { $0.kind.rawValue < $1.kind.rawValue }
+        // Provider rows are optional settings and never participate in core
+        // readiness. Provider status is served by the settings catalog.
+        let completeProviders: [ProviderReadiness] = []
 
         let sessions: [SessionSnapshot]
         do {
@@ -189,7 +154,7 @@ public actor RepoPromptReadinessService {
         checks.append(.init(name: "session-capacity", ready: capacityReady, detail: "\(activeSessionCount)/\(maximumActiveSessions)"))
         let projects = await authority.projectSnapshots()
         let degraded = projects.filter { $0.state == .degraded }.map(\.projectID).sorted { $0.uuidString < $1.uuidString }
-        let ready = checks.allSatisfy(\.ready) && completeProviders.allSatisfy(\.ready)
+        let ready = checks.allSatisfy(\.ready)
         let result = RepoPromptReadinessSnapshot(
             ready: ready,
             checks: checks,

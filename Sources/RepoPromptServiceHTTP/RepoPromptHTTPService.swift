@@ -148,7 +148,7 @@ public struct RepoPromptHTTPService: Sendable {
             _ = try await authenticatePortal(context: context)
             let service = try requireProviderSettings()
             let refresh = request.uri.queryParameters.get("refresh", as: Bool.self) ?? false
-            let catalog = try await service.catalog(refreshCLI: refresh)
+            let catalog = try await service.catalog(refreshCLI: refresh, refreshRuntime: refresh)
             return try portalJSON(catalog)
         } }
         router.patch("/portal/api/v1/provider-settings/:id") { request, context in await portalRespond(request) {
@@ -234,7 +234,8 @@ public struct RepoPromptHTTPService: Sendable {
         } }
         router.get("/internal/v1/provider-settings") { request, context in await respond(request) {
             _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp, .operatorRole], operation: "providerCatalog")
-            return try await HTTPResponses.json(requireProviderSettings().catalog(refreshCLI: request.uri.queryParameters.get("refresh", as: Bool.self) ?? false))
+            let refresh = request.uri.queryParameters.get("refresh", as: Bool.self) ?? false
+            return try await HTTPResponses.json(requireProviderSettings().catalog(refreshCLI: refresh, refreshRuntime: refresh))
         } }
         router.patch("/internal/v1/provider-settings/:id") { request, context in await respond(request) {
             let data = try await bodyData(request)

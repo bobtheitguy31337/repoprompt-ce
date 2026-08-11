@@ -52,12 +52,16 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
     private var enabledProviders: Set<ProviderKind>
     private var runtimeDefaults: [ProviderKind: ProviderRuntimeDefaults]
     private var knownRuns: [UUID: ProviderKind] = [:]
+    private var preflightCache: [ProviderKind: (capability: ProviderCapability, expiresAt: ContinuousClock.Instant)] = [:]
+    private var preflightTasks: [ProviderKind: Task<ProviderCapability, Never>] = [:]
+    private let preflightCacheDuration: Duration
 
-    public init(runtimes: [any AgentProviderRuntime], cataloguedConfigurations: [ProviderCLIConfiguration] = [], enabledProviders: Set<ProviderKind>? = nil) {
+    public init(runtimes: [any AgentProviderRuntime], cataloguedConfigurations: [ProviderCLIConfiguration] = [], enabledProviders: Set<ProviderKind>? = nil, preflightCacheDuration: Duration = .seconds(15)) {
         let initialEnabled = enabledProviders ?? Set(runtimes.map(\.kind))
         self.runtimes = Dictionary(uniqueKeysWithValues: runtimes.map { ($0.kind, $0) })
         self.cataloguedConfigurations = Dictionary(uniqueKeysWithValues: cataloguedConfigurations.map { ($0.kind, $0) })
         self.enabledProviders = initialEnabled
+        self.preflightCacheDuration = preflightCacheDuration
         runtimeDefaults = Dictionary(uniqueKeysWithValues: runtimes.map {
             ($0.kind, ProviderRuntimeDefaults(enabled: initialEnabled.contains($0.kind)))
         })
@@ -76,15 +80,35 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
     }
 
     public func preflight() async -> [ProviderCapability] {
-        var values: [ProviderCapability] = []
-        for kind in ProviderKind.allCases {
-            if enabledProviders.contains(kind), let runtime = runtimes[kind] {
-                await values.append(runtime.preflight())
-            } else {
-                values.append(unavailableCapability(for: kind))
+        await withTaskGroup(of: (ProviderKind, ProviderCapability).self) { group in
+            for kind in ProviderKind.allCases {
+                group.addTask { (kind, await self.preflight(kind: kind)) }
             }
+            var values: [ProviderKind: ProviderCapability] = [:]
+            for await (kind, capability) in group {
+                values[kind] = capability
+            }
+            return ProviderKind.allCases.compactMap { values[$0] }
         }
-        return values
+    }
+
+    private func preflight(kind: ProviderKind) async -> ProviderCapability {
+        guard enabledProviders.contains(kind), let runtime = runtimes[kind] else {
+            return unavailableCapability(for: kind)
+        }
+        let clock = ContinuousClock()
+        if let cached = preflightCache[kind], clock.now < cached.expiresAt {
+            return cached.capability
+        }
+        if let task = preflightTasks[kind] {
+            return await task.value
+        }
+        let task = Task { await runtime.preflight() }
+        preflightTasks[kind] = task
+        let capability = await task.value
+        preflightTasks[kind] = nil
+        preflightCache[kind] = (capability, clock.now.advanced(by: preflightCacheDuration))
+        return capability
     }
 
     public func recoverProcessFamilies() async throws {
@@ -98,6 +122,7 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
             throw ServiceAPIError(code: .providerUnavailable, message: "Provider is not configured")
         }
         runtimeDefaults[kind] = defaults
+        preflightCache[kind] = nil
         if defaults.enabled {
             enabledProviders.insert(kind)
         } else {
@@ -212,8 +237,8 @@ public actor ProviderCLIAdapter: AgentProviderDispatcher, InteractionDeliveryPor
         dispatcher = PortableAgentProviderDispatcher(runtimes: runtimes, cataloguedConfigurations: configurations, enabledProviders: enabledProviders)
     }
 
-    public init(runtimes: [any AgentProviderRuntime]) {
-        dispatcher = PortableAgentProviderDispatcher(runtimes: runtimes)
+    public init(runtimes: [any AgentProviderRuntime], preflightCacheDuration: Duration = .seconds(15)) {
+        dispatcher = PortableAgentProviderDispatcher(runtimes: runtimes, preflightCacheDuration: preflightCacheDuration)
     }
 
     public func capabilities() async -> [ProviderCapability] {

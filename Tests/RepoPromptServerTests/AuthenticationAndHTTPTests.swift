@@ -1,6 +1,7 @@
 import Foundation
 import Hummingbird
 import HummingbirdTesting
+import RepoPromptAgentRuntimeCore
 import RepoPromptHeadlessRuntime
 import RepoPromptServiceHTTP
 @testable import RepoPromptServicePersistence
@@ -216,7 +217,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         try await store.close()
     }
 
-    func testCredentialFreeReadinessAllowsZeroEnabledProviders() async throws {
+    func testProviderOptionalityZeroProvidersKeepsReadinessHealthy() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let provider = ProviderCLIAdapter(
             configurations: [
@@ -237,44 +238,75 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         )
 
         let snapshot = await readiness.snapshot(forceRefresh: true)
+        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: InternalRequestAuthenticator(keys: [], store: store), eventSigningKey: responseSigningKey, readiness: readiness)
+        let app = Application(router: service.healthRouter())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/health/ready", method: .get) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
 
         XCTAssertTrue(snapshot.ready)
-        let codex = try XCTUnwrap(snapshot.providers.first { $0.kind == .codex })
-        XCTAssertFalse(codex.required)
-        XCTAssertTrue(codex.ready)
-        XCTAssertEqual(codex.version, "1.0")
-        XCTAssertEqual(codex.protocolVersion, "app-server-v2")
-        XCTAssertEqual(codex.detail, "administratively disabled")
+        XCTAssertTrue(snapshot.providers.isEmpty)
         try await store.close()
     }
 
-    func testExplicitlyEnabledProviderStillFailsReadinessWhenPreflightFails() async throws {
+    func testProviderOptionalityAllFailingKeepsReadinessHealthyAndRefreshSingleFlight() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let provider = ProviderCLIAdapter(
-            configurations: [
-                .init(kind: .codex, executable: "/definitely/missing/repoprompt-provider", protocolVersion: "app-server-v2")
-            ],
-            enabledProviders: [.codex]
+        let runtime = CountingUnavailableProviderRuntime()
+        let adapter = ProviderCLIAdapter(runtimes: [runtime], preflightCacheDuration: .milliseconds(50))
+        let configuration = ProviderCLIConfiguration(
+            kind: .openCodeACP,
+            executable: "/usr/bin/true",
+            protocolVersion: "acp-v1"
         )
-        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
+        let providerSettings = ProviderSettingsService(
+            store: store,
+            adapter: adapter,
+            configurations: [configuration],
+            initiallyEnabled: [.openCodeACP]
+        )
+        try await providerSettings.bootstrap()
+
+        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: adapter)
         let readiness = RepoPromptReadinessService(
             authority: authority,
             store: store,
-            requiredProviders: [.codex],
-            expectedProviderProtocols: [.codex: "app-server-v2"],
+            requiredProviders: [.openCodeACP],
+            expectedProviderProtocols: [.openCodeACP: "acp-v1"],
             minimumFreeBytes: 0,
             minimumFreeNodes: 0,
             maximumActiveSessions: 10,
-            cacheDuration: 0
+            cacheDuration: 0,
+            providerSettings: providerSettings
         )
-
         let snapshot = await readiness.snapshot(forceRefresh: true)
+        XCTAssertTrue(snapshot.ready)
+        XCTAssertTrue(snapshot.providers.isEmpty)
+        let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: InternalRequestAuthenticator(keys: [], store: store), eventSigningKey: responseSigningKey, readiness: readiness, providerSettings: providerSettings)
+        let app = Application(router: service.healthRouter())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/health/ready", method: .get) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
 
-        XCTAssertFalse(snapshot.ready)
-        let codex = try XCTUnwrap(snapshot.providers.first { $0.kind == .codex })
-        XCTAssertTrue(codex.required)
-        XCTAssertFalse(codex.ready)
-        XCTAssertEqual(codex.detail, "configured binary is not executable")
+        let clock = ContinuousClock()
+        let started = clock.now
+        try await withThrowingTaskGroup(of: ProviderSettingsCatalogResponse.self) { group in
+            for _ in 0 ..< 12 {
+                group.addTask { try await providerSettings.catalog(refreshRuntime: true) }
+            }
+            for try await catalog in group {
+                let provider = try XCTUnwrap(catalog.providers.first { $0.providerID == .openCodeACP })
+                XCTAssertFalse(provider.runtimePreflightVerified)
+                XCTAssertFalse(provider.effectiveEnabled)
+            }
+        }
+        XCTAssertLessThan(started.duration(to: clock.now), .milliseconds(100))
+        try await Task.sleep(for: .milliseconds(350))
+        let preflightCount = await runtime.preflightCount()
+        XCTAssertEqual(preflightCount, 1)
         try await store.close()
     }
 
@@ -308,8 +340,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         }
         let snapshot = await readiness.snapshot(forceRefresh: true)
         XCTAssertFalse(snapshot.ready)
-        XCTAssertEqual(snapshot.providers.first { $0.kind == .codex }?.ready, false)
-        XCTAssertEqual(snapshot.providers.first { $0.kind == .codex }?.detail, "protocol-mismatch")
+        XCTAssertTrue(snapshot.providers.isEmpty)
         XCTAssertEqual(snapshot.checks.first { $0.name == "volume:missing" }?.detail, "missing")
         XCTAssertEqual(snapshot.checks.first { $0.name == "session-capacity" }?.ready, false)
         try await store.close()
@@ -465,4 +496,30 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         headers[.init("x-internal-signature")!] = CanonicalSigning.hmacSHA256(message: canonical, key: key.secret)
         return headers
     }
+}
+
+private actor CountingUnavailableProviderRuntime: AgentProviderRuntime {
+    let kind = ProviderKind.openCodeACP
+    private var count = 0
+
+    func capability() -> ProviderCapability {
+        .init(kind: kind, enabled: true, executable: "/usr/bin/true", supportsResume: true, supportsSteering: true, protocolVersion: "acp-v1")
+    }
+
+    func preflight() async -> ProviderCapability {
+        count += 1
+        try? await Task.sleep(for: .milliseconds(200))
+        return .init(kind: kind, enabled: false, executable: "/usr/bin/true", supportsResume: true, supportsSteering: true, protocolVersion: "acp-v1", reasonUnavailable: "ACP initialize handshake timed out")
+    }
+
+    func preflightCount() -> Int { count }
+
+    func execute(
+        _ request: ProviderExecutionRequest,
+        onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
+    ) async throws -> ProviderExecutionResult {
+        throw ServiceAPIError(code: .dependencyUnavailable, message: "provider unavailable")
+    }
+
+    func interrupt(runID _: UUID) {}
 }
