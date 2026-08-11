@@ -4,6 +4,15 @@ This is a Swift Package macOS app for RepoPrompt CE.
 
 Prefer the coordinated developer daemon (`make dev-*`, see "Developer daemon / coordinated validation" below) for builds, runs, and tests. It runs every job through a lane-serialized queue so concurrent agents do not build, launch, or test over each other, and it returns a ticket for each job so long builds can be detached and checked on later instead of blocking. The plain `make` / `swift` / `./Scripts` commands shown below are the uncoordinated fallback for when the daemon is unavailable.
 
+## Degentlemen sandbox continuous delivery
+
+- Implementation may happen on focused branches, but every deployable change must be reviewed and integrated into this repository's common `sandbox` branch.
+- Update RepoPrompt and chat-server `sandbox` first. Push chat-ops `sandbox` last; it is the single normal trigger for the GitHub Actions `Deploy sandbox` workflow, the sole normal deployment path.
+- Do not manually SSH-deploy, invoke `deploy-from-git.sh` directly, deploy feature branches or detached commits, or invent alternate preflight or activation methods. Manual SSH deployment is break-glass only after workflow unavailability is proven and the owner explicitly instructs it.
+- GitHub and the server resolve immutable revisions internally. Discuss branches and workflow/deployment status, not owner-managed SHA choreography.
+- Docker builds stay on the remote server. Preserve persistent caches; do not upload artifacts or caches. Keep automatic backups, media deployment, and maintenance off unless explicitly requested.
+- A release is complete only after the workflow succeeds and ordinary health/readiness verification passes. Provider/UI work currently underway must be integrated into the relevant `sandbox` branches and released through this workflow.
+
 ## Contribution preflight
 
 Before every commit or push, read and run the repository-local `$rpce-contribution-check` skill:
