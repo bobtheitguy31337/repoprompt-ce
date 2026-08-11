@@ -136,6 +136,63 @@ final class ProviderSupervisorTests: XCTestCase {
         XCTAssertEqual(result.output, "done")
     }
 
+    func testProviderVersionProbesUseWritableIsolatedHome() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let executable = directory.appendingPathComponent("opencode")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("""
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then
+          case "$HOME" in
+            */repoprompt-provider-probes/openCodeACP) ;;
+            *) exit 65 ;;
+          esac
+          mkdir -p "$HOME/.local/share" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME"
+          printf 'probe' > "$XDG_DATA_HOME/version-probe"
+          echo 'fixture 1.0'
+          exit 0
+        fi
+        if [ "$*" != "acp" ]; then exit 64; fi
+        while IFS= read -r line; do
+          case "$line" in
+            *initialize*) echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}' ;;
+          esac
+        done
+        """.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+            try? FileManager.default.removeItem(
+                at: FileManager.default.temporaryDirectory
+                    .appendingPathComponent("repoprompt-provider-probes/openCodeACP", isDirectory: true)
+            )
+        }
+        let configuration = ProviderCLIConfiguration(kind: .openCodeACP, executable: executable.path, expectedVersion: "1.0", protocolVersion: "acp-v1")
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let adapter = ProviderCLIAdapter(
+            configurations: [configuration],
+            enabledProviders: [.openCodeACP],
+            processPort: try PortableProcessSupervisionPort(),
+            processStore: store,
+            outputDirectory: directory.appendingPathComponent("output").path,
+            ephemeralHomeRoot: directory.appendingPathComponent("homes").path
+        )
+        let settings = ProviderSettingsService(store: store, adapter: adapter, configurations: [configuration], initiallyEnabled: [.openCodeACP])
+
+        try await settings.bootstrap()
+        let catalog = try await settings.catalog(refreshRuntime: true)
+        let provider = try XCTUnwrap(catalog.providers.first { $0.providerID == .openCodeACP })
+        XCTAssertTrue(provider.cli?.healthy == true)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: FileManager.default.temporaryDirectory
+                    .appendingPathComponent("repoprompt-provider-probes/openCodeACP/.local/share/version-probe")
+                    .path
+            )
+        )
+        try await store.close()
+    }
+
     func testProviderUsesAuthorityRunIDAndRemovesEphemeralCredentialHome() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let executable = directory.appendingPathComponent("provider")

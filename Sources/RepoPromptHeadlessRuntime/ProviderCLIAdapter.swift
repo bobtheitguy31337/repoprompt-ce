@@ -20,6 +20,30 @@ public struct ProviderCLIConfiguration: Codable, Hashable, Sendable {
     }
 }
 
+enum ProviderCLIProbeEnvironment {
+    static func prepare(for kind: ProviderKind) throws -> [String: String] {
+        let manager = FileManager.default
+        let home = manager.temporaryDirectory
+            .appendingPathComponent("repoprompt-provider-probes", isDirectory: true)
+            .appendingPathComponent(kind.rawValue, isDirectory: true)
+        let config = home.appendingPathComponent(".config", isDirectory: true)
+        let cache = home.appendingPathComponent(".cache", isDirectory: true)
+        let data = home.appendingPathComponent(".local/share", isDirectory: true)
+        for directory in [home, config, cache, data] {
+            try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+            try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        }
+        return [
+            "HOME": home.path,
+            "XDG_CONFIG_HOME": config.path,
+            "XDG_CACHE_HOME": cache.path,
+            "XDG_DATA_HOME": data.path,
+            "DISABLE_AUTOUPDATER": "1",
+            "CURSOR_AGENT_DISABLE_AUTO_UPDATE": "1"
+        ]
+    }
+}
+
 /// Provider-neutral runtime router. Provider protocol knowledge lives in the
 /// individual native runtime controllers, never in this dispatcher.
 public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, InteractionDeliveryPort {
@@ -262,7 +286,14 @@ private actor CommandCompatibilityProviderRuntime: AgentProviderRuntime {
         let base = capability()
         guard base.enabled else { return base }
         do {
-            let output = try await runner.run(executable: configuration.executable, arguments: ["--version"], workingDirectory: FileManager.default.currentDirectoryPath, maximumBytes: 65536)
+            let environment = try ProviderCLIProbeEnvironment.prepare(for: kind)
+            let output = try await runner.run(
+                executable: configuration.executable,
+                arguments: ["--version"],
+                workingDirectory: FileManager.default.currentDirectoryPath,
+                maximumBytes: 65536,
+                environment: environment
+            )
             return .init(kind: kind, enabled: true, executable: configuration.executable, supportsResume: base.supportsResume, supportsSteering: base.supportsSteering, version: output.split(whereSeparator: \.isNewline).first.map(String.init), protocolVersion: configuration.protocolVersion)
         } catch {
             return .init(kind: kind, enabled: false, executable: configuration.executable, supportsResume: base.supportsResume, supportsSteering: base.supportsSteering, version: configuration.expectedVersion, protocolVersion: configuration.protocolVersion, reasonUnavailable: "provider compatibility preflight failed")

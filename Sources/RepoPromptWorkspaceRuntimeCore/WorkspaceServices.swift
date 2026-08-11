@@ -4,10 +4,15 @@ import RepoPromptServiceProtocol
 
 public protocol WorkspaceCommandRunning: Sendable {
     func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int) async throws -> String
+    func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, environment: [String: String]) async throws -> String
     func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, launchValidation: @escaping @Sendable () throws -> Void) async throws -> String
 }
 
 public extension WorkspaceCommandRunning {
+    func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, environment _: [String: String]) async throws -> String {
+        try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes)
+    }
+
     func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, launchValidation: @escaping @Sendable () throws -> Void) async throws -> String {
         try launchValidation()
         return try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes)
@@ -18,10 +23,18 @@ public actor LocalWorkspaceCommandRunner: WorkspaceCommandRunning {
     public init() {}
 
     public func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int) async throws -> String {
-        try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes, launchValidation: {})
+        try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes, environment: [:], launchValidation: {})
+    }
+
+    public func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, environment: [String: String]) async throws -> String {
+        try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes, environment: environment, launchValidation: {})
     }
 
     public func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, launchValidation: @escaping @Sendable () throws -> Void) async throws -> String {
+        try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes, environment: [:], launchValidation: launchValidation)
+    }
+
+    private func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, environment: [String: String], launchValidation: @escaping @Sendable () throws -> Void) async throws -> String {
         guard FileManager.default.isExecutableFile(atPath: executable) else {
             throw ServiceAPIError(code: .capabilityMissing, message: "Required workspace executable is unavailable")
         }
@@ -31,6 +44,9 @@ public actor LocalWorkspaceCommandRunner: WorkspaceCommandRunning {
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
+        if !environment.isEmpty {
+            process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, override in override }
+        }
         process.standardOutput = output
         process.standardError = errors
         try launchValidation()

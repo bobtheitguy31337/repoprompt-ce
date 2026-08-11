@@ -79,11 +79,13 @@ private struct NativeProviderProcessSupport {
         guard base.enabled else { return base }
         do {
             let runner = LocalWorkspaceCommandRunner()
+            let environment = try ProviderCLIProbeEnvironment.prepare(for: configuration.kind)
             let output = try await runner.run(
                 executable: configuration.executable,
                 arguments: ["--version"],
                 workingDirectory: FileManager.default.currentDirectoryPath,
-                maximumBytes: 65536
+                maximumBytes: 65536,
+                environment: environment
             )
             let reported = output.split(whereSeparator: \.isNewline).first.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines)
             if let expected = configuration.expectedVersion, reported?.contains(expected) != true {

@@ -653,11 +653,13 @@ public actor ProviderSettingsService {
                 continue
             }
             do {
+                let environment = try ProviderCLIProbeEnvironment.prepare(for: kind)
                 let output = try await runner.run(
                     executable: configuration.executable,
                     arguments: ["--version"],
                     workingDirectory: FileManager.default.currentDirectoryPath,
-                    maximumBytes: 65536
+                    maximumBytes: 65536,
+                    environment: environment
                 )
                 let reported = Self.validCLIVersionOutput(output)
                 let matches = configuration.expectedVersion.map { reported?.contains($0) == true } ?? (reported != nil)
