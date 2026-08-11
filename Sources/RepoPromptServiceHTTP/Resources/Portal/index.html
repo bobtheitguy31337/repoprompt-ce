@@ -133,8 +133,8 @@
           <div class="sidebar-footnote">
             <span data-icon="info" aria-hidden="true"></span>
             <p>
-              Rich approvals, worktrees, permissions, and workflow editing
-              remain in RepoPrompt Desktop.
+              Server settings, permissions, tools, workflows, and worktrees are
+              managed from Settings.
             </p>
           </div>
         </aside>
@@ -273,78 +273,57 @@
                 data-icon="model"
                 >Agent Models</a
               >
-              <span
-                class="unavailable-nav-row"
-                aria-disabled="true"
-                data-search-label="Agent Permissions"
-                data-unavailable-reason="Available in RepoPrompt Desktop; the server API is not implemented."
+              <a
+                href="#settings/agent-permissions"
+                data-route="agent-permissions"
+                data-route-link
                 data-icon="shield"
-                ><span>Agent Permissions</span><small>Desktop only</small></span
+                >Agent Permissions</a
               >
-              <span
-                class="unavailable-nav-row"
-                aria-disabled="true"
-                data-search-label="Agent Workflows"
-                data-unavailable-reason="Available in RepoPrompt Desktop; the server API is not implemented."
+              <a
+                href="#settings/agent-workflows"
+                data-route="agent-workflows"
+                data-route-link
                 data-icon="workflow"
-                ><span>Agent Workflows</span><small>Desktop only</small></span
+                >Agent Workflows</a
               >
-              <span
-                class="unavailable-nav-row"
-                aria-disabled="true"
-                data-search-label="Context Builder"
-                data-unavailable-reason="Available in RepoPrompt Desktop; the server API is not implemented."
+              <a
+                href="#settings/context-builder"
+                data-route="context-builder"
+                data-route-link
                 data-icon="context"
-                ><span>Context Builder</span><small>Desktop only</small></span
-              >
-            </section>
-            <section data-settings-section>
-              <h2>General</h2>
-              <span
-                class="unavailable-nav-row"
-                aria-disabled="true"
-                data-search-label="Appearance"
-                data-unavailable-reason="Server portal appearance follows the browser and operating system."
-                data-icon="appearance"
-                ><span>Appearance</span><small>Unavailable</small></span
-              >
-              <span
-                class="unavailable-nav-row"
-                aria-disabled="true"
-                data-search-label="Updates"
-                data-unavailable-reason="Server updates are managed by the deployment owner."
-                data-icon="refresh"
-                ><span>Updates</span><small>Deployment managed</small></span
-              >
-              <span
-                class="unavailable-nav-row"
-                aria-disabled="true"
-                data-search-label="Keyboard Shortcuts"
-                data-unavailable-reason="Keyboard shortcuts are a RepoPrompt Desktop feature."
-                data-icon="keyboard"
-                ><span>Keyboard Shortcuts</span
-                ><small>Desktop only</small></span
-              >
-              <span
-                class="unavailable-nav-row"
-                aria-disabled="true"
-                data-search-label="Advanced Telemetry"
-                data-unavailable-reason="These settings have no portal API."
-                data-icon="sliders"
-                ><span>Advanced &amp; Telemetry</span
-                ><small>Unavailable</small></span
+                >Context Builder</a
               >
             </section>
             <section data-settings-section>
               <h2>MCP Server</h2>
-              <span
-                class="unavailable-nav-row"
-                aria-disabled="true"
-                data-search-label="MCP Server Tools Workspace Approvals Model Presets"
-                data-unavailable-reason="MCP administration is not exposed through the portal API."
+              <a
+                href="#settings/mcp-server"
+                data-route="mcp-server"
+                data-route-link
                 data-icon="server"
-                ><span>MCP, Tools &amp; Presets</span
-                ><small>Unavailable</small></span
+                >MCP Server</a
+              >
+              <a
+                href="#settings/mcp-tools"
+                data-route="mcp-tools"
+                data-route-link
+                data-icon="sliders"
+                >Tools</a
+              >
+              <a
+                href="#settings/workspace-approvals"
+                data-route="workspace-approvals"
+                data-route-link
+                data-icon="shield"
+                >Workspace Approvals</a
+              >
+              <a
+                href="#settings/model-presets"
+                data-route="model-presets"
+                data-route-link
+                data-icon="model"
+                >Model Presets</a
               >
             </section>
             <section data-settings-section>
@@ -356,41 +335,43 @@
                 data-icon="cloud"
                 >API Providers</a
               >
-              <span
-                class="unavailable-nav-row"
-                aria-disabled="true"
-                data-search-label="OpenRouter Custom API Model Config"
-                data-unavailable-reason="Only providers advertised by the server catalog are configurable here."
+              <a
+                href="#settings/openrouter"
+                data-route="openrouter"
+                data-route-link
+                data-icon="cloud"
+                >OpenRouter</a
+              >
+              <a
+                href="#settings/custom-api"
+                data-route="custom-api"
+                data-route-link
                 data-icon="sliders"
-                ><span>OpenRouter, Custom API &amp; Model Config</span
-                ><small>Desktop only</small></span
+                >Custom API</a
+              >
+              <a
+                href="#settings/model-config"
+                data-route="model-config"
+                data-route-link
+                data-icon="model"
+                >Model Config</a
               >
             </section>
             <section data-settings-section>
               <h2>Workspaces</h2>
-              <span
-                class="unavailable-nav-row"
-                aria-disabled="true"
-                data-search-label="Manage Workspaces Manage Presets"
-                data-unavailable-reason="Workspace management has no portal API."
+              <a
+                href="#settings/manage-workspaces"
+                data-route="manage-workspaces"
+                data-route-link
                 data-icon="folder"
-                ><span>Manage Workspaces &amp; Presets</span
-                ><small>Unavailable</small></span
+                >Manage Workspaces</a
               >
-            </section>
-            <section
-              data-settings-section
-              aria-label="Prompting (Copy &amp; Chat)"
-            >
-              <h2>Prompting</h2>
-              <span
-                class="unavailable-nav-row"
-                aria-disabled="true"
-                data-search-label="Chat Settings Workflow Presets Copy Prompt Order Copy &amp; Chat"
-                data-unavailable-reason="Prompting settings remain in RepoPrompt Desktop."
-                data-icon="message"
-                ><span>Chat, Workflow Presets &amp; Copy Order</span
-                ><small>Desktop only</small></span
+              <a
+                href="#settings/manage-presets"
+                data-route="manage-presets"
+                data-route-link
+                data-icon="workflow"
+                >Manage Presets</a
               >
             </section>
             <p id="settings-no-results" class="settings-no-results" hidden>

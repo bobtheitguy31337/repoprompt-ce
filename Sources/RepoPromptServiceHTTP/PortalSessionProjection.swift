@@ -119,7 +119,8 @@ enum RepoPromptPortalSessionProjection {
 
     static func validatedCreateInput(
         _ request: PortalCreateSessionRequest,
-        provider: ProviderSettingsSnapshot
+        provider: ProviderSettingsSnapshot,
+        runtimeDefaults: PortalDesktopSettingsService.RuntimeDefaults
     ) throws -> CreateSessionInput {
         let prompt = request.initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else {
@@ -149,7 +150,9 @@ enum RepoPromptPortalSessionProjection {
             model: request.model,
             visibility: .privateSession,
             initialPrompt: prompt,
-            startImmediately: true
+            startImmediately: true,
+            initialPermissionMode: runtimeDefaults.mode,
+            initialProviderSettings: runtimeDefaults.providerSettings
         )
     }
 

@@ -369,8 +369,10 @@ public struct CreateSessionInput: Codable, Sendable {
     public let initialPrompt: String?
     public let selectedMessageContext: SelectedMessageContext?
     public let startImmediately: Bool?
+    public let initialPermissionMode: String?
+    public let initialProviderSettings: [String: String]?
 
-    public init(projectID: UUID, parentSessionID: UUID? = nil, provider: ProviderKind, model: String? = nil, visibility: Visibility, initialPrompt: String? = nil, selectedMessageContext: SelectedMessageContext? = nil, startImmediately: Bool = false) {
+    public init(projectID: UUID, parentSessionID: UUID? = nil, provider: ProviderKind, model: String? = nil, visibility: Visibility, initialPrompt: String? = nil, selectedMessageContext: SelectedMessageContext? = nil, startImmediately: Bool = false, initialPermissionMode: String? = nil, initialProviderSettings: [String: String]? = nil) {
         self.projectID = projectID
         self.parentSessionID = parentSessionID
         self.provider = provider
@@ -379,6 +381,8 @@ public struct CreateSessionInput: Codable, Sendable {
         self.initialPrompt = initialPrompt
         self.selectedMessageContext = selectedMessageContext
         self.startImmediately = startImmediately
+        self.initialPermissionMode = initialPermissionMode
+        self.initialProviderSettings = initialProviderSettings
     }
 
     public var hasInitialProviderIntent: Bool {
@@ -396,7 +400,9 @@ public struct CreateSessionInput: Codable, Sendable {
             visibility: visibility,
             initialPrompt: context?.frozenPrompt(userPrompt: initialPrompt) ?? initialPrompt,
             selectedMessageContext: nil,
-            startImmediately: startImmediately == true
+            startImmediately: startImmediately == true,
+            initialPermissionMode: initialPermissionMode,
+            initialProviderSettings: initialProviderSettings
         )
     }
 
@@ -409,6 +415,8 @@ public struct CreateSessionInput: Codable, Sendable {
         case initialPrompt
         case selectedMessageContext
         case startImmediately
+        case initialPermissionMode
+        case initialProviderSettings
     }
 }
 

@@ -288,6 +288,70 @@ function providerCatalog() {
   ];
 }
 
+function desktopSettingsFixture(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    revision: 0,
+    updatedAt: "1970-01-01T00:00:00Z",
+    values: {
+      providerConversationCleanupAction: "archive",
+      agentSessionHandoffInstructions: "",
+      oracleModel: "",
+      contextBuilderAgent: "codexExec",
+      contextBuilderModel: "",
+      exploreRoleModel: "",
+      engineerRoleModel: "",
+      pairRoleModel: "",
+      designRoleModel: "",
+      restrictAgentDiscoveryToRoles: "false",
+      codexPermissionLevel: "autoReview",
+      codexBashEnabled: "true",
+      codexSearchEnabled: "true",
+      codexGoalsEnabled: "true",
+      codexReasoningSummariesEnabled: "false",
+      codexMemoriesEnabled: "false",
+      codexEnabledMCPServers: '["RepoPromptCE"]',
+      claudePermissionLevel: "requireApproval",
+      claudeBashEnabled: "true",
+      claudeStrictMCPEnabled: "false",
+      claudeToolSearchEnabled: "true",
+      openCodePermissionLevel: "managedDefault",
+      cursorPermissionLevel: "managedDefault",
+      subagentPolicy: "safeManaged",
+      subagentCodexPermissionLevel: "autoReview",
+      subagentClaudePermissionLevel: "requireApproval",
+      includeWorkflowCleanupGuidance: "true",
+      featuredWorkflows:
+        '["build","investigate","oracleExport","orchestrate","optimize","deepPlan"]',
+      customWorkflows: "[]",
+      contextBuilderBudget: "160000",
+      contextBuilderEnhancementMode: "fullRewrite",
+      contextBuilderQuestionTimeout: "60",
+      contextBuilderUIClarifyingQuestions: "true",
+      contextBuilderFollowUpAnalysis: "false",
+      contextBuilderAnalysisBudget: "32000",
+      contextBuilderMCPClarifyingQuestions: "false",
+      contextBuilderCustomInstructions: "",
+      mcpToolsEnabled: "true",
+      mcpUseModelPresets: "true",
+      mcpDisabledTools: "[]",
+      workspaceApprovalsGlobal: "false",
+      workspaceApprovalOperations: "[]",
+      modelPresets: "[]",
+      openRouterIncludeDefaults: "true",
+      openRouterUseCustomSettings: "false",
+      openRouterMaxTokens: "0",
+      customProviderIncludeContentType: "true",
+      modelOverrides: "[]",
+      defaultWorktreeMode: "isolated",
+      worktreeBaseRef: "",
+      removeCompletedWorktrees: "false",
+      serverDefaultExecutionMode: "workspaceWrite",
+      ...overrides,
+    },
+  };
+}
+
 function jsonResponse(body, status = 200) {
   const encoded = JSON.stringify(body);
   return {
@@ -334,6 +398,7 @@ async function createHarness({
   hash = "#settings/cli-providers",
   providers = providerCatalog(),
   bootstrap = bootstrapFixture(),
+  desktopSettings = desktopSettingsFixture(),
   handler,
 } = {}) {
   const dom = new JSDOM(htmlSource, {
@@ -343,7 +408,7 @@ async function createHarness({
   });
   const { window } = dom;
   const calls = [];
-  const context = { providers, bootstrap };
+  const context = { providers, bootstrap, desktopSettings };
 
   window.__REPOPROMPT_PORTAL_TEST_HOOK__ = true;
   window.fetch = async (path, options = {}) => {
@@ -360,6 +425,19 @@ async function createHarness({
     }
     if (call.path === "api/v1/bootstrap") {
       return jsonResponse(context.bootstrap);
+    }
+    if (call.path === "api/v1/desktop-settings" && call.method === "GET") {
+      return jsonResponse(context.desktopSettings);
+    }
+    if (call.path === "api/v1/desktop-settings" && call.method === "PATCH") {
+      const payload = JSON.parse(call.body);
+      context.desktopSettings = {
+        ...context.desktopSettings,
+        revision: context.desktopSettings.revision + 1,
+        updatedAt: "2026-08-11T20:00:00Z",
+        values: { ...context.desktopSettings.values, ...payload.changes },
+      };
+      return jsonResponse(context.desktopSettings);
     }
     if (
       call.path.startsWith("api/v1/provider-settings") &&
@@ -407,24 +485,45 @@ function click(window, control) {
   );
 }
 
-test("deep links, settings search, keyboard clearing, and unavailable explanations work", async (t) => {
+test("filtered Desktop settings hierarchy deep-links, searches, and excludes desktop-only destinations", async (t) => {
   const harness = await createHarness();
   t.after(() => harness.close());
   const { document, window } = harness;
 
   assert.equal(document.getElementById("home-shell").hidden, true);
-  assert.equal(document.getElementById("settings-shell").hidden, false);
   assert.equal(
     document.getElementById("settings-detail-title").textContent,
     "CLI Providers",
   );
-  assert.equal(document.querySelectorAll("[data-provider-id]").length, 4);
-  assert.equal(
-    document
-      .querySelector('[data-route="cli-providers"]')
-      .getAttribute("aria-current"),
-    "page",
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /Primary way to add Agent Mode model support/,
   );
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /Claude Code–Compatible Backends/,
+  );
+  assert.equal(document.querySelectorAll(".desktop-provider-card").length, 5);
+
+  const navText = document.getElementById("settings-nav").textContent;
+  for (const included of [
+    "Agent Permissions",
+    "Context Builder",
+    "MCP Server",
+    "Workspace Approvals",
+    "Manage Workspaces",
+  ]) {
+    assert.match(navText, new RegExp(included));
+  }
+  for (const excluded of [
+    "Appearance",
+    "Keyboard Shortcuts",
+    "Updates",
+    "Telemetry",
+    "Copy Prompt Order",
+  ]) {
+    assert.doesNotMatch(navText, new RegExp(excluded));
+  }
 
   window.location.hash = "#settings/agent-models";
   window.dispatchEvent(new window.HashChangeEvent("hashchange"));
@@ -434,43 +533,29 @@ test("deep links, settings search, keyboard clearing, and unavailable explanatio
   );
   assert.match(
     document.getElementById("settings-content").textContent,
-    /Fast mode/,
+    /Oracle Model/,
   );
-
-  window.location.hash = "#settings/not-a-real-page";
-  window.dispatchEvent(new window.HashChangeEvent("hashchange"));
-  assert.equal(
-    document.getElementById("settings-detail-title").textContent,
-    "Overview",
+  assert.doesNotMatch(
+    document.getElementById("settings-content").textContent,
+    /Provider defaults/,
   );
 
   const search = document.getElementById("settings-search");
   search.focus();
-  search.value = "API Providers";
+  search.value = "Context Builder";
   search.dispatchEvent(new window.Event("input", { bubbles: true }));
   assert.equal(
-    document.querySelector('[data-route="api-providers"]').hidden,
+    document.querySelector('[data-route="context-builder"]').hidden,
     false,
   );
   assert.equal(
     document.querySelector('[data-route="cli-providers"]').hidden,
     true,
   );
-  assert.equal(document.getElementById("clear-settings-search").hidden, false);
-
   search.dispatchEvent(
     new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
   );
   assert.equal(search.value, "");
-  assert.equal(
-    document.querySelector('[data-route="cli-providers"]').hidden,
-    false,
-  );
-
-  for (const unavailable of document.querySelectorAll(".unavailable-nav-row")) {
-    assert.equal(unavailable.getAttribute("aria-disabled"), "true");
-    assert.ok(unavailable.dataset.unavailableReason);
-  }
 
   const skip = document.querySelector('[data-action="skip-content"]');
   click(window, skip);
@@ -480,449 +565,62 @@ test("deep links, settings search, keyboard clearing, and unavailable explanatio
   );
 });
 
-test("provider enable, model, effort, fast-mode, and tier controls submit the full revision", async (t) => {
-  const fixture = providerFixture({
-    supportsSpeedMode: true,
-    models: [
-      model("model-a", { speedModes: ["standard"], serviceTiers: ["fast"] }),
-      model("model-b", {
-        speedModes: ["standard", "fast"],
-        serviceTiers: ["fast", "priority"],
-      }),
-    ],
+test("connected Codex disclosure shows Desktop account and runtime controls without credential forms", async (t) => {
+  const connection = connectionFixture({
+    authenticationMethod: "deviceCodeBeta",
+    accountLabel: "owner@example.com",
   });
-  let patchBody = null;
-  const harness = await createHarness({
-    providers: [fixture],
-    handler(call) {
-      if (call.method === "PATCH") {
-        patchBody = JSON.parse(call.body);
-        return jsonResponse({
-          ...fixture,
-          preference: {
-            ...fixture.preference,
-            ...patchBody,
-            providerID: fixture.providerID,
-            revision: 2,
-          },
-        });
-      }
-      return null;
+  const providers = providerCatalog();
+  providers[0] = providerFixture({
+    connection,
+    authentication: {
+      authenticated: true,
+      state: "authenticated",
+      method: "deviceCodeBeta",
+      accountLabel: "owner@example.com",
+      planLabel: "Plus",
+      authenticationLabel: "Managed ChatGPT",
     },
   });
+  const harness = await createHarness({ providers });
   t.after(() => harness.close());
-  const { document, window } = harness;
-  const form = document.querySelector('[data-provider-settings="codex"]');
-  const save = form.querySelector('[data-action="save-provider-settings"]');
+  const { document } = harness;
+  const codex = document.querySelector('[data-provider-id="codex"]');
+  codex.open = true;
+  assert.match(codex.textContent, /Signed in to Codex/);
+  assert.match(codex.textContent, /Account\s*owner@example.com/);
+  assert.match(codex.textContent, /Plan\s*Plus/);
+  assert.match(codex.textContent, /Permissions & Runtime/);
+  assert.match(codex.textContent, /Reasoning Summaries/);
+  assert.match(codex.textContent, /RepoPrompt · Required/);
+  assert.equal(codex.querySelector(".credential-card"), null);
+  assert.doesNotMatch(
+    codex.textContent,
+    /Provider defaults|revision|vault|runtime-ready/i,
+  );
+});
 
-  assert.equal(save.disabled, true);
-  assert.match(save.title, /change a setting/i);
-  change(window, form.elements.defaultModel, "model-b");
-  change(window, form.elements.reasoningEffort, "high");
-  change(window, form.elements.speedMode, "fast");
-  change(window, form.elements.serviceTier, "priority");
-  change(window, form.elements.enabled, false);
-  assert.equal(save.disabled, false);
-
-  submit(window, form);
-  await waitFor(() => patchBody !== null, "preference PATCH was not sent");
+test("Desktop setting controls persist through the versioned settings contract", async (t) => {
+  const harness = await createHarness({ hash: "#settings/agent-permissions" });
+  t.after(() => harness.close());
+  const { document, window, calls } = harness;
+  const mode = [...document.querySelectorAll("select")].find(
+    (select) => select.getAttribute("aria-label") === "Default Execution Mode",
+  );
+  change(window, mode, "readOnly");
+  await window.RepoPromptPortalTest.whenIdle();
   await settle();
-
-  assert.deepEqual(patchBody, {
-    expectedRevision: 1,
-    enabled: false,
-    defaultModel: "model-b",
-    reasoningEffort: "high",
-    speedMode: "fast",
-    serviceTier: "priority",
-  });
-  assert.equal(
-    harness.calls.find((call) => call.method === "PATCH").headers[
-      "X-RepoPrompt-Portal-CSRF"
-    ],
-    "1",
-  );
-  assert.match(
-    document.getElementById("toast-region").textContent,
-    /settings saved/i,
-  );
-});
-
-test("direct authentication fields are capability-gated for every supported family", async (t) => {
-  const harness = await createHarness();
-  t.after(() => harness.close());
-  const { document, window } = harness;
-
-  const codex = document.querySelector('[data-provider-connect="codex"]');
-  assert.deepEqual(
-    [...codex.elements.authenticationMethod.options].map(
-      (option) => option.value,
-    ),
-    ["apiKey", "enterpriseAccessToken"],
-  );
-  assert.ok(codex.elements.credential);
-  change(window, codex.elements.authenticationMethod, "enterpriseAccessToken");
-  assert.equal(codex.elements.credential.type, "password");
-  assert.equal(codex.elements.credential.dataset.sensitive, "true");
-
-  const claude = document.querySelector(
-    '[data-provider-connect="claudeCompatible"]',
-  );
-  assert.deepEqual(
-    [...claude.elements.authenticationMethod.options].map(
-      (option) => option.value,
-    ),
-    ["apiKey", "authToken", "keyHelper", "workloadIdentityFederation"],
-  );
-  change(window, claude.elements.authenticationMethod, "authToken");
-  assert.ok(claude.elements.credential);
-  change(window, claude.elements.authenticationMethod, "keyHelper");
-  assert.ok(claude.elements.keyHelperCommand);
-  assert.equal(claude.elements.keyHelperCommand.dataset.sensitive, "true");
-  change(
-    window,
-    claude.elements.authenticationMethod,
-    "workloadIdentityFederation",
-  );
-  assert.ok(claude.elements.workloadIdentityProvider);
-  assert.ok(claude.elements.workloadIdentityServiceAccount);
-  assert.equal(claude.querySelector('[name="credential"]'), null);
-
-  const openCode = document.querySelector(
-    '[data-provider-connect="openCodeACP"]',
-  );
-  assert.deepEqual(
-    [...openCode.elements.authenticationMethod.options].map(
-      (option) => option.value,
-    ),
-    ["providerSpecific"],
-  );
-  assert.equal(openCode.querySelector("[data-sensitive]"), null);
-  assert.match(openCode.textContent, /No raw credential is proxied/);
-
-  const cursor = document.querySelector('[data-provider-connect="cursorACP"]');
-  assert.deepEqual(
-    [...cursor.elements.authenticationMethod.options].map(
-      (option) => option.value,
-    ),
-    ["apiKey"],
-  );
-  assert.match(
-    document.querySelector('[data-provider-id="cursorACP"]').textContent,
-    /Complete browser login in the isolated account/,
-  );
-
-  for (const unavailable of document.querySelectorAll(
-    '[data-action="start-auth-flow"]:disabled',
-  )) {
-    assert.ok(
-      unavailable.dataset.disabledReason,
-      `missing disabled reason for ${unavailable.textContent}`,
-    );
-  }
-});
-
-test("write-only credential inputs are disposed after both success and failure", async (t) => {
-  const fixture = providerFixture({
-    authenticationMethods: ["apiKey"],
-    authFlows: [],
-  });
-  let attempts = 0;
-  const harness = await createHarness({
-    providers: [fixture],
-    handler(call) {
-      if (call.path.endsWith("/connect")) {
-        attempts += 1;
-        if (attempts === 1) {
-          const connected = connectionFixture({
-            testState: "notTested",
-            state: "attention",
-          });
-          return jsonResponse(
-            providerFixture({
-              authenticationMethods: ["apiKey"],
-              authFlows: [],
-              connection: connected,
-              authentication: {
-                state: "attention",
-                authenticated: false,
-                method: "apiKey",
-                accountLabel: "sandbox team",
-                detail: "Credential stored; validation is required",
-              },
-            }),
-            201,
-          );
-        }
-        return jsonResponse(
-          {
-            code: "invalidRequest",
-            message: "The test value was rejected",
-            retryable: false,
-          },
-          422,
-        );
-      }
-      return null;
-    },
-  });
-  t.after(() => harness.close());
-  const { document, window } = harness;
-
-  const firstForm = document.querySelector('[data-provider-connect="codex"]');
-  const firstSecret = firstForm.elements.credential;
-  firstSecret.value = "not-a-real-value";
-  submit(window, firstForm);
-  await waitFor(() => attempts === 1);
-  await settle();
-  assert.equal(firstSecret.value, "");
-
-  const secondForm = document.querySelector('[data-provider-connect="codex"]');
-  const secondSecret = secondForm.elements.credential;
-  secondSecret.value = "another-fake-value";
-  submit(window, secondForm);
-  await waitFor(() => attempts === 2);
-  await waitFor(() => secondForm.querySelector(".inline-message.error"));
-  assert.equal(secondSecret.value, "");
-  assert.match(
-    secondForm.querySelector(".inline-message.error").textContent,
-    /fields were cleared/i,
-  );
-  assert.equal(secondForm.querySelector('[type="submit"]').disabled, false);
-
-  const connectCalls = harness.calls.filter((call) =>
-    call.path.endsWith("/connect"),
-  );
-  assert.equal(connectCalls.length, 2);
-  for (const call of connectCalls) {
-    assert.equal(call.headers["X-RepoPrompt-Portal-CSRF"], "1");
-    assert.equal(call.headers["Content-Type"], "application/json");
-  }
-});
-
-test("device auth state machine starts, polls to completion, refreshes, and cancels", async (t) => {
-  let fixture = providerFixture({
-    authenticationMethods: ["deviceCodeBeta"],
-    authFlows: [
-      {
-        kind: "deviceCodeBeta",
-        displayName: "Use device code instead",
-        startable: true,
-        detail:
-          "Uses your Codex subscription. RepoPrompt CE keeps this sign-in separate from ~/.codex.",
-      },
-    ],
-  });
-  let starts = 0;
-  let polls = 0;
-  let cancels = 0;
-  const harness = await createHarness({
-    providers: [fixture],
-    handler(call, context) {
-      if (call.path.endsWith("/auth-flows") && call.method === "POST") {
-        starts += 1;
-        return jsonResponse(
-          {
-            flowID: `20000000-0000-0000-0000-00000000000${starts}`,
-            providerID: "codex",
-            kind: "deviceCodeBeta",
-            state: "pending",
-            userCode: "ABCD-EFGH",
-            verificationURL: "https://provider.example/device",
-            expiresAt: "2026-08-10T21:00:00Z",
-            detail: "Awaiting authorization",
-          },
-          202,
-        );
-      }
-      if (
-        call.path.startsWith("api/v1/provider-auth-flows/") &&
-        call.method === "GET"
-      ) {
-        polls += 1;
-        fixture = providerFixture({
-          authenticationMethods: ["deviceCodeBeta"],
-          authFlows: fixture.capabilities.authFlows,
-          connection: connectionFixture({
-            authenticationMethod: "deviceCodeBeta",
-          }),
-          authentication: {
-            state: "authenticated",
-            authenticated: true,
-            method: "deviceCodeBeta",
-            accountLabel: "device account",
-            detail: "Authenticated",
-          },
-          preflight: {
-            ready: true,
-            reason: "ready",
-            detail: "Provider is ready",
-          },
-        });
-        context.providers = [fixture];
-        return jsonResponse({
-          flowID: "20000000-0000-0000-0000-000000000001",
-          providerID: "codex",
-          kind: "deviceCodeBeta",
-          state: "completed",
-          userCode: null,
-          verificationURL: null,
-          expiresAt: "2026-08-10T21:00:00Z",
-          detail: "Authorization completed",
-        });
-      }
-      if (
-        call.path.startsWith("api/v1/provider-auth-flows/") &&
-        call.method === "DELETE"
-      ) {
-        cancels += 1;
-        return emptyResponse();
-      }
-      return null;
-    },
-  });
-  t.after(() => harness.close());
-  const { document, window } = harness;
-
-  click(
-    window,
-    document.querySelector('[data-action="start-auth-flow"]:not(:disabled)'),
-  );
-  await waitFor(() => document.querySelector(".device-panel"));
-  assert.equal(document.querySelector(".device-code").textContent, "ABCD-EFGH");
-  assert.equal(
-    document.querySelector(".verification-link").rel,
-    "noopener noreferrer",
-  );
-  assert.equal(
-    harness.calls.find((call) => call.path.endsWith("/auth-flows")).body,
-    '{"kind":"deviceCodeBeta"}',
-  );
-
-  click(window, document.querySelector('[data-action="cancel-auth-flow"]'));
-  await waitFor(() => cancels === 1);
-  await waitFor(() => window.RepoPromptPortalTest.state.activeFlow === null);
-  const cancelCall = harness.calls.find(
+  const patch = calls.find(
     (call) =>
-      call.method === "DELETE" &&
-      call.path.startsWith("api/v1/provider-auth-flows/"),
+      call.path === "api/v1/desktop-settings" && call.method === "PATCH",
   );
-  assert.equal(cancelCall.headers["X-RepoPrompt-Portal-CSRF"], "1");
-
-  click(
-    window,
-    document.querySelector('[data-action="start-auth-flow"]:not(:disabled)'),
-  );
-  await waitFor(() => document.querySelector(".device-panel"));
-  await window.RepoPromptPortalTest.pollActiveFlow(true);
-  await settle();
-  assert.equal(polls, 1);
-  assert.equal(document.querySelector(".device-panel"), null);
-  assert.match(
-    document.querySelector('[data-provider-id="codex"]').textContent,
-    /Authenticated/,
-  );
-  assert.equal(window.RepoPromptPortalTest.state.activeFlow, null);
-});
-
-test("connection test, disconnect, revoke, confirmation, and Escape are wired", async (t) => {
-  const connected = connectionFixture();
-  const fixture = providerFixture({ connection: connected });
-  const operations = [];
-  const harness = await createHarness({
-    providers: [fixture],
-    handler(call) {
-      const operation = ["test", "disconnect", "revoke"].find((name) =>
-        call.path.endsWith(`/${name}`),
-      );
-      if (!operation) return null;
-      operations.push(operation);
-      if (operation === "test") {
-        return jsonResponse(
-          providerFixture({
-            connection: connectionFixture({
-              revision: 3,
-              detail: "Credential accepted again",
-            }),
-          }),
-        );
-      }
-      return jsonResponse(
-        providerFixture({
-          connection: null,
-          authentication: {
-            state: "notConfigured",
-            authenticated: false,
-            method: null,
-            accountLabel: null,
-            detail: "Provision credentials on the server",
-          },
-          preflight: {
-            ready: false,
-            reason: "missingCredential",
-            detail: "Provider credential is not configured",
-          },
-        }),
-      );
-    },
+  assert.deepEqual(JSON.parse(patch.body), {
+    expectedRevision: 0,
+    changes: { serverDefaultExecutionMode: "readOnly" },
   });
-  t.after(() => harness.close());
-  const { document, window } = harness;
-
-  click(window, document.querySelector('[data-action="test-connection"]'));
-  await waitFor(() => operations.includes("test"));
-  await waitFor(() =>
-    /accepted again/i.test(
-      document.querySelector(".connection-panel").textContent,
-    ),
-  );
-
-  const disconnect = document.querySelector(
-    '[data-action="request-disconnect"]',
-  );
-  disconnect.focus();
-  click(window, disconnect);
-  await waitFor(() => !document.getElementById("confirm-dialog").hidden);
-  document.dispatchEvent(
-    new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
-  );
-  assert.equal(document.getElementById("confirm-dialog").hidden, true);
-  assert.equal(document.activeElement, disconnect);
-  assert.deepEqual(operations, ["test"]);
-
-  click(window, disconnect);
-  await waitFor(() => !document.getElementById("confirm-dialog").hidden);
-  click(window, document.getElementById("confirm-action-button"));
-  await waitFor(() => operations.includes("disconnect"));
-  assert.equal(document.querySelector(".connection-panel"), null);
-  const disconnectCall = harness.calls.find((call) =>
-    call.path.endsWith("/disconnect"),
-  );
-  assert.equal(disconnectCall.body, "{}");
-  assert.equal(disconnectCall.headers["X-RepoPrompt-Portal-CSRF"], "1");
-
-  const revokeFixture = providerFixture({ connection: connectionFixture() });
-  const revokeHarness = await createHarness({
-    providers: [revokeFixture],
-    handler(call) {
-      if (!call.path.endsWith("/revoke")) return null;
-      return jsonResponse(providerFixture({ connection: null }));
-    },
-  });
-  t.after(() => revokeHarness.close());
-  click(
-    revokeHarness.window,
-    revokeHarness.document.querySelector('[data-action="request-revoke"]'),
-  );
-  await waitFor(
-    () => !revokeHarness.document.getElementById("confirm-dialog").hidden,
-  );
-  click(
-    revokeHarness.window,
-    revokeHarness.document.getElementById("confirm-action-button"),
-  );
-  await waitFor(() =>
-    revokeHarness.calls.some((call) => call.path.endsWith("/revoke")),
+  assert.equal(
+    harness.context.desktopSettings.values.serverDefaultExecutionMode,
+    "readOnly",
   );
 });
 
@@ -1196,69 +894,6 @@ test("composer creates sessions and sends revision-checked follow-ups through po
   assert.equal(messageCall.headers["X-RepoPrompt-Portal-CSRF"], "1");
   await window.RepoPromptPortalTest.whenIdle();
   await settle();
-});
-
-test("provider settings show connection outcomes and authentication methods remain peers", async (t) => {
-  const codex = providerFixture();
-  const connected = providerFixture({
-    providerID: "claudeCompatible",
-    displayName: "Claude Code",
-    connection: connectionFixture({ providerID: "claudeCompatible" }),
-  });
-  const failed = providerFixture({
-    providerID: "openCodeACP",
-    displayName: "OpenCode",
-    connection: connectionFixture({
-      providerID: "openCodeACP",
-      state: "attention",
-      testState: "invalid",
-      detail: "Credential rejected",
-    }),
-    authentication: { state: "attention", authenticated: false },
-  });
-  const unsupported = providerFixture({
-    providerID: "cursorACP",
-    displayName: "Cursor",
-    deploymentAllowed: false,
-    preference: { enabled: false },
-  });
-  const harness = await createHarness({
-    providers: [codex, connected, failed, unsupported],
-  });
-  t.after(() => harness.close());
-  const { document } = harness;
-  const card = document.querySelector('[data-provider-id="codex"]');
-  const choices = [...card.querySelectorAll(".auth-choice")];
-
-  assert.deepEqual(
-    [...document.querySelectorAll(".connection-badge")].map((badge) =>
-      badge.textContent.trim(),
-    ),
-    ["Not configured", "Connected", "Credential rejected"],
-  );
-  assert.equal(document.querySelector('[data-provider-id="cursorACP"]'), null);
-  assert.deepEqual(
-    choices.map((choice) => choice.querySelector("strong").textContent),
-    [
-      "Use device code instead",
-      "Login with ChatGPT",
-      "OpenAI API Key",
-      "Enterprise access token",
-    ],
-  );
-  assert.match(choices[0].textContent, /Codex subscription/i);
-  assert.match(choices[2].textContent, /API-billed/i);
-  assert.ok(choices[0].querySelector('[data-action="start-auth-flow"]'));
-  assert.ok(choices[2].querySelector('[data-action="choose-auth-method"]'));
-  assert.equal(card.querySelectorAll(".flow-option").length, 0);
-  assert.match(card.textContent, /Codex CLI/);
-  assert.match(card.textContent, /separate sign-in from ~\/.codex/);
-  assert.match(card.textContent, /identity verification \(KYC\)/);
-  assert.match(
-    card.textContent,
-    /Permissions and runtime controls appear here after Codex is connected/,
-  );
-  assert.equal(card.textContent.includes("migrated"), false);
 });
 
 test("offline failures are visible and an online event refreshes retained UI", async (t) => {

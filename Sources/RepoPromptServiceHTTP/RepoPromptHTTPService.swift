@@ -22,6 +22,7 @@ public struct RepoPromptHTTPService: Sendable {
     private let drainController: MutationDrainController
     private let durabilityOperations: DurabilityOperationsService?
     private let providerSettings: ProviderSettingsService?
+    private let portalDesktopSettings: PortalDesktopSettingsService
 
     public init(
         authority: RepoPromptHeadlessAuthority,
@@ -32,7 +33,8 @@ public struct RepoPromptHTTPService: Sendable {
         readiness: RepoPromptReadinessService? = nil,
         drainController: MutationDrainController = MutationDrainController(),
         durabilityOperations: DurabilityOperationsService? = nil,
-        providerSettings: ProviderSettingsService? = nil
+        providerSettings: ProviderSettingsService? = nil,
+        portalDesktopSettings: PortalDesktopSettingsService? = nil
     ) {
         self.authority = authority
         self.store = store
@@ -42,6 +44,7 @@ public struct RepoPromptHTTPService: Sendable {
         self.drainController = drainController
         self.durabilityOperations = durabilityOperations
         self.providerSettings = providerSettings
+        self.portalDesktopSettings = portalDesktopSettings ?? PortalDesktopSettingsService(store: store)
         self.readiness = readiness ?? RepoPromptReadinessService(
             authority: authority,
             store: store,
@@ -101,7 +104,12 @@ public struct RepoPromptHTTPService: Sendable {
             guard let provider = catalog.providers.first(where: { $0.providerID == input.providerID }) else {
                 throw ServiceAPIError(code: .notFound, message: "Provider settings not found")
             }
-            let createInput = try RepoPromptPortalSessionProjection.validatedCreateInput(input, provider: provider)
+            let runtimeDefaults = try await requirePortalDesktopSettings().runtimeDefaults(for: input.providerID)
+            let createInput = try RepoPromptPortalSessionProjection.validatedCreateInput(
+                input,
+                provider: provider,
+                runtimeDefaults: runtimeDefaults
+            )
             let snapshot = try await authority.createSession(
                 input: createInput,
                 externalActor: principal.externalActor,
@@ -125,6 +133,16 @@ public struct RepoPromptHTTPService: Sendable {
                 requestDigest: CanonicalSigning.bodyDigest(data)
             )
             return try portalJSON(receipt, status: .accepted)
+        } }
+        router.get("/portal/api/v1/desktop-settings") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            return try await portalJSON(requirePortalDesktopSettings().snapshot())
+        } }
+        router.patch("/portal/api/v1/desktop-settings") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let input = try await JSONDecoder.serviceDecoder.decode(UpdatePortalDesktopSettingsRequest.self, from: bodyData(request))
+            return try await portalJSON(requirePortalDesktopSettings().update(input))
         } }
         router.get("/portal/api/v1/provider-settings") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(context: context)
@@ -795,6 +813,10 @@ public struct RepoPromptHTTPService: Sendable {
             throw ServiceAPIError(code: .notFound, message: "Provider settings not found")
         }
         return providerID
+    }
+
+    private func requirePortalDesktopSettings() -> PortalDesktopSettingsService {
+        portalDesktopSettings
     }
 
     private func requireProviderSettings() throws -> ProviderSettingsService {

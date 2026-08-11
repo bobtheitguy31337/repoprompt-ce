@@ -97,14 +97,18 @@ public struct ProviderAuthenticationStatus: Codable, Hashable, Sendable {
     public let authenticated: Bool
     public let method: ProviderAuthenticationMethod?
     public let accountLabel: String?
+    public let planLabel: String?
+    public let authenticationLabel: String?
     public let expiresAt: Date?
     public let detail: String?
 
-    public init(state: ProviderAuthenticationState, authenticated: Bool, method: ProviderAuthenticationMethod? = nil, accountLabel: String? = nil, expiresAt: Date? = nil, detail: String? = nil) {
+    public init(state: ProviderAuthenticationState, authenticated: Bool, method: ProviderAuthenticationMethod? = nil, accountLabel: String? = nil, planLabel: String? = nil, authenticationLabel: String? = nil, expiresAt: Date? = nil, detail: String? = nil) {
         self.state = state
         self.authenticated = authenticated
         self.method = method
         self.accountLabel = accountLabel
+        self.planLabel = planLabel
+        self.authenticationLabel = authenticationLabel
         self.expiresAt = expiresAt
         self.detail = detail
     }

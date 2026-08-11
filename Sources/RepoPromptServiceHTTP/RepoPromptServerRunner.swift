@@ -375,6 +375,7 @@ public enum RepoPromptServerRunner {
             vault: providerVault,
             credentialTester: ProviderAuthenticationAdapter(configurations: providerConfigurations)
         )
+        let portalDesktopSettings = PortalDesktopSettingsService(store: store)
         try await providers.recoverProcessFamilies()
         try await providerSettings.bootstrap()
         let authority = RepoPromptHeadlessAuthority(
@@ -416,7 +417,8 @@ public enum RepoPromptServerRunner {
             readiness: readiness,
             drainController: drainController,
             durabilityOperations: durabilityOperations,
-            providerSettings: providerSettings
+            providerSettings: providerSettings,
+            portalDesktopSettings: portalDesktopSettings
         )
         let internalApplication = try Application(
             router: service.internalRouter(),

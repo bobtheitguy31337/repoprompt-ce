@@ -153,6 +153,12 @@ private struct NativeProviderProcessSupport {
         environment["CLAUDE_CONFIG_DIR"] = home.appendingPathComponent(".claude", isDirectory: true).path
         environment["DISABLE_AUTOUPDATER"] = "1"
         environment["CURSOR_AGENT_DISABLE_AUTO_UPDATE"] = "1"
+        if configuration.kind == .claudeCompatible {
+            environment["ENABLE_CLAUDEAI_MCP_SERVERS"] = "false"
+            if policy.providerSettings["claude.toolSearchEnabled"] != "true" {
+                environment["ENABLE_TOOL_SEARCH"] = "false"
+            }
+        }
         if configuration.kind == .claudeCompatible,
            let effort = policy.providerSettings["provider.reasoningEffort"],
            ["low", "medium", "high", "xhigh", "max"].contains(effort)
@@ -511,6 +517,8 @@ private actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             try await process.notify(method: "initialized")
             let policy = Self.codexPolicy(request.policy, workingDirectory: request.workingDirectory)
             var threadParams: [String: Any] = ["cwd": request.workingDirectory, "approvalPolicy": policy.approvalPolicy, "sandbox": policy.sandbox]
+            let config = Self.codexConfig(request.policy.providerSettings)
+            if !config.isEmpty { threadParams["config"] = config }
             if let model = request.model { threadParams["model"] = model }
             if let effort = request.policy.providerSettings["provider.reasoningEffort"] { threadParams["effort"] = effort }
             if let tier = request.policy.providerSettings["provider.serviceTier"] { threadParams["serviceTier"] = tier }
@@ -578,6 +586,39 @@ private actor CodexAppServerProviderRuntime: AgentProviderRuntime {
         let id: Any = Int(providerRequestID) ?? providerRequestID
         let payload = (try? JSONSerialization.jsonObject(with: answer)) ?? ["decision": "decline"]
         try await process.sendResponse(id: id, result: payload)
+    }
+
+    private nonisolated static func codexConfig(_ settings: [String: String]) -> [String: Any] {
+        let bash = settings["codex.bashEnabled"] != "false"
+        let search = settings["codex.searchEnabled"] != "false"
+        let goals = settings["codex.goalsEnabled"] != "false"
+        let summaries = settings["codex.reasoningSummariesEnabled"] == "true"
+        let memories = settings["codex.memoriesEnabled"] == "true"
+        var config: [String: Any] = [
+            "features.apps": false,
+            "features.shell_tool": bash,
+            "features.goals": goals,
+            "features.memories": memories,
+            "features.computer_use": false,
+            "features.plugins": false,
+            "features.tool_call_mcp_elicitation": false,
+            "features.tool_suggest": false,
+            "memories.generate_memories": memories,
+            "memories.use_memories": memories,
+            "web_search": search ? "live" : "disabled",
+            "model_reasoning_summary": summaries ? "auto" : "none",
+            "features.code_mode.direct_only_tool_namespaces": ["mcp__RepoPromptCE"]
+        ]
+        if !bash { config["features.unified_exec"] = false }
+        if let encoded = settings["codex.enabledMCPServers"],
+           let data = encoded.data(using: .utf8),
+           let names = try? JSONDecoder().decode([String].self, from: data)
+        {
+            for name in names where name.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-")).contains($0) }) {
+                config["mcp_servers.\(name).enabled"] = true
+            }
+        }
+        return config
     }
 
     private nonisolated static func codexPolicy(_ policy: ProviderExecutionPolicy, workingDirectory: String) -> (approvalPolicy: String, sandbox: String, sandboxPolicy: [String: Any]) {
@@ -924,6 +965,12 @@ private actor ClaudeNativeProviderRuntime: AgentProviderRuntime {
             arguments += ["--permission-mode", mode]
         case .fullAccess:
             arguments.append("--allow-dangerously-skip-permissions")
+        }
+        if request.policy.mode != .readOnly, request.policy.providerSettings["claude.bashEnabled"] == "false" {
+            arguments += ["--disallowedTools", "Bash"]
+        }
+        if request.policy.providerSettings["claude.strictMCPEnabled"] == "true" {
+            arguments.append("--strict-mcp-config")
         }
         if let resume = request.resumeProviderSessionID { arguments += ["--resume", resume] }
         if let model = request.model { arguments += ["--model", model] }

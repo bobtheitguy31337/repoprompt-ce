@@ -14,6 +14,18 @@ public enum CodexCLIContract {
     public static let deviceFlowType = "chatgptDeviceCode"
 }
 
+public struct ProviderManagedAccountSummary: Sendable, Equatable {
+    public let account: String
+    public let plan: String
+    public let authentication: String
+
+    public init(account: String, plan: String, authentication: String) {
+        self.account = account
+        self.plan = plan
+        self.authentication = authentication
+    }
+}
+
 public enum ProviderManagedAuthenticationState: Sendable, Equatable {
     case authenticated(accountLabel: String?)
     case notAuthenticated
@@ -23,7 +35,12 @@ public enum ProviderManagedAuthenticationState: Sendable, Equatable {
 public protocol ProviderManagedAuthenticationDriving: Sendable {
     func authFlowDescriptor(providerID: ProviderSettingsID, forceRefresh: Bool) async -> ProviderAuthFlowDescriptor?
     func authenticationState(providerID: ProviderSettingsID) async -> ProviderManagedAuthenticationState
+    func accountSummary(providerID: ProviderSettingsID) async -> ProviderManagedAccountSummary?
     func logout(providerID: ProviderSettingsID) async throws
+}
+
+public extension ProviderManagedAuthenticationDriving {
+    func accountSummary(providerID _: ProviderSettingsID) async -> ProviderManagedAccountSummary? { nil }
 }
 
 public struct UnavailableProviderManagedAuthenticationDriver: ProviderManagedAuthenticationDriving {
@@ -264,6 +281,7 @@ public actor CodexDeviceAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuth
     private var flows: [UUID: Flow] = [:]
     private var expiryTasks: [UUID: Task<Void, Never>] = [:]
     private var cachedAvailability: (Date, Bool)?
+    private var managedAccountSummary: ProviderManagedAccountSummary?
 
     public init(
         executable: String,
@@ -304,7 +322,11 @@ public actor CodexDeviceAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuth
             do {
                 let reply = try await process.request(method: "account/read", params: ["refreshToken": true], timeout: requestTimeout)
                 await process.stop()
-                guard Self.isAuthenticatedAccountRead(reply.result) else { return .notAuthenticated }
+                guard Self.isAuthenticatedAccountRead(reply.result) else {
+                    managedAccountSummary = nil
+                    return .notAuthenticated
+                }
+                managedAccountSummary = Self.accountSummary(reply.result)
                 return .authenticated(accountLabel: Self.accountLabel(reply.result))
             } catch {
                 await process.stop()
@@ -313,6 +335,10 @@ public actor CodexDeviceAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuth
         } catch {
             return .unavailable
         }
+    }
+
+    public func accountSummary(providerID: ProviderSettingsID) async -> ProviderManagedAccountSummary? {
+        providerID == .codex ? managedAccountSummary : nil
     }
 
     public func start(providerID: ProviderSettingsID, kind: ProviderAuthFlowKind) async throws -> ProviderAuthTransactionStatus {
@@ -543,6 +569,40 @@ public actor CodexDeviceAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuth
     private nonisolated static func accountLabel(_ response: [String: Any]) -> String? {
         guard let account = response["account"] as? [String: Any] else { return nil }
         return string(account, keys: ["email"])
+    }
+
+    private nonisolated static func accountSummary(_ response: [String: Any]) -> ProviderManagedAccountSummary? {
+        guard let account = response["account"] as? [String: Any] else { return nil }
+        let email = string(account, keys: ["email"])
+        let plan = string(account, keys: ["planType", "plan_type", "plan"])
+        let authentication = string(account, keys: ["authenticationMode", "authentication_mode", "authMode", "auth_mode"])
+            ?? string(response, keys: ["authenticationMode", "authentication_mode", "authMode", "auth_mode"])
+            ?? "managed_chatgpt"
+        return .init(
+            account: email ?? "Managed Codex account",
+            plan: normalizedLabel(plan) ?? "Plan not provided",
+            authentication: normalizedLabel(authentication) ?? "Managed Codex sign-in"
+        )
+    }
+
+    private nonisolated static func normalizedLabel(_ rawValue: String?) -> String? {
+        guard let trimmed = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
+        if trimmed.caseInsensitiveCompare("chatgpt") == .orderedSame { return "ChatGPT" }
+        return trimmed
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .split(whereSeparator: \.isWhitespace)
+            .map { word in
+                let lowered = word.lowercased()
+                return switch lowered {
+                case "api": "API"
+                case "chatgpt": "ChatGPT"
+                case "oauth": "OAuth"
+                case "sso": "SSO"
+                default: lowered.prefix(1).uppercased() + lowered.dropFirst()
+                }
+            }
+            .joined(separator: " ")
     }
 
     private nonisolated static func hasFailedCompletion(_ notifications: [[String: Any]], loginID: String) -> Bool {

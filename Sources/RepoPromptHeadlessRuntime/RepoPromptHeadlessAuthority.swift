@@ -949,7 +949,13 @@ public actor RepoPromptHeadlessAuthority {
         if let prompt = input.initialPrompt, !prompt.isEmpty { transcript.append(TranscriptEntry(entryID: ids.next(), sessionSequence: 1, kind: .human, content: prompt, actor: externalActor, timestamp: clock.now())) }
         let snapshot = SessionSnapshot(sessionID: sessionID, projectID: input.projectID, parentSessionID: input.parentSessionID, rootSessionID: rootSessionID, creator: externalActor, provider: input.provider, model: input.model, visibility: input.visibility, state: .idle, runGeneration: 0, turnEpoch: 0, revision: 1, transcript: transcript, interactions: [], cursor: cursor)
         let agent = AgentSnapshot(agentID: sessionID, sessionID: sessionID, rootSessionID: rootSessionID, parentAgentID: input.parentSessionID, role: input.parentSessionID == nil ? "root" : "child", state: snapshot.state, revision: 1)
-        let permissions = ExecutionPermissionSnapshot(sessionID: sessionID, mode: "workspaceWrite", providerSettings: [:], revision: 1, updatedActor: externalActor)
+        let permissions = ExecutionPermissionSnapshot(
+            sessionID: sessionID,
+            mode: input.initialPermissionMode ?? "workspaceWrite",
+            providerSettings: input.initialProviderSettings ?? [:],
+            revision: 1,
+            updatedActor: externalActor
+        )
         let collaboration = CollaborationMetadataSnapshot(sessionID: sessionID, visibility: input.visibility, collaborativeSteeringEnabled: false, controllerUserID: externalActor.goblinUserID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
         var initialWorktrees: [WorktreeBindingSnapshot] = []
         if input.parentSessionID == nil, let worktreeService, !project.roots.isEmpty {

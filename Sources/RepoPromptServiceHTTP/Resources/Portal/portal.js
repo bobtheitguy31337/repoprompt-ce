@@ -12,7 +12,19 @@
     "overview",
     "cli-providers",
     "agent-models",
+    "agent-permissions",
+    "agent-workflows",
+    "context-builder",
+    "mcp-server",
+    "mcp-tools",
+    "workspace-approvals",
+    "model-presets",
     "api-providers",
+    "openrouter",
+    "custom-api",
+    "model-config",
+    "manage-workspaces",
+    "manage-presets",
   ]);
   const directAuthenticationMethods = new Set([
     "apiKey",
@@ -38,6 +50,8 @@
   const state = {
     providers: [],
     bootstrap: null,
+    desktopSettings: null,
+    settingsMutation: null,
     generatedAt: null,
     route: "home",
     loading: false,
@@ -72,7 +86,7 @@
     search: '<circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3.5 3.5"/>',
     refresh: '<path d="M13 5V2l-2 2a5.5 5.5 0 1 0 1.2 7.8"/>',
     settings:
-      '<circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4"/>',
+      '<path d="M14.7 9V7l-1.8-.6-.4-1 .9-1.7L12 2.3l-1.7.9-1-.4L8.7 1h-2l-.6 1.8-1 .4-1.7-.9L2 3.7l.9 1.7-.4 1L.7 7v2l1.8.6.4 1-.9 1.7 1.4 1.4 1.7-.9 1 .4.6 1.8h2l.6-1.8 1-.4 1.7.9 1.4-1.4-.9-1.7.4-1z"/><circle cx="7.7" cy="8" r="2.2"/>',
     message: '<path d="M2 3.5h12v8H7l-3.5 2v-2H2z"/>',
     folder: '<path d="M1.5 4h5l1.4 1.5h6.6v7.5h-13z"/>',
     workflow:
@@ -88,6 +102,8 @@
     keyboard:
       '<path d="M1.5 4h13v8h-13zM4 7h.1M7 7h.1M10 7h.1M12 7h.1M4 10h8"/>',
     sliders: '<path d="M2 4h12M2 8h12M2 12h12M5 2v4M11 6v4M7 10v4"/>',
+    context:
+      '<path d="M2 3h12v10H2zM5 6h6M5 9h4"/><path d="M1 5V2h3M15 5V2h-3M1 11v3h3M15 11v3h-3"/>',
     server:
       '<rect x="2" y="2" width="12" height="5" rx="1"/><rect x="2" y="9" width="12" height="5" rx="1"/><circle cx="5" cy="4.5" r=".6" fill="currentColor"/><circle cx="5" cy="11.5" r=".6" fill="currentColor"/>',
     cloud:
@@ -385,10 +401,13 @@
     setLoading(true);
     state.loadPromise = (async () => {
       try {
-        const [bootstrap, providerCatalog] = await Promise.all([
-          api("api/v1/bootstrap"),
-          api(`api/v1/provider-settings${refresh ? "?refresh=true" : ""}`),
-        ]);
+        const [bootstrap, providerCatalog, desktopSettings] = await Promise.all(
+          [
+            api("api/v1/bootstrap"),
+            api(`api/v1/provider-settings${refresh ? "?refresh=true" : ""}`),
+            api("api/v1/desktop-settings"),
+          ],
+        );
         if (!providerCatalog || !Array.isArray(providerCatalog.providers)) {
           throw new PortalError("The provider catalog response is incomplete.");
         }
@@ -401,6 +420,7 @@
         state.bootstrap.sessions ||= [];
         state.bootstrap.workflows ||= [];
         state.providers = providerCatalog.providers;
+        state.desktopSettings = desktopSettings;
         state.generatedAt =
           providerCatalog.generatedAt || new Date().toISOString();
         document.getElementById("service-caption").textContent =
@@ -1110,26 +1130,43 @@
         overview: "Overview",
         "cli-providers": "CLI Providers",
         "agent-models": "Agent Models",
+        "agent-permissions": "Agent Permissions",
+        "agent-workflows": "Agent Workflows",
+        "context-builder": "Context Builder",
+        "mcp-server": "MCP Server",
+        "mcp-tools": "Tools",
+        "workspace-approvals": "Workspace Approvals",
+        "model-presets": "Model Presets",
         "api-providers": "API Providers",
+        openrouter: "OpenRouter",
+        "custom-api": "Custom API",
+        "model-config": "Model Config",
+        "manage-workspaces": "Manage Workspaces",
+        "manage-presets": "Manage Presets",
       };
       document.getElementById("settings-detail-title").textContent =
         titles[route.page];
-      if (!state.providers.length && state.loading)
+      const renderers = {
+        overview: renderOverview,
+        "cli-providers": renderCLIProviders,
+        "agent-models": renderDesktopAgentModels,
+        "agent-permissions": renderAgentPermissions,
+        "agent-workflows": renderAgentWorkflows,
+        "context-builder": renderContextBuilder,
+        "mcp-server": renderMCPServer,
+        "mcp-tools": renderMCPTools,
+        "workspace-approvals": renderWorkspaceApprovals,
+        "model-presets": renderModelPresets,
+        "api-providers": renderAPIProviders,
+        openrouter: renderOpenRouter,
+        "custom-api": renderCustomAPI,
+        "model-config": renderModelConfig,
+        "manage-workspaces": renderManageWorkspaces,
+        "manage-presets": renderManagePresets,
+      };
+      if ((!state.providers.length || !state.desktopSettings) && state.loading)
         renderInitialSettingsLoading();
-      else if (route.page === "overview") renderOverview();
-      else if (route.page === "cli-providers") {
-        renderProviders(
-          "cliProvider",
-          "CLI Providers",
-          "Configure provider admission, defaults, and server-isolated authentication for Agent Mode CLI runtimes.",
-        );
-      } else if (route.page === "api-providers") {
-        renderProviders(
-          "apiProvider",
-          "API Providers",
-          "Configure authentication and defaults for direct providers.",
-        );
-      } else renderAgentModels();
+      else renderers[route.page]();
     }
 
     if (state.focusAfterRoute) {
@@ -1178,14 +1215,1180 @@
     return banner;
   }
 
+  function settingValue(key, fallback = "") {
+    return state.desktopSettings?.values?.[key] ?? fallback;
+  }
+
+  function settingBool(key, fallback = false) {
+    const value = settingValue(key, fallback ? "true" : "false");
+    return value === "true";
+  }
+
+  function settingArray(key) {
+    try {
+      const value = JSON.parse(settingValue(key, "[]"));
+      return Array.isArray(value) ? value : [];
+    } catch (_error) {
+      return [];
+    }
+  }
+
+  async function saveSetting(key, value, control) {
+    if (!state.desktopSettings || state.settingsMutation) return;
+    state.settingsMutation = (async () => {
+      if (control) setDisabledReason(control, true, "Saving setting…");
+      try {
+        state.desktopSettings = await api("api/v1/desktop-settings", {
+          method: "PATCH",
+          body: JSON.stringify({
+            expectedRevision: state.desktopSettings.revision,
+            changes: { [key]: String(value) },
+          }),
+        });
+        document.getElementById("settings-freshness").textContent = "Saved";
+        announce("Setting saved");
+        renderRoute();
+      } catch (error) {
+        toast(error.message, true);
+        if (error.code === "staleRevision") await loadAll(false);
+        else renderRoute();
+      } finally {
+        state.settingsMutation = null;
+      }
+    })();
+    return state.settingsMutation;
+  }
+
+  function desktopCard(title, detail) {
+    const card = element("section", "desktop-settings-card");
+    if (title) card.append(element("h2", "", title));
+    if (detail) card.append(element("p", "card-subtitle", detail));
+    return card;
+  }
+
+  function desktopRow(label, detail, control) {
+    const row = element("div", "desktop-setting-row");
+    const copy = element("div", "desktop-setting-copy");
+    copy.append(element("strong", "", label));
+    if (detail) copy.append(element("small", "", detail));
+    row.append(copy, control);
+    return row;
+  }
+
+  function toggleSetting(key, label, detail, fallback = false) {
+    const toggle = element("label", "toggle desktop-toggle");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = settingBool(key, fallback);
+    input.setAttribute("aria-label", label);
+    input.addEventListener("change", () =>
+      saveSetting(key, input.checked, input),
+    );
+    toggle.append(input, element("span"));
+    return desktopRow(label, detail, toggle);
+  }
+
+  function selectSetting(key, label, detail, options, fallback = "") {
+    const select = document.createElement("select");
+    select.setAttribute("aria-label", label);
+    options.forEach(([value, title]) => {
+      const option = element("option", "", title);
+      option.value = value;
+      option.selected = value === settingValue(key, fallback);
+      select.append(option);
+    });
+    select.addEventListener("change", () =>
+      saveSetting(key, select.value, select),
+    );
+    return desktopRow(label, detail, select);
+  }
+
+  function textSetting(key, label, detail, placeholder = "") {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = settingValue(key);
+    input.placeholder = placeholder;
+    input.setAttribute("aria-label", label);
+    input.addEventListener("change", () =>
+      saveSetting(key, input.value.trim(), input),
+    );
+    return desktopRow(label, detail, input);
+  }
+
+  function numberSetting(key, label, detail, min, max, step = 1) {
+    const input = document.createElement("input");
+    input.type = "number";
+    input.min = String(min);
+    input.max = String(max);
+    input.step = String(step);
+    input.value = settingValue(key);
+    input.setAttribute("aria-label", label);
+    input.addEventListener("change", () =>
+      saveSetting(key, input.value, input),
+    );
+    return desktopRow(label, detail, input);
+  }
+
+  function modelChoices(includeAutomatic = true) {
+    const choices = [];
+    if (includeAutomatic) choices.push(["", "Automatic"]);
+    const seen = new Set();
+    orderedProviders().forEach((provider) =>
+      (provider.models || []).forEach((model) => {
+        if (seen.has(model.id)) return;
+        seen.add(model.id);
+        choices.push([
+          model.id,
+          `${model.displayName} · ${provider.displayName}`,
+        ]);
+      }),
+    );
+    return choices;
+  }
+
+  function settingsPage(title, subtitle, icon, cards = [], banner = null) {
+    const content = document.getElementById("settings-content");
+    disposeSensitiveInputs(content);
+    content.replaceChildren(pageHeader(title, subtitle, icon));
+    if (banner) content.append(banner);
+    cards.forEach((card) => content.append(card));
+    installIcons(content);
+  }
+
+  function renderCLIProviders() {
+    const content = document.getElementById("settings-content");
+    disposeSensitiveInputs(content);
+    content.replaceChildren(
+      pageHeader(
+        "CLI Providers",
+        "Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, or Cursor to leverage your existing subscriptions — OpenCode can also proxy any API key.",
+        "terminal",
+      ),
+      recommendation(
+        "check",
+        "CLI providers connected.",
+        "Check recommendations to optimize your setup.",
+      ),
+    );
+    const stack = element("div", "desktop-provider-list");
+    const byID = Object.fromEntries(
+      orderedProviders().map((provider) => [provider.providerID, provider]),
+    );
+    if (byID.codex) stack.append(cliProviderCard(byID.codex));
+    if (byID.claudeCompatible)
+      stack.append(cliProviderCard(byID.claudeCompatible));
+    stack.append(compatibleBackendsCard(byID.claudeCompatible));
+    if (byID.openCodeACP) stack.append(cliProviderCard(byID.openCodeACP));
+    if (byID.cursorACP) stack.append(cliProviderCard(byID.cursorACP));
+    content.append(stack);
+    installIcons(content);
+  }
+
+  function cliProviderCard(provider) {
+    const presentation = desktopProviderPresentation(provider);
+    const details = element("details", "desktop-provider-card");
+    details.dataset.providerId = provider.providerID;
+    const summary = document.createElement("summary");
+    const status = providerStatus(provider);
+    const badge = element("span", `connection-badge ${status.tone}`.trim());
+    badge.append(element("i"), element("span", "", status.label));
+    const name = element("span", "provider-name");
+    name.append(
+      element("strong", "", presentation.title),
+      element("small", "", presentation.subtitle),
+    );
+    summary.append(
+      iconNode("terminal", "provider-glyph"),
+      name,
+      badge,
+      iconNode("chevron"),
+    );
+    const body = element("div", "desktop-provider-body");
+    const connected =
+      provider.authentication?.authenticated &&
+      provider.connection?.state === "connected";
+    if (connected) {
+      body.append(connectedProviderSummary(provider));
+      body.append(providerRuntimeControls(provider));
+    } else {
+      if (provider.providerID === "codex") {
+        const note = element("p", "codex-auth-note");
+        note.append(
+          document.createTextNode(
+            "ChatGPT may require identity verification (KYC) to access Codex. ",
+          ),
+        );
+        const link = element("a", "", "Learn more");
+        link.href = "https://chatgpt.com/cyber";
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        note.append(link);
+        body.append(
+          note,
+          element(
+            "p",
+            "card-subtitle",
+            "Permissions and runtime controls appear here after Codex is connected.",
+          ),
+        );
+      }
+      const message = element(
+        "div",
+        "inline-message info",
+        "Choose a sign-in method to connect this provider.",
+      );
+      message.setAttribute("role", "status");
+      body.append(authenticationMethodChoices(provider, message));
+      if (state.activeFlow?.providerID === provider.providerID)
+        body.append(devicePanel(provider));
+      const directMethods = (
+        provider.capabilities.authenticationMethods || []
+      ).filter((method) => directAuthenticationMethods.has(method));
+      if (directMethods.length)
+        body.append(credentialForm(provider, directMethods));
+      if (!(provider.capabilities.authenticationMethods || []).length) {
+        body.append(
+          element(
+            "p",
+            "unavailable-panel",
+            "Connect this CLI in the server's isolated provider account.",
+          ),
+        );
+      }
+      body.append(message);
+    }
+    details.append(summary, body);
+    return details;
+  }
+
+  function connectedProviderSummary(provider) {
+    const card = desktopCard(
+      provider.providerID === "codex" ? "Signed in to Codex" : "Connected",
+    );
+    const summary = provider.authentication || {};
+    const rows = element("dl", "desktop-account-summary");
+    [
+      [
+        "Account",
+        summary.accountLabel ||
+          provider.connection?.accountLabel ||
+          "Connected account",
+      ],
+      ["Plan", summary.planLabel || "Plan not provided"],
+      [
+        "Authentication",
+        summary.authenticationLabel ||
+          humanize(summary.method || provider.connection?.authenticationMethod),
+      ],
+    ].forEach(([label, value]) => {
+      rows.append(element("dt", "", label), element("dd", "", value));
+    });
+    const actions = element("div", "button-row desktop-connection-actions");
+    const message = element(
+      "div",
+      "inline-message info",
+      "Connection is ready.",
+    );
+    const test = element("button", "secondary-button", "Test Connection");
+    test.type = "button";
+    test.addEventListener("click", () =>
+      runConnectionAction(provider, "test", test, message),
+    );
+    const signOut = element("button", "danger-button subtle", "Sign Out");
+    signOut.type = "button";
+    signOut.addEventListener("click", async () => {
+      const accepted = await confirmAction({
+        title: `Sign out of ${provider.displayName}?`,
+        message: "New agent runs will no longer use this account.",
+        label: "Sign Out",
+        returnFocus: signOut,
+      });
+      if (accepted)
+        await runConnectionAction(provider, "disconnect", signOut, message);
+    });
+    actions.append(test, signOut);
+    card.append(rows, actions, message);
+    return card;
+  }
+
+  function providerRuntimeControls(provider) {
+    const card = desktopCard("Permissions & Runtime");
+    if (provider.providerID === "codex") {
+      card.append(
+        selectSetting(
+          "codexPermissionLevel",
+          "Permission Level",
+          "Controls approvals and sandbox access for direct Codex agents.",
+          [
+            ["readOnly", "Read Only"],
+            ["defaultPermission", "Default Permission"],
+            ["autoReview", "Auto Review"],
+            ["fullAccess", "Full Access"],
+          ],
+          "autoReview",
+        ),
+        element("h3", "desktop-subheading", "Core tools"),
+        toggleSetting(
+          "codexBashEnabled",
+          "Bash",
+          "Allow Codex to run shell commands in its approved execution mode.",
+          true,
+        ),
+        toggleSetting(
+          "codexSearchEnabled",
+          "Search",
+          "Allow live web search requests from Codex.",
+          true,
+        ),
+        toggleSetting(
+          "codexGoalsEnabled",
+          "Goals",
+          "Enable /goal support and the goal lifecycle for Codex Agent Mode.",
+          true,
+        ),
+        toggleSetting(
+          "codexReasoningSummariesEnabled",
+          "Reasoning Summaries",
+          "Request model reasoning summaries for app-server threads.",
+          false,
+        ),
+        toggleSetting(
+          "codexMemoriesEnabled",
+          "Local Memories",
+          "Allow Codex to generate and use memories in its isolated server home.",
+          false,
+        ),
+      );
+      const mcp = desktopRow(
+        "MCP servers",
+        "RepoPrompt is required for Agent Mode.",
+        element("span", "required-pill", "RepoPrompt · Required"),
+      );
+      card.append(mcp);
+    } else if (provider.providerID === "claudeCompatible") {
+      card.append(
+        selectSetting(
+          "claudePermissionLevel",
+          "Permission Level",
+          "Controls Claude Code permission prompts.",
+          [
+            ["requireApproval", "Require Approval"],
+            ["autoApproveEdits", "Auto-Approve Edits"],
+            ["auto", "Auto"],
+            ["fullAccess", "Full Access"],
+          ],
+          "requireApproval",
+        ),
+        element("h3", "desktop-subheading", "Tools"),
+        toggleSetting(
+          "claudeBashEnabled",
+          "Bash",
+          "Allow Claude Code's native Bash tool.",
+          true,
+        ),
+        toggleSetting(
+          "claudeStrictMCPEnabled",
+          "RepoPrompt Only (Strict MCP)",
+          "Launch with strict MCP configuration so only RepoPrompt tools are active.",
+          false,
+        ),
+        toggleSetting(
+          "claudeToolSearchEnabled",
+          "Lazy Tool Loading",
+          "Claude searches for each tool before use; this saves context but adds latency.",
+          true,
+        ),
+      );
+    } else {
+      const key =
+        provider.providerID === "openCodeACP"
+          ? "openCodePermissionLevel"
+          : "cursorPermissionLevel";
+      card.append(
+        selectSetting(
+          key,
+          provider.providerID === "cursorACP"
+            ? "ACP Auto-Approve"
+            : "ACP Session Mode",
+          "Choose the provider's managed mode or full access.",
+          [
+            ["managedDefault", "Managed Default"],
+            ["fullAccess", "Full Access"],
+          ],
+          "managedDefault",
+        ),
+      );
+    }
+    return card;
+  }
+
+  function compatibleBackendsCard(provider) {
+    const details = element(
+      "details",
+      "desktop-provider-card compatible-provider-card",
+    );
+    const summary = document.createElement("summary");
+    const name = element("span", "provider-name");
+    name.append(
+      element("strong", "", "Claude Code–Compatible Backends"),
+      element(
+        "small",
+        "",
+        "Use Claude Code with GLM (Z.AI), Kimi (Moonshot AI), or a custom compatible endpoint.",
+      ),
+    );
+    const badge = element("span", "connection-badge");
+    badge.append(
+      element("i"),
+      element(
+        "span",
+        "",
+        provider?.authentication?.authenticated
+          ? "Available"
+          : "Not configured",
+      ),
+    );
+    summary.append(
+      iconNode("terminal", "provider-glyph"),
+      name,
+      badge,
+      iconNode("chevron"),
+    );
+    const body = element("div", "compatible-backend-list");
+    [
+      ["GLM (Z.AI)", "Z.AI's Claude-compatible API"],
+      ["Kimi (Moonshot AI)", "Moonshot AI's Claude-compatible API"],
+      ["Custom Provider", "Any Claude Code-compatible endpoint"],
+    ].forEach(([title, subtitle]) => {
+      const row = element("div", "compact-backend-row");
+      const copy = element("span", "provider-name");
+      copy.append(element("strong", "", title), element("small", "", subtitle));
+      row.append(copy, element("span", "connection-badge", "Not configured"));
+      body.append(row);
+    });
+    details.append(summary, body);
+    return details;
+  }
+
+  function renderDesktopAgentModels() {
+    const routing = desktopCard(
+      "Agent Model Routing",
+      "Set global models for Oracle, Context Builder, and Agent roles. Workspace overrides inherit these values.",
+    );
+    routing.append(
+      selectSetting(
+        "oracleModel",
+        "Oracle Model",
+        "Used for Oracle chat, planning, and review.",
+        modelChoices(),
+        "",
+      ),
+      selectSetting(
+        "contextBuilderAgent",
+        "Context Builder Agent",
+        "Agent used for discovery and prompt enhancement.",
+        [
+          ["codexExec", "Codex"],
+          ["claudeCode", "Claude Code"],
+          ["openCode", "OpenCode"],
+          ["cursor", "Cursor"],
+        ],
+        "codexExec",
+      ),
+      selectSetting(
+        "contextBuilderModel",
+        "Context Builder Model",
+        "Optional model override for Context Builder.",
+        modelChoices(),
+        "",
+      ),
+    );
+    const roles = desktopCard(
+      "Agent Role Defaults",
+      "Role labels keep workflow and MCP discovery stable while models change.",
+    );
+    [
+      ["exploreRoleModel", "Explore"],
+      ["engineerRoleModel", "Engineer"],
+      ["pairRoleModel", "Pair"],
+      ["designRoleModel", "Design"],
+    ].forEach(([key, label]) =>
+      roles.append(
+        selectSetting(key, label, `${label} agent model.`, modelChoices(), ""),
+      ),
+    );
+    roles.append(
+      toggleSetting(
+        "restrictAgentDiscoveryToRoles",
+        "Hide non-role models from MCP agents",
+        "Restrict agent discovery to configured role labels.",
+        false,
+      ),
+    );
+    settingsPage(
+      "Agent Models",
+      "Choose model routing for direct agents, sub-agents, Oracle, and Context Builder.",
+      "model",
+      [routing, roles],
+      recommendation(
+        "model",
+        "Shared server defaults",
+        "All portal users and server agents use this profile unless a session supplies an explicit model.",
+      ),
+    );
+  }
+
+  function renderAgentPermissions() {
+    const direct = desktopCard(
+      "Direct Agents",
+      "Provider-specific controls are shared with each connected CLI provider.",
+    );
+    direct.append(
+      selectSetting(
+        "serverDefaultExecutionMode",
+        "Default Execution Mode",
+        "Fallback mode for providers without a more specific permission setting.",
+        [
+          ["readOnly", "Read Only"],
+          ["workspaceWrite", "Workspace Write"],
+          ["fullAccess", "Full Access"],
+        ],
+        "workspaceWrite",
+      ),
+      selectSetting(
+        "codexPermissionLevel",
+        "Codex",
+        "Direct Codex agent permissions.",
+        [
+          ["readOnly", "Read Only"],
+          ["defaultPermission", "Default Permission"],
+          ["autoReview", "Auto Review"],
+          ["fullAccess", "Full Access"],
+        ],
+        "autoReview",
+      ),
+      selectSetting(
+        "claudePermissionLevel",
+        "Claude Code",
+        "Direct Claude Code agent permissions.",
+        [
+          ["requireApproval", "Require Approval"],
+          ["autoApproveEdits", "Auto-Approve Edits"],
+          ["auto", "Auto"],
+          ["fullAccess", "Full Access"],
+        ],
+        "requireApproval",
+      ),
+    );
+    const subagents = desktopCard(
+      "Sub-Agents",
+      "Safe Managed is recommended and keeps delegated agents inside bounded permissions.",
+    );
+    subagents.append(
+      selectSetting(
+        "subagentPolicy",
+        "Permission Policy",
+        "Controls how sub-agents derive provider permissions.",
+        [
+          ["safeManaged", "Safe Managed"],
+          ["inheritProviderSettings", "Inherit Provider Settings"],
+          ["custom", "Custom"],
+        ],
+        "safeManaged",
+      ),
+    );
+    if (settingValue("subagentPolicy", "safeManaged") === "custom") {
+      subagents.append(
+        selectSetting(
+          "subagentCodexPermissionLevel",
+          "Codex",
+          "Custom sub-agent permission.",
+          [
+            ["readOnly", "Read Only"],
+            ["defaultPermission", "Default Permission"],
+            ["autoReview", "Auto Review"],
+            ["fullAccess", "Full Access"],
+          ],
+          "autoReview",
+        ),
+        selectSetting(
+          "subagentClaudePermissionLevel",
+          "Claude Code",
+          "Custom sub-agent permission.",
+          [
+            ["requireApproval", "Require Approval"],
+            ["autoApproveEdits", "Auto-Approve Edits"],
+            ["auto", "Auto"],
+            ["fullAccess", "Full Access"],
+          ],
+          "requireApproval",
+        ),
+      );
+    }
+    settingsPage(
+      "Agent Permissions",
+      "Configure direct-agent and sub-agent permission policies.",
+      "shield",
+      [direct, subagents],
+      recommendation(
+        "shield",
+        "Safe Managed",
+        "Sub-agents can read and reason broadly while destructive or unrestricted actions remain bounded.",
+      ),
+    );
+  }
+
+  function renderAgentWorkflows() {
+    const card = desktopCard(
+      "Featured Workflows",
+      "Choose which built-in workflows appear and arrange their order.",
+    );
+    card.append(
+      toggleSetting(
+        "includeWorkflowCleanupGuidance",
+        "Include cleanup guidance",
+        "Tell workflow agents to clean completed temporary worktrees and artifacts.",
+        true,
+      ),
+    );
+    const list = element("div", "workflow-settings-list");
+    const labels = {
+      build: "Build",
+      investigate: "Investigate",
+      oracleExport: "Oracle Export",
+      orchestrate: "Orchestrate",
+      optimize: "Optimize",
+      deepPlan: "Deep Plan",
+    };
+    settingArray("featuredWorkflows").forEach((workflow, index, workflows) => {
+      const row = element("div", "desktop-setting-row compact");
+      row.append(element("strong", "", labels[workflow] || humanize(workflow)));
+      const buttons = element("div", "button-row");
+      [
+        ["↑", index - 1],
+        ["↓", index + 1],
+      ].forEach(([label, target]) => {
+        const button = element("button", "small-icon-button text-icon", label);
+        button.type = "button";
+        button.disabled = target < 0 || target >= workflows.length;
+        button.addEventListener("click", () => {
+          const next = [...workflows];
+          [next[index], next[target]] = [next[target], next[index]];
+          saveSetting("featuredWorkflows", JSON.stringify(next), button);
+        });
+        buttons.append(button);
+      });
+      row.append(buttons);
+      list.append(row);
+    });
+    card.append(list);
+    const custom = desktopCard(
+      "Custom Workflows",
+      "Custom workflow documents are stored on the server and shared with portal agents.",
+    );
+    const workflows = settingArray("customWorkflows");
+    custom.append(
+      element(
+        "p",
+        workflows.length ? "card-subtitle" : "empty-inline",
+        workflows.length
+          ? `${workflows.length} custom workflow${workflows.length === 1 ? "" : "s"}.`
+          : "No custom workflows.",
+      ),
+    );
+    settingsPage(
+      "Agent Workflows",
+      "Control built-in workflow recommendations and shared custom workflows.",
+      "workflow",
+      [card, custom],
+    );
+  }
+
+  function renderContextBuilder() {
+    const about = desktopCard(
+      "About",
+      "Context Builder discovers relevant code, curates file context, and can improve the prompt before an agent begins.",
+    );
+    const agent = desktopCard("Context Builder Agent");
+    agent.append(
+      selectSetting(
+        "contextBuilderAgent",
+        "Agent",
+        "Provider used for Context Builder.",
+        [
+          ["codexExec", "Codex"],
+          ["claudeCode", "Claude Code"],
+          ["openCode", "OpenCode"],
+          ["cursor", "Cursor"],
+        ],
+        "codexExec",
+      ),
+      selectSetting(
+        "contextBuilderModel",
+        "Model",
+        "Optional model override.",
+        modelChoices(),
+        "",
+      ),
+    );
+    const shared = desktopCard("Shared Settings");
+    shared.append(
+      numberSetting(
+        "contextBuilderBudget",
+        "Context Budget",
+        "Maximum selected-context token budget.",
+        8000,
+        240000,
+        1000,
+      ),
+      selectSetting(
+        "contextBuilderEnhancementMode",
+        "Prompt Enhancement",
+        "Choose whether Context Builder rewrites, augments, or preserves the prompt.",
+        [
+          ["fullRewrite", "Rewrite"],
+          ["augment", "Augment"],
+          ["preserve", "Preserve"],
+        ],
+        "fullRewrite",
+      ),
+      selectSetting(
+        "contextBuilderQuestionTimeout",
+        "Question Timeout",
+        "How long server clarification prompts wait.",
+        [
+          ["30", "30 seconds"],
+          ["60", "1 minute"],
+          ["120", "2 minutes"],
+          ["300", "5 minutes"],
+        ],
+        "60",
+      ),
+      toggleSetting(
+        "contextBuilderUIClarifyingQuestions",
+        "UI clarifying questions",
+        "Allow Context Builder to ask the portal user focused questions.",
+        true,
+      ),
+      toggleSetting(
+        "contextBuilderFollowUpAnalysis",
+        "Follow-up analysis",
+        "Run an Oracle-backed analysis after context discovery.",
+        false,
+      ),
+      numberSetting(
+        "contextBuilderAnalysisBudget",
+        "Analysis Budget",
+        "Maximum analysis token budget.",
+        8000,
+        240000,
+        1000,
+      ),
+      toggleSetting(
+        "contextBuilderMCPClarifyingQuestions",
+        "MCP clarifying questions",
+        "Allow clarification when Context Builder is invoked through MCP.",
+        false,
+      ),
+      textSetting(
+        "contextBuilderCustomInstructions",
+        "Custom Instructions",
+        "Additional shared guidance for Context Builder.",
+        "Optional instructions",
+      ),
+    );
+    settingsPage(
+      "Context Builder",
+      "Configure context discovery, prompt enhancement, and optional follow-up analysis.",
+      "context",
+      [about, agent, shared],
+    );
+  }
+
+  function renderMCPServer() {
+    const status = desktopCard(
+      "MCP Server",
+      "RepoPrompt's MCP server exposes approved tools to connected agents.",
+    );
+    status.append(
+      desktopRow(
+        "Server Status",
+        "Managed by the shared RepoPrompt service.",
+        element(
+          "span",
+          "required-pill",
+          state.online ? "Running" : "Unavailable",
+        ),
+      ),
+      toggleSetting(
+        "mcpToolsEnabled",
+        "Tools enabled",
+        "Allow approved MCP tools for server agents.",
+        true,
+      ),
+      toggleSetting(
+        "mcpUseModelPresets",
+        "Oracle Model Presets",
+        "Expose shared model presets to Oracle operations.",
+        true,
+      ),
+    );
+    settingsPage(
+      "MCP Server",
+      "Manage shared MCP availability and model behavior.",
+      "server",
+      [status],
+    );
+  }
+
+  function renderMCPTools() {
+    const card = desktopCard(
+      "MCP Tools",
+      "Enable tools for the shared server. Disabled tools remain unavailable to all portal agents.",
+    );
+    const disabled = new Set(settingArray("mcpDisabledTools"));
+    [
+      ["file_search", "File Search"],
+      ["read_file", "Read File"],
+      ["get_file_tree", "File Tree"],
+      ["apply_edits", "Apply Edits"],
+      ["manage_selection", "Manage Selection"],
+      ["manage_worktree", "Worktrees"],
+      ["ask_oracle", "Oracle"],
+    ].forEach(([id, label]) => {
+      const toggle = element("label", "toggle desktop-toggle");
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = !disabled.has(id);
+      input.setAttribute("aria-label", label);
+      input.addEventListener("change", () => {
+        const next = new Set(disabled);
+        if (input.checked) next.delete(id);
+        else next.add(id);
+        saveSetting(
+          "mcpDisabledTools",
+          JSON.stringify([...next].sort()),
+          input,
+        );
+      });
+      toggle.append(input, element("span"));
+      card.append(desktopRow(label, `Allow the ${label} MCP tool.`, toggle));
+    });
+    settingsPage(
+      "Tools",
+      "Choose which RepoPrompt MCP tools agents can call.",
+      "sliders",
+      [card],
+    );
+  }
+
+  function renderWorkspaceApprovals() {
+    const card = desktopCard(
+      "Workspace Approvals",
+      "Set server-wide defaults for operations that require explicit workspace approval.",
+    );
+    card.append(
+      toggleSetting(
+        "workspaceApprovalsGlobal",
+        "Require workspace approvals",
+        "Apply approval rules to all shared projects.",
+        false,
+      ),
+    );
+    const selected = new Set(settingArray("workspaceApprovalOperations"));
+    ["write", "move", "delete", "git", "worktree"].forEach((operation) => {
+      const toggle = element("label", "toggle desktop-toggle");
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = selected.has(operation);
+      input.addEventListener("change", () => {
+        const next = new Set(selected);
+        if (input.checked) next.add(operation);
+        else next.delete(operation);
+        saveSetting(
+          "workspaceApprovalOperations",
+          JSON.stringify([...next].sort()),
+          input,
+        );
+      });
+      toggle.append(input, element("span"));
+      card.append(
+        desktopRow(
+          humanize(operation),
+          `Require approval for ${operation} operations.`,
+          toggle,
+        ),
+      );
+    });
+    settingsPage(
+      "Workspace Approvals",
+      "Configure approval boundaries for shared project operations.",
+      "shield",
+      [card],
+    );
+  }
+
+  function renderModelPresets() {
+    const card = desktopCard(
+      "Model Presets",
+      "Reusable Oracle and agent model selections shared by the server.",
+    );
+    const presets = settingArray("modelPresets");
+    card.append(
+      element(
+        "p",
+        presets.length ? "card-subtitle" : "empty-inline",
+        presets.length
+          ? `${presets.length} model preset${presets.length === 1 ? "" : "s"}.`
+          : "No model presets configured.",
+      ),
+    );
+    settingsPage(
+      "Model Presets",
+      "Manage shared model presets used by MCP and Oracle.",
+      "model",
+      [card],
+    );
+  }
+
+  function renderAPIProviders() {
+    const providers = orderedProviders().filter(
+      (provider) =>
+        provider.category === "apiProvider" && provider.deploymentAllowed,
+    );
+    const cards = providers.map((provider) => {
+      const card = desktopCard(provider.displayName, provider.summary);
+      if (provider.authentication?.authenticated)
+        card.append(connectedProviderSummary(provider));
+      else {
+        const direct = (
+          provider.capabilities.authenticationMethods || []
+        ).filter((method) => directAuthenticationMethods.has(method));
+        if (direct.length) card.append(credentialForm(provider, direct));
+        else
+          card.append(
+            element(
+              "p",
+              "empty-inline",
+              "No browser-manageable authentication method is advertised.",
+            ),
+          );
+      }
+      return card;
+    });
+    if (!cards.length)
+      cards.push(
+        desktopCard(
+          "No API Providers",
+          "No direct API provider runtime is currently advertised by this server.",
+        ),
+      );
+    settingsPage(
+      "API Providers",
+      "Configure direct API provider authentication. Model routing remains in Agent Models and Model Config.",
+      "cloud",
+      cards,
+    );
+  }
+
+  function renderOpenRouter() {
+    const card = desktopCard(
+      "OpenRouter",
+      "Control server model catalog behavior for OpenRouter-backed configurations.",
+    );
+    card.append(
+      toggleSetting(
+        "openRouterIncludeDefaults",
+        "Include OpenRouter defaults",
+        "Show the default OpenRouter model catalog.",
+        true,
+      ),
+      toggleSetting(
+        "openRouterUseCustomSettings",
+        "Use custom settings",
+        "Override the default maximum output tokens.",
+        false,
+      ),
+      numberSetting(
+        "openRouterMaxTokens",
+        "Maximum Output Tokens",
+        "Zero uses the provider default.",
+        0,
+        2000000,
+        1000,
+      ),
+    );
+    settingsPage(
+      "OpenRouter",
+      "Configure shared OpenRouter catalog defaults.",
+      "cloud",
+      [card],
+    );
+  }
+
+  function renderCustomAPI() {
+    const card = desktopCard(
+      "Custom API",
+      "Configure portable request behavior for server-managed custom API providers.",
+    );
+    card.append(
+      toggleSetting(
+        "customProviderIncludeContentType",
+        "Include Content-Type header",
+        "Send application/json when the provider does not add it automatically.",
+        true,
+      ),
+    );
+    settingsPage(
+      "Custom API",
+      "Set shared behavior for custom API connections.",
+      "sliders",
+      [card],
+    );
+  }
+
+  function renderModelConfig() {
+    const card = desktopCard(
+      "Model Config",
+      "Per-model overrides are shared by Agent Models, Oracle, and Context Builder.",
+    );
+    const overrides = settingArray("modelOverrides");
+    card.append(
+      selectSetting(
+        "openAIServiceTier",
+        "OpenAI Service Tier",
+        "Default tier for direct OpenAI API model requests; CLI provider connections do not use this control.",
+        [
+          ["auto", "Auto"],
+          ["default", "Default"],
+          ["flex", "Flex"],
+          ["priority", "Priority"],
+        ],
+        "auto",
+      ),
+      toggleSetting(
+        "openAIShowServiceTierVariants",
+        "Show service tier variants",
+        "Expose tier variants in shared model selection.",
+        false,
+      ),
+      element(
+        "p",
+        overrides.length ? "card-subtitle" : "empty-inline",
+        overrides.length
+          ? `${overrides.length} model override${overrides.length === 1 ? "" : "s"}.`
+          : "No model overrides configured.",
+      ),
+    );
+    settingsPage(
+      "Model Config",
+      "Manage shared model capability overrides.",
+      "model",
+      [card],
+    );
+  }
+
+  function renderManageWorkspaces() {
+    const projects = state.bootstrap?.projects || [];
+    const card = desktopCard(
+      "Manage Workspaces",
+      "Projects available to this shared server.",
+    );
+    const list = element("div", "glance-list");
+    projects.forEach((project) => {
+      const row = element("div", "glance-item static");
+      row.append(
+        element("strong", "", project.name || project.projectId),
+        element(
+          "small",
+          "",
+          `${project.rootCount ?? project.roots?.length ?? 0} roots`,
+        ),
+      );
+      list.append(row);
+    });
+    if (!projects.length)
+      list.append(
+        element("p", "empty-inline", "No server projects are available."),
+      );
+    card.append(list);
+    const worktrees = desktopCard(
+      "Worktrees",
+      "Defaults for server-owned session worktrees.",
+    );
+    worktrees.append(
+      selectSetting(
+        "defaultWorktreeMode",
+        "Default Worktree Mode",
+        "Create an isolated worktree for each root session or use the current checkout.",
+        [
+          ["isolated", "Isolated Worktree"],
+          ["currentCheckout", "Current Checkout"],
+          ["disabled", "Disabled"],
+        ],
+        "isolated",
+      ),
+      textSetting(
+        "worktreeBaseRef",
+        "Base Reference",
+        "Optional Git ref used when creating isolated worktrees.",
+        "Repository default branch",
+      ),
+      toggleSetting(
+        "removeCompletedWorktrees",
+        "Remove completed worktrees",
+        "Clean server-owned worktrees after successful workflow completion.",
+        false,
+      ),
+    );
+    settingsPage(
+      "Manage Workspaces",
+      "Review shared projects and configure server worktree defaults.",
+      "folder",
+      [card, worktrees],
+    );
+  }
+
+  function renderManagePresets() {
+    const card = desktopCard(
+      "Manage Presets",
+      "Workflow presets advertised by the shared server.",
+    );
+    const workflows = state.bootstrap?.workflows || [];
+    const list = element("div", "glance-list");
+    workflows.forEach((workflow) => {
+      const row = element("div", "glance-item static");
+      row.append(
+        element("strong", "", workflow.name),
+        element("small", "", workflow.enabled ? "Enabled" : "Disabled"),
+      );
+      list.append(row);
+    });
+    if (!workflows.length)
+      list.append(
+        element(
+          "p",
+          "empty-inline",
+          "No server workflow presets are available.",
+        ),
+      );
+    card.append(list);
+    settingsPage(
+      "Manage Presets",
+      "Review workflow presets available to shared agents.",
+      "workflow",
+      [card],
+    );
+  }
+
   function renderOverview() {
     const content = document.getElementById("settings-content");
     disposeSensitiveInputs(content);
     content.replaceChildren();
     content.append(
       pageHeader(
-        "Provider Settings",
-        "Manage provider models, preferences, and connections.",
+        "Agent Mode",
+        "Configure shared agent behavior, provider connections, models, permissions, workflows, and Context Builder.",
         "agent",
       ),
     );
@@ -1198,15 +2401,46 @@
       const empty = element("div", "empty-state-panel");
       empty.append(
         element("h2", "", "No provider catalog"),
-        element(
-          "p",
-          "",
-          "Refresh after the provider catalog loads.",
-        ),
+        element("p", "", "Refresh after the provider catalog loads."),
       );
       content.append(empty);
       return;
     }
+
+    const defaults = desktopCard(
+      "Session Defaults",
+      "Shared behavior for new server agent sessions.",
+    );
+    defaults.append(
+      selectSetting(
+        "providerConversationCleanupAction",
+        "Conversation Cleanup",
+        "Choose what happens to provider-side conversations after cleanup.",
+        [
+          ["archive", "Archive"],
+          ["delete", "Delete"],
+        ],
+        "archive",
+      ),
+      textSetting(
+        "agentSessionHandoffInstructions",
+        "Handoff Instructions",
+        "Instructions included when an agent hands work to another agent.",
+        "Optional handoff guidance",
+      ),
+      selectSetting(
+        "serverDefaultExecutionMode",
+        "Execution Mode",
+        "Fallback execution mode for new sessions.",
+        [
+          ["readOnly", "Read Only"],
+          ["workspaceWrite", "Workspace Write"],
+          ["fullAccess", "Full Access"],
+        ],
+        "workspaceWrite",
+      ),
+    );
+    content.append(defaults);
 
     const card = element("section", "settings-card");
     card.append(
@@ -2574,6 +3808,7 @@
       disposeSensitiveInputs,
       whenIdle: async () => {
         await state.loadPromise;
+        await state.settingsMutation;
         await state.agent.transcriptPromise;
         await state.agent.mutationPromise;
       },

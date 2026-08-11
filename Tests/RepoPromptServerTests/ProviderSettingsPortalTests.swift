@@ -26,13 +26,48 @@ final class ProviderSettingsPortalTests: XCTestCase {
         let persisted = try await store.providerSettings()
         let metadata = try await store.metadata()
         XCTAssertEqual(persisted, [initial])
-        XCTAssertEqual(metadata.schemaVersion, 4)
+        XCTAssertEqual(metadata.schemaVersion, 5)
 
         do {
             _ = try await store.upsertProviderSettings(initial, expectedRevision: 0)
             XCTFail("expected stale revision")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .staleRevision)
+        }
+    }
+
+    func testPortalDesktopSettingsAreVersionedValidatedAndAppliedToRuntimeDefaults() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let service = PortalDesktopSettingsService(store: store)
+
+        let initial = try await service.snapshot()
+        XCTAssertEqual(initial.revision, 0)
+        XCTAssertEqual(initial.values[PortalDesktopSettingKey.codexPermissionLevel.rawValue], "autoReview")
+        XCTAssertNil(initial.values["appearanceMode"])
+
+        let updated = try await service.update(.init(expectedRevision: 0, changes: [
+            PortalDesktopSettingKey.codexPermissionLevel.rawValue: "readOnly",
+            PortalDesktopSettingKey.codexBashEnabled.rawValue: "false",
+            PortalDesktopSettingKey.codexGoalsEnabled.rawValue: "false"
+        ]))
+        XCTAssertEqual(updated.revision, 1)
+        let defaults = try await service.runtimeDefaults(for: .codex)
+        XCTAssertEqual(defaults.mode, "readOnly")
+        XCTAssertEqual(defaults.providerSettings["codex.bashEnabled"], "false")
+        XCTAssertEqual(defaults.providerSettings["codex.goalsEnabled"], "false")
+
+        do {
+            _ = try await service.update(.init(expectedRevision: 0, changes: [PortalDesktopSettingKey.codexBashEnabled.rawValue: "true"]))
+            XCTFail("expected stale settings revision")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .staleRevision)
+        }
+        do {
+            _ = try await service.update(.init(expectedRevision: 1, changes: ["appearanceMode": "dark"]))
+            XCTFail("desktop-only settings must not enter the server contract")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
         }
     }
 

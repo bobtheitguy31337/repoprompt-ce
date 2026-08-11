@@ -1506,6 +1506,40 @@ public actor SQLiteServiceStore {
             && !ProviderSecretRedaction.containsLikelySecret(value)
     }
 
+    public func portalDesktopSettings() async throws -> PortalDesktopSettingsSnapshot? {
+        guard let row = try await connection.query(
+            "SELECT schema_version,values_json,revision,updated_at FROM portal_desktop_settings WHERE fixed_id=1"
+        ).first,
+            let valuesJSON = row.column("values_json")?.string
+        else { return nil }
+        return try PortalDesktopSettingsSnapshot(
+            schemaVersion: row.column("schema_version")?.integer ?? 1,
+            revision: Int64(row.column("revision")?.integer ?? 0),
+            values: decoder.decode([String: String].self, from: Data(valuesJSON.utf8)),
+            updatedAt: Date(timeIntervalSince1970: row.column("updated_at")?.double ?? 0)
+        )
+    }
+
+    @discardableResult
+    public func upsertPortalDesktopSettings(
+        _ snapshot: PortalDesktopSettingsSnapshot,
+        expectedRevision: Int64
+    ) async throws -> PortalDesktopSettingsSnapshot {
+        try await transaction {
+            let observed = Int64(try await connection.query(
+                "SELECT revision FROM portal_desktop_settings WHERE fixed_id=1"
+            ).first?.column("revision")?.integer ?? 0)
+            guard observed == expectedRevision, snapshot.revision == expectedRevision + 1 else {
+                throw ServiceAPIError(code: .staleRevision, message: "Settings revision is stale", currentRevision: observed)
+            }
+            _ = try await connection.query(
+                "INSERT INTO portal_desktop_settings(fixed_id,schema_version,values_json,revision,updated_at) VALUES(1,1,?,?,?) ON CONFLICT(fixed_id) DO UPDATE SET values_json=excluded.values_json,revision=excluded.revision,updated_at=excluded.updated_at",
+                [.text(encodeText(snapshot.values)), .integer(Int(snapshot.revision)), .float(snapshot.updatedAt.timeIntervalSince1970)]
+            )
+            return snapshot
+        }
+    }
+
     public func providerSettings() async throws -> [ProviderSettingsPreference] {
         try await connection.query(
             "SELECT provider_id,enabled,default_model,reasoning_effort,speed_mode,service_tier,revision FROM provider_settings ORDER BY provider_id"
@@ -1593,6 +1627,9 @@ public actor SQLiteServiceStore {
         for statement in SchemaV4.statements {
             _ = try await connection.query(statement)
         }
+        for statement in SchemaV5.statements {
+            _ = try await connection.query(statement)
+        }
         let count = try await connection.query("SELECT COUNT(*) AS count FROM service_metadata").first?.column("count")?.integer ?? 0
         if count == 0 {
             _ = try await connection.query("INSERT INTO service_metadata(fixed_id,store_id,schema_version,created_at,last_clean_shutdown,current_boot_epoch,next_global_sequence,replay_floor) VALUES(1,?,1,CURRENT_TIMESTAMP,0,1,1,0)", [.text(UUID().uuidString)])
@@ -1626,6 +1663,15 @@ public actor SQLiteServiceStore {
         } else {
             _ = try await connection.query("UPDATE service_metadata SET schema_version=4 WHERE fixed_id=1")
             _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v4',4,'provider connection metadata and secret-free audit attribution',?,CURRENT_TIMESTAMP)", [.text(SchemaV4.digest)])
+        }
+        let v5 = try await connection.query("SELECT digest FROM schema_migrations WHERE version=5").first
+        if let v5 {
+            guard v5.column("digest")?.string == SchemaV5.digest else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Schema v5 migration digest mismatch", retryable: false)
+            }
+        } else {
+            _ = try await connection.query("UPDATE service_metadata SET schema_version=5 WHERE fixed_id=1")
+            _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v5',5,'server-authoritative Desktop settings projection',?,CURRENT_TIMESTAMP)", [.text(SchemaV5.digest)])
         }
     }
 

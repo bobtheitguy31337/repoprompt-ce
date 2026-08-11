@@ -60,6 +60,7 @@ public actor ProviderSettingsService {
     private var modelCatalogs: [ProviderSettingsID: [ProviderModelCatalogEntry]] = [:]
     private var connections: [ProviderSettingsID: SQLiteServiceStore.StoredProviderConnection] = [:]
     private var managedAuthFlowDescriptors: [ProviderSettingsID: [ProviderAuthFlowDescriptor]] = [:]
+    private var managedAccountSummaries: [ProviderSettingsID: ProviderManagedAccountSummary] = [:]
     private var authFlowContexts: [UUID: AuthFlowContext] = [:]
 
     public init(
@@ -493,6 +494,7 @@ public actor ProviderSettingsService {
     private func reconcileManagedAuthentication(attribution: ProviderMutationAttribution) async throws {
         let providerID = ProviderSettingsID.codex
         let state = await managedAuthentication.authenticationState(providerID: providerID)
+        managedAccountSummaries[providerID] = await managedAuthentication.accountSummary(providerID: providerID)
         let current = connections[providerID]
         if current == nil, case let .authenticated(accountLabel) = state {
             let now = Date()
@@ -717,7 +719,9 @@ public actor ProviderSettingsService {
                 state: connection.state == .connected && !expired ? .authenticated : .attention,
                 authenticated: connection.state == .connected && !expired,
                 method: connection.authenticationMethod,
-                accountLabel: connection.accountLabel,
+                accountLabel: managedAccountSummaries[providerID]?.account ?? connection.accountLabel,
+                planLabel: managedAccountSummaries[providerID]?.plan,
+                authenticationLabel: managedAccountSummaries[providerID]?.authentication,
                 expiresAt: connection.expiresAt,
                 detail: expired ? "Provider credential has expired" : connection.detail
             )
