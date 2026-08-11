@@ -333,10 +333,12 @@ private actor NativeJSONLineProcess {
         try await send(object)
     }
 
-    func request(method: String, params: [String: Any]? = nil, onFrame: @escaping @Sendable (Data) async throws -> Void) async throws -> Data {
+    func request(method: String, params: [String: Any]? = nil, timeout: Duration? = nil, onFrame: @escaping @Sendable (Data) async throws -> Void) async throws -> Data {
         let id = try await beginRequest(method: method, params: params)
+        let clock = ContinuousClock()
+        let deadline = timeout.map { clock.now.advanced(by: $0) }
         while true {
-            let line = try await nextLine()
+            let line = try await nextLine(deadline: deadline)
             guard let frame = try JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
             if (frame["id"] as? Int) == id {
                 if let error = frame["error"] as? [String: Any] {
@@ -370,8 +372,12 @@ private actor NativeJSONLineProcess {
         try await processPort.write(line, to: captured)
     }
 
-    func nextLine() async throws -> Data {
+    func nextLine(deadline: ContinuousClock.Instant? = nil) async throws -> Data {
+        let clock = ContinuousClock()
         while true {
+            if let deadline, clock.now >= deadline {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider protocol request timed out")
+            }
             if let newline = buffer.firstIndex(of: 0x0A) {
                 let line = Data(buffer[..<newline])
                 buffer.removeSubrange(...newline)
@@ -489,7 +495,7 @@ private actor CodexAppServerProviderRuntime: AgentProviderRuntime {
         do {
             let process = try await support.makeSession(runID: runID, arguments: ["app-server"], workingDirectory: FileManager.default.currentDirectoryPath, includeCredentials: false)
             preflightProcess = process
-            _ = try await process.request(method: "initialize", params: ["clientInfo": ["name": "repoprompt-server-preflight", "title": "RepoPrompt Server Preflight", "version": "1"], "capabilities": ["experimentalApi": true]], onFrame: { _ in })
+            _ = try await process.request(method: "initialize", params: ["clientInfo": ["name": "repoprompt-server-preflight", "title": "RepoPrompt Server Preflight", "version": "1"], "capabilities": ["experimentalApi": true]], timeout: .seconds(2), onFrame: { _ in })
             try await process.notify(method: "initialized")
             await process.finish()
             return base
@@ -726,7 +732,7 @@ private actor ACPProviderRuntime: AgentProviderRuntime {
         do {
             let process = try await support.makeSession(runID: UUID(), arguments: arguments, workingDirectory: FileManager.default.currentDirectoryPath)
             preflightProcess = process
-            let response = try await process.request(method: "initialize", params: ["protocolVersion": 1, "clientInfo": ["name": "RepoPrompt Preflight", "version": "1"], "clientCapabilities": ["fs": ["readTextFile": false, "writeTextFile": false], "terminal": false]], onFrame: { _ in })
+            let response = try await process.request(method: "initialize", params: ["protocolVersion": 1, "clientInfo": ["name": "RepoPrompt Preflight", "version": "1"], "clientCapabilities": ["fs": ["readTextFile": false, "writeTextFile": false], "terminal": false]], timeout: .seconds(2), onFrame: { _ in })
             let object = try CodexAppServerProviderRuntime.object(response)
             guard object["agentCapabilities"] is [String: Any] else {
                 throw ServiceAPIError(code: .dependencyUnavailable, message: "ACP initialize omitted agent capabilities")
@@ -1183,7 +1189,7 @@ private actor MCPStdioProviderRuntime: AgentProviderRuntime {
         do {
             let process = try await support.makeSession(runID: UUID(), arguments: arguments, workingDirectory: FileManager.default.currentDirectoryPath)
             preflightProcess = process
-            let initialized = try await process.request(method: "initialize", params: ["protocolVersion": "2025-03-26", "capabilities": [:], "clientInfo": ["name": "RepoPromptServerPreflight", "version": "1"]], onFrame: { _ in })
+            let initialized = try await process.request(method: "initialize", params: ["protocolVersion": "2025-03-26", "capabilities": [:], "clientInfo": ["name": "RepoPromptServerPreflight", "version": "1"]], timeout: .seconds(2), onFrame: { _ in })
             let object = try CodexAppServerProviderRuntime.object(initialized)
             guard object["protocolVersion"] is String else {
                 throw ServiceAPIError(code: .dependencyUnavailable, message: "MCP initialize omitted protocol version")

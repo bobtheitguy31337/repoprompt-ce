@@ -154,9 +154,7 @@ final class ProviderSupervisorTests: XCTestCase {
         fi
         if [ "$*" != "acp" ]; then exit 64; fi
         while IFS= read -r line; do
-          case "$line" in
-            *initialize*) echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}' ;;
-          esac
+          sleep 30
         done
         """.utf8).write(to: executable)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
@@ -179,10 +177,14 @@ final class ProviderSupervisorTests: XCTestCase {
         )
         let settings = ProviderSettingsService(store: store, adapter: adapter, configurations: [configuration], initiallyEnabled: [.openCodeACP])
 
+        let clock = ContinuousClock()
+        let started = clock.now
         try await settings.bootstrap()
-        let catalog = try await settings.catalog(refreshRuntime: true)
+        let catalog = try await settings.catalog(refreshRuntime: false)
         let provider = try XCTUnwrap(catalog.providers.first { $0.providerID == .openCodeACP })
+        XCTAssertLessThan(started.duration(to: clock.now), .seconds(5))
         XCTAssertTrue(provider.cli?.healthy == true)
+        XCTAssertFalse(provider.preflight.ready)
         XCTAssertTrue(
             FileManager.default.fileExists(
                 atPath: FileManager.default.temporaryDirectory
