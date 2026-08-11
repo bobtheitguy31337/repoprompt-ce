@@ -1,6 +1,7 @@
 import Foundation
 import Hummingbird
 import HummingbirdTLS
+import RepoPromptAgentRuntimeCore
 import RepoPromptHeadlessRuntime
 import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
@@ -29,6 +30,9 @@ public struct RepoPromptServerConfiguration: Sendable {
     public let providerCredentialSources: [ProviderKind: String]
     public let providerAuthenticationStatusFiles: [ProviderSettingsID: String]
     public let providerModelCatalogFiles: [ProviderSettingsID: String]
+    public let providerVaultKey: ProviderVaultKey?
+    public let providerVaultDecryptionKeys: [ProviderVaultKey]
+    public let providerVaultFilePath: String
     public let minimumFreeBytes: Int64
     public let minimumFreeNodes: Int64
     public let maximumActiveSessions: Int
@@ -114,6 +118,35 @@ public struct RepoPromptServerConfiguration: Sendable {
             (.xAI, environment["REPOPROMPT_XAI_MODEL_CATALOG_FILE"])
         ], label: "Provider model catalog")
         let stateDatabase = environment["REPOPROMPT_STATE_DB"] ?? "/var/lib/repoprompt/state/repoprompt.sqlite"
+        let vaultKey: ProviderVaultKey?
+        if let keyFile = environment["REPOPROMPT_PROVIDER_VAULT_MASTER_KEY_FILE"], !keyFile.isEmpty {
+            guard keyFile.hasPrefix("/") else { throw ConfigurationError.invalid("Provider vault master key path must be absolute") }
+            vaultKey = try ProviderVaultKey.load(keyID: environment["REPOPROMPT_PROVIDER_VAULT_KEY_ID"] ?? "provider-vault-v1", filePath: keyFile)
+        } else {
+            vaultKey = nil
+        }
+        let previousVaultKeyID = environment["REPOPROMPT_PROVIDER_VAULT_PREVIOUS_KEY_ID"]
+        let previousVaultKeyFile = environment["REPOPROMPT_PROVIDER_VAULT_PREVIOUS_MASTER_KEY_FILE"]
+        guard (previousVaultKeyID == nil) == (previousVaultKeyFile == nil) else {
+            throw ConfigurationError.invalid("Provider vault previous key ID and master key file must be configured together")
+        }
+        let previousVaultKeys: [ProviderVaultKey]
+        if let previousVaultKeyID, let previousVaultKeyFile {
+            guard !previousVaultKeyID.isEmpty,
+                  previousVaultKeyFile.hasPrefix("/"),
+                  let vaultKey,
+                  previousVaultKeyID != vaultKey.keyID
+            else {
+                throw ConfigurationError.invalid("Provider vault previous key requires a distinct active key and an absolute key path")
+            }
+            previousVaultKeys = try [ProviderVaultKey.load(keyID: previousVaultKeyID, filePath: previousVaultKeyFile)]
+        } else {
+            previousVaultKeys = []
+        }
+        let vaultFilePath = environment["REPOPROMPT_PROVIDER_VAULT_FILE"] ?? URL(fileURLWithPath: stateDatabase).deletingLastPathComponent().appendingPathComponent("provider-credentials.vault").path
+        guard vaultFilePath.hasPrefix("/") else {
+            throw ConfigurationError.invalid("Provider vault path must be absolute")
+        }
         let projectSourcePolicy: ProjectSourcePolicy
         if let path = environment["REPOPROMPT_PROJECT_SOURCE_POLICY_FILE"], !path.isEmpty {
             guard path.hasPrefix("/") else { throw ConfigurationError.invalid("Project source policy path must be absolute") }
@@ -143,6 +176,9 @@ public struct RepoPromptServerConfiguration: Sendable {
             providerCredentialSources: credentialSources,
             providerAuthenticationStatusFiles: authenticationStatusFiles,
             providerModelCatalogFiles: modelCatalogFiles,
+            providerVaultKey: vaultKey,
+            providerVaultDecryptionKeys: previousVaultKeys,
+            providerVaultFilePath: vaultFilePath,
             minimumFreeBytes: Int64(environment["REPOPROMPT_MINIMUM_FREE_BYTES"] ?? "268435456") ?? 268_435_456,
             minimumFreeNodes: Int64(environment["REPOPROMPT_MINIMUM_FREE_NODES"] ?? "1024") ?? 1024,
             maximumActiveSessions: Int(environment["REPOPROMPT_MAX_ACTIVE_SESSIONS"] ?? "64") ?? 64,
@@ -281,13 +317,29 @@ public enum RepoPromptServerRunner {
                 credentialSourceDirectory: configuration.providerCredentialSources[kind]
             )
         }
+        if FileManager.default.fileExists(atPath: configuration.providerVaultFilePath), configuration.providerVaultKey == nil {
+            throw ServiceAPIError(code: .persistenceUnavailable, message: "Provider credential vault exists but no master key is configured", retryable: false)
+        }
+        let providerVault = try configuration.providerVaultKey.map {
+            try ProviderCredentialVault(
+                fileURL: URL(fileURLWithPath: configuration.providerVaultFilePath),
+                activeKey: $0,
+                decryptionKeys: configuration.providerVaultDecryptionKeys
+            )
+        }
+        let credentialEnvironment: any ProviderProcessEnvironmentProviding = VaultProviderProcessEnvironment(
+            store: store,
+            vault: providerVault,
+            externallyProvisionedKinds: Set(configuration.providerCredentialSources.keys)
+        )
         let providers = ProviderCLIAdapter(
             configurations: providerConfigurations,
             enabledProviders: configuration.enabledProviders,
             processPort: processPort,
             processStore: store,
             outputDirectory: processOutput,
-            ephemeralHomeRoot: configuration.providerHomeDirectory
+            ephemeralHomeRoot: configuration.providerHomeDirectory,
+            credentialEnvironment: credentialEnvironment
         )
         let providerSettings = ProviderSettingsService(
             store: store,
@@ -295,7 +347,9 @@ public enum RepoPromptServerRunner {
             configurations: providerConfigurations,
             initiallyEnabled: configuration.enabledProviders,
             authenticationStatusFiles: configuration.providerAuthenticationStatusFiles,
-            modelCatalogFiles: configuration.providerModelCatalogFiles
+            modelCatalogFiles: configuration.providerModelCatalogFiles,
+            vault: providerVault,
+            credentialTester: ProviderAuthenticationAdapter(configurations: providerConfigurations)
         )
         try await providerSettings.bootstrap()
         let authority = RepoPromptHeadlessAuthority(
@@ -325,7 +379,8 @@ public enum RepoPromptServerRunner {
             minimumFreeNodes: configuration.minimumFreeNodes,
             maximumActiveSessions: configuration.maximumActiveSessions,
             drainController: drainController,
-            trustConfigurationValid: true
+            trustConfigurationValid: true,
+            providerSettings: providerSettings
         )
         let service = RepoPromptHTTPService(
             authority: authority,

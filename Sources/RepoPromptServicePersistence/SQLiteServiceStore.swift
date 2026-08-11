@@ -159,7 +159,7 @@ public actor SQLiteServiceStore {
         try await transaction {
             if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             if let expectedRevision {
-                let observed = Int64(try await connection.query(
+                let observed = try await Int64(connection.query(
                     "SELECT revision FROM projects WHERE project_id=?",
                     [.text(snapshot.projectID.uuidString)]
                 ).first?.column("revision")?.integer ?? 0)
@@ -243,7 +243,7 @@ public actor SQLiteServiceStore {
                     [.text(worktree.bindingID.uuidString), .text(worktree.projectID.uuidString), .text(worktree.rootID.uuidString), .text(snapshot.sessionID.uuidString), .text(worktree.baseRef), .text(worktree.branch), .text(worktree.physicalPath), .text(worktree.ownershipState.rawValue), .text(worktree.mergeState.rawValue), .integer(Int(worktree.revision))]
                 )
                 try await activatePreparedOwnedResourceIfPresent(externalID: worktree.bindingID, kind: .worktree, path: worktree.physicalPath)
-                worktreeEvents.append(try await appendEvent(
+                try await worktreeEvents.append(appendEvent(
                     projectID: snapshot.projectID,
                     sessionID: snapshot.sessionID,
                     rootSessionID: snapshot.rootSessionID,
@@ -716,7 +716,7 @@ public actor SQLiteServiceStore {
                     [.text(snapshot.bindingID.uuidString), .text(snapshot.projectID.uuidString), .text(snapshot.rootID.uuidString), snapshot.sessionID.map { .text($0.uuidString) } ?? .null, .text(snapshot.baseRef), .text(snapshot.branch), .text(snapshot.physicalPath), .text(snapshot.ownershipState.rawValue), .text(snapshot.mergeState.rawValue), .integer(Int(snapshot.revision))]
                 )
                 try await activatePreparedOwnedResourceIfPresent(externalID: snapshot.bindingID, kind: .worktree, path: snapshot.physicalPath)
-                events.append(try await appendEvent(
+                try await events.append(appendEvent(
                     projectID: snapshot.projectID,
                     sessionID: snapshot.sessionID,
                     rootSessionID: snapshot.sessionID,
@@ -761,7 +761,7 @@ public actor SQLiteServiceStore {
                     "INSERT INTO worktree_bindings(binding_id,project_id,root_id,session_id,schema_version,base_ref,branch,physical_path,ownership_state,merge_state,revision) VALUES(?,?,?,?,1,?,?,?,?,?,?) ON CONFLICT(binding_id) DO UPDATE SET session_id=excluded.session_id,base_ref=excluded.base_ref,branch=excluded.branch,physical_path=excluded.physical_path,ownership_state=excluded.ownership_state,merge_state=excluded.merge_state,revision=excluded.revision",
                     [.text(snapshot.bindingID.uuidString), .text(snapshot.projectID.uuidString), .text(snapshot.rootID.uuidString), snapshot.sessionID.map { .text($0.uuidString) } ?? .null, .text(snapshot.baseRef), .text(snapshot.branch), .text(snapshot.physicalPath), .text(snapshot.ownershipState.rawValue), .text(snapshot.mergeState.rawValue), .integer(Int(snapshot.revision))]
                 )
-                events.append(try await appendEvent(
+                try await events.append(appendEvent(
                     projectID: session.projectID,
                     sessionID: session.sessionID,
                     rootSessionID: session.rootSessionID,
@@ -1098,7 +1098,7 @@ public actor SQLiteServiceStore {
     private func canonicalEventForPublication(_ event: EventEnvelope) throws -> EventEnvelope {
         let keyID = eventSigningKey?.keyID ?? "unsigned-local"
         let unsigned = event.replacingIntegrity(keyID: keyID, digest: "", signature: "")
-        let digest = CanonicalSigning.bodyDigest(try unsigned.signingData())
+        let digest = try CanonicalSigning.bodyDigest(unsigned.signingData())
         let signature = eventSigningKey.map { CanonicalSigning.hmacSHA256(message: digest, key: $0.secret) } ?? ""
         return unsigned.replacingIntegrity(keyID: keyID, digest: digest, signature: signature)
     }
@@ -1112,7 +1112,7 @@ public actor SQLiteServiceStore {
         let objectPayload = try EventPayload(jsonData: payload)
         let eventID = UUID()
         let unsigned = EventEnvelope(protocolVersion: 1, eventID: eventID, storeID: meta.storeID, globalSequence: sequence, timestamp: eventTimestamp, projectID: projectID, sessionID: sessionID, agentID: agentID, parentAgentID: parentAgentID, rootSessionID: rootSessionID, runID: runID, sessionSequence: sessionSequence, eventType: type, payloadVersion: 1, generation: generation, turnEpoch: turnEpoch, actor: actor, correlationID: correlationID, causationID: nil, payload: objectPayload, digest: "", keyID: keyID, signature: "")
-        let digest = CanonicalSigning.bodyDigest(try unsigned.signingData())
+        let digest = try CanonicalSigning.bodyDigest(unsigned.signingData())
         let signature = eventSigningKey.map { CanonicalSigning.hmacSHA256(message: digest, key: $0.secret) } ?? ""
         let envelope = EventEnvelope(protocolVersion: 1, eventID: eventID, storeID: meta.storeID, globalSequence: sequence, timestamp: eventTimestamp, projectID: projectID, sessionID: sessionID, agentID: agentID, parentAgentID: parentAgentID, rootSessionID: rootSessionID, runID: runID, sessionSequence: sessionSequence, eventType: type, payloadVersion: 1, generation: generation, turnEpoch: turnEpoch, actor: actor, correlationID: correlationID, causationID: nil, payload: objectPayload, digest: digest, keyID: keyID, signature: signature)
         let actorJSON = try actor.map(encodeText)
@@ -1220,11 +1220,290 @@ public actor SQLiteServiceStore {
     }
 
     private func upsertCollaboration(_ metadata: CollaborationMetadataSnapshot) async throws {
-        let acknowledgement: SQLiteData = try metadata.goblinAcknowledgement.map { .text(try encodeText($0)) } ?? .null
+        let acknowledgement: SQLiteData = try metadata.goblinAcknowledgement.map { try .text(encodeText($0)) } ?? .null
         _ = try await connection.query(
             "INSERT INTO collaboration_metadata(session_id,schema_version,visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision,goblin_acknowledgement_json,updated_at) VALUES(?,1,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET visibility=excluded.visibility,collaborative_steering_enabled=excluded.collaborative_steering_enabled,controller_user_id=excluded.controller_user_id,policy_revision=excluded.policy_revision,controller_revision=excluded.controller_revision,membership_revision=excluded.membership_revision,goblin_acknowledgement_json=excluded.goblin_acknowledgement_json,updated_at=CURRENT_TIMESTAMP",
             [.text(metadata.sessionID.uuidString), .text(metadata.visibility.rawValue), .integer(metadata.collaborativeSteeringEnabled ? 1 : 0), .text(metadata.controllerUserID), .integer(Int(metadata.policyRevision)), .integer(Int(metadata.controllerRevision)), .integer(Int(metadata.membershipRevision)), acknowledgement]
         )
+    }
+
+    public struct StoredProviderConnection: Sendable {
+        public let record: ProviderConnectionRecord
+        public let credentialReference: UUID?
+
+        public init(record: ProviderConnectionRecord, credentialReference: UUID?) {
+            self.record = record
+            self.credentialReference = credentialReference
+        }
+    }
+
+    public struct ProviderConnectionAuditRecord: Codable, Hashable, Sendable {
+        public let auditID: UUID
+        public let providerID: ProviderSettingsID
+        public let connectionID: UUID?
+        public let operation: String
+        public let attribution: ProviderMutationAttribution
+        public let authenticationMethod: ProviderAuthenticationMethod?
+        public let result: String
+        public let createdAt: Date
+    }
+
+    public struct ProviderConnectionAuditMutation: Sendable {
+        public let operation: String
+        public let attribution: ProviderMutationAttribution
+        public let authenticationMethod: ProviderAuthenticationMethod?
+        public let result: String
+
+        public init(operation: String, attribution: ProviderMutationAttribution, authenticationMethod: ProviderAuthenticationMethod?, result: String) {
+            self.operation = operation
+            self.attribution = attribution
+            self.authenticationMethod = authenticationMethod
+            self.result = result
+        }
+    }
+
+    public func providerConnections() async throws -> [StoredProviderConnection] {
+        try await connection.query("SELECT provider_id,connection_id,authentication_method,state,account_label,expires_at,last_tested_at,test_state,detail,key_helper_configured,workload_identity_configured,credential_reference,created_at,updated_at,revision FROM provider_connections ORDER BY provider_id").map { row in
+            guard let rawProvider = row.column("provider_id")?.string,
+                  let providerID = ProviderSettingsID(rawValue: rawProvider),
+                  let rawConnection = row.column("connection_id")?.string,
+                  let connectionID = UUID(uuidString: rawConnection),
+                  let rawMethod = row.column("authentication_method")?.string,
+                  let method = ProviderAuthenticationMethod(rawValue: rawMethod),
+                  let rawState = row.column("state")?.string,
+                  let state = ProviderConnectionState(rawValue: rawState),
+                  let rawTestState = row.column("test_state")?.string,
+                  let testState = ProviderCredentialTestState(rawValue: rawTestState)
+            else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Provider connection metadata is invalid", retryable: false) }
+            let credentialReference: UUID?
+            if let rawReference = row.column("credential_reference")?.string {
+                guard let parsed = UUID(uuidString: rawReference) else {
+                    throw ServiceAPIError(code: .persistenceUnavailable, message: "Provider credential reference is invalid", retryable: false)
+                }
+                credentialReference = parsed
+            } else {
+                credentialReference = nil
+            }
+            guard let createdTimestamp = row.column("created_at")?.double,
+                  let updatedTimestamp = row.column("updated_at")?.double,
+                  createdTimestamp.isFinite,
+                  updatedTimestamp.isFinite,
+                  let rawRevision = row.column("revision")?.integer,
+                  rawRevision > 0
+            else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Provider connection timestamps or revision are invalid", retryable: false)
+            }
+            let stored = StoredProviderConnection(
+                record: ProviderConnectionRecord(
+                    connectionID: connectionID,
+                    providerID: providerID,
+                    authenticationMethod: method,
+                    state: state,
+                    accountLabel: row.column("account_label")?.string,
+                    expiresAt: row.column("expires_at")?.double.map(Date.init(timeIntervalSince1970:)),
+                    lastTestedAt: row.column("last_tested_at")?.double.map(Date.init(timeIntervalSince1970:)),
+                    testState: testState,
+                    detail: row.column("detail")?.string,
+                    keyHelperConfigured: row.column("key_helper_configured")?.bool ?? false,
+                    workloadIdentityConfigured: row.column("workload_identity_configured")?.bool ?? false,
+                    createdAt: Date(timeIntervalSince1970: createdTimestamp),
+                    updatedAt: Date(timeIntervalSince1970: updatedTimestamp),
+                    revision: Int64(rawRevision)
+                ),
+                credentialReference: credentialReference
+            )
+            try Self.validateProviderConnection(stored)
+            return stored
+        }
+    }
+
+    public func providerConnection(providerID: ProviderSettingsID) async throws -> StoredProviderConnection? {
+        try await providerConnections().first { $0.record.providerID == providerID }
+    }
+
+    @discardableResult
+    public func upsertProviderConnection(
+        _ value: StoredProviderConnection,
+        expectedRevision: Int64,
+        audit: ProviderConnectionAuditMutation? = nil
+    ) async throws -> StoredProviderConnection {
+        try await transaction {
+            try Self.validateProviderConnection(value)
+            let observed = try await Int64(connection.query("SELECT revision FROM provider_connections WHERE provider_id=?", [.text(value.record.providerID.rawValue)]).first?.column("revision")?.integer ?? 0)
+            guard observed == expectedRevision, value.record.revision == expectedRevision + 1 else {
+                throw ServiceAPIError(code: .staleRevision, message: "Provider connection revision is stale", currentRevision: observed)
+            }
+            let record = value.record
+            _ = try await connection.query(
+                "INSERT INTO provider_connections(provider_id,schema_version,connection_id,authentication_method,state,account_label,expires_at,last_tested_at,test_state,detail,key_helper_configured,workload_identity_configured,credential_reference,created_at,updated_at,revision) VALUES(?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(provider_id) DO UPDATE SET connection_id=excluded.connection_id,authentication_method=excluded.authentication_method,state=excluded.state,account_label=excluded.account_label,expires_at=excluded.expires_at,last_tested_at=excluded.last_tested_at,test_state=excluded.test_state,detail=excluded.detail,key_helper_configured=excluded.key_helper_configured,workload_identity_configured=excluded.workload_identity_configured,credential_reference=excluded.credential_reference,updated_at=excluded.updated_at,revision=excluded.revision",
+                [
+                    .text(record.providerID.rawValue), .text(record.connectionID.uuidString), .text(record.authenticationMethod.rawValue), .text(record.state.rawValue),
+                    record.accountLabel.map(SQLiteData.text) ?? .null, record.expiresAt.map { .float($0.timeIntervalSince1970) } ?? .null,
+                    record.lastTestedAt.map { .float($0.timeIntervalSince1970) } ?? .null, .text(record.testState.rawValue), record.detail.map(SQLiteData.text) ?? .null,
+                    .integer(record.keyHelperConfigured ? 1 : 0), .integer(record.workloadIdentityConfigured ? 1 : 0),
+                    value.credentialReference.map { .text($0.uuidString) } ?? .null,
+                    .float(record.createdAt.timeIntervalSince1970), .float(record.updatedAt.timeIntervalSince1970), .integer(Int(record.revision))
+                ]
+            )
+            if let audit {
+                try await appendProviderConnectionAuditInTransaction(
+                    providerID: record.providerID,
+                    connectionID: record.connectionID,
+                    mutation: audit
+                )
+            }
+            return value
+        }
+    }
+
+    public func deleteProviderConnection(
+        providerID: ProviderSettingsID,
+        expectedRevision: Int64,
+        audit: ProviderConnectionAuditMutation? = nil
+    ) async throws {
+        try await transaction {
+            let current = try await connection.query("SELECT connection_id,revision FROM provider_connections WHERE provider_id=?", [.text(providerID.rawValue)]).first
+            let observed = Int64(current?.column("revision")?.integer ?? 0)
+            guard observed == expectedRevision else {
+                throw ServiceAPIError(code: .staleRevision, message: "Provider connection revision is stale", currentRevision: observed)
+            }
+            guard let rawConnectionID = current?.column("connection_id")?.string,
+                  let connectionID = UUID(uuidString: rawConnectionID)
+            else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Provider connection identifier is invalid", retryable: false)
+            }
+            _ = try await connection.query("DELETE FROM provider_connections WHERE provider_id=?", [.text(providerID.rawValue)])
+            if let audit {
+                try await appendProviderConnectionAuditInTransaction(
+                    providerID: providerID,
+                    connectionID: connectionID,
+                    mutation: audit
+                )
+            }
+        }
+    }
+
+    public func appendProviderConnectionAudit(providerID: ProviderSettingsID, connectionID: UUID?, operation: String, attribution: ProviderMutationAttribution, authenticationMethod: ProviderAuthenticationMethod?, result: String) async throws {
+        try await transaction {
+            try await appendProviderConnectionAuditInTransaction(
+                providerID: providerID,
+                connectionID: connectionID,
+                mutation: .init(operation: operation, attribution: attribution, authenticationMethod: authenticationMethod, result: result)
+            )
+        }
+    }
+
+    public func providerConnectionAudit() async throws -> [ProviderConnectionAuditRecord] {
+        try await connection.query("SELECT audit_id,provider_id,connection_id,operation,actor_id,actor_label,channel,authentication_method,result,created_at FROM provider_connection_audit ORDER BY created_at").map { row in
+            guard let auditID = row.column("audit_id")?.string.flatMap(UUID.init(uuidString:)),
+                  let providerID = row.column("provider_id")?.string.flatMap(ProviderSettingsID.init(rawValue:)),
+                  let operation = row.column("operation")?.string,
+                  let actorID = row.column("actor_id")?.string,
+                  let actorLabel = row.column("actor_label")?.string,
+                  let channel = row.column("channel")?.string,
+                  let result = row.column("result")?.string,
+                  let createdTimestamp = row.column("created_at")?.double,
+                  createdTimestamp.isFinite
+            else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Provider audit metadata is invalid", retryable: false)
+            }
+            let rawConnectionID = row.column("connection_id")?.string
+            let connectionID = try rawConnectionID.map { value -> UUID in
+                guard let parsed = UUID(uuidString: value) else {
+                    throw ServiceAPIError(code: .persistenceUnavailable, message: "Provider audit connection identifier is invalid", retryable: false)
+                }
+                return parsed
+            }
+            let rawMethod = row.column("authentication_method")?.string
+            let authenticationMethod = try rawMethod.map { value -> ProviderAuthenticationMethod in
+                guard let parsed = ProviderAuthenticationMethod(rawValue: value) else {
+                    throw ServiceAPIError(code: .persistenceUnavailable, message: "Provider audit authentication method is invalid", retryable: false)
+                }
+                return parsed
+            }
+            let attribution = ProviderMutationAttribution(actorID: actorID, actorLabel: actorLabel, channel: channel)
+            try Self.validateProviderAudit(.init(operation: operation, attribution: attribution, authenticationMethod: authenticationMethod, result: result))
+            return ProviderConnectionAuditRecord(
+                auditID: auditID,
+                providerID: providerID,
+                connectionID: connectionID,
+                operation: operation,
+                attribution: attribution,
+                authenticationMethod: authenticationMethod,
+                result: result,
+                createdAt: Date(timeIntervalSince1970: createdTimestamp)
+            )
+        }
+    }
+
+    private func appendProviderConnectionAuditInTransaction(
+        providerID: ProviderSettingsID,
+        connectionID: UUID?,
+        mutation: ProviderConnectionAuditMutation
+    ) async throws {
+        try Self.validateProviderAudit(mutation)
+        _ = try await connection.query(
+            "INSERT INTO provider_connection_audit(audit_id,schema_version,provider_id,connection_id,operation,actor_id,actor_label,channel,authentication_method,result,created_at) VALUES(?,1,?,?,?,?,?,?,?,?,?)",
+            [
+                .text(UUID().uuidString),
+                .text(providerID.rawValue),
+                connectionID.map { .text($0.uuidString) } ?? .null,
+                .text(mutation.operation),
+                .text(mutation.attribution.actorID),
+                .text(mutation.attribution.actorLabel),
+                .text(mutation.attribution.channel),
+                mutation.authenticationMethod.map { .text($0.rawValue) } ?? .null,
+                .text(mutation.result),
+                .float(Date().timeIntervalSince1970)
+            ]
+        )
+    }
+
+    private nonisolated static func validateProviderAudit(_ value: ProviderConnectionAuditMutation) throws {
+        guard value.operation.range(of: "^[a-z][A-Za-z0-9]{0,63}$", options: .regularExpression) != nil,
+              value.result.range(of: "^[a-z][A-Za-z0-9_.-]{0,63}$", options: .regularExpression) != nil,
+              (1 ... 256).contains(value.attribution.actorID.utf8.count),
+              (1 ... 128).contains(value.attribution.actorLabel.utf8.count),
+              value.attribution.channel.range(of: "^[a-z][a-z0-9_.-]{0,63}$", options: .regularExpression) != nil,
+              isSafeProviderMetadata(value.attribution.actorID),
+              isSafeProviderMetadata(value.attribution.actorLabel)
+        else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Provider audit metadata is invalid")
+        }
+    }
+
+    private nonisolated static func validateProviderConnection(_ value: StoredProviderConnection) throws {
+        let record = value.record
+        let allowedMethods: Set<ProviderAuthenticationMethod> = switch record.providerID {
+        case .codex: [.apiKey, .enterpriseAccessToken]
+        case .claudeCompatible: [.apiKey, .authToken]
+        case .cursorACP: [.apiKey, .browserLogin]
+        case .openCodeACP: [.providerSpecific]
+        case .xAI: [.apiKey]
+        }
+        let vaultMethods: Set<ProviderAuthenticationMethod> = [.apiKey, .enterpriseAccessToken, .authToken]
+        guard allowedMethods.contains(record.authenticationMethod),
+              vaultMethods.contains(record.authenticationMethod) ? value.credentialReference != nil : value.credentialReference == nil,
+              record.revision > 0,
+              record.createdAt.timeIntervalSince1970.isFinite,
+              record.updatedAt.timeIntervalSince1970.isFinite,
+              record.updatedAt >= record.createdAt,
+              record.expiresAt?.timeIntervalSince1970.isFinite ?? true,
+              record.lastTestedAt?.timeIntervalSince1970.isFinite ?? true,
+              (record.state == .connected) == (record.testState == .valid),
+              record.keyHelperConfigured == false,
+              record.workloadIdentityConfigured == false,
+              record.accountLabel.map({ $0.utf8.count <= 256 && Self.isSafeProviderMetadata($0) }) ?? true,
+              record.detail.map({ $0.utf8.count <= 512 && Self.isSafeProviderMetadata($0) }) ?? true
+        else {
+            throw ServiceAPIError(code: .persistenceUnavailable, message: "Provider connection metadata is invalid", retryable: false)
+        }
+    }
+
+    private nonisolated static func isSafeProviderMetadata(_ value: String) -> Bool {
+        !value.isEmpty
+            && !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+            && !ProviderSecretRedaction.containsLikelySecret(value)
     }
 
     public func providerSettings() async throws -> [ProviderSettingsPreference] {
@@ -1251,10 +1530,11 @@ public actor SQLiteServiceStore {
     @discardableResult
     public func upsertProviderSettings(
         _ value: ProviderSettingsPreference,
-        expectedRevision: Int64
+        expectedRevision: Int64,
+        audit: ProviderConnectionAuditMutation? = nil
     ) async throws -> ProviderSettingsPreference {
         try await transaction {
-            let observed = Int64(try await connection.query(
+            let observed = try await Int64(connection.query(
                 "SELECT revision FROM provider_settings WHERE provider_id=?",
                 [.text(value.providerID.rawValue)]
             ).first?.column("revision")?.integer ?? 0)
@@ -1269,6 +1549,13 @@ public actor SQLiteServiceStore {
                 "INSERT INTO provider_settings(provider_id,schema_version,enabled,default_model,reasoning_effort,speed_mode,service_tier,revision,updated_at) VALUES(?,1,?,?,?,?,?,?,?) ON CONFLICT(provider_id) DO UPDATE SET enabled=excluded.enabled,default_model=excluded.default_model,reasoning_effort=excluded.reasoning_effort,speed_mode=excluded.speed_mode,service_tier=excluded.service_tier,revision=excluded.revision,updated_at=excluded.updated_at",
                 [.text(value.providerID.rawValue), .integer(value.enabled ? 1 : 0), defaultModel, reasoningEffort, speedMode, serviceTier, .integer(Int(value.revision)), .float(Date().timeIntervalSince1970)]
             )
+            if let audit {
+                try await appendProviderConnectionAuditInTransaction(
+                    providerID: value.providerID,
+                    connectionID: nil,
+                    mutation: audit
+                )
+            }
             return value
         }
     }
@@ -1303,6 +1590,9 @@ public actor SQLiteServiceStore {
         for statement in SchemaV3.statements {
             _ = try await connection.query(statement)
         }
+        for statement in SchemaV4.statements {
+            _ = try await connection.query(statement)
+        }
         let count = try await connection.query("SELECT COUNT(*) AS count FROM service_metadata").first?.column("count")?.integer ?? 0
         if count == 0 {
             _ = try await connection.query("INSERT INTO service_metadata(fixed_id,store_id,schema_version,created_at,last_clean_shutdown,current_boot_epoch,next_global_sequence,replay_floor) VALUES(1,?,1,CURRENT_TIMESTAMP,0,1,1,0)", [.text(UUID().uuidString)])
@@ -1327,6 +1617,15 @@ public actor SQLiteServiceStore {
         } else {
             _ = try await connection.query("UPDATE service_metadata SET schema_version=3 WHERE fixed_id=1")
             _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v3',3,'provider settings and browser-safe portal preferences',?,CURRENT_TIMESTAMP)", [.text(SchemaV3.digest)])
+        }
+        let v4 = try await connection.query("SELECT digest FROM schema_migrations WHERE version=4").first
+        if let v4 {
+            guard v4.column("digest")?.string == SchemaV4.digest else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Schema v4 migration digest mismatch", retryable: false)
+            }
+        } else {
+            _ = try await connection.query("UPDATE service_metadata SET schema_version=4 WHERE fixed_id=1")
+            _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v4',4,'provider connection metadata and secret-free audit attribution',?,CURRENT_TIMESTAMP)", [.text(SchemaV4.digest)])
         }
     }
 

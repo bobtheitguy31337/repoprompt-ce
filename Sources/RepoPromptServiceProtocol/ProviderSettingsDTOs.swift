@@ -196,10 +196,12 @@ public struct ProviderSettingsSnapshot: Codable, Hashable, Sendable {
     public let preference: ProviderSettingsPreference
     public let cli: ProviderCLIHealth?
     public let authentication: ProviderAuthenticationStatus
+    public let connection: ProviderConnectionRecord?
+    public let preflight: ProviderPreflightStatus
     public let capabilities: ProviderSettingsCapabilities
     public let models: [ProviderModelCatalogEntry]
 
-    public init(providerID: ProviderSettingsID, displayName: String, category: ProviderSettingsCategory, summary: String, deploymentAllowed: Bool, runtimePreflightVerified: Bool, effectiveEnabled: Bool, preference: ProviderSettingsPreference, cli: ProviderCLIHealth?, authentication: ProviderAuthenticationStatus, capabilities: ProviderSettingsCapabilities, models: [ProviderModelCatalogEntry]) {
+    public init(providerID: ProviderSettingsID, displayName: String, category: ProviderSettingsCategory, summary: String, deploymentAllowed: Bool, runtimePreflightVerified: Bool, effectiveEnabled: Bool, preference: ProviderSettingsPreference, cli: ProviderCLIHealth?, authentication: ProviderAuthenticationStatus, connection: ProviderConnectionRecord? = nil, preflight: ProviderPreflightStatus = .init(ready: false, reason: .runtimeUnavailable, detail: "Provider preflight has not run"), capabilities: ProviderSettingsCapabilities, models: [ProviderModelCatalogEntry]) {
         self.providerID = providerID
         self.displayName = displayName
         self.category = category
@@ -210,6 +212,8 @@ public struct ProviderSettingsSnapshot: Codable, Hashable, Sendable {
         self.preference = preference
         self.cli = cli
         self.authentication = authentication
+        self.connection = connection
+        self.preflight = preflight
         self.capabilities = capabilities
         self.models = models
     }

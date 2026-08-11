@@ -10,14 +10,16 @@ enum NativeProviderRuntimeFactory {
         processPort: PortableProcessSupervisionPort,
         processStore: SQLiteServiceStore?,
         outputDirectory: String,
-        ephemeralHomeRoot: String
+        ephemeralHomeRoot: String,
+        credentialEnvironment: any ProviderProcessEnvironmentProviding
     ) -> any AgentProviderRuntime {
         let support = NativeProviderProcessSupport(
             configuration: configuration,
             processPort: processPort,
             processStore: processStore,
             outputDirectory: outputDirectory,
-            ephemeralHomeRoot: ephemeralHomeRoot
+            ephemeralHomeRoot: ephemeralHomeRoot,
+            credentialEnvironment: credentialEnvironment
         )
         switch configuration.kind {
         case .codex:
@@ -53,6 +55,7 @@ private struct NativeProviderProcessSupport {
     let processStore: SQLiteServiceStore?
     let outputDirectory: String
     let ephemeralHomeRoot: String
+    let credentialEnvironment: any ProviderProcessEnvironmentProviding
 
     func capability(supportsResume: Bool, supportsSteering: Bool) -> ProviderCapability {
         let executable = FileManager.default.isExecutableFile(atPath: configuration.executable)
@@ -91,7 +94,13 @@ private struct NativeProviderProcessSupport {
 
     func makeSession(runID: UUID, arguments: [String], workingDirectory: String, policy: ProviderExecutionPolicy = .init(), launchValidation: @escaping @Sendable () throws -> Void = {}) async throws -> NativeJSONLineProcess {
         let preparedHome = try await prepareEphemeralHome(runID: runID)
-        let environment = providerEnvironment(home: preparedHome.url, workingDirectory: workingDirectory, policy: policy)
+        var environment = providerEnvironment(home: preparedHome.url, workingDirectory: workingDirectory, policy: policy)
+        let injected = try await credentialEnvironment.environment(for: configuration.kind)
+        let reserved = Set(["HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "PATH", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD"])
+        guard injected.keys.allSatisfy({ !reserved.contains($0) }) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Provider credential environment attempted to override an isolated runtime key")
+        }
+        environment.merge(injected) { _, injected in injected }
         let supervisor = ProviderProcessSupervisor(processPort: processPort, store: processStore)
         do {
             return try await NativeJSONLineProcess.launch(

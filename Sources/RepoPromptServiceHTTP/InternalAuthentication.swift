@@ -48,6 +48,7 @@ public struct SignedInternalRequest: Sendable {
 
 public struct AuthenticatedInternalRequest: Sendable {
     public let role: InternalRouteRole
+    public let keyID: String
     public let decision: GoblinAuthorizationDecision?
 }
 
@@ -86,11 +87,10 @@ public actor InternalRequestAuthenticator {
             let decisionSignature = CanonicalSigning.hmacSHA256(message: unsigned, key: key.secret)
             guard decision.keyID == key.keyID, CanonicalSigning.secureEquals(decisionSignature, decision.signature) else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision signature is invalid") }
             try await store.consumeAuthorizationDecision(decision)
-            return AuthenticatedInternalRequest(role: key.role, decision: decision)
+            return AuthenticatedInternalRequest(role: key.role, keyID: key.keyID, decision: decision)
         }
-        return AuthenticatedInternalRequest(role: key.role, decision: nil)
+        return AuthenticatedInternalRequest(role: key.role, keyID: key.keyID, decision: nil)
     }
-
 }
 
 extension HTTPField.Name {

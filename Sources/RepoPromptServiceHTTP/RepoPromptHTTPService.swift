@@ -1,3 +1,4 @@
+import Crypto
 import Foundation
 import Hummingbird
 import NIOSSL
@@ -58,14 +59,14 @@ public struct RepoPromptHTTPService: Sendable {
     public func internalRouter() -> Router<RepoPromptRequestContext> {
         let router = Router<RepoPromptRequestContext>(context: RepoPromptRequestContext.self)
         router.get("/portal") { request, context in await portalRespond(request) {
-            try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(context: context)
             if request.uri.string.split(separator: "?", maxSplits: 1).first == "/portal" {
                 return RepoPromptPortalAssets.canonicalRedirect()
             }
             return try RepoPromptPortalAssets.response(for: .index)
         } }
         router.get("/portal/assets/:name") { request, context in await portalRespond(request) {
-            try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(context: context)
             let name = try context.parameters.require("name")
             guard let asset = RepoPromptPortalAssets.Asset(routeName: name) else {
                 throw ServiceAPIError(code: .notFound, message: "Portal asset not found")
@@ -73,19 +74,19 @@ public struct RepoPromptHTTPService: Sendable {
             return try RepoPromptPortalAssets.response(for: asset)
         } }
         router.get("/portal/api/v1/bootstrap") { request, context in await portalRespond(request) {
-            try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(context: context)
             let bootstrap = try await portalBootstrap()
             return try portalJSON(bootstrap)
         } }
         router.get("/portal/api/v1/provider-settings") { request, context in await portalRespond(request) {
-            try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(context: context)
             let service = try requireProviderSettings()
             let refresh = request.uri.queryParameters.get("refresh", as: Bool.self) ?? false
             let catalog = try await service.catalog(refreshCLI: refresh)
             return try portalJSON(catalog)
         } }
         router.patch("/portal/api/v1/provider-settings/:id") { request, context in await portalRespond(request) {
-            try await authenticatePortal(context: context)
+            let attribution = try await authenticatePortal(context: context)
             try validatePortalMutation(request)
             let id = try context.parameters.require("id")
             guard let providerID = ProviderSettingsID(rawValue: id) else {
@@ -93,11 +94,25 @@ public struct RepoPromptHTTPService: Sendable {
             }
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(UpdateProviderSettingsRequest.self, from: data)
-            let snapshot = try await requireProviderSettings().update(providerID: providerID, request: input)
+            let snapshot = try await requireProviderSettings().update(providerID: providerID, request: input, attribution: attribution)
+            return try portalJSON(snapshot)
+        } }
+        router.post("/portal/api/v1/provider-settings/:id/enable") { request, context in await portalRespond(request) {
+            let attribution = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let input = try await JSONDecoder.serviceDecoder.decode(SetProviderEnabledRequest.self, from: bodyData(request))
+            let snapshot = try await requireProviderSettings().setEnabled(providerID: providerSettingsID(context), enabled: true, request: input, attribution: attribution)
+            return try portalJSON(snapshot)
+        } }
+        router.post("/portal/api/v1/provider-settings/:id/disable") { request, context in await portalRespond(request) {
+            let attribution = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let input = try await JSONDecoder.serviceDecoder.decode(SetProviderEnabledRequest.self, from: bodyData(request))
+            let snapshot = try await requireProviderSettings().setEnabled(providerID: providerSettingsID(context), enabled: false, request: input, attribution: attribution)
             return try portalJSON(snapshot)
         } }
         router.post("/portal/api/v1/provider-settings/:id/auth-flows") { request, context in await portalRespond(request) {
-            try await authenticatePortal(context: context)
+            let attribution = try await authenticatePortal(context: context)
             try validatePortalMutation(request)
             let id = try context.parameters.require("id")
             guard let providerID = ProviderSettingsID(rawValue: id) else {
@@ -105,28 +120,138 @@ public struct RepoPromptHTTPService: Sendable {
             }
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(StartProviderAuthFlowRequest.self, from: data)
-            let challenge = try await requireProviderSettings().startAuthFlow(providerID: providerID, request: input)
+            let challenge = try await requireProviderSettings().startAuthFlow(providerID: providerID, request: input, ownerID: attribution.actorID)
             return try portalJSON(challenge, status: .accepted)
+        } }
+        router.post("/portal/api/v1/provider-settings/:id/connect") { request, context in await portalRespond(request) {
+            let attribution = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let providerID = try providerSettingsID(context)
+            let input = try await JSONDecoder.serviceDecoder.decode(ConnectProviderRequest.self, from: bodyData(request))
+            let snapshot = try await requireProviderSettings().connect(providerID: providerID, request: input, attribution: attribution)
+            return try portalJSON(snapshot, status: .created)
+        } }
+        router.post("/portal/api/v1/provider-settings/:id/test") { request, context in await portalRespond(request) {
+            let attribution = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let snapshot = try await requireProviderSettings().testConnection(providerID: providerSettingsID(context), attribution: attribution)
+            return try portalJSON(snapshot)
+        } }
+        router.post("/portal/api/v1/provider-settings/:id/disconnect") { request, context in await portalRespond(request) {
+            let attribution = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let snapshot = try await requireProviderSettings().disconnect(providerID: providerSettingsID(context), attribution: attribution)
+            return try portalJSON(snapshot)
+        } }
+        router.post("/portal/api/v1/provider-settings/:id/revoke") { request, context in await portalRespond(request) {
+            let attribution = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let snapshot = try await requireProviderSettings().disconnect(providerID: providerSettingsID(context), attribution: attribution, revoke: true)
+            return try portalJSON(snapshot)
+        } }
+        router.get("/portal/api/v1/provider-auth-flows/:flowID") { request, context in await portalRespond(request) {
+            let attribution = try await authenticatePortal(context: context)
+            let flowID = try context.parameters.require("flowID", as: UUID.self)
+            let status = try await requireProviderSettings().pollAuthFlow(flowID: flowID, ownerID: attribution.actorID)
+            return try portalJSON(status)
+        } }
+        router.delete("/portal/api/v1/provider-auth-flows/:flowID") { request, context in await portalRespond(request) {
+            let attribution = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let flowID = try context.parameters.require("flowID", as: UUID.self)
+            try await requireProviderSettings().cancelAuthFlow(flowID: flowID, ownerID: attribution.actorID)
+            return HTTPResponses.empty()
+        } }
+        router.get("/internal/v1/provider-settings") { request, context in await respond(request) {
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp, .operatorRole], operation: "providerCatalog")
+            return try await HTTPResponses.json(requireProviderSettings().catalog(refreshCLI: request.uri.queryParameters.get("refresh", as: Bool.self) ?? false))
+        } }
+        router.patch("/internal/v1/provider-settings/:id") { request, context in await respond(request) {
+            let data = try await bodyData(request)
+            _ = try requireIdempotency(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerUpdate")
+            let input = try JSONDecoder.serviceDecoder.decode(UpdateProviderSettingsRequest.self, from: data)
+            return try await HTTPResponses.json(requireProviderSettings().update(providerID: providerSettingsID(context), request: input, attribution: providerAttribution(auth)))
+        } }
+        router.post("/internal/v1/provider-settings/:id/enable") { request, context in await respond(request) {
+            let data = try await bodyData(request)
+            _ = try requireIdempotency(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerEnable")
+            let input = try JSONDecoder.serviceDecoder.decode(SetProviderEnabledRequest.self, from: data)
+            return try await HTTPResponses.json(requireProviderSettings().setEnabled(providerID: providerSettingsID(context), enabled: true, request: input, attribution: providerAttribution(auth)))
+        } }
+        router.post("/internal/v1/provider-settings/:id/disable") { request, context in await respond(request) {
+            let data = try await bodyData(request)
+            _ = try requireIdempotency(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerDisable")
+            let input = try JSONDecoder.serviceDecoder.decode(SetProviderEnabledRequest.self, from: data)
+            return try await HTTPResponses.json(requireProviderSettings().setEnabled(providerID: providerSettingsID(context), enabled: false, request: input, attribution: providerAttribution(auth)))
+        } }
+        router.post("/internal/v1/provider-settings/:id/connect") { request, context in await respond(request) {
+            let data = try await bodyData(request)
+            _ = try requireIdempotency(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerConnect")
+            let input = try JSONDecoder.serviceDecoder.decode(ConnectProviderRequest.self, from: data)
+            let snapshot = try await requireProviderSettings().connect(providerID: providerSettingsID(context), request: input, attribution: providerAttribution(auth))
+            return try HTTPResponses.json(snapshot, status: .created)
+        } }
+        router.post("/internal/v1/provider-settings/:id/test") { request, context in await respond(request) {
+            let data = try await bodyData(request)
+            _ = try requireIdempotency(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerTest")
+            return try await HTTPResponses.json(requireProviderSettings().testConnection(providerID: providerSettingsID(context), attribution: providerAttribution(auth)))
+        } }
+        router.post("/internal/v1/provider-settings/:id/disconnect") { request, context in await respond(request) {
+            let data = try await bodyData(request)
+            _ = try requireIdempotency(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerDisconnect")
+            return try await HTTPResponses.json(requireProviderSettings().disconnect(providerID: providerSettingsID(context), attribution: providerAttribution(auth)))
+        } }
+        router.post("/internal/v1/provider-settings/:id/revoke") { request, context in await respond(request) {
+            let data = try await bodyData(request)
+            _ = try requireIdempotency(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerRevoke")
+            return try await HTTPResponses.json(requireProviderSettings().disconnect(providerID: providerSettingsID(context), attribution: providerAttribution(auth), revoke: true))
+        } }
+        router.post("/internal/v1/provider-settings/:id/auth-flows") { request, context in await respond(request) {
+            let data = try await bodyData(request)
+            _ = try requireIdempotency(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerAuthStart")
+            let input = try JSONDecoder.serviceDecoder.decode(StartProviderAuthFlowRequest.self, from: data)
+            let status = try await requireProviderSettings().startAuthFlow(providerID: providerSettingsID(context), request: input, ownerID: providerAttribution(auth).actorID)
+            return try HTTPResponses.json(status, status: .accepted)
+        } }
+        router.get("/internal/v1/provider-auth-flows/:flowID") { request, context in await respond(request) {
+            let auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp, .operatorRole], operation: "providerAuthPoll")
+            let status = try await requireProviderSettings().pollAuthFlow(flowID: context.parameters.require("flowID", as: UUID.self), ownerID: providerAttribution(auth).actorID)
+            return try HTTPResponses.json(status)
+        } }
+        router.delete("/internal/v1/provider-auth-flows/:flowID") { request, context in await respond(request) {
+            let data = try await bodyData(request)
+            _ = try requireIdempotency(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerAuthCancel")
+            try await requireProviderSettings().cancelAuthFlow(flowID: context.parameters.require("flowID", as: UUID.self), ownerID: providerAttribution(auth).actorID)
+            return HTTPResponses.empty()
         } }
         router.get("/internal/v1/capabilities") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp, .goblinSync], operation: "capabilities")
             let meta = try await store.metadata()
-            return try HTTPResponses.json(ServiceCapabilitiesResponse(
+            return try await HTTPResponses.json(ServiceCapabilitiesResponse(
                 protocolRange: .init(minimum: 1, maximum: 1),
                 schemaVersion: meta.schemaVersion,
                 storeID: meta.storeID,
                 replayFloor: meta.replayFloor,
-                providers: await providerCatalog(),
+                providers: providerCatalog(),
                 models: [],
-                workflows: try await authority.workflowSnapshots(),
+                workflows: authority.workflowSnapshots(),
                 executionModes: executionModeCatalog(),
                 eventTypes: EventType.allCases,
-                projectSources: await authority.projectSourceCapabilities()
+                projectSources: authority.projectSourceCapabilities()
             ))
         } }
         router.get("/internal/v1/diagnostics") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.operatorRole], operation: "diagnostics")
             let meta = try await store.metadata()
             let currentReadiness = await readiness.snapshot(forceRefresh: true)
-            return try HTTPResponses.json(RepoPromptDiagnostics(
+            return try await HTTPResponses.json(RepoPromptDiagnostics(
                 storeID: meta.storeID,
                 schemaVersion: meta.schemaVersion,
                 nextGlobalSequence: meta.nextGlobalSequence,
@@ -134,7 +259,7 @@ public struct RepoPromptHTTPService: Sendable {
                 readiness: currentReadiness,
                 operational: currentReadiness.operational,
                 drain: currentReadiness.drain,
-                maintenance: await durabilityOperations?.snapshot()
+                maintenance: durabilityOperations?.snapshot()
             ))
         } }
         router.get("/metrics") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.operatorRole], operation: "metrics")
@@ -521,7 +646,7 @@ public struct RepoPromptHTTPService: Sendable {
                 for try await frame in heartbeatFrames(stream) {
                     switch frame {
                     case let .event(event):
-                        let json = String(decoding: try JSONEncoder.serviceEncoder.encode(event), as: UTF8.self)
+                        let json = try String(decoding: JSONEncoder.serviceEncoder.encode(event), as: UTF8.self)
                         try await writer.write(ByteBuffer(string: "id: \(event.storeID.uuidString):\(event.globalSequence)\nevent: \(event.eventType.rawValue)\ndata: \(json)\n\n"))
                     case .heartbeat:
                         try await writer.write(ByteBuffer(string: ": heartbeat\n\n"))
@@ -573,7 +698,7 @@ public struct RepoPromptHTTPService: Sendable {
     private func portalRespond(_ request: Request, _ operation: () async throws -> Response) async -> Response {
         let method = String(describing: request.method).uppercased()
         let isMutation = method == "POST" || method == "PUT" || method == "PATCH" || method == "DELETE"
-        if isMutation, !(await drainController.beginMutation()) {
+        if isMutation, await !(drainController.beginMutation()) {
             return portalError(ServiceAPIError(code: .quiescing, message: "Service is draining mutations", retryable: true))
         }
         let response: Response
@@ -582,13 +707,26 @@ public struct RepoPromptHTTPService: Sendable {
         return response
     }
 
-    private func authenticatePortal(context: RepoPromptRequestContext) async throws {
+    private func authenticatePortal(context: RepoPromptRequestContext) async throws -> ProviderMutationAttribution {
         guard let certificateRoleResolver,
-              let certificate = try await context.channel.nioSSL_peerCertificate().get(),
-              RepoPromptPortalCertificateAuthorization.allows(try certificateRoleResolver.role(certificate: certificate))
+              let certificate = try await context.channel.nioSSL_peerCertificate().get()
         else {
             throw ServiceAPIError(code: .internalAuthFailed, message: "An authorized portal client certificate is required")
         }
+        let role = try certificateRoleResolver.role(certificate: certificate)
+        guard RepoPromptPortalCertificateAuthorization.allows(role) else {
+            throw ServiceAPIError(code: .internalAuthFailed, message: "An authorized portal client certificate is required")
+        }
+        let digest = try SHA256.hash(data: Data(certificate.toDERBytes())).map { String(format: "%02x", $0) }.joined()
+        return ProviderMutationAttribution(actorID: "certificate:\(digest)", actorLabel: role.rawValue, channel: "portal-mtls")
+    }
+
+    private func providerSettingsID(_ context: RepoPromptRequestContext) throws -> ProviderSettingsID {
+        let id = try context.parameters.require("id")
+        guard let providerID = ProviderSettingsID(rawValue: id) else {
+            throw ServiceAPIError(code: .notFound, message: "Provider settings not found")
+        }
+        return providerID
     }
 
     private func requireProviderSettings() throws -> ProviderSettingsService {
@@ -596,6 +734,13 @@ public struct RepoPromptHTTPService: Sendable {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider settings are unavailable", retryable: true)
         }
         return providerSettings
+    }
+
+    private func providerAttribution(_ auth: AuthenticatedInternalRequest) -> ProviderMutationAttribution {
+        if let actor = auth.decision?.actor {
+            return .init(actorID: actor.goblinUserID, actorLabel: actor.username, channel: "goblin-app")
+        }
+        return .init(actorID: "signing-key:\(auth.keyID)", actorLabel: auth.role.rawValue, channel: "internal-hmac")
     }
 
     private func portalJSON(_ value: some Encodable, status: HTTPResponse.Status = .ok) throws -> Response {
@@ -723,11 +868,10 @@ public struct RepoPromptHTTPService: Sendable {
         let ordered = items.sorted { sortKey($0) < sortKey($1) }
         guard offset <= ordered.count else { throw ServiceAPIError(code: .invalidRequest, message: "Pagination offset is invalid") }
         let end = min(ordered.count, offset + requestedLimit)
-        let nextToken: String?
-        if end < ordered.count {
-            nextToken = CanonicalSigning.base64URLEncode(try JSONEncoder.serviceEncoder.encode(PageToken(storeID: cursor.storeID, globalSequence: cursor.globalSequence, offset: end)))
+        let nextToken: String? = if end < ordered.count {
+            try CanonicalSigning.base64URLEncode(JSONEncoder.serviceEncoder.encode(PageToken(storeID: cursor.storeID, globalSequence: cursor.globalSequence, offset: end)))
         } else {
-            nextToken = nil
+            nil
         }
         return Page(items: Array(ordered[offset ..< end]), nextPageToken: nextToken, cursor: cursor)
     }
@@ -848,7 +992,7 @@ public struct RepoPromptHTTPService: Sendable {
         headers[.contentType] = "text/event-stream"
         headers[.cacheControl] = "no-store"
         let transition = CursorExpiredResponse(storeID: cursor.storeID, replayFloor: cursor.globalSequence)
-        let payload = String(decoding: try JSONEncoder.serviceEncoder.encode(transition), as: UTF8.self)
+        let payload = try String(decoding: JSONEncoder.serviceEncoder.encode(transition), as: UTF8.self)
         return Response(status: .ok, headers: headers, body: ResponseBody { writer in
             try await writer.write(ByteBuffer(string: "event: cursor_expired\ndata: \(payload)\n\n"))
             try await writer.finish(nil)
