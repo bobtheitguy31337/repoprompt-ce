@@ -23,6 +23,16 @@ Focused validation and release validation remain explicit; use the validation ma
 
 Local `docs/investigations/*.md` reports are intentionally left unignored so RepoPrompt tooling can read them. Do not stage or merge these local investigation artifacts unless intentionally requested.
 
+## Degentlemen sandbox delivery
+
+For Degentlemen provider or deployment work, also read `/Users/jared/Projects/degentlemen-chat/AGENTS.md` and preserve its credential and host-safety rules.
+
+- Work in an isolated worktree and do not overwrite another agent's checkout or provider/deployment changes.
+- Commit completed changes. Do not stop at the feature/worktree commit: merge or cherry-pick it into this repository's existing `sandbox` branch and push `sandbox`.
+- For a cross-repository deployment, update and push `chat-server` and `repoprompt-ce` `sandbox` first. Push `chat-ops` `sandbox` last; that push is the sole normal trigger for the GitHub Actions `Deploy sandbox` workflow.
+- Do not create a new sandbox ownership model, use an alternate deployment pipeline, invoke the chat-ops deployment script directly, or manually deploy over SSH.
+- Monitor the `Deploy sandbox` workflow and verify ordinary live health/readiness before reporting delivery complete.
+
 ## Run
 
 ```bash
