@@ -155,8 +155,11 @@ final class ProviderSettingsPortalTests: XCTestCase {
         let css = String(decoding: try RepoPromptPortalAssets.data(for: .stylesheet), as: UTF8.self)
         let script = String(decoding: try RepoPromptPortalAssets.data(for: .script), as: UTF8.self)
 
-        for term in ["What are we building?", "Models &amp; Providers", "Copy &amp; Chat", "Runtime"] {
-            XCTAssertTrue(html.contains(term), "missing desktop term: \(term)")
+        for term in ["Provider and model settings", "Models &amp; Providers", "Copy &amp; Chat", "Settings portal scope"] {
+            XCTAssertTrue(html.contains(term), "missing portal term: \(term)")
+        }
+        for unavailablePlaceholder in ["What are we building?", "New Agent Session", "Agent transcript"] {
+            XCTAssertFalse(html.contains(unavailablePlaceholder), "dead desktop placeholder leaked into portal: \(unavailablePlaceholder)")
         }
         for token in ["--space-4: 4px", "--space-16: 16px", "--space-32: 32px", "ui-rounded", "ui-monospace"] {
             XCTAssertTrue(css.contains(token), "missing visual token: \(token)")
@@ -165,7 +168,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertFalse(script.contains("sessionStorage"))
         XCTAssertFalse(script.contains("console."))
         XCTAssertFalse(script.contains("style."), "strict CSP forbids inline style mutation")
-        XCTAssertTrue(script.contains("challenge.userCode"), "device challenge should be transiently renderable")
+        XCTAssertTrue(script.contains("flow.userCode"), "device challenge should be transiently renderable")
         XCTAssertTrue(html.contains("href=\"assets/portal.css\""))
         XCTAssertTrue(html.contains("src=\"assets/portal.js\""))
         XCTAssertFalse(html.contains("/portal/assets/"))
