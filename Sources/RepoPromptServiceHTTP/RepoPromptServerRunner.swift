@@ -78,9 +78,13 @@ public struct RepoPromptServerConfiguration: Sendable {
             .openCodeACP: environment["REPOPROMPT_OPENCODE_EXECUTABLE"] ?? "/opt/repoprompt/providers/opencode",
             .cursorACP: environment["REPOPROMPT_CURSOR_EXECUTABLE"] ?? "/opt/repoprompt/providers/cursor-agent"
         ]
-        let enabledProviderNames = (environment["REPOPROMPT_ENABLED_PROVIDERS"] ?? "")
-            .split(separator: ",")
-            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        let enabledProviderNames = if let configured = environment["REPOPROMPT_ENABLED_PROVIDERS"] {
+            configured
+                .split(separator: ",")
+                .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        } else {
+            [ProviderKind.codex.rawValue, ProviderKind.claudeCompatible.rawValue]
+        }
         var enabledProviders = Set<ProviderKind>()
         for name in enabledProviderNames {
             guard let kind = ProviderKind(rawValue: name), providers[kind] != nil else {

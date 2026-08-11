@@ -107,6 +107,8 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertTrue(codex.capabilities.supportsReasoningEffort)
         XCTAssertTrue(codex.capabilities.supportsServiceTier)
         XCTAssertFalse(codex.capabilities.supportsSpeedMode)
+        XCTAssertTrue(codex.capabilities.authenticationMethods.isEmpty)
+        XCTAssertTrue(codex.capabilities.authFlows.isEmpty)
         XCTAssertFalse(codex.deploymentAllowed)
         XCTAssertFalse(codex.runtimePreflightVerified)
         XCTAssertFalse(codex.effectiveEnabled)

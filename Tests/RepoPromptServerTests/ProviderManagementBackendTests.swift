@@ -1,7 +1,10 @@
 import Crypto
 import Foundation
+#if canImport(FoundationNetworking)
+    import FoundationNetworking
+#endif
 import RepoPromptAgentRuntimeCore
-import RepoPromptHeadlessRuntime
+@testable import RepoPromptHeadlessRuntime
 @testable import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 import RepoPromptWorkspaceRuntimeCore
@@ -80,6 +83,60 @@ final class ProviderManagementBackendTests: XCTestCase {
         XCTAssertNoThrow(try ProviderVaultKey.load(keyID: "test", filePath: file.path))
     }
 
+    func testProductionCredentialValidatorUsesFixedHTTPSHeaderContractsAndClosedResults() async throws {
+        let transport = RecordingCredentialHTTPTransport(statusCode: 200)
+        let adapter = ProviderAuthenticationAdapter(
+            configurations: [
+                .init(kind: .codex, executable: "/usr/bin/true"),
+                .init(kind: .claudeCompatible, executable: "/usr/bin/true")
+            ],
+            transport: transport
+        )
+        let openAISecret = "sk-test-openai-secret"
+        let anthropicSecret = "sk-ant-test-secret"
+
+        let openAI = await adapter.test(providerID: .codex, method: .apiKey, secret: Data(openAISecret.utf8))
+        let anthropic = await adapter.test(providerID: .claudeCompatible, method: .apiKey, secret: Data(anthropicSecret.utf8))
+        let requests = await transport.requests()
+
+        XCTAssertEqual(openAI.state, .valid)
+        XCTAssertEqual(openAI.detail, "OpenAI credential validated")
+        XCTAssertEqual(anthropic.state, .valid)
+        XCTAssertEqual(anthropic.detail, "Anthropic credential validated")
+        XCTAssertEqual(requests.map { $0.url?.absoluteString }, [
+            "https://api.openai.com/v1/models",
+            "https://api.anthropic.com/v1/models?limit=1"
+        ])
+        XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Authorization"), "Bearer \(openAISecret)")
+        XCTAssertEqual(requests[1].value(forHTTPHeaderField: "x-api-key"), anthropicSecret)
+        XCTAssertEqual(requests[1].value(forHTTPHeaderField: "anthropic-version"), "2023-06-01")
+        XCTAssertFalse(requests.compactMap { $0.url?.absoluteString }.contains { $0.contains(openAISecret) || $0.contains(anthropicSecret) })
+
+        let unsupported = await adapter.test(providerID: .claudeCompatible, method: .authToken, secret: Data(anthropicSecret.utf8))
+        XCTAssertEqual(unsupported.state, .unavailable)
+        XCTAssertFalse(unsupported.detail.contains(anthropicSecret))
+    }
+
+    func testProductionCredentialValidatorClassifiesRejectionAndSanitizesTransportFailure() async {
+        let rejected = ProviderAuthenticationAdapter(
+            configurations: [.init(kind: .codex, executable: "/usr/bin/true")],
+            transport: RecordingCredentialHTTPTransport(statusCode: 401)
+        )
+        let rejectedResult = await rejected.test(providerID: .codex, method: .apiKey, secret: Data("sk-rejected-secret".utf8))
+        XCTAssertEqual(rejectedResult.state, .invalid)
+        XCTAssertEqual(rejectedResult.detail, "Provider rejected the configured credential")
+
+        let failed = ProviderAuthenticationAdapter(
+            configurations: [.init(kind: .codex, executable: "/usr/bin/true")],
+            transport: FailingCredentialHTTPTransport()
+        )
+        let secret = "sk-transport-secret"
+        let failedResult = await failed.test(providerID: .codex, method: .apiKey, secret: Data(secret.utf8))
+        XCTAssertEqual(failedResult.state, .unavailable)
+        XCTAssertEqual(failedResult.detail, "Provider credential validation is temporarily unavailable")
+        XCTAssertFalse(failedResult.detail.contains(secret))
+    }
+
     func testAPIKeyConnectionIsEncryptedAuditedValidatedAndInjectedOnlyThroughEnvironment() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -92,6 +149,10 @@ final class ProviderManagementBackendTests: XCTestCase {
         let tester = RecordingCredentialTester(result: .init(state: .valid, detail: "Credential accepted"))
         let service = ProviderSettingsService(store: store, adapter: adapter, configurations: [configuration], initiallyEnabled: [.codex], vault: vault, credentialTester: tester, runner: StaticVersionRunner())
         try await service.bootstrap()
+        let initialCatalog = try await service.catalog()
+        let initialCodex = try XCTUnwrap(initialCatalog.providers.first { $0.providerID == .codex })
+        XCTAssertEqual(initialCodex.capabilities.authenticationMethods, [.apiKey])
+        XCTAssertTrue(initialCodex.capabilities.authFlows.isEmpty)
         let attribution = ProviderMutationAttribution(actorID: "admin-1", actorLabel: "alice", channel: "test")
         let secret = "sk-test-write-only-value"
 
@@ -162,7 +223,7 @@ final class ProviderManagementBackendTests: XCTestCase {
         do {
             _ = try await service.connect(providerID: .openCodeACP, request: .init(authenticationMethod: .providerSpecific, credential: "must-not-proxy"), attribution: .init(actorID: "a", actorLabel: "a", channel: "test"))
             XCTFail("OpenCode raw credential proxy was accepted")
-        } catch let error as ServiceAPIError { XCTAssertEqual(error.code, .invalidRequest) }
+        } catch let error as ServiceAPIError { XCTAssertEqual(error.code, .capabilityMissing) }
     }
 
     func testTransientAuthFlowIsOwnerFencedAndCancelRemovesState() async throws {
@@ -190,6 +251,10 @@ private actor RecordingCredentialTester: ProviderCredentialTesting {
         self.result = result
     }
 
+    func supportedAuthenticationMethods(for _: ProviderSettingsID) async -> Set<ProviderAuthenticationMethod> {
+        [.apiKey]
+    }
+
     func test(providerID _: ProviderSettingsID, method _: ProviderAuthenticationMethod, secret _: Data?) async -> ProviderCredentialTestResult {
         result
     }
@@ -198,11 +263,43 @@ private actor RecordingCredentialTester: ProviderCredentialTesting {
 }
 
 private actor EchoingCredentialTester: ProviderCredentialTesting {
+    func supportedAuthenticationMethods(for _: ProviderSettingsID) async -> Set<ProviderAuthenticationMethod> {
+        [.apiKey]
+    }
+
     func test(providerID _: ProviderSettingsID, method _: ProviderAuthenticationMethod, secret: Data?) async -> ProviderCredentialTestResult {
         .init(state: .valid, detail: "Credential accepted", accountLabel: secret.flatMap { String(data: $0, encoding: .utf8) })
     }
 
     func logout(providerID _: ProviderSettingsID, method _: ProviderAuthenticationMethod) async {}
+}
+
+private actor RecordingCredentialHTTPTransport: ProviderCredentialHTTPTransport {
+    private let statusCode: Int
+    private var captured: [URLRequest] = []
+
+    init(statusCode: Int) {
+        self.statusCode = statusCode
+    }
+
+    func statusCode(for request: URLRequest, timeout _: Duration) async throws -> Int {
+        captured.append(request)
+        return statusCode
+    }
+
+    func requests() -> [URLRequest] {
+        captured
+    }
+}
+
+private struct FailingCredentialHTTPTransport: ProviderCredentialHTTPTransport {
+    private struct SecretBearingError: Error, CustomStringConvertible {
+        let description = "Authorization: Bearer sk-transport-secret"
+    }
+
+    func statusCode(for _: URLRequest, timeout _: Duration) async throws -> Int {
+        throw SecretBearingError()
+    }
 }
 
 private actor StaticVersionRunner: WorkspaceCommandRunning {

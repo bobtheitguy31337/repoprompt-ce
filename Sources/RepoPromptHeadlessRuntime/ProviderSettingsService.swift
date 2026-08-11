@@ -49,6 +49,7 @@ public actor ProviderSettingsService {
     private var preferences: [ProviderSettingsID: ProviderSettingsPreference] = [:]
     private var cliHealth: [ProviderSettingsID: ProviderCLIHealth] = [:]
     private var runtimePreflight: [ProviderSettingsID: Bool] = [:]
+    private var supportedAuthenticationMethods: [ProviderSettingsID: Set<ProviderAuthenticationMethod>] = [:]
     private var modelCatalogs: [ProviderSettingsID: [ProviderModelCatalogEntry]] = [:]
     private var connections: [ProviderSettingsID: SQLiteServiceStore.StoredProviderConnection] = [:]
 
@@ -109,6 +110,17 @@ public actor ProviderSettingsService {
             try await vault.reconcile(references: credentialReferences)
         }
         for providerID in ProviderSettingsID.allCases {
+            let validatorMethods = await credentialTester.supportedAuthenticationMethods(for: providerID)
+            if vault != nil,
+               let runtimeKind = providerID.runtimeKind,
+               let configuration = configurations[runtimeKind],
+               initiallyEnabled.contains(runtimeKind),
+               FileManager.default.isExecutableFile(atPath: configuration.executable)
+            {
+                supportedAuthenticationMethods[providerID] = validatorMethods
+            } else {
+                supportedAuthenticationMethods[providerID] = []
+            }
             if preferences[providerID] == nil {
                 let initial = ProviderSettingsPreference(
                     providerID: providerID,
@@ -215,8 +227,7 @@ public actor ProviderSettingsService {
     }
 
     public func connect(providerID: ProviderSettingsID, request: ConnectProviderRequest, attribution: ProviderMutationAttribution) async throws -> ProviderSettingsSnapshot {
-        let definition = Self.definition(providerID)
-        guard definition.capabilities.authenticationMethods.contains(request.authenticationMethod) else {
+        guard supportedAuthenticationMethods[providerID, default: []].contains(request.authenticationMethod) else {
             throw ServiceAPIError(code: .capabilityMissing, message: "Authentication method is not supported by this provider")
         }
         guard ![ProviderAuthenticationMethod.browserOAuth, .deviceCodeBeta].contains(request.authenticationMethod) else {
@@ -356,7 +367,11 @@ public actor ProviderSettingsService {
     private func credentialMaterial(_ request: ConnectProviderRequest, providerID: ProviderSettingsID) throws -> Data? {
         switch request.authenticationMethod {
         case .apiKey, .enterpriseAccessToken, .authToken:
-            guard let value = request.credential?.trimmingCharacters(in: .whitespacesAndNewlines), value.utf8.count >= 8, value.utf8.count <= 65536, !value.contains("\0") else {
+            guard let value = request.credential?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  value.utf8.count >= 8,
+                  value.utf8.count <= 65536,
+                  !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+            else {
                 throw ServiceAPIError(code: .invalidRequest, message: "A valid write-only credential is required")
             }
             return Data(value.utf8)
@@ -491,7 +506,7 @@ public actor ProviderSettingsService {
             authentication: authenticationStatus(providerID),
             connection: connection,
             preflight: preflight,
-            capabilities: definition.capabilities,
+            capabilities: projectedCapabilities(definition.capabilities, providerID: providerID),
             models: models
         )
     }
@@ -640,6 +655,21 @@ public actor ProviderSettingsService {
         }
     }
 
+    private func projectedCapabilities(
+        _ capabilities: ProviderSettingsCapabilities,
+        providerID: ProviderSettingsID
+    ) -> ProviderSettingsCapabilities {
+        let supported = supportedAuthenticationMethods[providerID, default: []]
+        return .init(
+            supportsModelSelection: capabilities.supportsModelSelection,
+            supportsReasoningEffort: capabilities.supportsReasoningEffort,
+            supportsSpeedMode: capabilities.supportsSpeedMode,
+            supportsServiceTier: capabilities.supportsServiceTier,
+            authenticationMethods: ProviderAuthenticationMethod.allCases.filter(supported.contains),
+            authFlows: []
+        )
+    }
+
     private struct Definition {
         let displayName: String
         let category: ProviderSettingsCategory
@@ -648,21 +678,17 @@ public actor ProviderSettingsService {
     }
 
     private nonisolated static func definition(_ providerID: ProviderSettingsID) -> Definition {
-        let external = ProviderAuthFlowDescriptor(kind: .externalProvisioning, displayName: "Server credential provisioning", startable: false, detail: "Mount credentials or a provider key helper on the server; secret values never pass through the portal")
         switch providerID {
         case .codex:
-            return Definition(displayName: "Codex", category: .cliProvider, summary: "OpenAI Codex app-server with isolated CODEX_HOME", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: true, authenticationMethods: [.apiKey, .enterpriseAccessToken], authFlows: [
-                .init(kind: .browserOAuth, displayName: "Browser OAuth", startable: false, detail: "Server-side OAuth adapter seam; not installed in this slice"),
-                .init(kind: .deviceCodeBeta, displayName: "Device auth (beta)", startable: false, detail: "Transient owner-fenced driver seam is present; a Codex device driver is not installed"), external
-            ]))
+            return Definition(displayName: "Codex", category: .cliProvider, summary: "OpenAI Codex app-server with isolated CODEX_HOME", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: true, authenticationMethods: [], authFlows: []))
         case .claudeCompatible:
-            return Definition(displayName: "Claude Code", category: .cliProvider, summary: "Claude-compatible stream JSON with isolated CLAUDE_CONFIG_DIR", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [.apiKey, .authToken], authFlows: [external]))
+            return Definition(displayName: "Claude Code", category: .cliProvider, summary: "Claude-compatible stream JSON with isolated CLAUDE_CONFIG_DIR", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
         case .openCodeACP:
-            return Definition(displayName: "OpenCode", category: .cliProvider, summary: "Provider-specific ACP catalog and authentication", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [.providerSpecific], authFlows: [external]))
+            return Definition(displayName: "OpenCode", category: .cliProvider, summary: "Provider-specific ACP catalog and authentication", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
         case .cursorACP:
-            return Definition(displayName: "Cursor", category: .cliProvider, summary: "Cursor ACP with browser login or server-side API key", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [.browserLogin, .apiKey], authFlows: [external]))
+            return Definition(displayName: "Cursor", category: .cliProvider, summary: "Cursor ACP with externally provisioned authentication", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
         case .xAI:
-            return Definition(displayName: "xAI", category: .apiProvider, summary: "API-key-only provider; runtime extraction is pending", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: true, authenticationMethods: [.apiKey], authFlows: [external]))
+            return Definition(displayName: "xAI", category: .apiProvider, summary: "Provider runtime is not available on the server", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: true, authenticationMethods: [], authFlows: []))
         }
     }
 

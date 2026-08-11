@@ -1,15 +1,24 @@
 import Foundation
+#if canImport(FoundationNetworking)
+    import FoundationNetworking
+#endif
 import RepoPromptAgentRuntimeCore
 import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 
 public protocol ProviderCredentialTesting: Sendable {
+    func supportedAuthenticationMethods(for providerID: ProviderSettingsID) async -> Set<ProviderAuthenticationMethod>
     func test(providerID: ProviderSettingsID, method: ProviderAuthenticationMethod, secret: Data?) async -> ProviderCredentialTestResult
     func logout(providerID: ProviderSettingsID, method: ProviderAuthenticationMethod) async
 }
 
 public struct UnavailableProviderCredentialTester: ProviderCredentialTesting {
     public init() {}
+
+    public func supportedAuthenticationMethods(for _: ProviderSettingsID) async -> Set<ProviderAuthenticationMethod> {
+        []
+    }
+
     public func test(providerID _: ProviderSettingsID, method _: ProviderAuthenticationMethod, secret _: Data?) async -> ProviderCredentialTestResult {
         .init(state: .unavailable, detail: "Credential validation adapter is unavailable")
     }
@@ -78,20 +87,79 @@ public actor VaultProviderProcessEnvironment: ProviderProcessEnvironmentProvidin
     }
 }
 
-/// Provider-specific status/logout adapter. Raw command and HTTP output is
-/// discarded; callers receive only closed, redacted states.
+/// Provider-specific API-key validator. Credentials are sent only to fixed
+/// provider HTTPS endpoints in request headers; response bodies and transport
+/// diagnostics are discarded before returning a closed result.
 public actor ProviderAuthenticationAdapter: ProviderCredentialTesting {
-    public init(configurations _: [ProviderCLIConfiguration]) {}
+    private let configuredKinds: Set<ProviderKind>
+    private let transport: any ProviderCredentialHTTPTransport
 
-    /// Credential verification is deliberately fail-closed until an
-    /// administrator opts the deployment into a provider-specific validator.
-    /// The server neither sends write-only credentials over an implicit
-    /// network path nor starts an unbounded login-status subprocess.
-    public func test(providerID _: ProviderSettingsID, method _: ProviderAuthenticationMethod, secret: Data?) async -> ProviderCredentialTestResult {
-        guard secret?.isEmpty == false else {
-            return .init(state: .invalid, detail: "Provider credential is missing")
+    public init(configurations: [ProviderCLIConfiguration]) {
+        configuredKinds = Set(configurations.map(\.kind))
+        transport = URLSessionProviderCredentialHTTPTransport()
+    }
+
+    init(configurations: [ProviderCLIConfiguration], transport: any ProviderCredentialHTTPTransport) {
+        configuredKinds = Set(configurations.map(\.kind))
+        self.transport = transport
+    }
+
+    public func supportedAuthenticationMethods(for providerID: ProviderSettingsID) async -> Set<ProviderAuthenticationMethod> {
+        switch providerID {
+        case .codex where configuredKinds.contains(.codex),
+             .claudeCompatible where configuredKinds.contains(.claudeCompatible):
+            [.apiKey]
+        case .codex, .claudeCompatible, .openCodeACP, .cursorACP, .xAI:
+            []
         }
-        return .init(state: .unavailable, detail: "Provider credential validation is not configured for this deployment")
+    }
+
+    public func test(providerID: ProviderSettingsID, method: ProviderAuthenticationMethod, secret: Data?) async -> ProviderCredentialTestResult {
+        guard await supportedAuthenticationMethods(for: providerID).contains(method) else {
+            return .init(state: .unavailable, detail: "Provider credential validation is unavailable")
+        }
+        guard let secret,
+              let value = String(data: secret, encoding: .utf8),
+              !value.isEmpty,
+              !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        else {
+            return .init(state: .invalid, detail: "Provider credential is invalid")
+        }
+
+        var request: URLRequest
+        let acceptedDetail: String
+        switch providerID {
+        case .codex:
+            request = URLRequest(url: URL(string: "https://api.openai.com/v1/models")!)
+            request.setValue("Bearer \(value)", forHTTPHeaderField: "Authorization")
+            acceptedDetail = "OpenAI credential validated"
+        case .claudeCompatible:
+            request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/models?limit=1")!)
+            request.setValue(value, forHTTPHeaderField: "x-api-key")
+            request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            acceptedDetail = "Anthropic credential validated"
+        case .openCodeACP, .cursorACP, .xAI:
+            return .init(state: .unavailable, detail: "Provider credential validation is unavailable")
+        }
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 10
+
+        do {
+            let status = try await transport.statusCode(for: request, timeout: .seconds(10))
+            switch status {
+            case 200 ..< 300:
+                return .init(state: .valid, detail: acceptedDetail)
+            case 401, 403:
+                return .init(state: .invalid, detail: "Provider rejected the configured credential")
+            default:
+                return .init(state: .unavailable, detail: "Provider credential validation is temporarily unavailable")
+            }
+        } catch is CancellationError {
+            return .init(state: .unavailable, detail: "Provider credential validation was cancelled")
+        } catch {
+            return .init(state: .unavailable, detail: "Provider credential validation is temporarily unavailable")
+        }
     }
 
     public func logout(providerID _: ProviderSettingsID, method _: ProviderAuthenticationMethod) async {}

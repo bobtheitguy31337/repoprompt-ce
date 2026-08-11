@@ -31,8 +31,11 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         XCTAssertEqual(configuration.signingKeys.first(where: { $0.keyID == "app-v0" })?.active, false)
         XCTAssertEqual(configuration.signingKeys.first(where: { $0.keyID == "app-v0" })?.role, .goblinApp)
         XCTAssertEqual(Set(configuration.providerExecutables.keys), [.codex, .claudeCompatible, .openCodeACP, .cursorACP])
-        XCTAssertTrue(configuration.enabledProviders.isEmpty)
+        XCTAssertEqual(configuration.enabledProviders, [.codex, .claudeCompatible])
 
+        environment["REPOPROMPT_ENABLED_PROVIDERS"] = ""
+        let disabledConfiguration = try RepoPromptServerConfiguration.environment(environment)
+        XCTAssertTrue(disabledConfiguration.enabledProviders.isEmpty)
         environment["REPOPROMPT_ENABLED_PROVIDERS"] = "codex, claudeCompatible"
         let enabledConfiguration = try RepoPromptServerConfiguration.environment(environment)
         XCTAssertEqual(enabledConfiguration.enabledProviders, [.codex, .claudeCompatible])
