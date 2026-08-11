@@ -488,7 +488,7 @@ public struct RepoPromptHTTPService: Sendable {
             _ = try await authenticate(request, context: context, body: data, roles: [.operatorRole], operation: "quiesce")
             await drainController.startDrain()
             try await authority.quiesce()
-            return Response(status: .accepted)
+            return HTTPResponses.empty(status: .accepted)
         } }
 
         return router
