@@ -1,8 +1,9 @@
 import Foundation
 import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
+import RepoPromptHeadlessRuntime
 
-public actor PortalDesktopSettingsService {
+public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProviding {
     public struct RuntimeDefaults: Sendable, Equatable {
         public let mode: String
         public let providerSettings: [String: String]
@@ -65,7 +66,7 @@ public actor PortalDesktopSettingsService {
                 "codex.memoriesEnabled": values[PortalDesktopSettingKey.codexMemoriesEnabled.rawValue] ?? "false",
                 "codex.enabledMCPServers": values[PortalDesktopSettingKey.codexEnabledMCPServers.rawValue] ?? "[\"RepoPromptCE\"]"
             ])
-        case .claudeCompatible:
+        case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom:
             let permission = values[PortalDesktopSettingKey.claudePermissionLevel.rawValue] ?? "requireApproval"
             let mode = permission == "fullAccess" ? "fullAccess" : (permission == "requireApproval" ? "workspaceWrite" : fallbackMode)
             let claudeMode: String = switch permission {
@@ -73,12 +74,23 @@ public actor PortalDesktopSettingsService {
             case "auto": "auto"
             default: "default"
             }
-            return .init(mode: mode, providerSettings: [
+            var providerSettings = [
                 "claude.permissionMode": claudeMode,
                 "claude.bashEnabled": values[PortalDesktopSettingKey.claudeBashEnabled.rawValue] ?? "true",
                 "claude.strictMCPEnabled": values[PortalDesktopSettingKey.claudeStrictMCPEnabled.rawValue] ?? "false",
                 "claude.toolSearchEnabled": values[PortalDesktopSettingKey.claudeToolSearchEnabled.rawValue] ?? "true"
-            ])
+            ]
+            if providerID != .claudeCompatible {
+                let backend = try Self.backendSettings(providerID: providerID, values: values)
+                providerSettings["claude.backendID"] = providerID.rawValue
+                providerSettings["claude.backendBaseURL"] = backend.baseURL
+                providerSettings["claude.backendAuthHeader"] = backend.authHeader.rawValue
+                providerSettings["claude.backendModelBehavior"] = backend.modelBehavior.rawValue
+                providerSettings["claude.backendHaikuModel"] = backend.haikuModel
+                providerSettings["claude.backendSonnetModel"] = backend.sonnetModel
+                providerSettings["claude.backendOpusModel"] = backend.opusModel
+            }
+            return .init(mode: mode, providerSettings: providerSettings)
         case .openCodeACP:
             let permission = values[PortalDesktopSettingKey.openCodePermissionLevel.rawValue] ?? "managedDefault"
             return .init(mode: permission == "fullAccess" ? "fullAccess" : fallbackMode, providerSettings: [:])
@@ -88,6 +100,41 @@ public actor PortalDesktopSettingsService {
         case .xAI:
             return .init(mode: fallbackMode, providerSettings: [:])
         }
+    }
+
+    public func backendSettings(for providerID: ProviderSettingsID) async throws -> ClaudeCompatibleBackendSettings? {
+        guard [.claudeGLM, .claudeKimi, .claudeCustom].contains(providerID) else { return nil }
+        let values = try await snapshot().values
+        return try Self.backendSettings(providerID: providerID, values: values)
+    }
+
+    private nonisolated static func backendSettings(providerID: ProviderSettingsID, values: [String: String]) throws -> ClaudeCompatibleBackendSettings {
+        let keys: (PortalDesktopSettingKey, PortalDesktopSettingKey, PortalDesktopSettingKey, PortalDesktopSettingKey, PortalDesktopSettingKey, PortalDesktopSettingKey, PortalDesktopSettingKey)
+        let defaultBehavior: ClaudeCompatibleBackendModelBehavior
+        switch providerID {
+        case .claudeGLM:
+            keys = (.claudeGLMDisplayName, .claudeGLMBaseURL, .claudeGLMAuthHeader, .claudeGLMHaikuModel, .claudeGLMSonnetModel, .claudeGLMOpusModel, .claudeCustomModelBehavior)
+            defaultBehavior = .claudeSlotMapping
+        case .claudeKimi:
+            keys = (.claudeKimiDisplayName, .claudeKimiBaseURL, .claudeKimiAuthHeader, .claudeCustomHaikuModel, .claudeCustomSonnetModel, .claudeCustomOpusModel, .claudeCustomModelBehavior)
+            defaultBehavior = .noModel
+        case .claudeCustom:
+            keys = (.claudeCustomDisplayName, .claudeCustomBaseURL, .claudeCustomAuthHeader, .claudeCustomHaikuModel, .claudeCustomSonnetModel, .claudeCustomOpusModel, .claudeCustomModelBehavior)
+            defaultBehavior = ClaudeCompatibleBackendModelBehavior(rawValue: values[keys.6.rawValue] ?? "") ?? .noModel
+        default:
+            throw ServiceAPIError(code: .invalidRequest, message: "Claude-compatible backend settings were requested for an unrelated provider")
+        }
+        let auth = ClaudeCompatibleBackendAuthHeader(rawValue: values[keys.2.rawValue] ?? "") ?? .anthropicAPIKey
+        return .init(
+            providerID: providerID,
+            displayName: values[keys.0.rawValue] ?? keys.0.defaultValue,
+            baseURL: values[keys.1.rawValue] ?? keys.1.defaultValue,
+            authHeader: auth,
+            modelBehavior: defaultBehavior,
+            haikuModel: values[keys.3.rawValue] ?? keys.3.defaultValue,
+            sonnetModel: values[keys.4.rawValue] ?? keys.4.defaultValue,
+            opusModel: values[keys.5.rawValue] ?? keys.5.defaultValue
+        )
     }
 
     private nonisolated static func executionMode(_ permission: String, fallback: String) -> String {

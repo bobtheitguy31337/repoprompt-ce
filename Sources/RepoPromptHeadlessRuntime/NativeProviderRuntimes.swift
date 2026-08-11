@@ -95,10 +95,10 @@ private struct NativeProviderProcessSupport {
         }
     }
 
-    func makeSession(runID: UUID, arguments: [String], workingDirectory: String, policy: ProviderExecutionPolicy = .init(), includeCredentials: Bool = true, launchValidation: @escaping @Sendable () throws -> Void = {}) async throws -> NativeJSONLineProcess {
+    func makeSession(runID: UUID, arguments: [String], workingDirectory: String, model: String? = nil, policy: ProviderExecutionPolicy = .init(), includeCredentials: Bool = true, launchValidation: @escaping @Sendable () throws -> Void = {}) async throws -> NativeJSONLineProcess {
         let preparedHome = try await prepareEphemeralHome(runID: runID, includeCredentials: includeCredentials)
         var environment = providerEnvironment(home: preparedHome.url, workingDirectory: workingDirectory, policy: policy)
-        let injected = includeCredentials ? try await credentialEnvironment.environment(for: configuration.kind) : [:]
+        let injected = includeCredentials ? try await credentialEnvironment.environment(for: configuration.kind, model: model, policy: policy) : [:]
         let reserved = Set(["HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "CODEX_HOME", "CODEX_SQLITE_HOME", "CLAUDE_CONFIG_DIR", "PATH", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD"])
         guard injected.keys.allSatisfy({ !reserved.contains($0) }) else {
             throw ServiceAPIError(code: .invalidRequest, message: "Provider credential environment attempted to override an isolated runtime key")
@@ -973,8 +973,9 @@ private actor ClaudeNativeProviderRuntime: AgentProviderRuntime {
             arguments.append("--strict-mcp-config")
         }
         if let resume = request.resumeProviderSessionID { arguments += ["--resume", resume] }
-        if let model = request.model { arguments += ["--model", model] }
-        let process = try await support.makeSession(runID: request.runID, arguments: arguments, workingDirectory: request.workingDirectory, policy: request.policy, launchValidation: { try request.validateLaunch() })
+        let effectiveModel = Self.effectiveModel(request.model, settings: request.policy.providerSettings)
+        if let effectiveModel { arguments += ["--model", effectiveModel] }
+        let process = try await support.makeSession(runID: request.runID, arguments: arguments, workingDirectory: request.workingDirectory, model: request.model, policy: request.policy, launchValidation: { try request.validateLaunch() })
         sessions[request.runID] = process
         defer { sessions[request.runID] = nil }
         do {
@@ -1039,6 +1040,21 @@ private actor ClaudeNativeProviderRuntime: AgentProviderRuntime {
 
     private nonisolated static func sendInterrupt(to process: NativeJSONLineProcess) async throws {
         try await process.sendRaw(JSONSerialization.data(withJSONObject: ["type": "control_request", "request_id": UUID().uuidString, "request": ["subtype": "interrupt", "reason": "authority control"]]))
+    }
+
+    private nonisolated static func effectiveModel(_ requested: String?, settings: [String: String]) -> String? {
+        guard let backendID = settings["claude.backendID"] else { return requested }
+        if backendID == ProviderSettingsID.claudeKimi.rawValue { return nil }
+        if settings["claude.backendModelBehavior"] == ClaudeCompatibleBackendModelBehavior.noModel.rawValue { return nil }
+        guard let requested else { return "sonnet" }
+        let normalized = requested.lowercased()
+        let slots = [
+            ("claude.backendHaikuModel", "haiku"),
+            ("claude.backendSonnetModel", "sonnet"),
+            ("claude.backendOpusModel", "opus")
+        ]
+        return slots.first(where: { settings[$0.0]?.lowercased() == normalized })?.1
+            ?? (["haiku", "sonnet", "opus"].contains(normalized) ? normalized : "sonnet")
     }
 }
 

@@ -46,18 +46,30 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertTrue(operational.migrationsValid, "the latest persisted settings migration must keep server readiness healthy")
         XCTAssertEqual(initial.revision, 0)
         XCTAssertEqual(initial.values[PortalDesktopSettingKey.codexPermissionLevel.rawValue], "autoReview")
+        XCTAssertEqual(initial.values[PortalDesktopSettingKey.claudeGLMBaseURL.rawValue], "https://api.z.ai/api/anthropic")
+        XCTAssertEqual(initial.values[PortalDesktopSettingKey.claudeKimiBaseURL.rawValue], "https://api.kimi.com/coding/")
         XCTAssertNil(initial.values["appearanceMode"])
 
         let updated = try await service.update(.init(expectedRevision: 0, changes: [
             PortalDesktopSettingKey.codexPermissionLevel.rawValue: "readOnly",
             PortalDesktopSettingKey.codexBashEnabled.rawValue: "false",
-            PortalDesktopSettingKey.codexGoalsEnabled.rawValue: "false"
+            PortalDesktopSettingKey.codexGoalsEnabled.rawValue: "false",
+            PortalDesktopSettingKey.claudeGLMSonnetModel.rawValue: "glm-4.7"
         ]))
         XCTAssertEqual(updated.revision, 1)
         let defaults = try await service.runtimeDefaults(for: .codex)
         XCTAssertEqual(defaults.mode, "readOnly")
         XCTAssertEqual(defaults.providerSettings["codex.bashEnabled"], "false")
         XCTAssertEqual(defaults.providerSettings["codex.goalsEnabled"], "false")
+        let glmDefaults = try await service.runtimeDefaults(for: .claudeGLM)
+        XCTAssertEqual(glmDefaults.providerSettings["claude.backendID"], ProviderSettingsID.claudeGLM.rawValue)
+        XCTAssertEqual(glmDefaults.providerSettings["claude.backendBaseURL"], "https://api.z.ai/api/anthropic")
+        XCTAssertEqual(glmDefaults.providerSettings["claude.backendAuthHeader"], "anthropicAuthToken")
+        XCTAssertEqual(glmDefaults.providerSettings["claude.backendSonnetModel"], "glm-4.7")
+        let kimiSettings = try await service.backendSettings(for: .claudeKimi)
+        let kimi = try XCTUnwrap(kimiSettings)
+        XCTAssertEqual(kimi.modelBehavior, .noModel)
+        XCTAssertEqual(kimi.authHeader, .anthropicAPIKey)
 
         do {
             _ = try await service.update(.init(expectedRevision: 0, changes: [PortalDesktopSettingKey.codexBashEnabled.rawValue: "true"]))
@@ -68,6 +80,14 @@ final class ProviderSettingsPortalTests: XCTestCase {
         do {
             _ = try await service.update(.init(expectedRevision: 1, changes: ["appearanceMode": "dark"]))
             XCTFail("desktop-only settings must not enter the server contract")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+        }
+        do {
+            _ = try await service.update(.init(expectedRevision: 1, changes: [
+                PortalDesktopSettingKey.claudeCustomBaseURL.rawValue: "http://unsafe.example"
+            ]))
+            XCTFail("compatible backend URLs must use credential-free HTTPS")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .invalidRequest)
         }

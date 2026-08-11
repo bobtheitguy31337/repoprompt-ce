@@ -44,30 +44,51 @@ public struct StaticProviderCredentialSource: ProviderCredentialSourceProviding 
     public func sourceDirectory(for kind: ProviderKind) async throws -> String? { sources[kind] }
 }
 
+public protocol ClaudeCompatibleBackendSettingsProviding: Sendable {
+    func backendSettings(for providerID: ProviderSettingsID) async throws -> ClaudeCompatibleBackendSettings?
+}
+
 public actor VaultProviderProcessEnvironment: ProviderProcessEnvironmentProviding, ProviderCredentialSourceProviding {
     private let store: SQLiteServiceStore
     private let vault: ProviderCredentialVault?
     private let externallyProvisionedKinds: Set<ProviderKind>
     private let credentialSourceDirectories: [ProviderKind: String]
     private let managedCodexCredentialSource: String?
+    private let backendSettings: (any ClaudeCompatibleBackendSettingsProviding)?
 
     public init(
         store: SQLiteServiceStore,
         vault: ProviderCredentialVault?,
         externallyProvisionedKinds: Set<ProviderKind> = [],
         credentialSourceDirectories: [ProviderKind: String] = [:],
-        managedCodexCredentialSource: String? = nil
+        managedCodexCredentialSource: String? = nil,
+        backendSettings: (any ClaudeCompatibleBackendSettingsProviding)? = nil
     ) {
         self.store = store
         self.vault = vault
         self.externallyProvisionedKinds = externallyProvisionedKinds
         self.credentialSourceDirectories = credentialSourceDirectories
         self.managedCodexCredentialSource = managedCodexCredentialSource
+        self.backendSettings = backendSettings
     }
 
-    public func environment(for kind: ProviderKind) async throws -> [String: String] {
-        guard let providerID = Self.providerID(kind) else { return [:] }
+    public func environment(for kind: ProviderKind, model: String?, policy: ProviderExecutionPolicy) async throws -> [String: String] {
+        let providerID: ProviderSettingsID
+        if kind == .claudeCompatible,
+           let rawBackend = policy.providerSettings["claude.backendID"],
+           let backendID = ProviderSettingsID(rawValue: rawBackend),
+           [.claudeGLM, .claudeKimi, .claudeCustom].contains(backendID)
+        {
+            providerID = backendID
+        } else if let canonical = Self.providerID(kind) {
+            providerID = canonical
+        } else {
+            return [:]
+        }
         guard let stored = try await store.providerConnection(providerID: providerID) else {
+            if [.claudeGLM, .claudeKimi, .claudeCustom].contains(providerID) {
+                throw ServiceAPIError(code: .providerUnavailable, message: "Claude-compatible backend credential is not configured")
+            }
             guard externallyProvisionedKinds.contains(kind) else {
                 throw ServiceAPIError(code: .providerUnavailable, message: "Provider credential is not configured")
             }
@@ -97,6 +118,33 @@ public actor VaultProviderProcessEnvironment: ProviderProcessEnvironmentProvidin
         let secret = try await vault.load(providerID: providerID, connectionID: reference)
         guard let value = String(data: secret, encoding: .utf8), !value.isEmpty else {
             throw ServiceAPIError(code: .providerUnavailable, message: "Provider credential could not be injected")
+        }
+        if [.claudeGLM, .claudeKimi, .claudeCustom].contains(providerID) {
+            guard let config = try await backendSettings?.backendSettings(for: providerID),
+                  !config.baseURL.isEmpty,
+                  stored.record.authenticationMethod == config.authHeader.authenticationMethod
+            else {
+                throw ServiceAPIError(code: .providerUnavailable, message: "Claude-compatible backend settings do not match the stored connection")
+            }
+            var environment = [
+                "ANTHROPIC_BASE_URL": config.baseURL,
+                (config.authHeader == .anthropicAPIKey ? "ANTHROPIC_API_KEY" : "ANTHROPIC_AUTH_TOKEN"): value
+            ]
+            if config.modelBehavior == .claudeSlotMapping {
+                guard !config.haikuModel.isEmpty, !config.sonnetModel.isEmpty, !config.opusModel.isEmpty else {
+                    throw ServiceAPIError(code: .providerUnavailable, message: "Claude-compatible model slots are incomplete")
+                }
+                environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = config.haikuModel
+                environment["ANTHROPIC_DEFAULT_SONNET_MODEL"] = config.sonnetModel
+                environment["ANTHROPIC_DEFAULT_OPUS_MODEL"] = config.opusModel
+            }
+            if providerID == .claudeGLM {
+                environment["API_TIMEOUT_MS"] = "3000000"
+                if model?.contains("[1m]") == true {
+                    environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "1000000"
+                }
+            }
+            return environment
         }
         switch (providerID, stored.record.authenticationMethod) {
         case (.codex, .apiKey), (.codex, .enterpriseAccessToken): return ["OPENAI_API_KEY": value]
@@ -141,24 +189,33 @@ public actor VaultProviderProcessEnvironment: ProviderProcessEnvironmentProvidin
 public actor ProviderAuthenticationAdapter: ProviderCredentialTesting {
     private let configuredKinds: Set<ProviderKind>
     private let transport: any ProviderCredentialHTTPTransport
+    private let backendSettings: (any ClaudeCompatibleBackendSettingsProviding)?
 
-    public init(configurations: [ProviderCLIConfiguration]) {
+    public init(configurations: [ProviderCLIConfiguration], backendSettings: (any ClaudeCompatibleBackendSettingsProviding)? = nil) {
         configuredKinds = Set(configurations.map(\.kind))
         transport = URLSessionProviderCredentialHTTPTransport()
+        self.backendSettings = backendSettings
     }
 
-    init(configurations: [ProviderCLIConfiguration], transport: any ProviderCredentialHTTPTransport) {
+    init(configurations: [ProviderCLIConfiguration], transport: any ProviderCredentialHTTPTransport, backendSettings: (any ClaudeCompatibleBackendSettingsProviding)? = nil) {
         configuredKinds = Set(configurations.map(\.kind))
         self.transport = transport
+        self.backendSettings = backendSettings
     }
 
     public func supportedAuthenticationMethods(for providerID: ProviderSettingsID) async -> Set<ProviderAuthenticationMethod> {
         switch providerID {
-        case .codex where configuredKinds.contains(.codex),
-             .claudeCompatible where configuredKinds.contains(.claudeCompatible):
-            [.apiKey]
-        case .codex, .claudeCompatible, .openCodeACP, .cursorACP, .xAI:
-            []
+        case .codex:
+            return configuredKinds.contains(.codex) ? Set([ProviderAuthenticationMethod.apiKey]) : []
+        case .claudeCompatible:
+            return configuredKinds.contains(.claudeCompatible) ? Set([ProviderAuthenticationMethod.apiKey]) : []
+        case .claudeGLM, .claudeKimi:
+            guard configuredKinds.contains(.claudeCompatible),
+                  let config = try? await backendSettings?.backendSettings(for: providerID)
+            else { return [] }
+            return [config.authHeader.authenticationMethod]
+        case .claudeCustom, .openCodeACP, .cursorACP, .xAI:
+            return []
         }
     }
 
@@ -186,10 +243,31 @@ public actor ProviderAuthenticationAdapter: ProviderCredentialTesting {
             request.setValue(value, forHTTPHeaderField: "x-api-key")
             request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
             acceptedDetail = "Anthropic credential validated"
-        case .openCodeACP, .cursorACP, .xAI:
+        case .claudeGLM, .claudeKimi:
+            guard let config = try? await backendSettings?.backendSettings(for: providerID),
+                  let host = URLComponents(string: config.baseURL)?.host?.lowercased(),
+                  (providerID == .claudeGLM && host == "api.z.ai") || (providerID == .claudeKimi && host == "api.kimi.com"),
+                  let endpoint = URL(string: config.baseURL)?.appendingPathComponent("v1/messages")
+            else { return .init(state: .unavailable, detail: "Compatible backend validation configuration is unavailable") }
+            request = URLRequest(url: endpoint)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            switch config.authHeader {
+            case .anthropicAPIKey: request.setValue(value, forHTTPHeaderField: "x-api-key")
+            case .anthropicAuthToken: request.setValue("Bearer \(value)", forHTTPHeaderField: "Authorization")
+            }
+            request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            let model = providerID == .claudeGLM ? config.sonnetModel : "kimi-for-coding"
+            request.httpBody = try? JSONSerialization.data(withJSONObject: [
+                "model": model,
+                "max_tokens": 1,
+                "messages": [["role": "user", "content": "Reply OK"]]
+            ])
+            acceptedDetail = providerID == .claudeGLM ? "Z.ai credential validated" : "Kimi credential validated"
+        case .claudeCustom, .openCodeACP, .cursorACP, .xAI:
             return .init(state: .unavailable, detail: "Provider credential validation is unavailable")
         }
-        request.httpMethod = "GET"
+        if request.httpMethod == nil { request.httpMethod = "GET" }
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.timeoutInterval = 10
 

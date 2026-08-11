@@ -4,6 +4,9 @@
   const providerOrder = [
     "codex",
     "claudeCompatible",
+    "claudeGLM",
+    "claudeKimi",
+    "claudeCustom",
     "openCodeACP",
     "cursorACP",
     "xAI",
@@ -62,6 +65,7 @@
     pollPromise: null,
     confirmResolver: null,
     confirmReturnFocus: null,
+    settingsDrawerReturnFocus: null,
     focusAfterRoute: false,
     initialized: false,
     agent: {
@@ -91,6 +95,9 @@
     folder: '<path d="M1.5 4h5l1.4 1.5h6.6v7.5h-13z"/>',
     workflow:
       '<circle cx="4" cy="3" r="1.5"/><circle cx="12" cy="8" r="1.5"/><circle cx="4" cy="13" r="1.5"/><path d="M5.5 3h2A2.5 2.5 0 0 1 10 5.5V8M5.5 13h2A2.5 2.5 0 0 0 10 10.5V8"/>',
+    bolt: '<path d="M9 1.5 3.5 8H8l-1 6.5L12.5 7H8z"/>',
+    sparkles:
+      '<path d="M5 1.5c.3 2.1 1.4 3.2 3.5 3.5C6.4 5.3 5.3 6.4 5 8.5 4.7 6.4 3.6 5.3 1.5 5 3.6 4.7 4.7 3.6 5 1.5zM11.5 8c.2 1.6 1.1 2.5 2.7 2.7-1.6.2-2.5 1.1-2.7 2.7-.2-1.6-1.1-2.5-2.7-2.7 1.6-.2 2.5-1.1 2.7-2.7z"/>',
     model: '<path d="M8 1.5 14 5v6l-6 3.5L2 11V5zM2 5l6 3.5L14 5M8 8.5v6"/>',
     shield:
       '<path d="M8 1.5 13 3v4.3c0 3.2-2 5.7-5 7.2-3-1.5-5-4-5-7.2V3z"/><path d="m5.5 8 1.5 1.5 3.5-4"/>',
@@ -98,10 +105,21 @@
     terminal: '<path d="M1.5 3h13v10h-13zM4 6l2 2-2 2M8 10h3"/>',
     agent:
       '<circle cx="8" cy="5" r="3"/><path d="M2.5 14c.5-3 2.4-4.5 5.5-4.5s5 1.5 5.5 4.5"/>',
+    brain:
+      '<path d="M6.5 2.2A2.5 2.5 0 0 0 2.8 5a2.7 2.7 0 0 0 .4 4.8 2.5 2.5 0 0 0 3.3 3.1V2.2zM9.5 2.2A2.5 2.5 0 0 1 13.2 5a2.7 2.7 0 0 1-.4 4.8 2.5 2.5 0 0 1-3.3 3.1V2.2zM6.5 5H5M9.5 7H11M6.5 10H5.2M9.5 11h1.2"/>',
     appearance: '<circle cx="8" cy="8" r="6"/><path d="M8 2a6 6 0 0 0 0 12z"/>',
     keyboard:
       '<path d="M1.5 4h13v8h-13zM4 7h.1M7 7h.1M10 7h.1M12 7h.1M4 10h8"/>',
     sliders: '<path d="M2 4h12M2 8h12M2 12h12M5 2v4M11 6v4M7 10v4"/>',
+    key: '<circle cx="5" cy="7" r="3"/><path d="m7.3 9.3 5.2 5.2M10 12l1.5-1.5M8.5 10.5 10 9"/>',
+    network:
+      '<circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c2 1.7 3 3.7 3 6s-1 4.3-3 6c-2-1.7-3-3.7-3-6s1-4.3 3-6z"/>',
+    stack:
+      '<rect x="2" y="3" width="12" height="9" rx="1"/><path d="M4 1.5h8M4 14.5h8"/>',
+    listStar:
+      '<path d="M2 3h6M2 7h5M2 11h6"/><path d="m11.5 7 .7 1.5 1.7.2-1.2 1.2.3 1.7-1.5-.8-1.5.8.3-1.7-1.2-1.2 1.7-.2z"/>',
+    sidebar:
+      '<rect x="1.5" y="2" width="13" height="12" rx="1.5"/><path d="M5.5 2v12"/>',
     context:
       '<path d="M2 3h12v10H2zM5 6h6M5 9h4"/><path d="M1 5V2h3M15 5V2h-3M1 11v3h3M15 11v3h-3"/>',
     server:
@@ -296,6 +314,20 @@
         title: "Claude Code CLI",
         subtitle:
           "Uses your Claude Code CLI login for Anthropic models. Compatible backends use their own API keys.",
+      },
+      claudeGLM: {
+        title: settingValue("claudeGLMDisplayName", provider.displayName),
+        subtitle: `Claude Code routed through Z.ai. Haiku → ${settingValue("claudeGLMHaikuModel")} · Sonnet → ${settingValue("claudeGLMSonnetModel")} · Opus → ${settingValue("claudeGLMOpusModel")}.`,
+      },
+      claudeKimi: {
+        title: settingValue("claudeKimiDisplayName", provider.displayName),
+        subtitle:
+          "Claude Code routed through Kimi's coding backend. RepoPrompt does not pass --model.",
+      },
+      claudeCustom: {
+        title: settingValue("claudeCustomDisplayName", provider.displayName),
+        subtitle:
+          "Your own configurable Claude Code-compatible HTTPS endpoint.",
       },
       openCodeACP: {
         title: "OpenCode CLI",
@@ -1234,6 +1266,10 @@
   }
 
   async function saveSetting(key, value, control) {
+    return saveSettingsChanges({ [key]: String(value) }, control);
+  }
+
+  async function saveSettingsChanges(changes, control) {
     if (!state.desktopSettings || state.settingsMutation) return;
     state.settingsMutation = (async () => {
       if (control) setDisabledReason(control, true, "Saving setting…");
@@ -1242,7 +1278,7 @@
           method: "PATCH",
           body: JSON.stringify({
             expectedRevision: state.desktopSettings.revision,
-            changes: { [key]: String(value) },
+            changes,
           }),
         });
         document.getElementById("settings-freshness").textContent = "Saved";
@@ -1377,7 +1413,11 @@
     if (byID.codex) stack.append(cliProviderCard(byID.codex));
     if (byID.claudeCompatible)
       stack.append(cliProviderCard(byID.claudeCompatible));
-    stack.append(compatibleBackendsCard(byID.claudeCompatible));
+    stack.append(
+      compatibleBackendsCard(
+        [byID.claudeGLM, byID.claudeKimi, byID.claudeCustom].filter(Boolean),
+      ),
+    );
     if (byID.openCodeACP) stack.append(cliProviderCard(byID.openCodeACP));
     if (byID.cursorACP) stack.append(cliProviderCard(byID.cursorACP));
     content.append(stack);
@@ -1404,12 +1444,18 @@
       iconNode("chevron"),
     );
     const body = element("div", "desktop-provider-body");
+    const compatibleBackend = [
+      "claudeGLM",
+      "claudeKimi",
+      "claudeCustom",
+    ].includes(provider.providerID);
+    if (compatibleBackend) body.append(compatibleBackendSettingsCard(provider));
     const connected =
       provider.authentication?.authenticated &&
       provider.connection?.state === "connected";
     if (connected) {
       body.append(connectedProviderSummary(provider));
-      body.append(providerRuntimeControls(provider));
+      if (!compatibleBackend) body.append(providerRuntimeControls(provider));
     } else {
       if (provider.providerID === "codex") {
         const note = element("p", "codex-auth-note");
@@ -1432,33 +1478,47 @@
           ),
         );
       }
-      const message = element(
-        "div",
-        "inline-message info",
-        "Choose a sign-in method to connect this provider.",
-      );
-      message.setAttribute("role", "status");
-      body.append(authenticationMethodChoices(provider, message));
-      if (state.activeFlow?.providerID === provider.providerID)
-        body.append(devicePanel(provider));
-      const directMethods = (
-        provider.capabilities.authenticationMethods || []
-      ).filter((method) => directAuthenticationMethods.has(method));
-      if (directMethods.length)
-        body.append(credentialForm(provider, directMethods));
-      if (!(provider.capabilities.authenticationMethods || []).length) {
+      const methods = provider.capabilities.authenticationMethods || [];
+      if (methods.length) {
+        const message = element(
+          "div",
+          "inline-message info",
+          "Choose a sign-in method to connect this provider.",
+        );
+        message.setAttribute("role", "status");
+        body.append(authenticationMethodChoices(provider, message));
+        if (state.activeFlow?.providerID === provider.providerID)
+          body.append(devicePanel(provider));
+        const directMethods = methods.filter((method) =>
+          directAuthenticationMethods.has(method),
+        );
+        if (directMethods.length)
+          body.append(credentialForm(provider, directMethods));
+        body.append(message);
+      } else {
         body.append(
           element(
             "p",
             "unavailable-panel",
-            "Connect this CLI in the server's isolated provider account.",
+            providerActionUnavailableReason(provider),
           ),
         );
       }
-      body.append(message);
     }
     details.append(summary, body);
     return details;
+  }
+
+  function providerActionUnavailableReason(provider) {
+    if (!provider.deploymentAllowed)
+      return "This packaged provider is not enabled for this server deployment.";
+    if (provider.cli?.installed === false)
+      return "The provider command is not installed on this server.";
+    if (provider.providerID === "claudeCustom")
+      return "Custom endpoint credentials require an operator-managed connection until a safe endpoint validator is configured.";
+    if (["openCodeACP", "cursorACP"].includes(provider.providerID))
+      return "Complete this provider's sign-in in its isolated server account; the portal does not proxy browser credentials.";
+    return "No connection method is available for this provider on the server.";
   }
 
   function connectedProviderSummary(provider) {
@@ -1622,7 +1682,7 @@
     return card;
   }
 
-  function compatibleBackendsCard(provider) {
+  function compatibleBackendsCard(providers) {
     const details = element(
       "details",
       "desktop-provider-card compatible-provider-card",
@@ -1643,8 +1703,8 @@
       element(
         "span",
         "",
-        provider?.authentication?.authenticated
-          ? "Available"
+        providers.some((provider) => provider.authentication?.authenticated)
+          ? "Connected"
           : "Not configured",
       ),
     );
@@ -1655,19 +1715,191 @@
       iconNode("chevron"),
     );
     const body = element("div", "compatible-backend-list");
-    [
-      ["GLM (Z.AI)", "Z.AI's Claude-compatible API"],
-      ["Kimi (Moonshot AI)", "Moonshot AI's Claude-compatible API"],
-      ["Custom Provider", "Any Claude Code-compatible endpoint"],
-    ].forEach(([title, subtitle]) => {
-      const row = element("div", "compact-backend-row");
-      const copy = element("span", "provider-name");
-      copy.append(element("strong", "", title), element("small", "", subtitle));
-      row.append(copy, element("span", "connection-badge", "Not configured"));
-      body.append(row);
-    });
+    providers.forEach((provider) => body.append(cliProviderCard(provider)));
+    if (!providers.length)
+      body.append(
+        element(
+          "p",
+          "unavailable-panel",
+          "Compatible backend settings are not present in the server catalog.",
+        ),
+      );
     details.append(summary, body);
     return details;
+  }
+
+  function compatibleBackendSettingsCard(provider) {
+    const definitions = {
+      claudeGLM: {
+        keys: {
+          displayName: "claudeGLMDisplayName",
+          baseURL: "claudeGLMBaseURL",
+          auth: "claudeGLMAuthHeader",
+          haiku: "claudeGLMHaikuModel",
+          sonnet: "claudeGLMSonnetModel",
+          opus: "claudeGLMOpusModel",
+        },
+        behavior: "claudeSlotMapping",
+      },
+      claudeKimi: {
+        keys: {
+          displayName: "claudeKimiDisplayName",
+          baseURL: "claudeKimiBaseURL",
+          auth: "claudeKimiAuthHeader",
+        },
+        behavior: "noModel",
+      },
+      claudeCustom: {
+        keys: {
+          displayName: "claudeCustomDisplayName",
+          baseURL: "claudeCustomBaseURL",
+          auth: "claudeCustomAuthHeader",
+          behavior: "claudeCustomModelBehavior",
+          haiku: "claudeCustomHaikuModel",
+          sonnet: "claudeCustomSonnetModel",
+          opus: "claudeCustomOpusModel",
+        },
+        behavior: settingValue("claudeCustomModelBehavior", "noModel"),
+      },
+    };
+    const definition = definitions[provider.providerID];
+    const card = desktopCard("Backend Settings");
+    const enabledRow = desktopRow(
+      "Enable backend",
+      "Makes this configured backend available for new server sessions.",
+      providerEnabledToggle(provider),
+    );
+    card.append(enabledRow);
+    const form = element("form", "compatible-backend-form");
+    const fields = element("div", "settings-form");
+    function field(name, label, type = "text") {
+      const key = definition.keys[name];
+      const wrapper = element("label", "field");
+      wrapper.append(element("span", "", label));
+      const input = document.createElement(
+        type === "select" ? "select" : "input",
+      );
+      input.name = name;
+      input.dataset.settingKey = key;
+      if (type !== "select") input.type = type;
+      input.value = settingValue(key);
+      wrapper.append(input);
+      fields.append(wrapper);
+      return input;
+    }
+    field("displayName", "Display name");
+    field("baseURL", "Base URL", "url");
+    const auth = field("auth", "Auth header", "select");
+    [
+      ["anthropicAPIKey", "ANTHROPIC_API_KEY"],
+      ["anthropicAuthToken", "ANTHROPIC_AUTH_TOKEN"],
+    ].forEach(([value, label]) => {
+      const option = element("option", "", label);
+      option.value = value;
+      option.selected = value === settingValue(definition.keys.auth);
+      auth.append(option);
+    });
+    let behavior = definition.behavior;
+    if (definition.keys.behavior) {
+      const select = field("behavior", "Model behavior", "select");
+      [
+        ["noModel", "No model flag"],
+        ["claudeSlotMapping", "Claude slot mappings"],
+      ].forEach(([value, label]) => {
+        const option = element("option", "", label);
+        option.value = value;
+        option.selected = value === behavior;
+        select.append(option);
+      });
+      select.addEventListener("change", () => {
+        behavior = select.value;
+        slots.hidden = behavior !== "claudeSlotMapping";
+      });
+    }
+    const slots = element("fieldset", "compatible-slot-fields");
+    slots.append(element("legend", "", "Claude slot → backend model ID"));
+    if (definition.keys.haiku) {
+      [
+        ["haiku", "Haiku"],
+        ["sonnet", "Sonnet"],
+        ["opus", "Opus"],
+      ].forEach(([name, label]) => {
+        const wrapper = element("label", "field");
+        wrapper.append(element("span", "", label));
+        const input = document.createElement("input");
+        input.name = name;
+        input.dataset.settingKey = definition.keys[name];
+        input.value = settingValue(definition.keys[name]);
+        wrapper.append(input);
+        slots.append(wrapper);
+      });
+      slots.hidden = behavior !== "claudeSlotMapping";
+      fields.append(slots);
+    }
+    const message = element(
+      "div",
+      "inline-message info",
+      "Secrets are stored separately and never appear in these settings.",
+    );
+    message.setAttribute("role", "status");
+    const actions = element("div", "form-actions");
+    const save = element("button", "primary-button", "Save Settings");
+    save.type = "submit";
+    actions.append(
+      element("span", "form-note", "Applies to future sessions."),
+      save,
+    );
+    form.append(fields, message, actions);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const changes = {};
+      form.querySelectorAll("[data-setting-key]").forEach((input) => {
+        changes[input.dataset.settingKey] = input.value.trim();
+      });
+      await saveSettingsChanges(changes, save);
+      await loadAll(true);
+    });
+    card.append(form);
+    return card;
+  }
+
+  function providerEnabledToggle(provider) {
+    const toggle = element("label", "toggle desktop-toggle");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = provider.preference.enabled;
+    input.setAttribute("aria-label", `Enable ${provider.displayName}`);
+    if (!provider.deploymentAllowed)
+      setDisabledReason(
+        input,
+        true,
+        "This provider is not enabled for the server deployment.",
+      );
+    input.addEventListener("change", async () => {
+      setDisabledReason(input, true, "Saving provider state…");
+      try {
+        const updated = await api(
+          `api/v1/provider-settings/${encodeURIComponent(provider.providerID)}/${input.checked ? "enable" : "disable"}`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              expectedRevision: provider.preference.revision,
+            }),
+          },
+        );
+        replaceProvider(updated);
+        renderRoute();
+        announce(
+          `${provider.displayName} ${input.checked ? "enabled" : "disabled"}`,
+        );
+      } catch (error) {
+        input.checked = !input.checked;
+        setDisabledReason(input, false, "");
+        toast(error.message, true);
+      }
+    });
+    toggle.append(input, element("span"));
+    return toggle;
   }
 
   function renderDesktopAgentModels() {
@@ -3662,6 +3894,49 @@
     });
     document.getElementById("settings-no-results").hidden = visibleCount > 0;
     document.getElementById("clear-settings-search").hidden = !normalized;
+    document.getElementById("settings-search-status").textContent = normalized
+      ? visibleCount
+        ? `${visibleCount} setting${visibleCount === 1 ? "" : "s"} found.`
+        : "No settings found."
+      : "";
+  }
+
+  function visibleSettingsLinks() {
+    return [...document.querySelectorAll("#settings-nav a[data-route]")].filter(
+      (link) => !link.hidden && !link.closest("section")?.hidden,
+    );
+  }
+
+  function openSettingsDrawer() {
+    if (!window.matchMedia("(max-width: 720px)").matches) return;
+    const shell = document.getElementById("settings-shell");
+    const sidebar = document.getElementById("settings-sidebar");
+    const toggle = document.getElementById("settings-drawer-toggle");
+    state.settingsDrawerReturnFocus = document.activeElement;
+    shell.classList.add("drawer-open");
+    document.getElementById("settings-drawer-backdrop").hidden = false;
+    toggle.setAttribute("aria-expanded", "true");
+    toggle.setAttribute("aria-label", "Close settings navigation");
+    sidebar.setAttribute("aria-modal", "true");
+    window.setTimeout(
+      () => document.getElementById("settings-search").focus(),
+      0,
+    );
+  }
+
+  function closeSettingsDrawer({ restoreFocus = true } = {}) {
+    const shell = document.getElementById("settings-shell");
+    if (!shell.classList.contains("drawer-open")) return;
+    shell.classList.remove("drawer-open");
+    document.getElementById("settings-drawer-backdrop").hidden = true;
+    const toggle = document.getElementById("settings-drawer-toggle");
+    toggle.setAttribute("aria-expanded", "false");
+    toggle.setAttribute("aria-label", "Open settings navigation");
+    document.getElementById("settings-sidebar").removeAttribute("aria-modal");
+    const returnFocus = state.settingsDrawerReturnFocus;
+    state.settingsDrawerReturnFocus = null;
+    if (restoreFocus && returnFocus?.isConnected)
+      returnFocus.focus({ preventScroll: true });
   }
 
   function clearSettingsSearch(focus = true) {
@@ -3675,6 +3950,8 @@
     const routeLink = event.target.closest("[data-route-link]");
     if (routeLink) {
       state.focusAfterRoute = true;
+      if (routeLink.closest("#settings-sidebar"))
+        closeSettingsDrawer({ restoreFocus: false });
       if (routeLink.hash === location.hash) window.setTimeout(renderRoute, 0);
     }
     const action = event.target.closest("[data-action]")?.dataset.action;
@@ -3695,16 +3972,51 @@
         : document.getElementById("settings-main-content");
       target.focus({ preventScroll: true });
     } else if (action === "clear-settings-search") clearSettingsSearch();
+    else if (action === "toggle-settings-drawer") {
+      if (
+        document
+          .getElementById("settings-shell")
+          .classList.contains("drawer-open")
+      )
+        closeSettingsDrawer();
+      else openSettingsDrawer();
+    } else if (action === "close-settings-drawer") closeSettingsDrawer();
     else if (action === "cancel-confirm") closeConfirm(false);
     else if (action === "accept-confirm") closeConfirm(true);
   }
 
   function handleDocumentKeydown(event) {
     trapDialogFocus(event);
+    const drawerOpen = document
+      .getElementById("settings-shell")
+      .classList.contains("drawer-open");
+    if (drawerOpen && event.key === "Tab") {
+      const focusable = [
+        ...document
+          .getElementById("settings-sidebar")
+          .querySelectorAll(
+            "input:not(:disabled), button:not(:disabled):not([hidden]), a[href]:not([hidden])",
+          ),
+      ].filter((node) => !node.closest("[hidden]"));
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first?.focus();
+      }
+    }
     if (event.key !== "Escape") return;
     if (!document.getElementById("confirm-dialog").hidden) {
       event.preventDefault();
       closeConfirm(false);
+      return;
+    }
+    if (drawerOpen) {
+      event.preventDefault();
+      closeSettingsDrawer();
       return;
     }
     if (
@@ -3736,6 +4048,35 @@
       .getElementById("settings-search")
       .addEventListener("input", (event) => {
         filterSettingsNavigation(event.target.value);
+      });
+    document
+      .getElementById("settings-search")
+      .addEventListener("keydown", (event) => {
+        const links = visibleSettingsLinks();
+        if ((event.key === "ArrowDown" || event.key === "Enter") && links[0]) {
+          event.preventDefault();
+          if (event.key === "Enter") links[0].click();
+          else links[0].focus({ preventScroll: true });
+        }
+      });
+    document
+      .getElementById("settings-nav")
+      .addEventListener("keydown", (event) => {
+        if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key))
+          return;
+        const links = visibleSettingsLinks();
+        const current = links.indexOf(document.activeElement);
+        if (current < 0) return;
+        event.preventDefault();
+        const next =
+          event.key === "Home"
+            ? 0
+            : event.key === "End"
+              ? links.length - 1
+              : event.key === "ArrowDown"
+                ? Math.min(links.length - 1, current + 1)
+                : Math.max(0, current - 1);
+        links[next]?.focus({ preventScroll: true });
       });
     document
       .getElementById("session-search")

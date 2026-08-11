@@ -136,7 +136,7 @@ public actor ProviderSettingsService {
             if preferences[providerID] == nil {
                 let initial = ProviderSettingsPreference(
                     providerID: providerID,
-                    enabled: providerID.runtimeKind.map(initiallyEnabled.contains) ?? false,
+                    enabled: providerID.ownsRuntimeAdmission && (providerID.runtimeKind.map(initiallyEnabled.contains) ?? false),
                     defaultModel: defaultCatalog(for: providerID).first(where: \.isProviderDefault)?.id,
                     revision: 1
                 )
@@ -612,6 +612,7 @@ public actor ProviderSettingsService {
     }
 
     private func externallyProvisioned(_ providerID: ProviderSettingsID) -> Bool {
+        guard ![ProviderSettingsID.claudeGLM, .claudeKimi, .claudeCustom].contains(providerID) else { return false }
         guard let kind = providerID.runtimeKind,
               let source = configurations[kind]?.credentialSourceDirectory
         else { return false }
@@ -620,14 +621,18 @@ public actor ProviderSettingsService {
     }
 
     private func applyRuntimePreference(_ providerID: ProviderSettingsID) async throws {
-        guard let kind = providerID.runtimeKind, let preference = preferences[providerID] else { return }
+        guard let kind = providerID.runtimeKind else { return }
+        let ownerID = providerID.runtimeSettingsOwner
+        guard let preference = preferences[ownerID] else { return }
         guard configurations[kind] != nil else {
-            if preference.enabled {
+            if preferences.values.contains(where: { $0.providerID.runtimeKind == kind && $0.enabled }) {
                 throw ServiceAPIError(code: .providerUnavailable, message: "Provider executable is not configured")
             }
             return
         }
-        let effectiveAdmission = preference.enabled && initiallyEnabled.contains(kind)
+        let effectiveAdmission = initiallyEnabled.contains(kind) && preferences.values.contains {
+            $0.providerID.runtimeKind == kind && $0.enabled
+        }
         try await adapter.applyRuntimeDefaults(
             kind: kind,
             defaults: ProviderRuntimeDefaults(
@@ -682,8 +687,9 @@ public actor ProviderSettingsService {
             throw ServiceAPIError(code: .notFound, message: "Provider settings are not initialized")
         }
         let definition = Self.definition(providerID)
+        let runtimeSettingsID = providerID.runtimeSettingsOwner
         let deploymentAllowed = providerID.runtimeKind.map(initiallyEnabled.contains) ?? false
-        let preflightVerified = runtimePreflight[providerID] ?? false
+        let preflightVerified = runtimePreflight[runtimeSettingsID] ?? false
         let models = modelCatalogs[providerID] ?? defaultCatalog(for: providerID)
         let connection = connections[providerID]?.record
         let preflight = preflightStatus(
@@ -692,7 +698,7 @@ public actor ProviderSettingsService {
             deploymentAllowed: deploymentAllowed,
             runtimeVerified: preflightVerified,
             connection: connection,
-            cli: cliHealth[providerID]
+            cli: cliHealth[runtimeSettingsID]
         )
         return ProviderSettingsSnapshot(
             providerID: providerID,
@@ -703,7 +709,7 @@ public actor ProviderSettingsService {
             runtimePreflightVerified: preflightVerified,
             effectiveEnabled: preference.enabled && preflight.ready,
             preference: preference,
-            cli: providerID.runtimeKind == nil ? nil : cliHealth[providerID] ?? ProviderCLIHealth(installed: false, healthy: false, detail: "CLI health has not been checked"),
+            cli: providerID.runtimeKind == nil ? nil : cliHealth[runtimeSettingsID] ?? ProviderCLIHealth(installed: false, healthy: false, detail: "CLI health has not been checked"),
             authentication: authenticationStatus(providerID),
             connection: connection,
             preflight: preflight,
@@ -739,6 +745,7 @@ public actor ProviderSettingsService {
             )
         }
         if let kind = providerID.runtimeKind,
+           providerID.ownsRuntimeAdmission,
            let source = configurations[kind]?.credentialSourceDirectory,
            FileManager.default.fileExists(atPath: source)
         {
@@ -849,6 +856,18 @@ public actor ProviderSettingsService {
                 .init(id: "claude-sonnet-5", displayName: "Sonnet 5", reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]),
                 .init(id: "claude-haiku-4-5-20251001", displayName: "Haiku 4.5")
             ]
+        case .claudeGLM:
+            [
+                .init(id: "glm-4.5-air", displayName: "GLM 4.5 Air", reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]),
+                .init(id: "glm-4.7", displayName: "GLM 4.7", reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]),
+                .init(id: "glm-5.2[1m]", displayName: "GLM 5.2 · 1M", isProviderDefault: true, reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]),
+                .init(id: "glm-5-turbo", displayName: "GLM 5 Turbo", reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]),
+                .init(id: "glm-5.1", displayName: "GLM 5.1", reasoningEfforts: ["low", "medium", "high", "xhigh", "max"])
+            ]
+        case .claudeKimi:
+            [.init(id: "kimi-code", displayName: "Kimi Code", description: "Backend-managed model selection", isProviderDefault: true)]
+        case .claudeCustom:
+            [.init(id: "custom-claude-compatible", displayName: "Custom Claude-Compatible", description: "Backend-managed model selection", isProviderDefault: true)]
         case .cursorACP:
             [.init(id: "auto", displayName: "Auto", description: "Let Cursor choose the best advertised model", isProviderDefault: true)]
         case .openCodeACP, .xAI:
@@ -888,6 +907,12 @@ public actor ProviderSettingsService {
             return Definition(displayName: "Codex", category: .cliProvider, summary: "OpenAI Codex app-server with isolated CODEX_HOME", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: true, authenticationMethods: [], authFlows: []))
         case .claudeCompatible:
             return Definition(displayName: "Claude Code", category: .cliProvider, summary: "Claude-compatible stream JSON with isolated CLAUDE_CONFIG_DIR", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+        case .claudeGLM:
+            return Definition(displayName: "CC Zai", category: .cliProvider, summary: "Z.ai coding-plan backend launched through the packaged Claude Code CLI", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+        case .claudeKimi:
+            return Definition(displayName: "CC Moonshot", category: .cliProvider, summary: "Kimi coding-plan backend launched through the packaged Claude Code CLI", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+        case .claudeCustom:
+            return Definition(displayName: "CC Custom", category: .cliProvider, summary: "Custom Claude Code-compatible HTTPS backend", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
         case .openCodeACP:
             return Definition(displayName: "OpenCode", category: .cliProvider, summary: "Provider-specific ACP catalog and authentication", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
         case .cursorACP:

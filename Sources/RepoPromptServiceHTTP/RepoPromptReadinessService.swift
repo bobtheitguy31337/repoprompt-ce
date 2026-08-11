@@ -141,8 +141,9 @@ public actor RepoPromptReadinessService {
         // The authority and settings projections maintain independent preflight
         // state, so refresh both before combining them into readiness.
         let settingsCatalog = try? await providerSettings?.catalog(refreshRuntime: true)
-        let settingsByKind = Dictionary(uniqueKeysWithValues: (settingsCatalog?.providers ?? []).compactMap { snapshot in
-            snapshot.providerID.runtimeKind.map { ($0, snapshot) }
+        let settingsByKind: [ProviderKind: ProviderSettingsSnapshot] = Dictionary(uniqueKeysWithValues: (settingsCatalog?.providers ?? []).compactMap { snapshot in
+            guard snapshot.providerID.ownsRuntimeAdmission else { return nil }
+            return snapshot.providerID.runtimeKind.map { ($0, snapshot) }
         })
         let providers = capabilities.map { capability in
             let required = requiredProviders.contains(capability.kind)

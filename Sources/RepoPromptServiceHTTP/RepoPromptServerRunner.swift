@@ -346,12 +346,14 @@ public enum RepoPromptServerRunner {
             processStore: store,
             outputDirectory: processOutput
         )
+        let portalDesktopSettings = PortalDesktopSettingsService(store: store)
         let credentialEnvironment = VaultProviderProcessEnvironment(
             store: store,
             vault: providerVault,
             externallyProvisionedKinds: Set(configuration.providerCredentialSources.keys),
             credentialSourceDirectories: configuration.providerCredentialSources,
-            managedCodexCredentialSource: managedCodexHome.credentialSourceDirectory
+            managedCodexCredentialSource: managedCodexHome.credentialSourceDirectory,
+            backendSettings: portalDesktopSettings
         )
         let providers = ProviderCLIAdapter(
             configurations: providerConfigurations,
@@ -373,9 +375,8 @@ public enum RepoPromptServerRunner {
             authFlows: TransientProviderAuthFlowCoordinator(driver: codexAuthentication),
             managedAuthentication: codexAuthentication,
             vault: providerVault,
-            credentialTester: ProviderAuthenticationAdapter(configurations: providerConfigurations)
+            credentialTester: ProviderAuthenticationAdapter(configurations: providerConfigurations, backendSettings: portalDesktopSettings)
         )
-        let portalDesktopSettings = PortalDesktopSettingsService(store: store)
         try await providers.recoverProcessFamilies()
         try await providerSettings.bootstrap()
         let authority = RepoPromptHeadlessAuthority(

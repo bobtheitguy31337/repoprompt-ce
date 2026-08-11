@@ -219,7 +219,17 @@
       </main>
 
       <main id="settings-shell" class="settings-shell" hidden>
+        <button
+          id="settings-drawer-backdrop"
+          class="settings-drawer-backdrop"
+          type="button"
+          data-action="close-settings-drawer"
+          aria-label="Close settings navigation"
+          tabindex="-1"
+          hidden
+        ></button>
         <aside
+          id="settings-sidebar"
           class="settings-sidebar native-material"
           aria-label="Settings navigation"
         >
@@ -233,6 +243,8 @@
                 placeholder="Search Settings"
                 autocomplete="off"
                 aria-label="Search settings"
+                aria-controls="settings-nav"
+                aria-describedby="settings-search-status"
               />
               <button
                 id="clear-settings-search"
@@ -270,7 +282,7 @@
                 href="#settings/agent-models"
                 data-route="agent-models"
                 data-route-link
-                data-icon="model"
+                data-icon="brain"
                 >Agent Models</a
               >
               <a
@@ -284,14 +296,14 @@
                 href="#settings/agent-workflows"
                 data-route="agent-workflows"
                 data-route-link
-                data-icon="workflow"
+                data-icon="bolt"
                 >Agent Workflows</a
               >
               <a
                 href="#settings/context-builder"
                 data-route="context-builder"
                 data-route-link
-                data-icon="context"
+                data-icon="sparkles"
                 >Context Builder</a
               >
             </section>
@@ -332,28 +344,28 @@
                 href="#settings/api-providers"
                 data-route="api-providers"
                 data-route-link
-                data-icon="cloud"
+                data-icon="key"
                 >API Providers</a
               >
               <a
                 href="#settings/openrouter"
                 data-route="openrouter"
                 data-route-link
-                data-icon="cloud"
+                data-icon="network"
                 >OpenRouter</a
               >
               <a
                 href="#settings/custom-api"
                 data-route="custom-api"
                 data-route-link
-                data-icon="sliders"
+                data-icon="server"
                 >Custom API</a
               >
               <a
                 href="#settings/model-config"
                 data-route="model-config"
                 data-route-link
-                data-icon="model"
+                data-icon="sliders"
                 >Model Config</a
               >
             </section>
@@ -363,27 +375,45 @@
                 href="#settings/manage-workspaces"
                 data-route="manage-workspaces"
                 data-route-link
-                data-icon="folder"
+                data-icon="stack"
                 >Manage Workspaces</a
               >
               <a
                 href="#settings/manage-presets"
                 data-route="manage-presets"
                 data-route-link
-                data-icon="workflow"
+                data-icon="listStar"
                 >Manage Presets</a
               >
             </section>
             <p id="settings-no-results" class="settings-no-results" hidden>
               No settings found. Try different search terms.
             </p>
+            <p
+              id="settings-search-status"
+              class="sr-only"
+              role="status"
+              aria-live="polite"
+            ></p>
           </nav>
         </aside>
         <section class="settings-detail">
           <div class="settings-detail-toolbar">
-            <a class="back-link" href="#home" data-route-link
-              ><span data-icon="back"></span>Server Portal</a
-            >
+            <div class="settings-toolbar-leading">
+              <button
+                id="settings-drawer-toggle"
+                class="settings-drawer-toggle"
+                type="button"
+                data-action="toggle-settings-drawer"
+                data-icon="sidebar"
+                aria-label="Open settings navigation"
+                aria-controls="settings-sidebar"
+                aria-expanded="false"
+              ></button>
+              <a class="back-link" href="#home" data-route-link
+                ><span data-icon="back"></span>Server Portal</a
+              >
+            </div>
             <span id="settings-detail-title">Overview</span>
             <span id="settings-freshness" class="freshness-label"
               >Loading…</span

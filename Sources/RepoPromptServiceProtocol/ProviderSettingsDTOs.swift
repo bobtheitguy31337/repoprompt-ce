@@ -6,6 +6,9 @@ import Foundation
 public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
     case codex
     case claudeCompatible
+    case claudeGLM
+    case claudeKimi
+    case claudeCustom
     case openCodeACP
     case cursorACP
     case xAI
@@ -13,10 +16,27 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
     public var runtimeKind: ProviderKind? {
         switch self {
         case .codex: .codex
-        case .claudeCompatible: .claudeCompatible
+        case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom: .claudeCompatible
         case .openCodeACP: .openCodeACP
         case .cursorACP: .cursorACP
         case .xAI: nil
+        }
+    }
+
+    /// One native Claude process controller serves the standard account and
+    /// compatible backends. Only the standard row owns dispatcher admission;
+    /// backend rows select launch configuration and credentials per session.
+    public var ownsRuntimeAdmission: Bool {
+        switch self {
+        case .codex, .claudeCompatible, .openCodeACP, .cursorACP: true
+        case .claudeGLM, .claudeKimi, .claudeCustom, .xAI: false
+        }
+    }
+
+    public var runtimeSettingsOwner: ProviderSettingsID {
+        switch self {
+        case .claudeGLM, .claudeKimi, .claudeCustom: .claudeCompatible
+        default: self
         }
     }
 }
@@ -24,6 +44,47 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
 public enum ProviderSettingsCategory: String, Codable, Sendable {
     case cliProvider
     case apiProvider
+}
+
+public enum ClaudeCompatibleBackendAuthHeader: String, Codable, Hashable, Sendable {
+    case anthropicAPIKey
+    case anthropicAuthToken
+
+    public var authenticationMethod: ProviderAuthenticationMethod {
+        switch self {
+        case .anthropicAPIKey: .apiKey
+        case .anthropicAuthToken: .authToken
+        }
+    }
+}
+
+public enum ClaudeCompatibleBackendModelBehavior: String, Codable, Hashable, Sendable {
+    case noModel
+    case claudeSlotMapping
+}
+
+/// Sanitized launch configuration shared by the portal settings authority and
+/// the Linux Claude runtime. Credential material is deliberately absent.
+public struct ClaudeCompatibleBackendSettings: Codable, Hashable, Sendable {
+    public let providerID: ProviderSettingsID
+    public let displayName: String
+    public let baseURL: String
+    public let authHeader: ClaudeCompatibleBackendAuthHeader
+    public let modelBehavior: ClaudeCompatibleBackendModelBehavior
+    public let haikuModel: String
+    public let sonnetModel: String
+    public let opusModel: String
+
+    public init(providerID: ProviderSettingsID, displayName: String, baseURL: String, authHeader: ClaudeCompatibleBackendAuthHeader, modelBehavior: ClaudeCompatibleBackendModelBehavior, haikuModel: String = "", sonnetModel: String = "", opusModel: String = "") {
+        self.providerID = providerID
+        self.displayName = displayName
+        self.baseURL = baseURL
+        self.authHeader = authHeader
+        self.modelBehavior = modelBehavior
+        self.haikuModel = haikuModel
+        self.sonnetModel = sonnetModel
+        self.opusModel = opusModel
+    }
 }
 
 public enum ProviderAuthenticationState: String, Codable, Sendable {

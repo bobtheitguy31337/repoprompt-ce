@@ -183,6 +183,54 @@ final class ProviderManagementBackendTests: XCTestCase {
         XCTAssertFalse(failedResult.detail.contains(secret))
     }
 
+    func testClaudeCompatiblePresetValidatorsUseFixedHostsAndConfiguredHeaderStyles() async throws {
+        let transport = RecordingCredentialHTTPTransport(statusCode: 200)
+        let settings = StaticClaudeBackendSettings(configurations: [
+            .claudeGLM: .init(
+                providerID: .claudeGLM,
+                displayName: "CC Zai",
+                baseURL: "https://api.z.ai/api/anthropic",
+                authHeader: .anthropicAuthToken,
+                modelBehavior: .claudeSlotMapping,
+                sonnetModel: "glm-5.2[1m]"
+            ),
+            .claudeKimi: .init(
+                providerID: .claudeKimi,
+                displayName: "CC Moonshot",
+                baseURL: "https://api.kimi.com/coding/",
+                authHeader: .anthropicAPIKey,
+                modelBehavior: .noModel
+            )
+        ])
+        let adapter = ProviderAuthenticationAdapter(
+            configurations: [.init(kind: .claudeCompatible, executable: "/usr/bin/true")],
+            transport: transport,
+            backendSettings: settings
+        )
+
+        let glmMethods = await adapter.supportedAuthenticationMethods(for: .claudeGLM)
+        let kimiMethods = await adapter.supportedAuthenticationMethods(for: .claudeKimi)
+        let customMethods = await adapter.supportedAuthenticationMethods(for: .claudeCustom)
+        XCTAssertEqual(glmMethods, [.authToken])
+        XCTAssertEqual(kimiMethods, [.apiKey])
+        XCTAssertTrue(customMethods.isEmpty)
+        let zaiSecret = "zai-write-only-secret"
+        let kimiSecret = "kimi-write-only-secret"
+        let glmResult = await adapter.test(providerID: .claudeGLM, method: .authToken, secret: Data(zaiSecret.utf8))
+        let kimiResult = await adapter.test(providerID: .claudeKimi, method: .apiKey, secret: Data(kimiSecret.utf8))
+        XCTAssertEqual(glmResult.state, .valid)
+        XCTAssertEqual(kimiResult.state, .valid)
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map { $0.url?.absoluteString }, [
+            "https://api.z.ai/api/anthropic/v1/messages",
+            "https://api.kimi.com/coding/v1/messages"
+        ])
+        XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Authorization"), "Bearer \(zaiSecret)")
+        XCTAssertEqual(requests[1].value(forHTTPHeaderField: "x-api-key"), kimiSecret)
+        let encodedBodies = requests.compactMap(\.httpBody).map { String(decoding: $0, as: UTF8.self) }
+        XCTAssertFalse(encodedBodies.contains { $0.contains(zaiSecret) || $0.contains(kimiSecret) })
+    }
+
     func testAPIKeyConnectionIsEncryptedAuditedValidatedAndInjectedOnlyThroughEnvironment() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -209,7 +257,8 @@ final class ProviderManagementBackendTests: XCTestCase {
         XCTAssertEqual(snapshot.connection?.testState, .valid)
         XCTAssertTrue(snapshot.effectiveEnabled)
 
-        let environment = try await VaultProviderProcessEnvironment(store: store, vault: vault).environment(for: .codex)
+        let environment = try await VaultProviderProcessEnvironment(store: store, vault: vault)
+            .environment(for: .codex, model: nil, policy: .init())
         XCTAssertEqual(environment, ["OPENAI_API_KEY": secret])
         let encoded = try String(decoding: JSONEncoder.serviceEncoder.encode(snapshot), as: UTF8.self)
         XCTAssertFalse(encoded.contains(secret))
@@ -389,6 +438,18 @@ private actor RecordingCredentialHTTPTransport: ProviderCredentialHTTPTransport 
 
     func requests() -> [URLRequest] {
         captured
+    }
+}
+
+private actor StaticClaudeBackendSettings: ClaudeCompatibleBackendSettingsProviding {
+    let configurations: [ProviderSettingsID: ClaudeCompatibleBackendSettings]
+
+    init(configurations: [ProviderSettingsID: ClaudeCompatibleBackendSettings]) {
+        self.configurations = configurations
+    }
+
+    func backendSettings(for providerID: ProviderSettingsID) async throws -> ClaudeCompatibleBackendSettings? {
+        configurations[providerID]
     }
 }
 

@@ -215,6 +215,30 @@ function providerCatalog() {
       ],
     }),
     providerFixture({
+      providerID: "claudeGLM",
+      displayName: "CC Zai",
+      authenticationMethods: ["apiKey", "authToken"],
+      authFlows: [],
+      models: [model("glm-4.5-air"), model("glm-4.7"), model("glm-5.2[1m]")],
+      preference: { enabled: false },
+    }),
+    providerFixture({
+      providerID: "claudeKimi",
+      displayName: "CC Moonshot",
+      authenticationMethods: ["apiKey", "authToken"],
+      authFlows: [],
+      models: [model("kimi-code")],
+      preference: { enabled: false },
+    }),
+    providerFixture({
+      providerID: "claudeCustom",
+      displayName: "CC Custom",
+      authenticationMethods: [],
+      authFlows: [],
+      models: [model("custom-claude-compatible")],
+      preference: { enabled: false },
+    }),
+    providerFixture({
       providerID: "openCodeACP",
       displayName: "OpenCode",
       authenticationMethods: ["providerSpecific"],
@@ -315,6 +339,22 @@ function desktopSettingsFixture(overrides = {}) {
       claudeBashEnabled: "true",
       claudeStrictMCPEnabled: "false",
       claudeToolSearchEnabled: "true",
+      claudeGLMDisplayName: "CC Zai",
+      claudeGLMBaseURL: "https://api.z.ai/api/anthropic",
+      claudeGLMAuthHeader: "anthropicAuthToken",
+      claudeGLMHaikuModel: "glm-4.5-air",
+      claudeGLMSonnetModel: "glm-5.2[1m]",
+      claudeGLMOpusModel: "glm-5.2[1m]",
+      claudeKimiDisplayName: "CC Moonshot",
+      claudeKimiBaseURL: "https://api.kimi.com/coding/",
+      claudeKimiAuthHeader: "anthropicAPIKey",
+      claudeCustomDisplayName: "CC Custom",
+      claudeCustomBaseURL: "",
+      claudeCustomAuthHeader: "anthropicAPIKey",
+      claudeCustomModelBehavior: "noModel",
+      claudeCustomHaikuModel: "",
+      claudeCustomSonnetModel: "",
+      claudeCustomOpusModel: "",
       openCodePermissionLevel: "managedDefault",
       cursorPermissionLevel: "managedDefault",
       subagentPolicy: "safeManaged",
@@ -448,6 +488,20 @@ async function createHarness({
         generatedAt: "2026-08-10T20:00:00Z",
       });
     }
+    const preferenceMatch = call.path.match(
+      /^api\/v1\/provider-settings\/([^/]+)\/(enable|disable)$/,
+    );
+    if (preferenceMatch && call.method === "POST") {
+      const provider = context.providers.find(
+        (item) => item.providerID === decodeURIComponent(preferenceMatch[1]),
+      );
+      provider.preference = {
+        ...provider.preference,
+        enabled: preferenceMatch[2] === "enable",
+        revision: provider.preference.revision + 1,
+      };
+      return jsonResponse(provider);
+    }
     throw new Error(`Unexpected request: ${call.method} ${call.path}`);
   };
 
@@ -503,7 +557,15 @@ test("filtered Desktop settings hierarchy deep-links, searches, and excludes des
     document.getElementById("settings-content").textContent,
     /Claude Code–Compatible Backends/,
   );
-  assert.equal(document.querySelectorAll(".desktop-provider-card").length, 5);
+  assert.equal(document.querySelectorAll(".desktop-provider-card").length, 8);
+  assert.deepEqual(
+    [
+      ...document.querySelectorAll(
+        ".compatible-backend-list [data-provider-id]",
+      ),
+    ].map((row) => row.dataset.providerId),
+    ["claudeGLM", "claudeKimi", "claudeCustom"],
+  );
 
   const navText = document.getElementById("settings-nav").textContent;
   for (const included of [
@@ -557,12 +619,96 @@ test("filtered Desktop settings hierarchy deep-links, searches, and excludes des
   );
   assert.equal(search.value, "");
 
+  search.value = "CLI Providers";
+  search.dispatchEvent(new window.Event("input", { bubbles: true }));
+  search.dispatchEvent(
+    new window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+  );
+  await settle();
+  assert.equal(window.location.hash, "#settings/cli-providers");
+
   const skip = document.querySelector('[data-action="skip-content"]');
   click(window, skip);
   assert.equal(
     document.activeElement,
     document.getElementById("settings-main-content"),
   );
+});
+
+test("narrow settings navigation uses an accessible focus-trapped drawer", async (t) => {
+  const harness = await createHarness();
+  t.after(() => harness.close());
+  const { document, window } = harness;
+  window.matchMedia = () => ({ matches: true });
+
+  const toggle = document.getElementById("settings-drawer-toggle");
+  toggle.focus();
+  click(window, toggle);
+  await settle();
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(
+    document.getElementById("settings-sidebar").getAttribute("aria-modal"),
+    "true",
+  );
+  assert.equal(
+    document.activeElement,
+    document.getElementById("settings-search"),
+  );
+
+  document.dispatchEvent(
+    new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+  );
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(document.activeElement, toggle);
+});
+
+test("compatible backends remain visible and save non-secret Linux runtime settings", async (t) => {
+  const harness = await createHarness();
+  t.after(() => harness.close());
+  const { calls, document, window } = harness;
+  const group = document.querySelector(".compatible-provider-card");
+  group.open = true;
+  const glm = group.querySelector('[data-provider-id="claudeGLM"]');
+  glm.open = true;
+  assert.match(glm.textContent, /Backend Settings/);
+  assert.match(glm.textContent, /Choose a sign-in method/);
+  assert.doesNotMatch(glm.textContent, /readiness|availability|vault|DTO/i);
+
+  const form = glm.querySelector(".compatible-backend-form");
+  form.querySelector('[name="sonnet"]').value = "glm-4.7";
+  submit(window, form);
+  await waitFor(
+    () => calls.some((call) => call.method === "PATCH"),
+    "backend settings PATCH was not sent",
+  );
+  const patch = calls.find((call) => call.method === "PATCH");
+  const payload = JSON.parse(patch.body);
+  assert.equal(payload.changes.claudeGLMSonnetModel, "glm-4.7");
+  assert.equal(
+    payload.changes.claudeGLMBaseURL,
+    "https://api.z.ai/api/anthropic",
+  );
+  assert.equal("credential" in payload.changes, false);
+  await waitFor(
+    () =>
+      calls.filter(
+        (call) =>
+          call.method === "GET" &&
+          call.path.startsWith("api/v1/provider-settings"),
+      ).length >= 2,
+    "provider catalog did not refresh after saving backend settings",
+  );
+  await window.RepoPromptPortalTest.whenIdle();
+  await settle();
+
+  const refreshedGroup = document.querySelector(".compatible-provider-card");
+  refreshedGroup.open = true;
+  const custom = refreshedGroup.querySelector(
+    '[data-provider-id="claudeCustom"]',
+  );
+  custom.open = true;
+  assert.match(custom.textContent, /safe endpoint validator/i);
+  assert.equal(custom.querySelector(".credential-form"), null);
 });
 
 test("connected Codex disclosure shows Desktop account and runtime controls without credential forms", async (t) => {

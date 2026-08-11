@@ -107,12 +107,12 @@ public struct ProviderRuntimeDefaults: Codable, Hashable, Sendable {
 /// Supplies per-launch secret environment values from server-owned memory.
 /// Implementations must never place values in command arguments or diagnostics.
 public protocol ProviderProcessEnvironmentProviding: Sendable {
-    func environment(for kind: ProviderKind) async throws -> [String: String]
+    func environment(for kind: ProviderKind, model: String?, policy: ProviderExecutionPolicy) async throws -> [String: String]
 }
 
 public struct EmptyProviderProcessEnvironment: ProviderProcessEnvironmentProviding {
     public init() {}
-    public func environment(for _: ProviderKind) async throws -> [String: String] {
+    public func environment(for _: ProviderKind, model _: String?, policy _: ProviderExecutionPolicy) async throws -> [String: String] {
         [:]
     }
 }
