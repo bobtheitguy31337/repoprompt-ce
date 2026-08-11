@@ -60,15 +60,15 @@ async function loadAll(refresh = false) {
   document.getElementById("refresh-button").classList.add("loading");
   try {
     const [bootstrap, providerCatalog] = await Promise.all([
-      api("/portal/api/v1/bootstrap"),
-      api(`/portal/api/v1/provider-settings${refresh ? "?refresh=true" : ""}`)
+      api("api/v1/bootstrap"),
+      api(`api/v1/provider-settings${refresh ? "?refresh=true" : ""}`)
     ]);
     state.bootstrap = bootstrap;
     state.providers = providerCatalog.providers || [];
     updateShell();
     route();
     document.getElementById("service-dot").classList.add("healthy");
-    document.getElementById("service-caption").textContent = "Connected · mTLS operator";
+    document.getElementById("service-caption").textContent = "Connected · authenticated portal";
   } catch (error) {
     document.getElementById("service-dot").classList.remove("healthy");
     document.getElementById("service-caption").textContent = "Portal connection unavailable";
@@ -226,7 +226,7 @@ function settingsForm(provider) {
   form.addEventListener("submit", async event => {
     event.preventDefault(); save.disabled = true; save.textContent = "Saving…";
     try {
-      const updated = await api(`/portal/api/v1/provider-settings/${encodeURIComponent(provider.providerID)}`, {method:"PATCH", body:JSON.stringify({expectedRevision:provider.preference.revision,enabled:enabled.checked,defaultModel:model.value || null,reasoningEffort:effort.value || null,speedMode:speed.value || null,serviceTier:tier.value || null})});
+      const updated = await api(`api/v1/provider-settings/${encodeURIComponent(provider.providerID)}`, {method:"PATCH", body:JSON.stringify({expectedRevision:provider.preference.revision,enabled:enabled.checked,defaultModel:model.value || null,reasoningEffort:effort.value || null,speedMode:speed.value || null,serviceTier:tier.value || null})});
       const index = state.providers.findIndex(item => item.providerID === updated.providerID); if (index >= 0) state.providers[index] = updated;
       toast(`${provider.displayName} settings saved`); route(); updateShell();
     } catch (error) { toast(error.message, true); save.disabled = false; save.textContent = "Save Settings"; }
@@ -265,7 +265,7 @@ function authSection(provider) {
 async function startAuthFlow(provider, flow, button) {
   button.disabled = true;
   try {
-    const challenge = await api(`/portal/api/v1/provider-settings/${encodeURIComponent(provider.providerID)}/auth-flows`, {method:"POST", body:JSON.stringify({kind:flow.kind})});
+    const challenge = await api(`api/v1/provider-settings/${encodeURIComponent(provider.providerID)}/auth-flows`, {method:"POST", body:JSON.stringify({kind:flow.kind})});
     // Device codes are held only in this transient DOM toast; they are never
     // copied into storage, URLs, telemetry, or console output.
     toast(challenge.userCode ? `Device code: ${challenge.userCode}` : "Authentication flow started");

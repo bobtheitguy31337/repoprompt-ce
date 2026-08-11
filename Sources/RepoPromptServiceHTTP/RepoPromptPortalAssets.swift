@@ -44,6 +44,13 @@ public enum RepoPromptPortalAssets {
         return Response(status: .ok, headers: headers, body: .init(byteBuffer: ByteBuffer(bytes: body)))
     }
 
+    static func canonicalRedirect() -> Response {
+        var headers = securityHeaders(contentType: "text/plain; charset=utf-8")
+        headers[.location] = "/portal/"
+        headers[.cacheControl] = "private, no-store"
+        return Response(status: HTTPResponse.Status(code: 308), headers: headers)
+    }
+
     static func securityHeaders(contentType: String) -> HTTPFields {
         var headers = HTTPFields()
         headers[.contentType] = contentType
@@ -76,5 +83,11 @@ enum RepoPromptPortalRequestProtection {
         else {
             throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Portal mutation headers are invalid")
         }
+    }
+}
+
+enum RepoPromptPortalCertificateAuthorization {
+    static func allows(_ role: InternalRouteRole) -> Bool {
+        role == .operatorRole || role == .goblinApp
     }
 }

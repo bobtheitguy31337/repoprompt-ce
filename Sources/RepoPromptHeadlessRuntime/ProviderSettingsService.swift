@@ -23,9 +23,7 @@ public actor ProviderSettingsService {
     private struct SanitizedAuthenticationDocument: Decodable {
         let authenticated: Bool
         let method: ProviderAuthenticationMethod?
-        let accountLabel: String?
         let expiresAt: Date?
-        let detail: String?
     }
 
     private let store: SQLiteServiceStore
@@ -161,14 +159,14 @@ public actor ProviderSettingsService {
                     workingDirectory: FileManager.default.currentDirectoryPath,
                     maximumBytes: 65_536
                 )
-                let version = Self.sanitizedCLIVersion(output)
-                let matches = configuration.expectedVersion.map { version?.contains($0) == true } ?? true
+                let reported = Self.validCLIVersionOutput(output)
+                let matches = configuration.expectedVersion.map { reported?.contains($0) == true } ?? (reported != nil)
                 cliHealth[providerID] = ProviderCLIHealth(
                     installed: true,
-                    healthy: matches && version != nil,
-                    version: version,
+                    healthy: matches,
+                    version: matches ? configuration.expectedVersion : nil,
                     expectedVersion: configuration.expectedVersion,
-                    detail: version == nil ? "CLI returned invalid version output" : (matches ? nil : "Installed version does not match the pinned server contract")
+                    detail: reported == nil ? "CLI returned invalid version output" : (matches ? nil : "Installed version does not match the pinned server contract")
                 )
             } catch {
                 cliHealth[providerID] = ProviderCLIHealth(installed: true, healthy: false, expectedVersion: configuration.expectedVersion, detail: "CLI version probe failed")
@@ -217,9 +215,8 @@ public actor ProviderSettingsService {
                 state: document.authenticated ? .authenticated : .attention,
                 authenticated: document.authenticated,
                 method: document.method,
-                accountLabel: normalized(document.accountLabel),
                 expiresAt: document.expiresAt,
-                detail: normalized(document.detail)
+                detail: document.authenticated ? "Authenticated" : "Authentication requires attention"
             )
         }
         if let kind = providerID.runtimeKind,
@@ -326,7 +323,7 @@ public actor ProviderSettingsService {
         }
     }
 
-    private nonisolated static func sanitizedCLIVersion(_ output: String) -> String? {
+    private nonisolated static func validCLIVersionOutput(_ output: String) -> String? {
         guard let firstLine = output.split(whereSeparator: \.isNewline).first else { return nil }
         let value = firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty, value.utf8.count <= 128 else { return nil }

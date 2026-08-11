@@ -6,6 +6,7 @@ import RepoPromptHeadlessRuntime
 @testable import RepoPromptServiceHTTP
 @testable import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
+import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 final class ProviderSettingsPortalTests: XCTestCase {
@@ -79,7 +80,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let statusURL = directory.appendingPathComponent("status.json")
-        try Data(#"{"authenticated":true,"method":"apiKey","accountLabel":"server account","detail":"Connected"}"#.utf8).write(to: statusURL)
+        try Data(#"{"authenticated":true,"method":"apiKey","accountLabel":"/run/secrets/provider-token","detail":"raw helper output"}"#.utf8).write(to: statusURL)
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let configuration = ProviderCLIConfiguration(kind: .codex, executable: "/usr/bin/swift", protocolVersion: "app-server-v2")
@@ -97,7 +98,11 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertTrue(codex.cli?.installed == true)
         XCTAssertTrue(codex.cli?.healthy == true)
         XCTAssertTrue(codex.authentication.authenticated)
-        XCTAssertEqual(codex.authentication.accountLabel, "server account")
+        XCTAssertNil(codex.authentication.accountLabel)
+        XCTAssertEqual(codex.authentication.detail, "Authenticated")
+        let encodedCatalog = String(decoding: try JSONEncoder.serviceEncoder.encode(catalog), as: UTF8.self)
+        XCTAssertFalse(encodedCatalog.contains("/run/secrets"))
+        XCTAssertFalse(encodedCatalog.contains("raw helper output"))
         XCTAssertEqual(codex.models.first?.id, "gpt-5.6-sol")
         XCTAssertTrue(codex.capabilities.supportsReasoningEffort)
         XCTAssertTrue(codex.capabilities.supportsServiceTier)
@@ -161,11 +166,20 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertFalse(script.contains("console."))
         XCTAssertFalse(script.contains("style."), "strict CSP forbids inline style mutation")
         XCTAssertTrue(script.contains("challenge.userCode"), "device challenge should be transiently renderable")
+        XCTAssertTrue(html.contains("href=\"assets/portal.css\""))
+        XCTAssertTrue(html.contains("src=\"assets/portal.js\""))
+        XCTAssertFalse(html.contains("/portal/assets/"))
+        XCTAssertTrue(script.contains("api(\"api/v1/bootstrap\")"))
+        XCTAssertFalse(script.contains("api(\"/portal/"))
         XCTAssertEqual(try RepoPromptPortalAssets.response(for: .index).headers[.cacheControl], "private, no-store")
         XCTAssertEqual(try RepoPromptPortalAssets.response(for: .stylesheet).headers[.cacheControl], "private, max-age=3600")
+        let redirect = RepoPromptPortalAssets.canonicalRedirect()
+        XCTAssertEqual(redirect.status.code, 308)
+        XCTAssertEqual(redirect.headers[.location], "/portal/")
+        XCTAssertEqual(redirect.headers[.cacheControl], "private, no-store")
     }
 
-    func testPortalRejectsRequestsWithoutOperatorCertificate() async throws {
+    func testPortalRejectsRequestsWithoutAuthorizedCertificate() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
         let service = RepoPromptHTTPService(
@@ -183,5 +197,50 @@ final class ProviderSettingsPortalTests: XCTestCase {
             }
         }
         try await store.close()
+    }
+
+    func testPortalCertificateRolesAllowOperatorAndGoblinProxyOnly() {
+        XCTAssertTrue(RepoPromptPortalCertificateAuthorization.allows(.operatorRole))
+        XCTAssertTrue(RepoPromptPortalCertificateAuthorization.allows(.goblinApp))
+        XCTAssertFalse(RepoPromptPortalCertificateAuthorization.allows(.goblinSync))
+    }
+
+    func testCLIHealthNeverProjectsRawVersionProbeOutput() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let configuration = ProviderCLIConfiguration(
+            kind: .codex,
+            executable: "/usr/bin/swift",
+            expectedVersion: "9.9.9",
+            protocolVersion: "app-server-v2"
+        )
+        let adapter = ProviderCLIAdapter(configurations: [configuration], enabledProviders: [])
+        let service = ProviderSettingsService(
+            store: store,
+            adapter: adapter,
+            configurations: [configuration],
+            initiallyEnabled: [],
+            runner: StaticProviderVersionRunner(output: "tool 9.9.9 /run/secrets/raw-token")
+        )
+        try await service.bootstrap()
+        let catalog = try await service.catalog()
+        let codex = try XCTUnwrap(catalog.providers.first { $0.providerID == .codex })
+        XCTAssertTrue(codex.cli?.healthy == true)
+        XCTAssertEqual(codex.cli?.version, "9.9.9")
+        let encoded = String(decoding: try JSONEncoder.serviceEncoder.encode(catalog), as: UTF8.self)
+        XCTAssertFalse(encoded.contains("/run/secrets"))
+        XCTAssertFalse(encoded.contains("raw-token"))
+        try await store.close()
+    }
+}
+
+private actor StaticProviderVersionRunner: WorkspaceCommandRunning {
+    let output: String
+
+    init(output: String) {
+        self.output = output
+    }
+
+    func run(executable _: String, arguments _: [String], workingDirectory _: String, maximumBytes _: Int) async throws -> String {
+        output
     }
 }

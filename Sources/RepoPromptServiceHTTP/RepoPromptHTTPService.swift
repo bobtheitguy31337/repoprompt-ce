@@ -59,6 +59,9 @@ public struct RepoPromptHTTPService: Sendable {
         let router = Router<RepoPromptRequestContext>(context: RepoPromptRequestContext.self)
         router.get("/portal") { request, context in await portalRespond(request) {
             try await authenticatePortal(context: context)
+            if request.uri.string.split(separator: "?", maxSplits: 1).first == "/portal" {
+                return RepoPromptPortalAssets.canonicalRedirect()
+            }
             return try RepoPromptPortalAssets.response(for: .index)
         } }
         router.get("/portal/assets/:name") { request, context in await portalRespond(request) {
@@ -582,9 +585,9 @@ public struct RepoPromptHTTPService: Sendable {
     private func authenticatePortal(context: RepoPromptRequestContext) async throws {
         guard let certificateRoleResolver,
               let certificate = try await context.channel.nioSSL_peerCertificate().get(),
-              try certificateRoleResolver.role(certificate: certificate) == .operatorRole
+              RepoPromptPortalCertificateAuthorization.allows(try certificateRoleResolver.role(certificate: certificate))
         else {
-            throw ServiceAPIError(code: .internalAuthFailed, message: "An operator client certificate is required")
+            throw ServiceAPIError(code: .internalAuthFailed, message: "An authorized portal client certificate is required")
         }
     }
 
