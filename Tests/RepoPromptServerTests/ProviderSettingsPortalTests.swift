@@ -157,11 +157,11 @@ final class ProviderSettingsPortalTests: XCTestCase {
         let css = try String(decoding: RepoPromptPortalAssets.data(for: .stylesheet), as: UTF8.self)
         let script = try String(decoding: RepoPromptPortalAssets.data(for: .script), as: UTF8.self)
 
-        for term in ["Provider and model settings", "Models &amp; Providers", "Copy &amp; Chat", "Settings portal scope"] {
+        for term in ["Projects", "Sessions", "Ask RepoPrompt anything", "Models &amp; Providers", "Server Portal"] {
             XCTAssertTrue(html.contains(term), "missing portal term: \(term)")
         }
-        for unavailablePlaceholder in ["What are we building?", "New Agent Session", "Agent transcript"] {
-            XCTAssertFalse(html.contains(unavailablePlaceholder), "dead desktop placeholder leaked into portal: \(unavailablePlaceholder)")
+        for unavailablePlaceholder in ["Session creation arrives", "APIs do not exist yet", "Provider and model settings"] {
+            XCTAssertFalse(html.contains(unavailablePlaceholder), "dead placeholder leaked into portal: \(unavailablePlaceholder)")
         }
         for token in ["--space-4: 4px", "--space-16: 16px", "--space-32: 32px", "ui-rounded", "ui-monospace"] {
             XCTAssertTrue(css.contains(token), "missing visual token: \(token)")
@@ -175,6 +175,9 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertTrue(html.contains("src=\"assets/portal.js\""))
         XCTAssertFalse(html.contains("/portal/assets/"))
         XCTAssertTrue(script.contains("api(\"api/v1/bootstrap\")"))
+        XCTAssertTrue(script.contains("api(\"api/v1/sessions\""))
+        XCTAssertTrue(script.contains("/transcript?"))
+        XCTAssertTrue(script.contains("/messages"))
         XCTAssertFalse(script.contains("api(\"/portal/"))
         XCTAssertEqual(try RepoPromptPortalAssets.response(for: .index).headers[.cacheControl], "private, no-store")
         XCTAssertEqual(try RepoPromptPortalAssets.response(for: .stylesheet).headers[.cacheControl], "private, max-age=3600")
@@ -182,6 +185,79 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertEqual(redirect.status.code, 308)
         XCTAssertEqual(redirect.headers[.location], "/portal/")
         XCTAssertEqual(redirect.headers[.cacheControl], "private, no-store")
+    }
+
+    func testPortalSessionProjectionBoundsAndSanitizesTranscript() throws {
+        let actor = ExternalActor(goblinUserID: "portal-user", username: "alice", displayName: "Alice")
+        let sessionID = UUID()
+        let transcript = [
+            TranscriptEntry(
+                entryID: UUID(),
+                sessionSequence: 1,
+                kind: .human,
+                content: "  Build   the provider portal\nfaithfully  ",
+                actor: actor,
+                timestamp: Date(timeIntervalSince1970: 1),
+                presentationPayload: Data("private-human-presentation".utf8)
+            ),
+            TranscriptEntry(
+                entryID: UUID(),
+                sessionSequence: 2,
+                kind: .assistant,
+                content: String(repeating: "x", count: RepoPromptPortalSessionProjection.maximumEntryBytes + 10),
+                actor: actor,
+                timestamp: Date(timeIntervalSince1970: 2),
+                presentationPayload: Data("private-assistant-presentation".utf8)
+            ),
+        ]
+        let session = SessionSnapshot(
+            sessionID: sessionID,
+            projectID: UUID(),
+            parentSessionID: nil,
+            rootSessionID: sessionID,
+            creator: actor,
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            visibility: .privateSession,
+            state: .idle,
+            runGeneration: 1,
+            turnEpoch: 1,
+            revision: 3,
+            transcript: transcript,
+            interactions: [],
+            cursor: ServiceCursor(storeID: UUID(), globalSequence: 2)
+        )
+
+        let page = try RepoPromptPortalSessionProjection.transcriptPage(
+            session: session,
+            limit: 2,
+            beforeSequence: nil,
+            afterSequence: nil
+        )
+        XCTAssertEqual(page.session.title, "Build the provider portal faithfully")
+        XCTAssertEqual(page.items.map(\.sessionSequence), [1, 2])
+        XCTAssertTrue(page.items[1].truncated)
+        XCTAssertEqual(page.items[1].content.utf8.count, RepoPromptPortalSessionProjection.maximumEntryBytes)
+        let encoded = try String(decoding: JSONEncoder.serviceEncoder.encode(page), as: UTF8.self)
+        XCTAssertFalse(encoded.contains("portal-user"))
+        XCTAssertFalse(encoded.contains("private-human-presentation"))
+        XCTAssertFalse(encoded.contains("private-assistant-presentation"))
+        XCTAssertTrue(encoded.contains("\"sessionId\""))
+        XCTAssertTrue(encoded.contains("\"entryId\""))
+        XCTAssertFalse(encoded.contains("\"sessionID\""))
+        XCTAssertFalse(encoded.contains("\"entryID\""))
+        XCTAssertFalse(encoded.contains("presentationPayload"))
+        XCTAssertFalse(encoded.contains("actor"))
+    }
+
+    func testPortalFollowupContractOnlyMapsTextAndExpectedRevision() throws {
+        let request = PortalSendMessageRequest(operationID: UUID(), expectedRevision: 9, text: "  keep both auth methods  ")
+        let command = try RepoPromptPortalSessionProjection.validatedSendCommand(request)
+        guard case let .sendFollowup(text, expectedSessionRevision) = command else {
+            return XCTFail("portal request mapped to a broader session command")
+        }
+        XCTAssertEqual(text, "keep both auth methods")
+        XCTAssertEqual(expectedSessionRevision, 9)
     }
 
     func testPortalRejectsRequestsWithoutAuthorizedCertificate() async throws {

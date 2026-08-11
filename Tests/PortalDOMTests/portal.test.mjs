@@ -18,6 +18,54 @@ const scriptSource = readFileSync(
 );
 const cssSource = readFileSync(resolve(portalDirectory, "portal.css"), "utf8");
 
+const projectOneID = "10000000-0000-0000-0000-000000000010";
+const projectTwoID = "10000000-0000-0000-0000-000000000020";
+const sessionOneID = "20000000-0000-0000-0000-000000000010";
+const sessionTwoID = "20000000-0000-0000-0000-000000000020";
+
+function sessionFixture(overrides = {}) {
+  return {
+    sessionId: sessionOneID,
+    projectId: projectOneID,
+    parentSessionId: null,
+    title: "Implement provider portal",
+    provider: "codex",
+    model: "model-a",
+    state: "idle",
+    revision: 3,
+    runGeneration: 1,
+    lastActivityAt: "2026-08-10T20:00:00Z",
+    ...overrides,
+  };
+}
+
+function bootstrapFixture(overrides = {}) {
+  return {
+    projects: [
+      {
+        projectId: projectOneID,
+        name: "Sandbox Workspace",
+        state: "active",
+        rootNames: ["RepoPrompt"],
+      },
+    ],
+    sessions: [],
+    workflows: [],
+    ...overrides,
+  };
+}
+
+function transcriptPageFixture(session = sessionFixture(), items = []) {
+  return {
+    session,
+    items,
+    hasMoreBefore: false,
+    hasMoreAfter: false,
+    earliestSequence: items[0]?.sessionSequence ?? null,
+    latestSequence: items.at(-1)?.sessionSequence ?? null,
+  };
+}
+
 function model(id, overrides = {}) {
   return {
     id,
@@ -45,15 +93,16 @@ function providerFixture({
   authFlows = [
     {
       kind: "browserOAuth",
-      displayName: "Browser OAuth",
+      displayName: "Login with ChatGPT",
       startable: false,
-      detail: "OAuth adapter is not installed.",
+      detail: "Browser login is not available on this server.",
     },
     {
       kind: "deviceCodeBeta",
-      displayName: "Device auth (beta)",
+      displayName: "Use device code instead",
       startable: true,
-      detail: "Authorize this device with the provider.",
+      detail:
+        "Uses your Codex subscription. RepoPrompt CE keeps this sign-in separate from ~/.codex.",
     },
   ],
   supportsSpeedMode = false,
@@ -284,6 +333,7 @@ async function waitFor(predicate, message = "condition was not reached") {
 async function createHarness({
   hash = "#settings/cli-providers",
   providers = providerCatalog(),
+  bootstrap = bootstrapFixture(),
   handler,
 } = {}) {
   const dom = new JSDOM(htmlSource, {
@@ -293,7 +343,7 @@ async function createHarness({
   });
   const { window } = dom;
   const calls = [];
-  const context = { providers };
+  const context = { providers, bootstrap };
 
   window.__REPOPROMPT_PORTAL_TEST_HOOK__ = true;
   window.fetch = async (path, options = {}) => {
@@ -309,11 +359,7 @@ async function createHarness({
       if (handled) return handled;
     }
     if (call.path === "api/v1/bootstrap") {
-      return jsonResponse({
-        projects: [{ name: "Sandbox Workspace", rootNames: ["RepoPrompt"] }],
-        sessions: [],
-        workflows: [],
-      });
+      return jsonResponse(context.bootstrap);
     }
     if (
       call.path.startsWith("api/v1/provider-settings") &&
@@ -428,7 +474,10 @@ test("deep links, settings search, keyboard clearing, and unavailable explanatio
 
   const skip = document.querySelector('[data-action="skip-content"]');
   click(window, skip);
-  assert.equal(document.activeElement, document.getElementById("main-content"));
+  assert.equal(
+    document.activeElement,
+    document.getElementById("settings-main-content"),
+  );
 });
 
 test("provider enable, model, effort, fast-mode, and tier controls submit the full revision", async (t) => {
@@ -560,7 +609,7 @@ test("direct authentication fields are capability-gated for every supported fami
   );
   assert.match(
     document.querySelector('[data-provider-id="cursorACP"]').textContent,
-    /Browser login requires a provider flow/,
+    /Complete browser login in the isolated account/,
   );
 
   for (const unavailable of document.querySelectorAll(
@@ -657,9 +706,10 @@ test("device auth state machine starts, polls to completion, refreshes, and canc
     authFlows: [
       {
         kind: "deviceCodeBeta",
-        displayName: "Device auth (beta)",
+        displayName: "Use device code instead",
         startable: true,
-        detail: "Authorize this device.",
+        detail:
+          "Uses your Codex subscription. RepoPrompt CE keeps this sign-in separate from ~/.codex.",
       },
     ],
   });
@@ -749,21 +799,6 @@ test("device auth state machine starts, polls to completion, refreshes, and canc
     '{"kind":"deviceCodeBeta"}',
   );
 
-  await window.RepoPromptPortalTest.pollActiveFlow(true);
-  await settle();
-  assert.equal(polls, 1);
-  assert.equal(document.querySelector(".device-panel"), null);
-  assert.match(
-    document.querySelector('[data-provider-id="codex"]').textContent,
-    /Authenticated/,
-  );
-  assert.equal(window.RepoPromptPortalTest.state.activeFlow, null);
-
-  click(
-    window,
-    document.querySelector('[data-action="start-auth-flow"]:not(:disabled)'),
-  );
-  await waitFor(() => document.querySelector(".device-panel"));
   click(window, document.querySelector('[data-action="cancel-auth-flow"]'));
   await waitFor(() => cancels === 1);
   await waitFor(() => window.RepoPromptPortalTest.state.activeFlow === null);
@@ -773,6 +808,21 @@ test("device auth state machine starts, polls to completion, refreshes, and canc
       call.path.startsWith("api/v1/provider-auth-flows/"),
   );
   assert.equal(cancelCall.headers["X-RepoPrompt-Portal-CSRF"], "1");
+
+  click(
+    window,
+    document.querySelector('[data-action="start-auth-flow"]:not(:disabled)'),
+  );
+  await waitFor(() => document.querySelector(".device-panel"));
+  await window.RepoPromptPortalTest.pollActiveFlow(true);
+  await settle();
+  assert.equal(polls, 1);
+  assert.equal(document.querySelector(".device-panel"), null);
+  assert.match(
+    document.querySelector('[data-provider-id="codex"]').textContent,
+    /Authenticated/,
+  );
+  assert.equal(window.RepoPromptPortalTest.state.activeFlow, null);
 });
 
 test("connection test, disconnect, revoke, confirmation, and Escape are wired", async (t) => {
@@ -876,6 +926,356 @@ test("connection test, disconnect, revoke, confirmation, and Escape are wired", 
   );
 });
 
+test("project and threaded session navigation render a literal server transcript", async (t) => {
+  const child = sessionFixture({
+    sessionId: sessionTwoID,
+    parentSessionId: sessionOneID,
+    title: "Review provider states",
+    state: "running",
+    lastActivityAt: "2026-08-10T21:00:00Z",
+  });
+  const root = sessionFixture();
+  const malicious = '<img src=x onerror="window.__transcriptExecuted = true">';
+  const harness = await createHarness({
+    hash: "#home",
+    bootstrap: bootstrapFixture({
+      projects: [
+        ...bootstrapFixture().projects,
+        {
+          projectId: projectTwoID,
+          name: "Desktop Reference",
+          state: "active",
+          rootNames: ["RepoPromptApp"],
+        },
+      ],
+      sessions: [root, child],
+    }),
+    handler(call) {
+      if (call.path.includes(`/sessions/${sessionTwoID}/transcript`)) {
+        return jsonResponse(
+          transcriptPageFixture(child, [
+            {
+              entryId: "30000000-0000-0000-0000-000000000010",
+              sessionSequence: 1,
+              kind: "human",
+              content: malicious,
+              timestamp: "2026-08-10T21:00:00Z",
+              truncated: false,
+            },
+            {
+              entryId: "30000000-0000-0000-0000-000000000020",
+              sessionSequence: 2,
+              kind: "assistant",
+              content: "I will inspect the live provider capabilities.",
+              timestamp: "2026-08-10T21:00:01Z",
+              truncated: false,
+            },
+          ]),
+        );
+      }
+      return null;
+    },
+  });
+  t.after(() => harness.close());
+  const { document, window } = harness;
+
+  assert.equal(
+    document.querySelectorAll("#project-list .project-row").length,
+    2,
+  );
+  assert.equal(
+    document.querySelectorAll("#session-list .session-row").length,
+    2,
+  );
+  assert.ok(
+    document
+      .querySelector(`[data-session-id="${sessionTwoID}"]`)
+      .classList.contains("depth-1"),
+  );
+  assert.equal(
+    document.getElementById("active-session-title").textContent,
+    child.title,
+  );
+  assert.match(
+    document.getElementById("transcript-list").textContent,
+    /<img src=x/,
+  );
+  assert.equal(document.querySelector("#transcript-list img"), null);
+  assert.equal(window.__transcriptExecuted, undefined);
+
+  click(window, document.querySelector(`[data-project-id="${projectTwoID}"]`));
+  assert.equal(
+    document.getElementById("active-workspace-name").textContent,
+    "Desktop Reference",
+  );
+  assert.match(
+    document.getElementById("session-list").textContent,
+    /No sessions yet/i,
+  );
+  assert.equal(
+    document.getElementById("active-session-title").textContent,
+    "New chat",
+  );
+});
+
+test("switching sessions starts the new transcript request without waiting for a stale request", async (t) => {
+  const root = sessionFixture();
+  const child = sessionFixture({
+    sessionId: sessionTwoID,
+    parentSessionId: sessionOneID,
+    title: "Child session",
+    lastActivityAt: "2026-08-10T19:00:00Z",
+  });
+  let stallRoot = false;
+  let releaseRoot;
+  const stalledRootResponse = new Promise((resolvePromise) => {
+    releaseRoot = resolvePromise;
+  });
+  const harness = await createHarness({
+    hash: "#home",
+    bootstrap: bootstrapFixture({ sessions: [root, child] }),
+    handler(call) {
+      if (call.path.includes(`/sessions/${sessionOneID}/transcript`)) {
+        if (stallRoot) return stalledRootResponse;
+        return jsonResponse(
+          transcriptPageFixture(root, [
+            {
+              entryId: "30000000-0000-0000-0000-000000000050",
+              sessionSequence: 1,
+              kind: "assistant",
+              content: "Root transcript",
+              timestamp: "2026-08-10T20:00:00Z",
+              truncated: false,
+            },
+          ]),
+        );
+      }
+      if (call.path.includes(`/sessions/${sessionTwoID}/transcript`)) {
+        return jsonResponse(
+          transcriptPageFixture(child, [
+            {
+              entryId: "30000000-0000-0000-0000-000000000060",
+              sessionSequence: 1,
+              kind: "assistant",
+              content: "Child transcript",
+              timestamp: "2026-08-10T19:00:00Z",
+              truncated: false,
+            },
+          ]),
+        );
+      }
+      return null;
+    },
+  });
+  t.after(() => harness.close());
+  const { document, window } = harness;
+
+  stallRoot = true;
+  const staleRequest = window.RepoPromptPortalTest.loadTranscript({
+    after: 1,
+    silent: true,
+  });
+  window.RepoPromptPortalTest.selectSession(sessionTwoID);
+  await waitFor(
+    () =>
+      document
+        .getElementById("transcript-list")
+        .textContent.includes("Child transcript"),
+    "new session transcript was blocked by the stale request",
+  );
+
+  releaseRoot(
+    jsonResponse(
+      transcriptPageFixture(root, [
+        {
+          entryId: "30000000-0000-0000-0000-000000000070",
+          sessionSequence: 2,
+          kind: "assistant",
+          content: "Late root transcript",
+          timestamp: "2026-08-10T20:01:00Z",
+          truncated: false,
+        },
+      ]),
+    ),
+  );
+  await staleRequest;
+  assert.match(
+    document.getElementById("transcript-list").textContent,
+    /Child transcript/,
+  );
+  assert.doesNotMatch(
+    document.getElementById("transcript-list").textContent,
+    /Late root transcript/,
+  );
+});
+
+test("composer creates sessions and sends revision-checked follow-ups through portal APIs", async (t) => {
+  const connectedProvider = providerFixture({
+    connection: connectionFixture(),
+  });
+  const created = sessionFixture({ title: "Draft the portal" });
+  const transcriptItems = [
+    {
+      entryId: "30000000-0000-0000-0000-000000000030",
+      sessionSequence: 1,
+      kind: "human",
+      content: "Draft the portal",
+      timestamp: "2026-08-10T22:00:00Z",
+      truncated: false,
+    },
+  ];
+  const harness = await createHarness({
+    hash: "#home",
+    providers: [connectedProvider],
+    handler(call) {
+      if (call.path === "api/v1/sessions" && call.method === "POST") {
+        return jsonResponse(created, 202);
+      }
+      if (call.path.includes(`/sessions/${sessionOneID}/messages`)) {
+        transcriptItems.push({
+          entryId: "30000000-0000-0000-0000-000000000040",
+          sessionSequence: 2,
+          kind: "human",
+          content: "Polish the provider states",
+          timestamp: "2026-08-10T22:01:00Z",
+          truncated: false,
+        });
+        return jsonResponse({ accepted: true }, 202);
+      }
+      if (call.path.includes(`/sessions/${sessionOneID}/transcript`)) {
+        return jsonResponse(transcriptPageFixture(created, transcriptItems));
+      }
+      return null;
+    },
+  });
+  t.after(() => harness.close());
+  const { document, window } = harness;
+  const composer = document.getElementById("composer-text");
+
+  composer.value = "Draft the portal";
+  composer.dispatchEvent(new window.Event("input", { bubbles: true }));
+  change(window, document.getElementById("composer-model"), "model-b");
+  submit(window, document.getElementById("composer-form"));
+  await waitFor(() =>
+    harness.calls.some(
+      (call) => call.path === "api/v1/sessions" && call.method === "POST",
+    ),
+  );
+  await waitFor(
+    () =>
+      document.getElementById("active-session-title").textContent ===
+      created.title,
+  );
+
+  const createCall = harness.calls.find(
+    (call) => call.path === "api/v1/sessions" && call.method === "POST",
+  );
+  const createBody = JSON.parse(createCall.body);
+  assert.equal(createBody.projectId, projectOneID);
+  assert.equal(createBody.providerId, "codex");
+  assert.equal(createBody.model, "model-b");
+  assert.equal(createBody.initialPrompt, "Draft the portal");
+  assert.match(createBody.operationId, /^[0-9a-f-]{36}$/i);
+  assert.equal(createCall.headers["X-RepoPrompt-Portal-CSRF"], "1");
+
+  composer.value = "Polish the provider states";
+  composer.dispatchEvent(new window.Event("input", { bubbles: true }));
+  submit(window, document.getElementById("composer-form"));
+  await waitFor(() =>
+    harness.calls.some((call) =>
+      call.path.includes(`/sessions/${sessionOneID}/messages`),
+    ),
+  );
+  const messageCall = harness.calls.find((call) =>
+    call.path.includes(`/sessions/${sessionOneID}/messages`),
+  );
+  const messageBody = JSON.parse(messageCall.body);
+  assert.equal(messageBody.expectedRevision, 3);
+  assert.equal(messageBody.text, "Polish the provider states");
+  assert.match(messageBody.operationId, /^[0-9a-f-]{36}$/i);
+  assert.equal(messageCall.headers["X-RepoPrompt-Portal-CSRF"], "1");
+  await window.RepoPromptPortalTest.whenIdle();
+  await settle();
+});
+
+test("provider status separates runtime availability and authentication methods remain peers", async (t) => {
+  const codex = providerFixture();
+  const connected = providerFixture({
+    providerID: "claudeCompatible",
+    displayName: "Claude Code",
+    connection: connectionFixture({ providerID: "claudeCompatible" }),
+  });
+  const failed = providerFixture({
+    providerID: "openCodeACP",
+    displayName: "OpenCode",
+    connection: connectionFixture({
+      providerID: "openCodeACP",
+      state: "attention",
+      testState: "invalid",
+    }),
+    authentication: { state: "attention", authenticated: false },
+  });
+  const disabled = providerFixture({
+    providerID: "cursorACP",
+    displayName: "Cursor",
+    preference: { enabled: false },
+  });
+  const harness = await createHarness({
+    providers: [codex, connected, failed, disabled],
+  });
+  t.after(() => harness.close());
+  const { document } = harness;
+  const card = document.querySelector('[data-provider-id="codex"]');
+  const choices = [...card.querySelectorAll(".auth-choice")];
+
+  assert.match(
+    card.querySelector(".connection-badge").textContent,
+    /Available · authentication required/,
+  );
+  assert.doesNotMatch(
+    card.querySelector(".connection-badge").textContent,
+    /^Ready$/i,
+  );
+  assert.match(
+    document.querySelector(
+      '[data-provider-id="claudeCompatible"] .connection-badge',
+    ).textContent,
+    /^Connected$/,
+  );
+  assert.match(
+    document.querySelector('[data-provider-id="openCodeACP"] .connection-badge')
+      .textContent,
+    /^Validation failed$/,
+  );
+  assert.match(
+    document.querySelector('[data-provider-id="cursorACP"] .connection-badge')
+      .textContent,
+    /^Disabled$/,
+  );
+  assert.deepEqual(
+    choices.map((choice) => choice.querySelector("strong").textContent),
+    [
+      "Use device code instead",
+      "Login with ChatGPT",
+      "OpenAI API Key",
+      "Enterprise access token",
+    ],
+  );
+  assert.match(choices[0].textContent, /Codex subscription/i);
+  assert.match(choices[2].textContent, /API-billed/i);
+  assert.ok(choices[0].querySelector('[data-action="start-auth-flow"]'));
+  assert.ok(choices[2].querySelector('[data-action="choose-auth-method"]'));
+  assert.equal(card.querySelectorAll(".flow-option").length, 0);
+  assert.match(card.textContent, /Codex CLI/);
+  assert.match(card.textContent, /separate sign-in from ~\/.codex/);
+  assert.match(card.textContent, /identity verification \(KYC\)/);
+  assert.match(
+    card.textContent,
+    /Permissions and runtime controls appear here after Codex is connected/,
+  );
+  assert.equal(card.textContent.includes("migrated"), false);
+});
+
 test("offline failures are visible and an online event refreshes retained UI", async (t) => {
   let fail = true;
   const harness = await createHarness({
@@ -897,7 +1297,7 @@ test("offline failures are visible and an online event refreshes retained UI", a
     true,
   );
   assert.match(
-    document.getElementById("home-provider-list").textContent,
+    document.getElementById("session-list").textContent,
     /cannot reach/i,
   );
 
@@ -908,8 +1308,12 @@ test("offline failures are visible and an online event refreshes retained UI", a
   );
   assert.equal(document.getElementById("connection-banner").hidden, true);
   assert.equal(
-    document.querySelectorAll("#home-provider-list .glance-item").length,
-    5,
+    document.querySelectorAll("#project-list .project-row").length,
+    1,
+  );
+  assert.match(
+    document.getElementById("session-list").textContent,
+    /no sessions yet/i,
   );
 });
 
@@ -965,10 +1369,11 @@ test("every visible interactive element works or is disabled with an explanation
 
 test("portal assets retain security, API, loading, and no-placeholder contracts", () => {
   for (const term of [
-    "Provider and model settings",
+    "Projects",
+    "Sessions",
+    "Ask RepoPrompt anything",
     "Models &amp; Providers",
-    "Copy &amp; Chat",
-    "Settings portal scope",
+    "Server Portal",
   ]) {
     assert.ok(
       htmlSource.includes(term),
@@ -976,10 +1381,9 @@ test("portal assets retain security, API, loading, and no-placeholder contracts"
     );
   }
   for (const deadPlaceholder of [
-    "What are we building?",
-    "New Agent Session",
-    "Agent transcript",
     "Session creation arrives",
+    "APIs do not exist yet",
+    "Provider and model settings",
   ]) {
     assert.equal(htmlSource.includes(deadPlaceholder), false);
   }
@@ -1006,6 +1410,9 @@ test("portal assets retain security, API, loading, and no-placeholder contracts"
   }
   for (const endpoint of [
     'api("api/v1/bootstrap")',
+    'api("api/v1/sessions"',
+    "/transcript?",
+    "/messages",
     "api/v1/provider-settings/",
     "/connect",
     "/auth-flows",

@@ -50,6 +50,20 @@
     confirmReturnFocus: null,
     focusAfterRoute: false,
     initialized: false,
+    agent: {
+      selectedProjectID: null,
+      selectedSessionID: null,
+      newSessionMode: false,
+      searchText: "",
+      transcriptItems: [],
+      transcriptPage: null,
+      transcriptPromise: null,
+      transcriptPromiseSessionID: null,
+      mutationPromise: null,
+      pollTimer: null,
+      selectionGeneration: 0,
+      retryOperation: null,
+    },
   };
 
   // Hand-authored web-safe semantic line glyphs substitute for non-portable
@@ -84,6 +98,7 @@
     close: '<path d="m3 3 10 10M13 3 3 13"/>',
     check: '<path d="m2.5 8 3.5 3.5 7.5-7.5"/>',
     link: '<path d="M6.5 9.5 9.5 6.5M5 11H3.5a2.5 2.5 0 0 1 0-5H6M10 5h2.5a2.5 2.5 0 0 1 0 5H10"/>',
+    send: '<path d="M1.5 8 14.5 2 10 14l-2-5zM8 9l6.5-7"/>',
   };
 
   class PortalError extends Error {
@@ -254,20 +269,65 @@
       : "cli-providers";
   }
 
+  function desktopProviderPresentation(provider) {
+    const presentations = {
+      codex: {
+        title: "Codex CLI",
+        subtitle:
+          "Runs RepoPrompt CE's managed Codex runtime with a separate sign-in from ~/.codex.",
+      },
+      claudeCompatible: {
+        title: "Claude Code CLI",
+        subtitle:
+          "Uses your Claude Code CLI login for Anthropic models. Compatible backends use their own API keys.",
+      },
+      openCodeACP: {
+        title: "OpenCode CLI",
+        subtitle:
+          "Uses OpenCode's ACP runtime for Agent Mode; headless OpenCode runs use a managed no-native-tools mode.",
+      },
+      cursorACP: {
+        title: "Cursor CLI",
+        subtitle:
+          "Uses Cursor's ACP runtime for Agent Mode, headless tasks, and chat.",
+      },
+    };
+    return (
+      presentations[provider.providerID] || {
+        title: provider.displayName,
+        subtitle: provider.summary,
+      }
+    );
+  }
+
   function providerStatus(provider) {
-    if (provider.preflight?.ready || provider.effectiveEnabled)
-      return { label: "Ready", tone: "ready" };
     if (!provider.deploymentAllowed)
-      return { label: "Deployment disabled", tone: "" };
+      return { label: "Unavailable · deployment disabled", tone: "" };
     if (!provider.preference?.enabled) return { label: "Disabled", tone: "" };
     if (
       provider.connection?.testState === "invalid" ||
-      provider.authentication?.state === "attention"
+      provider.authentication?.state === "attention" ||
+      provider.preflight?.reason === "invalidCredential"
     ) {
-      return { label: "Needs attention", tone: "attention" };
+      return { label: "Validation failed", tone: "attention" };
     }
+    if (
+      provider.authentication?.authenticated &&
+      (provider.connection?.testState === "valid" || provider.preflight?.ready)
+    ) {
+      return { label: "Connected", tone: "connected" };
+    }
+    if (provider.authentication?.authenticated)
+      return { label: "Connected · validation required", tone: "available" };
+    if (provider.cli?.healthy || provider.runtimePreflightVerified)
+      return {
+        label: "Available · authentication required",
+        tone: "available",
+      };
+    if (provider.cli && !provider.cli.installed)
+      return { label: "Unavailable · executable missing", tone: "attention" };
     return {
-      label: humanize(provider.preflight?.reason || "Needs attention"),
+      label: humanize(provider.preflight?.reason || "Unavailable"),
       tone: "attention",
     };
   }
@@ -301,7 +361,7 @@
     refresh.setAttribute("aria-busy", String(loading));
     setDisabledReason(refresh, loading, "Refresh is already in progress.");
     document
-      .getElementById("home-provider-list")
+      .getElementById("session-list")
       .setAttribute("aria-busy", String(loading));
     document
       .getElementById("settings-content")
@@ -309,10 +369,19 @@
   }
 
   function renderInitialLoading() {
-    const list = document.getElementById("home-provider-list");
-    list.replaceChildren();
-    for (let index = 0; index < providerOrder.length; index += 1)
-      list.append(element("div", "skeleton-card"));
+    const projects = document.getElementById("project-list");
+    const sessions = document.getElementById("session-list");
+    projects.replaceChildren(
+      element("div", "sidebar-loading", "Loading projects…"),
+    );
+    sessions.replaceChildren(
+      element("div", "sidebar-loading", "Loading sessions…"),
+    );
+    document
+      .getElementById("transcript-list")
+      .replaceChildren(
+        element("div", "transcript-empty", "Loading workspace…"),
+      );
     const content = document.getElementById("settings-content");
     content.replaceChildren(
       element("div", "empty-state-panel", "Loading provider settings…"),
@@ -331,7 +400,14 @@
         if (!providerCatalog || !Array.isArray(providerCatalog.providers)) {
           throw new PortalError("The provider catalog response is incomplete.");
         }
-        state.bootstrap = bootstrap || { projects: [] };
+        state.bootstrap = bootstrap || {
+          projects: [],
+          sessions: [],
+          workflows: [],
+        };
+        state.bootstrap.projects ||= [];
+        state.bootstrap.sessions ||= [];
+        state.bootstrap.workflows ||= [];
         state.providers = providerCatalog.providers;
         state.generatedAt =
           providerCatalog.generatedAt || new Date().toISOString();
@@ -341,6 +417,9 @@
         updateShell();
         renderHomeProviders();
         renderRoute();
+        if (state.route === "home" && state.agent.selectedSessionID) {
+          await loadTranscript({ silent: true });
+        }
         if (refresh) {
           toast("Server state refreshed");
           announce("Server state refreshed");
@@ -370,9 +449,9 @@
   }
 
   function updateShell() {
-    const firstProject = state.bootstrap?.projects?.[0];
+    const project = selectedProject() || state.bootstrap?.projects?.[0];
     document.getElementById("active-workspace-name").textContent =
-      firstProject?.name || "RepoPrompt Server";
+      project?.name || "RepoPrompt Server";
     const freshness = state.generatedAt
       ? `Updated ${formatDate(state.generatedAt)}`
       : "Not yet loaded";
@@ -380,50 +459,610 @@
     document.getElementById("settings-freshness").textContent = freshness;
   }
 
-  function renderHomeProviders() {
-    const list = document.getElementById("home-provider-list");
-    list.replaceChildren();
-    const providers = orderedProviders();
-    if (!providers.length) {
-      list.append(
-        element(
-          "div",
-          "empty-state-panel",
-          "No providers are advertised by this server.",
-        ),
-      );
-      list.setAttribute("aria-busy", "false");
-      return;
+  function selectedProject() {
+    return state.bootstrap?.projects?.find(
+      (project) => project.projectId === state.agent.selectedProjectID,
+    );
+  }
+
+  function selectedSession() {
+    return state.bootstrap?.sessions?.find(
+      (session) => session.sessionId === state.agent.selectedSessionID,
+    );
+  }
+
+  function eligibleSessionProviders() {
+    return orderedProviders().filter(
+      (provider) =>
+        provider.category === "cliProvider" &&
+        provider.deploymentAllowed &&
+        provider.effectiveEnabled,
+    );
+  }
+
+  function reconcileAgentSelection() {
+    const projects = state.bootstrap?.projects || [];
+    if (
+      !projects.some((item) => item.projectId === state.agent.selectedProjectID)
+    ) {
+      state.agent.selectedProjectID =
+        projects.find((item) => item.state === "active")?.projectId ||
+        projects[0]?.projectId ||
+        null;
     }
-    providers.forEach((provider) => {
-      const link = element("a", "glance-item");
-      link.href = `#settings/${providerDestination(provider)}`;
-      link.dataset.routeLink = "";
-      link.dataset.providerLink = provider.providerID;
-      const status = providerStatus(provider);
-      const badge = element("span", `glance-status ${status.tone}`.trim());
-      badge.append(element("i"), document.createTextNode(status.label));
-      link.append(
-        element("strong", "", provider.displayName),
+    const sessions = (state.bootstrap?.sessions || []).filter(
+      (item) => item.projectId === state.agent.selectedProjectID,
+    );
+    if (
+      !sessions.some((item) => item.sessionId === state.agent.selectedSessionID)
+    ) {
+      state.agent.selectedSessionID =
+        [...sessions].sort(
+          (left, right) =>
+            new Date(right.lastActivityAt || 0) -
+              new Date(left.lastActivityAt || 0) ||
+            left.sessionId.localeCompare(right.sessionId),
+        )[0]?.sessionId || null;
+      state.agent.newSessionMode = !state.agent.selectedSessionID;
+    }
+  }
+
+  function renderHomeProviders() {
+    reconcileAgentSelection();
+    renderProjects();
+    renderSessions();
+    renderAgentDetail();
+  }
+
+  function renderProjects() {
+    const list = document.getElementById("project-list");
+    list.replaceChildren();
+    const projects = state.bootstrap?.projects || [];
+    if (!projects.length) {
+      list.append(
+        element("div", "sidebar-empty", "No projects are available."),
+      );
+    }
+    projects.forEach((project) => {
+      const button = element("button", "project-row");
+      button.type = "button";
+      button.dataset.projectId = project.projectId;
+      button.dataset.action = "select-project";
+      button.classList.toggle(
+        "active",
+        project.projectId === state.agent.selectedProjectID,
+      );
+      button.setAttribute(
+        "aria-pressed",
+        String(project.projectId === state.agent.selectedProjectID),
+      );
+      const glyph = iconNode("folder", "project-row-icon");
+      const copy = element("span", "project-row-copy");
+      copy.append(
+        element("strong", "", project.name),
         element(
           "small",
           "",
-          provider.preference?.defaultModel || "Provider default model",
+          project.rootNames?.length
+            ? project.rootNames.join(" · ")
+            : humanize(project.state),
         ),
-        badge,
       );
-      list.append(link);
+      button.append(glyph, copy);
+      button.addEventListener("click", () => selectProject(project.projectId));
+      list.append(button);
+    });
+    const newChat = document.getElementById("new-chat-button");
+    const reason = !projects.length
+      ? "Create a project through an authorized RepoPrompt client first."
+      : !eligibleSessionProviders().length
+        ? "Connect and validate a CLI provider before starting a chat."
+        : "";
+    setDisabledReason(newChat, Boolean(reason), reason);
+    installIcons(list);
+  }
+
+  function sessionDepths(sessions) {
+    const byID = new Map(
+      sessions.map((session) => [session.sessionId, session]),
+    );
+    const depthByID = new Map();
+    function resolve(session, visiting = new Set()) {
+      if (depthByID.has(session.sessionId))
+        return depthByID.get(session.sessionId);
+      if (!session.parentSessionId || !byID.has(session.parentSessionId)) {
+        depthByID.set(session.sessionId, 0);
+        return 0;
+      }
+      if (visiting.has(session.sessionId)) {
+        depthByID.set(session.sessionId, 0);
+        return 0;
+      }
+      visiting.add(session.sessionId);
+      const depth = Math.min(
+        6,
+        resolve(byID.get(session.parentSessionId), visiting) + 1,
+      );
+      visiting.delete(session.sessionId);
+      depthByID.set(session.sessionId, depth);
+      return depth;
+    }
+    sessions.forEach((session) => resolve(session));
+    return depthByID;
+  }
+
+  function renderSessions() {
+    const list = document.getElementById("session-list");
+    list.replaceChildren();
+    const query = state.agent.searchText.trim().toLowerCase();
+    let sessions = (state.bootstrap?.sessions || []).filter(
+      (session) => session.projectId === state.agent.selectedProjectID,
+    );
+    const depthByID = sessionDepths(sessions);
+    sessions = sessions
+      .filter((session) => {
+        if (!query) return true;
+        return [session.title, session.provider, session.model]
+          .filter(Boolean)
+          .some((value) => String(value).toLowerCase().includes(query));
+      })
+      .sort(
+        (left, right) =>
+          new Date(right.lastActivityAt || 0) -
+            new Date(left.lastActivityAt || 0) ||
+          left.sessionId.localeCompare(right.sessionId),
+      );
+    document.getElementById("session-count").textContent = String(
+      sessions.length,
+    );
+    if (!sessions.length) {
+      list.append(
+        element(
+          "div",
+          "sidebar-empty",
+          query
+            ? "No matching sessions."
+            : "No sessions yet. Start a new chat.",
+        ),
+      );
+    }
+    sessions.forEach((session) => {
+      const depth = depthByID.get(session.sessionId) || 0;
+      const button = element("button", `session-row depth-${depth}`);
+      button.type = "button";
+      button.dataset.sessionId = session.sessionId;
+      button.dataset.action = "select-session";
+      const active =
+        !state.agent.newSessionMode &&
+        session.sessionId === state.agent.selectedSessionID;
+      button.classList.toggle("active", active);
+      if (active) button.setAttribute("aria-current", "true");
+      const plate = element("span", `session-status-plate ${session.state}`);
+      plate.setAttribute("aria-hidden", "true");
+      plate.append(element("i"));
+      const copy = element("span", "session-row-copy");
+      copy.append(
+        element("strong", "", session.title || "Agent Session"),
+        element(
+          "small",
+          "",
+          `${humanize(session.provider)}${session.model ? ` · ${session.model}` : ""}`,
+        ),
+      );
+      button.append(
+        plate,
+        copy,
+        element("span", "session-row-state", humanize(session.state)),
+      );
+      button.addEventListener("click", () => selectSession(session.sessionId));
+      list.append(button);
     });
     list.setAttribute("aria-busy", "false");
   }
 
+  function selectProject(projectID) {
+    if (state.agent.selectedProjectID === projectID) return;
+    clearAgentPoll();
+    state.agent.selectedProjectID = projectID;
+    state.agent.selectedSessionID = null;
+    state.agent.transcriptItems = [];
+    state.agent.transcriptPage = null;
+    state.agent.newSessionMode = false;
+    reconcileAgentSelection();
+    renderHomeProviders();
+    updateShell();
+    if (state.agent.selectedSessionID) loadTranscript();
+  }
+
+  function selectSession(sessionID) {
+    if (
+      state.agent.selectedSessionID === sessionID &&
+      !state.agent.newSessionMode
+    )
+      return;
+    clearAgentPoll();
+    state.agent.selectedSessionID = sessionID;
+    state.agent.newSessionMode = false;
+    state.agent.transcriptItems = [];
+    state.agent.transcriptPage = null;
+    state.agent.selectionGeneration += 1;
+    renderHomeProviders();
+    loadTranscript();
+  }
+
+  function beginNewSession() {
+    clearAgentPoll();
+    state.agent.newSessionMode = true;
+    state.agent.selectedSessionID = null;
+    state.agent.transcriptItems = [];
+    state.agent.transcriptPage = null;
+    state.agent.selectionGeneration += 1;
+    renderHomeProviders();
+    document.getElementById("composer-text").focus({ preventScroll: true });
+  }
+
+  function renderAgentDetail() {
+    const session = selectedSession();
+    const title = document.getElementById("active-session-title");
+    const metadata = document.getElementById("session-metadata");
+    const stateDot = document.getElementById("session-state-dot");
+    stateDot.className = "session-state-dot";
+    if (state.agent.newSessionMode) {
+      title.textContent = "New chat";
+      metadata.replaceChildren(
+        element(
+          "span",
+          "metadata-pill",
+          selectedProject()?.name || "No project",
+        ),
+      );
+      stateDot.classList.add("idle");
+    } else if (session) {
+      title.textContent = session.title || "Agent Session";
+      metadata.replaceChildren(
+        element("span", "metadata-pill", humanize(session.provider)),
+        element("span", "metadata-pill", session.model || "Provider default"),
+        element(
+          "span",
+          `metadata-pill state-${session.state}`,
+          humanize(session.state),
+        ),
+      );
+      stateDot.classList.add(session.state);
+    } else {
+      title.textContent = "What are we building?";
+      metadata.replaceChildren();
+      stateDot.classList.add("idle");
+    }
+    renderTranscript();
+    renderAgentComposer();
+  }
+
+  function renderTranscript() {
+    const list = document.getElementById("transcript-list");
+    const status = document.getElementById("transcript-status");
+    const earlier = document.getElementById("load-earlier-button");
+    list.replaceChildren();
+    status.textContent = "";
+    earlier.hidden = !state.agent.transcriptPage?.hasMoreBefore;
+    if (state.agent.newSessionMode || !state.agent.selectedSessionID) {
+      const empty = element("div", "agent-welcome");
+      const brand = document.createElement("img");
+      brand.src = "assets/repoprompt-icon.png";
+      brand.alt = "";
+      empty.append(
+        brand,
+        element("h2", "", "What are we building?"),
+        element(
+          "p",
+          "",
+          "Choose a connected provider, describe the task, and RepoPrompt will start an authoritative server session.",
+        ),
+      );
+      list.append(empty);
+      list.setAttribute("aria-busy", "false");
+      return;
+    }
+    if (!state.agent.transcriptItems.length) {
+      list.append(
+        element(
+          "div",
+          "transcript-empty",
+          state.agent.transcriptPromise
+            ? "Loading transcript…"
+            : "This session has no transcript yet.",
+        ),
+      );
+    }
+    state.agent.transcriptItems.forEach((item) => {
+      const row = element("article", `transcript-entry kind-${item.kind}`);
+      row.dataset.entryId = item.entryId;
+      const header = element("header", "transcript-entry-header");
+      const role =
+        item.kind === "human"
+          ? "You"
+          : item.kind === "assistant"
+            ? "RepoPrompt"
+            : humanize(item.kind);
+      header.append(
+        element("strong", "", role),
+        element("time", "", formatDate(item.timestamp)),
+      );
+      const content = element("div", "transcript-entry-content", item.content);
+      row.append(header, content);
+      if (item.truncated)
+        row.append(
+          element(
+            "small",
+            "transcript-truncated",
+            "Entry truncated by the portal safety bound.",
+          ),
+        );
+      list.append(row);
+    });
+    list.setAttribute(
+      "aria-busy",
+      String(Boolean(state.agent.transcriptPromise)),
+    );
+  }
+
+  function mergeTranscriptItems(items, prepend = false) {
+    const merged = new Map(
+      (prepend
+        ? items.concat(state.agent.transcriptItems)
+        : state.agent.transcriptItems.concat(items)
+      ).map((item) => [item.entryId, item]),
+    );
+    state.agent.transcriptItems = [...merged.values()].sort(
+      (left, right) => left.sessionSequence - right.sessionSequence,
+    );
+  }
+
+  async function loadTranscript({
+    before = null,
+    after = null,
+    silent = false,
+  } = {}) {
+    const sessionID = state.agent.selectedSessionID;
+    if (!sessionID || state.agent.newSessionMode) return null;
+    if (
+      state.agent.transcriptPromise &&
+      state.agent.transcriptPromiseSessionID === sessionID
+    )
+      return state.agent.transcriptPromise;
+    const generation = state.agent.selectionGeneration;
+    const query = new URLSearchParams({ limit: "200" });
+    if (before !== null) query.set("beforeSequence", String(before));
+    if (after !== null) query.set("afterSequence", String(after));
+    const requestPromise = (async () => {
+      if (!silent) renderTranscript();
+      try {
+        const page = await api(
+          `api/v1/sessions/${encodeURIComponent(sessionID)}/transcript?${query}`,
+        );
+        if (
+          generation !== state.agent.selectionGeneration ||
+          sessionID !== state.agent.selectedSessionID
+        )
+          return null;
+        state.agent.transcriptPage = page;
+        mergeTranscriptItems(page.items || [], before !== null);
+        const index = state.bootstrap.sessions.findIndex(
+          (item) => item.sessionId === sessionID,
+        );
+        if (index >= 0) state.bootstrap.sessions[index] = page.session;
+        renderSessions();
+        renderAgentDetail();
+        scheduleAgentPoll();
+        return page;
+      } catch (error) {
+        if (generation === state.agent.selectionGeneration) {
+          document.getElementById("transcript-status").textContent =
+            `${error.message} Showing the last loaded transcript.`;
+          toast(error.message, true);
+          scheduleAgentPoll();
+        }
+        return null;
+      } finally {
+        if (state.agent.transcriptPromise === requestPromise) {
+          state.agent.transcriptPromise = null;
+          state.agent.transcriptPromiseSessionID = null;
+        }
+        if (
+          generation === state.agent.selectionGeneration &&
+          sessionID === state.agent.selectedSessionID
+        )
+          document
+            .getElementById("transcript-list")
+            .setAttribute("aria-busy", "false");
+      }
+    })();
+    state.agent.transcriptPromise = requestPromise;
+    state.agent.transcriptPromiseSessionID = sessionID;
+    return requestPromise;
+  }
+
+  function clearAgentPoll() {
+    if (state.agent.pollTimer !== null) {
+      window.clearTimeout(state.agent.pollTimer);
+      state.agent.pollTimer = null;
+    }
+  }
+
+  function scheduleAgentPoll() {
+    clearAgentPoll();
+    if (
+      state.route !== "home" ||
+      !state.agent.selectedSessionID ||
+      state.agent.newSessionMode ||
+      document.hidden
+    )
+      return;
+    const delay = window.__REPOPROMPT_PORTAL_TEST_HOOK__ ? 60_000 : 2_500;
+    state.agent.pollTimer = window.setTimeout(async () => {
+      state.agent.pollTimer = null;
+      const latest = state.agent.transcriptItems.at(-1)?.sessionSequence || 0;
+      await loadTranscript({ after: latest, silent: true });
+    }, delay);
+  }
+
+  function renderAgentComposer() {
+    const form = document.getElementById("composer-form");
+    const options = document.getElementById("new-session-options");
+    const providerSelect = document.getElementById("composer-provider");
+    const modelSelect = document.getElementById("composer-model");
+    const help = document.getElementById("composer-capability-help");
+    const text = document.getElementById("composer-text");
+    const submit = document.getElementById("composer-submit");
+    options.hidden = !state.agent.newSessionMode;
+    const providers = eligibleSessionProviders();
+    const previousProvider = providerSelect.value;
+    const previousModel = modelSelect.value;
+    providerSelect.replaceChildren();
+    providers.forEach((provider) => {
+      const option = element("option", "", provider.displayName);
+      option.value = provider.providerID;
+      option.selected = provider.providerID === previousProvider;
+      providerSelect.append(option);
+    });
+    const provider =
+      providers.find((item) => item.providerID === providerSelect.value) ||
+      providers[0];
+    modelSelect.replaceChildren();
+    const providerDefault = element("option", "", "Provider default");
+    providerDefault.value = "";
+    modelSelect.append(providerDefault);
+    (provider?.models || []).forEach((model) => {
+      const option = element("option", "", model.displayName);
+      option.value = model.id;
+      option.selected = previousModel
+        ? model.id === previousModel
+        : model.id === provider.preference?.defaultModel;
+      modelSelect.append(option);
+    });
+    const modelReason = !provider
+      ? "Connect and validate a CLI provider in Settings."
+      : !provider.capabilities.supportsModelSelection
+        ? "This provider uses its own default model."
+        : !(provider.models || []).length
+          ? "No sanitized model catalog is available for this account."
+          : "Model choices come from the live provider catalog.";
+    setDisabledReason(
+      modelSelect,
+      !provider?.capabilities.supportsModelSelection ||
+        !(provider?.models || []).length,
+      modelReason,
+    );
+    help.textContent = modelReason;
+    const unavailable =
+      state.agent.newSessionMode && (!selectedProject() || !provider);
+    const empty = !text.value.trim();
+    const reason = state.agent.mutationPromise
+      ? "A message is already being sent."
+      : !state.online
+        ? "The server connection is unavailable."
+        : unavailable
+          ? "Select a project and connect a validated CLI provider first."
+          : empty
+            ? "Enter a message to send."
+            : "";
+    setDisabledReason(submit, Boolean(reason), reason);
+    form.setAttribute(
+      "aria-busy",
+      String(Boolean(state.agent.mutationPromise)),
+    );
+    document.getElementById("composer-message").textContent =
+      reason ||
+      (state.agent.newSessionMode
+        ? "Start a private root session."
+        : "Send a follow-up to this session.");
+  }
+
+  function operationIDFor(payload) {
+    const fingerprint = JSON.stringify(payload);
+    if (state.agent.retryOperation?.fingerprint === fingerprint)
+      return state.agent.retryOperation.operationID;
+    if (!window.crypto?.randomUUID) return null;
+    const operationID = window.crypto.randomUUID();
+    state.agent.retryOperation = { fingerprint, operationID };
+    return operationID;
+  }
+
+  async function submitComposer() {
+    if (state.agent.mutationPromise) return state.agent.mutationPromise;
+    const text = document.getElementById("composer-text").value.trim();
+    if (!text) return null;
+    const newSession = state.agent.newSessionMode;
+    const payload = newSession
+      ? {
+          projectId: state.agent.selectedProjectID,
+          providerId: document.getElementById("composer-provider").value,
+          model: document.getElementById("composer-model").value || null,
+          initialPrompt: text,
+        }
+      : {
+          expectedRevision:
+            state.agent.transcriptPage?.session?.revision ||
+            selectedSession()?.revision,
+          text,
+        };
+    const operationID = operationIDFor(payload);
+    if (!operationID) {
+      toast("This browser cannot create secure operation identifiers.", true);
+      return null;
+    }
+    const body = { operationId: operationID, ...payload };
+    state.agent.mutationPromise = (async () => {
+      renderAgentComposer();
+      try {
+        if (newSession) {
+          const session = await api("api/v1/sessions", {
+            method: "POST",
+            body: JSON.stringify(body),
+          });
+          state.bootstrap.sessions.push(session);
+          state.agent.selectedSessionID = session.sessionId;
+          state.agent.newSessionMode = false;
+          state.agent.transcriptItems = [];
+          state.agent.transcriptPage = null;
+          state.agent.selectionGeneration += 1;
+        } else {
+          await api(
+            `api/v1/sessions/${encodeURIComponent(state.agent.selectedSessionID)}/messages`,
+            { method: "POST", body: JSON.stringify(body) },
+          );
+        }
+        document.getElementById("composer-text").value = "";
+        state.agent.retryOperation = null;
+        renderHomeProviders();
+        await loadTranscript({ silent: true });
+        toast(newSession ? "Chat started" : "Message accepted");
+      } catch (error) {
+        const composerMessage = document.getElementById("composer-message");
+        composerMessage.textContent =
+          error.code === "staleRevision"
+            ? "Session changed; review your message and send again."
+            : error.message;
+        toast(error.message, true);
+        if (error.code === "staleRevision")
+          await loadTranscript({ silent: true });
+      } finally {
+        state.agent.mutationPromise = null;
+        renderAgentComposer();
+      }
+    })();
+    return state.agent.mutationPromise;
+  }
+
   function renderHomeError(error) {
-    const list = document.getElementById("home-provider-list");
     const panel = element("div", "error-banner");
     panel.setAttribute("role", "alert");
     panel.append(iconNode("warning"), document.createTextNode(error.message));
-    list.replaceChildren(panel);
-    list.setAttribute("aria-busy", "false");
+    document.getElementById("session-list").replaceChildren(panel);
+    document
+      .getElementById("transcript-list")
+      .replaceChildren(panel.cloneNode(true));
+    installIcons(document.getElementById("home-shell"));
   }
 
   function normalizedRoute() {
@@ -455,7 +1094,17 @@
     home.hidden = route.surface !== "home";
     settings.hidden = route.surface !== "settings";
     document.getElementById("window-title-text").textContent =
-      route.surface === "home" ? "Server Portal" : "Settings";
+      route.surface === "home" ? "Agent Mode" : "Settings";
+    if (route.surface === "home") {
+      renderHomeProviders();
+      if (state.agent.selectedSessionID && !state.agent.transcriptPage) {
+        loadTranscript();
+      } else {
+        scheduleAgentPoll();
+      }
+    } else {
+      clearAgentPoll();
+    }
     document.querySelectorAll("#settings-nav a[data-route]").forEach((link) => {
       const active =
         route.surface === "settings" && link.dataset.route === route.page;
@@ -495,8 +1144,8 @@
       state.focusAfterRoute = false;
       window.setTimeout(() => {
         (route.surface === "settings"
-          ? document.getElementById("main-content")
-          : home
+          ? document.getElementById("settings-main-content")
+          : document.getElementById("main-content")
         ).focus({
           preventScroll: true,
         });
@@ -544,13 +1193,13 @@
     content.append(
       pageHeader(
         "Provider Settings",
-        "Server-owned provider readiness, model defaults, and authenticated connection state in one place.",
+        "Server-owned runtime availability, model defaults, and authenticated connection state in one place.",
         "agent",
       ),
     );
 
     const providers = orderedProviders();
-    const ready = providers.filter(
+    const validated = providers.filter(
       (provider) => provider.preflight?.ready || provider.effectiveEnabled,
     ).length;
     const enabled = providers.filter(
@@ -564,7 +1213,7 @@
       ["Advertised", String(providers.length), "Server catalog entries"],
       ["Enabled", String(enabled), "Administrative preference"],
       ["Authenticated", String(connected), "Sanitized connection state"],
-      ["Ready", String(ready), "Passed provider preflight"],
+      ["Validated", String(validated), "Passed provider preflight"],
     ].forEach(([label, value, detail]) =>
       summary.append(statusTile(label, value, detail)),
     );
@@ -586,7 +1235,7 @@
 
     const card = element("section", "settings-card");
     card.append(
-      element("h2", "", "Provider readiness"),
+      element("h2", "", "Provider status"),
       element(
         "p",
         "card-subtitle",
@@ -690,6 +1339,7 @@
   }
 
   function providerCard(provider, open, modelsOnly) {
+    const presentation = desktopProviderPresentation(provider);
     const details = element("details", "provider-card");
     details.open = open;
     details.dataset.providerId = provider.providerID;
@@ -699,8 +1349,8 @@
     badge.append(element("i"), element("span", "", status.label));
     const name = element("span", "provider-name");
     name.append(
-      element("strong", "", provider.displayName),
-      element("small", "", provider.summary),
+      element("strong", "", presentation.title),
+      element("small", "", presentation.subtitle),
     );
     summary.append(
       iconNode(
@@ -1038,6 +1688,122 @@
     return section;
   }
 
+  function authFlowForMethod(flows, method) {
+    return (
+      flows.find((flow) => flow.kind === method) ||
+      (method === "browserLogin" || method === "providerSpecific"
+        ? flows.find((flow) => flow.kind === "externalProvisioning")
+        : null)
+    );
+  }
+
+  function authenticationMethodName(provider, method, flow) {
+    if (flow?.displayName) return flow.displayName;
+    if (provider.providerID === "codex" && method === "browserOAuth")
+      return "Login with ChatGPT";
+    if (provider.providerID === "codex" && method === "deviceCodeBeta")
+      return "Use device code instead";
+    if (provider.providerID === "codex" && method === "apiKey")
+      return "OpenAI API Key";
+    return humanize(method);
+  }
+
+  function authenticationMethodDescription(provider, method, flow) {
+    if (flow?.detail) return flow.detail;
+    if (
+      provider.providerID === "codex" &&
+      (method === "browserOAuth" || method === "deviceCodeBeta")
+    )
+      return "Uses your Codex subscription. RepoPrompt CE keeps this sign-in separate from ~/.codex.";
+    if (provider.providerID === "codex" && method === "apiKey")
+      return "API keys for direct model access. OpenAI API usage is API-billed.";
+    return provider.authentication?.detail || provider.summary;
+  }
+
+  function authenticationMethodChoices(provider, flowMessage) {
+    const choices = element("div", "auth-choice-grid");
+    const flows = provider.capabilities.authFlows || [];
+    const methods = [...(provider.capabilities.authenticationMethods || [])];
+    if (provider.providerID === "codex") {
+      const releaseOrder = ["deviceCodeBeta", "browserOAuth", "apiKey"];
+      methods.sort((left, right) => {
+        const leftIndex = releaseOrder.indexOf(left);
+        const rightIndex = releaseOrder.indexOf(right);
+        return (
+          (leftIndex < 0 ? 99 : leftIndex) - (rightIndex < 0 ? 99 : rightIndex)
+        );
+      });
+    }
+    methods.forEach((method) => {
+      const flow = authFlowForMethod(flows, method);
+      const methodName = authenticationMethodName(provider, method, flow);
+      const card = element("div", "auth-choice");
+      card.dataset.authenticationMethod = method;
+      const copy = element("div", "auth-choice-copy");
+      copy.append(
+        element("strong", "", methodName),
+        element(
+          "small",
+          "",
+          authenticationMethodDescription(provider, method, flow),
+        ),
+      );
+      const active = provider.connection?.authenticationMethod === method;
+      const direct = directAuthenticationMethods.has(method);
+      const action = element(
+        "button",
+        active
+          ? "secondary-button auth-choice-action active"
+          : "secondary-button auth-choice-action",
+        active
+          ? "Connected"
+          : direct
+            ? provider.connection
+              ? "Change"
+              : "Validate & Save"
+            : methodName,
+      );
+      action.type = "button";
+      action.dataset.action = direct ? "choose-auth-method" : "start-auth-flow";
+      if (flow) action.dataset.flowKind = flow.kind;
+      const anotherFlow =
+        state.activeFlow && state.activeFlow.providerID !== provider.providerID;
+      if (active) {
+        setDisabledReason(
+          action,
+          true,
+          "This is the current connection method.",
+        );
+      } else if (direct) {
+        action.addEventListener("click", () => {
+          const select = card
+            .closest(".provider-card")
+            ?.querySelector('.secret-form select[name="authenticationMethod"]');
+          if (!select) return;
+          select.value = method;
+          select.dispatchEvent(new window.Event("change", { bubbles: true }));
+          select.focus({ preventScroll: true });
+        });
+      } else if (!flow?.startable || anotherFlow) {
+        setDisabledReason(
+          action,
+          true,
+          anotherFlow
+            ? "Finish or cancel the active authentication flow first."
+            : flow?.detail ||
+                "This server does not advertise a startable adapter for this method.",
+        );
+      } else {
+        action.addEventListener("click", () =>
+          startAuthFlow(provider, flow, action, flowMessage),
+        );
+      }
+      card.append(copy, action);
+      choices.append(card);
+    });
+    return choices;
+  }
+
   function authenticationSection(provider) {
     const section = element("section", "provider-section");
     section.dataset.controlFamily = "authentication";
@@ -1048,16 +1814,44 @@
       ),
     );
 
-    const methods = element("div", "auth-methods");
-    provider.capabilities.authenticationMethods.forEach((method) => {
-      const chip = element(
-        "span",
-        `auth-chip${provider.connection?.authenticationMethod === method ? " active" : ""}`,
-        humanize(method),
+    if (provider.providerID === "codex") {
+      const note = element("p", "codex-auth-note");
+      note.append(
+        document.createTextNode(
+          "ChatGPT may require identity verification (KYC) to access Codex. ",
+        ),
       );
-      methods.append(chip);
-    });
-    section.append(methods);
+      const learnMore = element("a", "", "Learn more");
+      learnMore.href = "https://chatgpt.com/cyber";
+      learnMore.target = "_blank";
+      learnMore.rel = "noopener noreferrer";
+      note.append(learnMore);
+      section.append(note);
+      if (!provider.authentication?.authenticated)
+        section.append(
+          element(
+            "p",
+            "card-subtitle codex-permissions-note",
+            "Permissions and runtime controls appear here after Codex is connected.",
+          ),
+        );
+    }
+
+    const advertisedFlowDetail =
+      provider.capabilities.authFlows?.find((flow) => flow.startable)?.detail ||
+      provider.capabilities.authFlows?.[0]?.detail ||
+      provider.authentication?.detail ||
+      "No authentication flow detail is available.";
+    const flowMessage = element(
+      "div",
+      "inline-message info auth-flow-message",
+      provider.providerID === "codex"
+        ? "RepoPrompt CE will keep checking this separate Codex sign-in until it completes or expires."
+        : advertisedFlowDetail,
+    );
+    flowMessage.setAttribute("role", "status");
+    flowMessage.tabIndex = -1;
+    section.append(authenticationMethodChoices(provider, flowMessage));
 
     if (provider.connection) section.append(connectionPanel(provider));
 
@@ -1067,17 +1861,16 @@
     if (directMethods.length)
       section.append(credentialForm(provider, directMethods));
 
-    const flows = provider.capabilities.authFlows || [];
-    if (
-      flows.length ||
-      provider.capabilities.authenticationMethods.some((method) =>
-        transientAuthenticationMethods.has(method),
-      )
-    ) {
-      section.append(flowControls(provider, flows));
+    const hasTransientMethod = provider.capabilities.authenticationMethods.some(
+      (method) => transientAuthenticationMethods.has(method),
+    );
+    if (hasTransientMethod) {
+      section.append(flowMessage);
+      if (state.activeFlow?.providerID === provider.providerID)
+        section.append(devicePanel(provider));
     }
 
-    if (!directMethods.length && !flows.length) {
+    if (!provider.capabilities.authenticationMethods.length) {
       const unavailable = element("div", "unavailable-panel");
       unavailable.append(
         iconNode("info"),
@@ -1093,12 +1886,22 @@
   function connectionPanel(provider) {
     const connection = provider.connection;
     const panel = element("div", "settings-card connection-panel");
+    const activeFlow = authFlowForMethod(
+      provider.capabilities.authFlows || [],
+      connection.authenticationMethod,
+    );
     panel.append(
-      element("h2", "", "Current connection"),
+      element(
+        "h2",
+        "",
+        provider.providerID === "codex"
+          ? "Signed in to Codex"
+          : "Current connection",
+      ),
       element(
         "p",
         "card-subtitle",
-        `${humanize(connection.authenticationMethod)} · ${connection.accountLabel || "No account label"} · revision ${connection.revision}`,
+        `${authenticationMethodName(provider, connection.authenticationMethod, activeFlow)} · ${connection.accountLabel || "No account label"}`,
       ),
     );
     const grid = element("div", "provider-status-grid connection-details");
@@ -1220,16 +2023,27 @@
 
   function credentialForm(provider, methods) {
     const wrapper = element("div", "settings-card credential-card");
+    const codexAPIKey =
+      provider.providerID === "codex" && methods.includes("apiKey");
+    const hasDirectConnection = methods.includes(
+      provider.connection?.authenticationMethod,
+    );
     wrapper.append(
       element(
         "h2",
         "",
-        provider.connection ? "Rotate connection" : "Add connection",
+        codexAPIKey
+          ? "OpenAI API Key"
+          : hasDirectConnection
+            ? "Change connection"
+            : "Add connection",
       ),
       element(
         "p",
         "card-subtitle",
-        "Credential fields are write-only and are disposed after every request outcome.",
+        codexAPIKey
+          ? "API keys for direct model access. OpenAI API usage is API-billed."
+          : "Credential fields are write-only and are disposed after every request outcome.",
       ),
     );
     const form = element("form", "secret-form");
@@ -1260,7 +2074,7 @@
     const submit = element(
       "button",
       "primary-button",
-      provider.connection ? "Rotate Credential" : "Connect",
+      hasDirectConnection ? "Change" : "Validate & Save",
     );
     submit.type = "submit";
     submit.dataset.action = "connect-provider";
@@ -1346,7 +2160,7 @@
       form.querySelectorAll("input, select, button").forEach((control) => {
         setDisabledReason(control, true, "Connection request is in progress.");
       });
-      submit.textContent = provider.connection ? "Rotating…" : "Connecting…";
+      submit.textContent = hasDirectConnection ? "Saving…" : "Validating…";
       message.textContent = "Sending the write-only connection request…";
       try {
         const updated = await api(
@@ -1381,79 +2195,6 @@
     });
 
     wrapper.append(form);
-    return wrapper;
-  }
-
-  function flowControls(provider, flows) {
-    const wrapper = element("div", "settings-card flow-card");
-    wrapper.append(
-      element("h2", "", "Provider authentication flows"),
-      element(
-        "p",
-        "card-subtitle",
-        "Only server-advertised transient flows can start in the portal.",
-      ),
-    );
-    const message = element(
-      "div",
-      "inline-message info",
-      "Device codes remain only in this transient page state.",
-    );
-    message.setAttribute("role", "status");
-    message.tabIndex = -1;
-    const list = element("div", "flow-list");
-    flows.forEach((flow) => {
-      const row = element("div", "flow-option");
-      const copy = element("div");
-      copy.append(
-        element("strong", "", flow.displayName),
-        element("small", "", flow.detail),
-      );
-      const button = element(
-        "button",
-        "secondary-button",
-        flow.startable ? `Start ${flow.displayName}` : "Unavailable",
-      );
-      button.type = "button";
-      button.dataset.action = "start-auth-flow";
-      button.dataset.flowKind = flow.kind;
-      const anotherFlow =
-        state.activeFlow && state.activeFlow.providerID !== provider.providerID;
-      const reason = !flow.startable
-        ? flow.detail
-        : anotherFlow
-          ? "Finish or cancel the active authentication flow first."
-          : "";
-      setDisabledReason(button, !flow.startable || anotherFlow, reason);
-      if (!button.disabled) {
-        button.addEventListener("click", () =>
-          startAuthFlow(provider, flow, button, message),
-        );
-      }
-      row.append(copy, button);
-      list.append(row);
-    });
-
-    const missingDescriptors =
-      provider.capabilities.authenticationMethods.filter(
-        (method) =>
-          transientAuthenticationMethods.has(method) &&
-          !flows.some((flow) => flow.kind === method),
-      );
-    if (missingDescriptors.length) {
-      const unavailable = element("div", "unavailable-panel");
-      unavailable.append(
-        iconNode("info"),
-        document.createTextNode(
-          `${missingDescriptors.map(humanize).join(", ")} requires a provider flow, but this server does not advertise a startable adapter.`,
-        ),
-      );
-      list.append(unavailable);
-    }
-
-    wrapper.append(list, message);
-    if (state.activeFlow?.providerID === provider.providerID)
-      wrapper.append(devicePanel(provider));
     return wrapper;
   }
 
@@ -1496,7 +2237,15 @@
     const header = element("div", "device-panel-header");
     const copy = element("div");
     copy.append(
-      element("h4", "", humanize(flow.kind)),
+      element(
+        "h4",
+        "",
+        authenticationMethodName(
+          provider,
+          flow.kind,
+          authFlowForMethod(provider.capabilities.authFlows || [], flow.kind),
+        ),
+      ),
       element("p", "", flow.detail || "Waiting for provider authorization."),
     );
     header.append(copy);
@@ -1761,10 +2510,20 @@
     }
     const action = event.target.closest("[data-action]")?.dataset.action;
     if (action === "refresh") loadAll(true);
-    else if (action === "skip-content") {
+    else if (action === "new-chat") beginNewSession();
+    else if (action === "load-earlier") {
+      const earliest = state.agent.transcriptItems[0]?.sessionSequence;
+      if (earliest) loadTranscript({ before: earliest });
+    } else if (action === "clear-session-search") {
+      state.agent.searchText = "";
+      document.getElementById("session-search").value = "";
+      document.getElementById("clear-session-search").hidden = true;
+      renderSessions();
+      document.getElementById("session-search").focus({ preventScroll: true });
+    } else if (action === "skip-content") {
       const target = document.getElementById("settings-shell").hidden
-        ? document.getElementById("home-shell")
-        : document.getElementById("main-content");
+        ? document.getElementById("main-content")
+        : document.getElementById("settings-main-content");
       target.focus({ preventScroll: true });
     } else if (action === "clear-settings-search") clearSettingsSearch();
     else if (action === "cancel-confirm") closeConfirm(false);
@@ -1785,6 +2544,15 @@
     ) {
       event.preventDefault();
       clearSettingsSearch();
+    } else if (
+      document.activeElement === document.getElementById("session-search") &&
+      document.getElementById("session-search").value
+    ) {
+      event.preventDefault();
+      state.agent.searchText = "";
+      document.getElementById("session-search").value = "";
+      document.getElementById("clear-session-search").hidden = true;
+      renderSessions();
     }
   }
 
@@ -1800,6 +2568,37 @@
       .addEventListener("input", (event) => {
         filterSettingsNavigation(event.target.value);
       });
+    document
+      .getElementById("session-search")
+      .addEventListener("input", (event) => {
+        state.agent.searchText = event.target.value;
+        document.getElementById("clear-session-search").hidden =
+          !event.target.value;
+        renderSessions();
+      });
+    document
+      .getElementById("composer-provider")
+      .addEventListener("change", () => {
+        state.agent.retryOperation = null;
+        renderAgentComposer();
+      });
+    document.getElementById("composer-model").addEventListener("change", () => {
+      state.agent.retryOperation = null;
+    });
+    document.getElementById("composer-text").addEventListener("input", () => {
+      state.agent.retryOperation = null;
+      renderAgentComposer();
+    });
+    document
+      .getElementById("composer-form")
+      .addEventListener("submit", (event) => {
+        event.preventDefault();
+        submitComposer();
+      });
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) clearAgentPoll();
+      else scheduleAgentPoll();
+    });
     window.addEventListener("hashchange", renderRoute);
     window.addEventListener("offline", () => {
       setConnectionPresentation(
@@ -1820,6 +2619,7 @@
     window.addEventListener("pagehide", () => {
       disposeSensitiveInputs();
       clearPollTimer();
+      clearAgentPoll();
     });
     renderRoute();
     loadAll(false);
@@ -1832,8 +2632,16 @@
       loadAll,
       renderRoute,
       pollActiveFlow,
+      loadTranscript,
+      selectSession,
+      beginNewSession,
+      submitComposer,
       disposeSensitiveInputs,
-      whenIdle: async () => state.loadPromise,
+      whenIdle: async () => {
+        await state.loadPromise;
+        await state.agent.transcriptPromise;
+        await state.agent.mutationPromise;
+      },
     });
   }
 

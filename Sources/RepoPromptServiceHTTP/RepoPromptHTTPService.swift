@@ -78,6 +78,54 @@ public struct RepoPromptHTTPService: Sendable {
             let bootstrap = try await portalBootstrap()
             return try portalJSON(bootstrap)
         } }
+        router.get("/portal/api/v1/sessions/:id/transcript") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let limit = request.uri.queryParameters.get("limit", as: Int.self) ?? 200
+            let beforeSequence = request.uri.queryParameters.get("beforeSequence", as: Int64.self)
+            let afterSequence = request.uri.queryParameters.get("afterSequence", as: Int64.self)
+            let session = try await authority.sessionSnapshot(sessionID: sessionID)
+            return try portalJSON(RepoPromptPortalSessionProjection.transcriptPage(
+                session: session,
+                limit: limit,
+                beforeSequence: beforeSequence,
+                afterSequence: afterSequence
+            ))
+        } }
+        router.post("/portal/api/v1/sessions") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(PortalCreateSessionRequest.self, from: data)
+            let catalog = try await requireProviderSettings().catalog(refreshCLI: false)
+            guard let provider = catalog.providers.first(where: { $0.providerID == input.providerID }) else {
+                throw ServiceAPIError(code: .notFound, message: "Provider settings not found")
+            }
+            let createInput = try RepoPromptPortalSessionProjection.validatedCreateInput(input, provider: provider)
+            let snapshot = try await authority.createSession(
+                input: createInput,
+                externalActor: principal.externalActor,
+                idempotencyKey: portalIdempotencyKey(principal: principal, operationID: input.operationID),
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            return try portalJSON(RepoPromptPortalSessionProjection.project(snapshot), status: .accepted)
+        } }
+        router.post("/portal/api/v1/sessions/:id/messages") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(PortalSendMessageRequest.self, from: data)
+            let command = try RepoPromptPortalSessionProjection.validatedSendCommand(input)
+            let receipt = try await authority.execute(
+                command: command,
+                sessionID: sessionID,
+                externalActor: principal.externalActor,
+                idempotencyKey: portalIdempotencyKey(principal: principal, operationID: input.operationID),
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            return try portalJSON(receipt, status: .accepted)
+        } }
         router.get("/portal/api/v1/provider-settings") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(context: context)
             let service = try requireProviderSettings()
@@ -86,7 +134,7 @@ public struct RepoPromptHTTPService: Sendable {
             return try portalJSON(catalog)
         } }
         router.patch("/portal/api/v1/provider-settings/:id") { request, context in await portalRespond(request) {
-            let attribution = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(context: context)
             try validatePortalMutation(request)
             let id = try context.parameters.require("id")
             guard let providerID = ProviderSettingsID(rawValue: id) else {
@@ -94,25 +142,25 @@ public struct RepoPromptHTTPService: Sendable {
             }
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(UpdateProviderSettingsRequest.self, from: data)
-            let snapshot = try await requireProviderSettings().update(providerID: providerID, request: input, attribution: attribution)
+            let snapshot = try await requireProviderSettings().update(providerID: providerID, request: input, attribution: principal.providerAttribution)
             return try portalJSON(snapshot)
         } }
         router.post("/portal/api/v1/provider-settings/:id/enable") { request, context in await portalRespond(request) {
-            let attribution = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(context: context)
             try validatePortalMutation(request)
             let input = try await JSONDecoder.serviceDecoder.decode(SetProviderEnabledRequest.self, from: bodyData(request))
-            let snapshot = try await requireProviderSettings().setEnabled(providerID: providerSettingsID(context), enabled: true, request: input, attribution: attribution)
+            let snapshot = try await requireProviderSettings().setEnabled(providerID: providerSettingsID(context), enabled: true, request: input, attribution: principal.providerAttribution)
             return try portalJSON(snapshot)
         } }
         router.post("/portal/api/v1/provider-settings/:id/disable") { request, context in await portalRespond(request) {
-            let attribution = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(context: context)
             try validatePortalMutation(request)
             let input = try await JSONDecoder.serviceDecoder.decode(SetProviderEnabledRequest.self, from: bodyData(request))
-            let snapshot = try await requireProviderSettings().setEnabled(providerID: providerSettingsID(context), enabled: false, request: input, attribution: attribution)
+            let snapshot = try await requireProviderSettings().setEnabled(providerID: providerSettingsID(context), enabled: false, request: input, attribution: principal.providerAttribution)
             return try portalJSON(snapshot)
         } }
         router.post("/portal/api/v1/provider-settings/:id/auth-flows") { request, context in await portalRespond(request) {
-            let attribution = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(context: context)
             try validatePortalMutation(request)
             let id = try context.parameters.require("id")
             guard let providerID = ProviderSettingsID(rawValue: id) else {
@@ -120,46 +168,46 @@ public struct RepoPromptHTTPService: Sendable {
             }
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(StartProviderAuthFlowRequest.self, from: data)
-            let challenge = try await requireProviderSettings().startAuthFlow(providerID: providerID, request: input, ownerID: attribution.actorID)
+            let challenge = try await requireProviderSettings().startAuthFlow(providerID: providerID, request: input, ownerID: principal.actorID)
             return try portalJSON(challenge, status: .accepted)
         } }
         router.post("/portal/api/v1/provider-settings/:id/connect") { request, context in await portalRespond(request) {
-            let attribution = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(context: context)
             try validatePortalMutation(request)
             let providerID = try providerSettingsID(context)
             let input = try await JSONDecoder.serviceDecoder.decode(ConnectProviderRequest.self, from: bodyData(request))
-            let snapshot = try await requireProviderSettings().connect(providerID: providerID, request: input, attribution: attribution)
+            let snapshot = try await requireProviderSettings().connect(providerID: providerID, request: input, attribution: principal.providerAttribution)
             return try portalJSON(snapshot, status: .created)
         } }
         router.post("/portal/api/v1/provider-settings/:id/test") { request, context in await portalRespond(request) {
-            let attribution = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(context: context)
             try validatePortalMutation(request)
-            let snapshot = try await requireProviderSettings().testConnection(providerID: providerSettingsID(context), attribution: attribution)
+            let snapshot = try await requireProviderSettings().testConnection(providerID: providerSettingsID(context), attribution: principal.providerAttribution)
             return try portalJSON(snapshot)
         } }
         router.post("/portal/api/v1/provider-settings/:id/disconnect") { request, context in await portalRespond(request) {
-            let attribution = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(context: context)
             try validatePortalMutation(request)
-            let snapshot = try await requireProviderSettings().disconnect(providerID: providerSettingsID(context), attribution: attribution)
+            let snapshot = try await requireProviderSettings().disconnect(providerID: providerSettingsID(context), attribution: principal.providerAttribution)
             return try portalJSON(snapshot)
         } }
         router.post("/portal/api/v1/provider-settings/:id/revoke") { request, context in await portalRespond(request) {
-            let attribution = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(context: context)
             try validatePortalMutation(request)
-            let snapshot = try await requireProviderSettings().disconnect(providerID: providerSettingsID(context), attribution: attribution, revoke: true)
+            let snapshot = try await requireProviderSettings().disconnect(providerID: providerSettingsID(context), attribution: principal.providerAttribution, revoke: true)
             return try portalJSON(snapshot)
         } }
         router.get("/portal/api/v1/provider-auth-flows/:flowID") { request, context in await portalRespond(request) {
-            let attribution = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(context: context)
             let flowID = try context.parameters.require("flowID", as: UUID.self)
-            let status = try await requireProviderSettings().pollAuthFlow(flowID: flowID, ownerID: attribution.actorID)
+            let status = try await requireProviderSettings().pollAuthFlow(flowID: flowID, ownerID: principal.actorID)
             return try portalJSON(status)
         } }
         router.delete("/portal/api/v1/provider-auth-flows/:flowID") { request, context in await portalRespond(request) {
-            let attribution = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(context: context)
             try validatePortalMutation(request)
             let flowID = try context.parameters.require("flowID", as: UUID.self)
-            try await requireProviderSettings().cancelAuthFlow(flowID: flowID, ownerID: attribution.actorID)
+            try await requireProviderSettings().cancelAuthFlow(flowID: flowID, ownerID: principal.actorID)
             return HTTPResponses.empty()
         } }
         router.get("/internal/v1/provider-settings") { request, context in await respond(request) {
@@ -707,7 +755,13 @@ public struct RepoPromptHTTPService: Sendable {
         return response
     }
 
-    private func authenticatePortal(context: RepoPromptRequestContext) async throws -> ProviderMutationAttribution {
+    private struct PortalAuthenticatedPrincipal {
+        let actorID: String
+        let providerAttribution: ProviderMutationAttribution
+        let externalActor: ExternalActor
+    }
+
+    private func authenticatePortal(context: RepoPromptRequestContext) async throws -> PortalAuthenticatedPrincipal {
         guard let certificateRoleResolver,
               let certificate = try await context.channel.nioSSL_peerCertificate().get()
         else {
@@ -718,7 +772,17 @@ public struct RepoPromptHTTPService: Sendable {
             throw ServiceAPIError(code: .internalAuthFailed, message: "An authorized portal client certificate is required")
         }
         let digest = try SHA256.hash(data: Data(certificate.toDERBytes())).map { String(format: "%02x", $0) }.joined()
-        return ProviderMutationAttribution(actorID: "certificate:\(digest)", actorLabel: role.rawValue, channel: "portal-mtls")
+        let actorID = "certificate:\(digest)"
+        let actorLabel = "\(role.rawValue) portal"
+        return PortalAuthenticatedPrincipal(
+            actorID: actorID,
+            providerAttribution: ProviderMutationAttribution(actorID: actorID, actorLabel: actorLabel, channel: "portal-mtls"),
+            externalActor: ExternalActor(goblinUserID: actorID, username: actorLabel, displayName: actorLabel)
+        )
+    }
+
+    private func portalIdempotencyKey(principal: PortalAuthenticatedPrincipal, operationID: UUID) -> String {
+        "portal:\(principal.actorID):\(operationID.uuidString.lowercased())"
     }
 
     private func providerSettingsID(_ context: RepoPromptRequestContext) throws -> ProviderSettingsID {
@@ -775,56 +839,13 @@ public struct RepoPromptHTTPService: Sendable {
         )
     }
 
-    private struct PortalBootstrap: Encodable {
-        let projects: [PortalProject]
-        let sessions: [PortalSession]
-        let workflows: [PortalWorkflow]
-    }
-
-    private struct PortalProject: Encodable {
-        let projectID: UUID
-        let name: String
-        let state: ProjectLifecycleState
-        let rootNames: [String]
-    }
-
-    private struct PortalSession: Encodable {
-        let sessionID: UUID
-        let projectID: UUID
-        let parentSessionID: UUID?
-        let title: String
-        let provider: ProviderKind
-        let model: String?
-        let state: SessionLifecycleState
-        let lastActivityAt: Date?
-    }
-
-    private struct PortalWorkflow: Encodable {
-        let workflowID: String
-        let name: String
-        let enabled: Bool
-    }
-
-    private func portalBootstrap() async throws -> PortalBootstrap {
-        let projects = await authority.projectSnapshots().map {
-            PortalProject(projectID: $0.projectID, name: $0.name, state: $0.state, rootNames: $0.roots.map(\.logicalName))
-        }
-        let sessions = try await authority.sessionSnapshots().map { session in
-            PortalSession(
-                sessionID: session.sessionID,
-                projectID: session.projectID,
-                parentSessionID: session.parentSessionID,
-                title: "Agent Session",
-                provider: session.provider,
-                model: session.model,
-                state: session.state,
-                lastActivityAt: session.transcript.last?.timestamp
-            )
-        }
+    private func portalBootstrap() async throws -> PortalBootstrapResponse {
+        let projects = await authority.projectSnapshots().map(RepoPromptPortalSessionProjection.project)
+        let sessions = try await authority.sessionSnapshots().map(RepoPromptPortalSessionProjection.project)
         let workflows = try await authority.workflowSnapshots().map {
-            PortalWorkflow(workflowID: $0.workflowID, name: $0.name, enabled: $0.enabled)
+            PortalWorkflowSummary(workflowID: $0.workflowID, name: $0.name, enabled: $0.enabled)
         }
-        return PortalBootstrap(projects: projects, sessions: sessions, workflows: workflows)
+        return PortalBootstrapResponse(projects: projects, sessions: sessions, workflows: workflows)
     }
 
     private struct PageToken: Codable {
