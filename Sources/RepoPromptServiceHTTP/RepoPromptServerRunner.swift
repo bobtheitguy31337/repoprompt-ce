@@ -92,11 +92,15 @@ public struct RepoPromptServerConfiguration: Sendable {
             }
             enabledProviders.insert(kind)
         }
-        let versions: [ProviderKind: String] = [.codex: "0.147.0", .claudeCompatible: "2.1.226", .openCodeACP: "1.15.11", .cursorACP: "2026.08.04-aaa8809"]
+        let versions: [ProviderKind: String] = [.codex: CodexCLIContract.pinnedVersion, .claudeCompatible: "2.1.226", .openCodeACP: "1.15.11", .cursorACP: "2026.08.04-aaa8809"]
         let protocols: [ProviderKind: String] = [.codex: "app-server-v2", .claudeCompatible: "stream-json-v1", .openCodeACP: "acp-v1", .cursorACP: "acp-v1-beta"]
+        if environment["REPOPROMPT_CODEX_CREDENTIAL_HOME"].map({ !$0.isEmpty }) == true
+            || environment["REPOPROMPT_CODEX_AUTH_STATUS_FILE"].map({ !$0.isEmpty }) == true
+        {
+            throw ConfigurationError.invalid("Codex authentication must use the server-managed provider state")
+        }
         let credentialSources = [
-            (ProviderKind.codex, environment["REPOPROMPT_CODEX_CREDENTIAL_HOME"]),
-            (.claudeCompatible, environment["REPOPROMPT_CLAUDE_CREDENTIAL_HOME"]),
+            (ProviderKind.claudeCompatible, environment["REPOPROMPT_CLAUDE_CREDENTIAL_HOME"]),
             (.openCodeACP, environment["REPOPROMPT_OPENCODE_CREDENTIAL_HOME"]),
             (.cursorACP, environment["REPOPROMPT_CURSOR_CREDENTIAL_HOME"])
         ].reduce(into: [ProviderKind: String]()) { result, value in if let path = value.1, !path.isEmpty { result[value.0] = path } }
@@ -108,7 +112,6 @@ public struct RepoPromptServerConfiguration: Sendable {
             }
         }
         let authenticationStatusFiles = try optionalAbsoluteFiles([
-            (.codex, environment["REPOPROMPT_CODEX_AUTH_STATUS_FILE"]),
             (.claudeCompatible, environment["REPOPROMPT_CLAUDE_AUTH_STATUS_FILE"]),
             (.openCodeACP, environment["REPOPROMPT_OPENCODE_AUTH_STATUS_FILE"]),
             (.cursorACP, environment["REPOPROMPT_CURSOR_AUTH_STATUS_FILE"]),
@@ -331,10 +334,24 @@ public enum RepoPromptServerRunner {
                 decryptionKeys: configuration.providerVaultDecryptionKeys
             )
         }
-        let credentialEnvironment: any ProviderProcessEnvironmentProviding = VaultProviderProcessEnvironment(
+        let managedCodexHome = try CodexManagedAuthHome(
+            rootPath: URL(fileURLWithPath: stateDirectory, isDirectory: true)
+                .appendingPathComponent("provider-auth/codex", isDirectory: true).path
+        )
+        let codexAuthentication = CodexDeviceAuthDriver(
+            executable: configuration.providerExecutables[.codex] ?? "",
+            expectedVersion: configuration.providerVersions[.codex] ?? CodexCLIContract.pinnedVersion,
+            managedHome: managedCodexHome,
+            processPort: processPort,
+            processStore: store,
+            outputDirectory: processOutput
+        )
+        let credentialEnvironment = VaultProviderProcessEnvironment(
             store: store,
             vault: providerVault,
-            externallyProvisionedKinds: Set(configuration.providerCredentialSources.keys)
+            externallyProvisionedKinds: Set(configuration.providerCredentialSources.keys),
+            credentialSourceDirectories: configuration.providerCredentialSources,
+            managedCodexCredentialSource: managedCodexHome.credentialSourceDirectory
         )
         let providers = ProviderCLIAdapter(
             configurations: providerConfigurations,
@@ -343,7 +360,8 @@ public enum RepoPromptServerRunner {
             processStore: store,
             outputDirectory: processOutput,
             ephemeralHomeRoot: configuration.providerHomeDirectory,
-            credentialEnvironment: credentialEnvironment
+            credentialEnvironment: credentialEnvironment,
+            credentialSource: credentialEnvironment
         )
         let providerSettings = ProviderSettingsService(
             store: store,
@@ -352,9 +370,12 @@ public enum RepoPromptServerRunner {
             initiallyEnabled: configuration.enabledProviders,
             authenticationStatusFiles: configuration.providerAuthenticationStatusFiles,
             modelCatalogFiles: configuration.providerModelCatalogFiles,
+            authFlows: TransientProviderAuthFlowCoordinator(driver: codexAuthentication),
+            managedAuthentication: codexAuthentication,
             vault: providerVault,
             credentialTester: ProviderAuthenticationAdapter(configurations: providerConfigurations)
         )
+        try await providers.recoverProcessFamilies()
         try await providerSettings.bootstrap()
         let authority = RepoPromptHeadlessAuthority(
             store: store,

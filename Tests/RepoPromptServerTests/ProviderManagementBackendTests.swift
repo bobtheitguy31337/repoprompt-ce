@@ -226,6 +226,60 @@ final class ProviderManagementBackendTests: XCTestCase {
         } catch let error as ServiceAPIError { XCTAssertEqual(error.code, .capabilityMissing) }
     }
 
+    func testDeviceAndAPIKeyAreIndependentEqualChoicesAndExplicitSelectionSwitchesRuntimeAuth() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let vault = try ProviderCredentialVault(
+            fileURL: directory.appendingPathComponent("vault"),
+            activeKey: ProviderVaultKey(keyID: "test", material: Data(repeating: 5, count: 32))
+        )
+        let configuration = ProviderCLIConfiguration(kind: .codex, executable: "/usr/bin/swift")
+        let adapter = ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.codex], runner: StaticVersionRunner())
+        let managed = CompletingManagedAuthDriver()
+        let service = ProviderSettingsService(
+            store: store,
+            adapter: adapter,
+            configurations: [configuration],
+            initiallyEnabled: [.codex],
+            authFlows: TransientProviderAuthFlowCoordinator(driver: managed),
+            managedAuthentication: managed,
+            vault: vault,
+            credentialTester: RecordingCredentialTester(result: .init(state: .valid, detail: "Credential accepted")),
+            runner: StaticVersionRunner()
+        )
+        try await service.bootstrap()
+        let initial = try await service.catalog()
+        let codex = try XCTUnwrap(initial.providers.first { $0.providerID == .codex })
+        XCTAssertEqual(Set(codex.capabilities.authenticationMethods), [.deviceCodeBeta, .apiKey])
+        XCTAssertEqual(codex.capabilities.authFlows.map(\.kind), [.deviceCodeBeta])
+
+        let attribution = ProviderMutationAttribution(actorID: "admin-1", actorLabel: "alice", channel: "test")
+        let pending = try await service.startAuthFlow(
+            providerID: .codex,
+            request: .init(kind: .deviceCodeBeta),
+            attribution: attribution
+        )
+        let completed = try await service.pollAuthFlow(flowID: pending.flowID, ownerID: attribution.actorID)
+        XCTAssertEqual(completed.state, .completed)
+        let completedCatalog = try await service.catalog()
+        var snapshot = completedCatalog.providers.first { $0.providerID == .codex }
+        XCTAssertEqual(snapshot?.connection?.authenticationMethod, .deviceCodeBeta)
+        XCTAssertEqual(snapshot?.connection?.testState, .valid)
+
+        snapshot = try await service.connect(
+            providerID: .codex,
+            request: .init(authenticationMethod: .apiKey, credential: "sk-explicit-api-key"),
+            attribution: attribution
+        )
+        XCTAssertEqual(snapshot?.connection?.authenticationMethod, .apiKey)
+        XCTAssertEqual(snapshot?.connection?.testState, .notTested)
+        let logoutCount = await managed.logoutCount()
+        XCTAssertEqual(logoutCount, 1)
+    }
+
     func testTransientAuthFlowIsOwnerFencedAndCancelRemovesState() async throws {
         let driver = FakeAuthFlowDriver()
         let coordinator = TransientProviderAuthFlowCoordinator(driver: driver)
@@ -306,6 +360,62 @@ private actor StaticVersionRunner: WorkspaceCommandRunning {
     func run(executable _: String, arguments _: [String], workingDirectory _: String, maximumBytes _: Int) async throws -> String {
         "Swift version 6.2"
     }
+}
+
+private actor CompletingManagedAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuthenticationDriving {
+    private var state: ProviderManagedAuthenticationState = .notAuthenticated
+    private var statuses: [UUID: ProviderAuthTransactionStatus] = [:]
+    private var logoutCalls = 0
+
+    func authFlowDescriptor(providerID: ProviderSettingsID, forceRefresh _: Bool) async -> ProviderAuthFlowDescriptor? {
+        guard providerID == .codex else { return nil }
+        return .init(kind: .deviceCodeBeta, displayName: "ChatGPT device authorization", startable: true, detail: "Authorize on another device")
+    }
+
+    func authenticationState(providerID: ProviderSettingsID) async -> ProviderManagedAuthenticationState {
+        providerID == .codex ? state : .unavailable
+    }
+
+    func logout(providerID _: ProviderSettingsID) async throws {
+        state = .notAuthenticated
+        logoutCalls += 1
+    }
+
+    func start(providerID: ProviderSettingsID, kind: ProviderAuthFlowKind) async throws -> ProviderAuthTransactionStatus {
+        let status = ProviderAuthTransactionStatus(
+            flowID: UUID(),
+            providerID: providerID,
+            kind: kind,
+            state: .pending,
+            userCode: "ABCD-EFGH",
+            verificationURL: URL(string: "https://auth.openai.com/codex/device"),
+            expiresAt: Date().addingTimeInterval(300),
+            detail: "Awaiting authorization"
+        )
+        statuses[status.flowID] = status
+        return status
+    }
+
+    func poll(flowID: UUID) async throws -> ProviderAuthTransactionStatus {
+        guard let pending = statuses.removeValue(forKey: flowID) else {
+            throw ServiceAPIError(code: .notFound, message: "missing")
+        }
+        state = .authenticated(accountLabel: "owner@example.com")
+        return .init(
+            flowID: flowID,
+            providerID: pending.providerID,
+            kind: pending.kind,
+            state: .completed,
+            expiresAt: pending.expiresAt,
+            detail: "Completed"
+        )
+    }
+
+    func cancel(flowID: UUID) async {
+        statuses[flowID] = nil
+    }
+
+    func logoutCount() -> Int { logoutCalls }
 }
 
 private actor FakeAuthFlowDriver: ProviderAuthFlowDriving {

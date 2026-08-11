@@ -39,6 +39,14 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         environment["REPOPROMPT_ENABLED_PROVIDERS"] = "codex, claudeCompatible"
         let enabledConfiguration = try RepoPromptServerConfiguration.environment(environment)
         XCTAssertEqual(enabledConfiguration.enabledProviders, [.codex, .claudeCompatible])
+
+        environment["REPOPROMPT_CODEX_CREDENTIAL_HOME"] = directory.path
+        XCTAssertThrowsError(try RepoPromptServerConfiguration.environment(environment))
+        environment["REPOPROMPT_CODEX_CREDENTIAL_HOME"] = nil
+        environment["REPOPROMPT_CODEX_AUTH_STATUS_FILE"] = directory.appendingPathComponent("status.json").path
+        XCTAssertThrowsError(try RepoPromptServerConfiguration.environment(environment))
+        environment["REPOPROMPT_CODEX_AUTH_STATUS_FILE"] = nil
+
         environment["REPOPROMPT_ENABLED_PROVIDERS"] = "unknown-provider"
         XCTAssertThrowsError(try RepoPromptServerConfiguration.environment(environment))
         environment["REPOPROMPT_ENABLED_PROVIDERS"] = "codex"

@@ -128,6 +128,40 @@ final class ProviderSettingsPortalTests: XCTestCase {
         try await store.close()
     }
 
+    func testPortalProviderContractAdvertisesEqualCodexMethodsWithoutCredentialMaterial() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let configuration = ProviderCLIConfiguration(kind: .codex, executable: "/usr/bin/swift")
+        let service = ProviderSettingsService(
+            store: store,
+            adapter: ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.codex], runner: StaticProviderVersionRunner(output: "Swift version 6.2")),
+            configurations: [configuration],
+            initiallyEnabled: [.codex],
+            managedAuthentication: PortalManagedAuthentication(),
+            vault: try ProviderCredentialVault(
+                fileURL: directory.appendingPathComponent("vault"),
+                activeKey: ProviderVaultKey(keyID: "test", material: Data(repeating: 8, count: 32))
+            ),
+            credentialTester: PortalAPIKeyTester(),
+            runner: StaticProviderVersionRunner(output: "Swift version 6.2")
+        )
+        try await service.bootstrap()
+
+        let catalog = try await service.catalog()
+        let codex = try XCTUnwrap(catalog.providers.first { $0.providerID == .codex })
+        XCTAssertEqual(Set(codex.capabilities.authenticationMethods), [.deviceCodeBeta, .apiKey])
+        XCTAssertEqual(codex.capabilities.authFlows.map(\.kind), [.deviceCodeBeta])
+        XCTAssertEqual(codex.capabilities.authFlows.first?.startable, true)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder.serviceEncoder.encode(codex)) as? [String: Any])
+        let encoded = String(describing: object).lowercased()
+        XCTAssertFalse(encoded.contains("access_token"))
+        XCTAssertFalse(encoded.contains("auth.json"))
+        XCTAssertFalse(encoded.contains("usercode"), "catalog capability must not retain a transient device challenge")
+    }
+
     func testPortalMutationProtectionRequiresSameOriginJSONAndCustomHeader() throws {
         XCTAssertNoThrow(try RepoPromptPortalRequestProtection.validateMutation(
             origin: "https://server.example:9443",
@@ -312,6 +346,36 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertFalse(encoded.contains("raw-token"))
         try await store.close()
     }
+}
+
+private struct PortalManagedAuthentication: ProviderManagedAuthenticationDriving {
+    func authFlowDescriptor(providerID: ProviderSettingsID, forceRefresh _: Bool) async -> ProviderAuthFlowDescriptor? {
+        guard providerID == .codex else { return nil }
+        return .init(
+            kind: .deviceCodeBeta,
+            displayName: "ChatGPT device authorization",
+            startable: true,
+            detail: "Authorize the server on another device"
+        )
+    }
+
+    func authenticationState(providerID _: ProviderSettingsID) async -> ProviderManagedAuthenticationState {
+        .notAuthenticated
+    }
+
+    func logout(providerID _: ProviderSettingsID) async throws {}
+}
+
+private struct PortalAPIKeyTester: ProviderCredentialTesting {
+    func supportedAuthenticationMethods(for providerID: ProviderSettingsID) async -> Set<ProviderAuthenticationMethod> {
+        providerID == .codex ? [.apiKey] : []
+    }
+
+    func test(providerID _: ProviderSettingsID, method _: ProviderAuthenticationMethod, secret _: Data?) async -> ProviderCredentialTestResult {
+        .init(state: .valid, detail: "Validated")
+    }
+
+    func logout(providerID _: ProviderSettingsID, method _: ProviderAuthenticationMethod) async {}
 }
 
 private actor StaticProviderVersionRunner: WorkspaceCommandRunning {

@@ -28,15 +28,41 @@ public struct UnavailableProviderCredentialTester: ProviderCredentialTesting {
 
 /// Vault-backed, per-launch environment projection. Secrets exist only in the
 /// child environment and are never rendered into arguments or result DTOs.
-public actor VaultProviderProcessEnvironment: ProviderProcessEnvironmentProviding {
+public protocol ProviderCredentialSourceProviding: Sendable {
+    func sourceDirectory(for kind: ProviderKind) async throws -> String?
+}
+
+public struct StaticProviderCredentialSource: ProviderCredentialSourceProviding {
+    private let sources: [ProviderKind: String]
+
+    public init(configurations: [ProviderCLIConfiguration]) {
+        sources = Dictionary(uniqueKeysWithValues: configurations.compactMap { configuration in
+            configuration.credentialSourceDirectory.map { (configuration.kind, $0) }
+        })
+    }
+
+    public func sourceDirectory(for kind: ProviderKind) async throws -> String? { sources[kind] }
+}
+
+public actor VaultProviderProcessEnvironment: ProviderProcessEnvironmentProviding, ProviderCredentialSourceProviding {
     private let store: SQLiteServiceStore
     private let vault: ProviderCredentialVault?
     private let externallyProvisionedKinds: Set<ProviderKind>
+    private let credentialSourceDirectories: [ProviderKind: String]
+    private let managedCodexCredentialSource: String?
 
-    public init(store: SQLiteServiceStore, vault: ProviderCredentialVault?, externallyProvisionedKinds: Set<ProviderKind> = []) {
+    public init(
+        store: SQLiteServiceStore,
+        vault: ProviderCredentialVault?,
+        externallyProvisionedKinds: Set<ProviderKind> = [],
+        credentialSourceDirectories: [ProviderKind: String] = [:],
+        managedCodexCredentialSource: String? = nil
+    ) {
         self.store = store
         self.vault = vault
         self.externallyProvisionedKinds = externallyProvisionedKinds
+        self.credentialSourceDirectories = credentialSourceDirectories
+        self.managedCodexCredentialSource = managedCodexCredentialSource
     }
 
     public func environment(for kind: ProviderKind) async throws -> [String: String] {
@@ -52,6 +78,12 @@ public actor VaultProviderProcessEnvironment: ProviderProcessEnvironmentProvidin
               stored.record.expiresAt.map({ $0 > Date() }) ?? true
         else {
             throw ServiceAPIError(code: .providerUnavailable, message: "Provider credential is not validated")
+        }
+        if providerID == .codex, stored.record.authenticationMethod == .deviceCodeBeta {
+            guard managedCodexCredentialSource != nil else {
+                throw ServiceAPIError(code: .providerUnavailable, message: "Managed Codex credential source is unavailable")
+            }
+            return [:]
         }
         guard let reference = stored.credentialReference else {
             guard externallyProvisionedKinds.contains(kind) else {
@@ -74,6 +106,22 @@ public actor VaultProviderProcessEnvironment: ProviderProcessEnvironmentProvidin
         default:
             throw ServiceAPIError(code: .providerUnavailable, message: "Provider credential method is not runtime-wired")
         }
+    }
+
+    public func sourceDirectory(for kind: ProviderKind) async throws -> String? {
+        guard let providerID = Self.providerID(kind) else { return credentialSourceDirectories[kind] }
+        if providerID == .codex {
+            guard let stored = try await store.providerConnection(providerID: .codex),
+                  stored.record.authenticationMethod == .deviceCodeBeta,
+                  stored.record.state == .connected,
+                  stored.record.testState == .valid
+            else { return nil }
+            guard let managedCodexCredentialSource else {
+                throw ServiceAPIError(code: .providerUnavailable, message: "Managed Codex credential source is unavailable")
+            }
+            return managedCodexCredentialSource
+        }
+        return credentialSourceDirectories[kind]
     }
 
     private nonisolated static func providerID(_ kind: ProviderKind) -> ProviderSettingsID? {

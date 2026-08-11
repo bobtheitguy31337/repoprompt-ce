@@ -120,6 +120,76 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         return (Data(contents[offset ..< end]), end, processes[captured.identity.pid]?.isRunning == true)
     }
 
+    /// Returns bounded captured streams without ever rendering provider output
+    /// into an error. Authentication callers reduce these bytes to a closed,
+    /// sanitized status before crossing the service boundary.
+    public func capturedStreams(_ captured: CapturedProcess, maximumBytes: Int) throws -> (stdout: Data, stderr: Data, running: Bool) {
+        let limit = max(1, maximumBytes)
+        return (
+            try Self.readBoundedFile(captured.stdoutPath, maximumBytes: limit),
+            try Self.readBoundedFile(captured.stderrPath, maximumBytes: limit),
+            processes[captured.identity.pid]?.isRunning == true
+        )
+    }
+
+    /// Finalizes a process that has exited and returns only its status. Unlike
+    /// `waitForCapturedProcess`, this API can never include stderr in an error.
+    public func finalizeCapturedProcess(_ captured: CapturedProcess) async throws -> Int32 {
+        guard let process = processes[captured.identity.pid] else {
+            cleanupCapturedFiles(captured)
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider process record is missing")
+        }
+        guard !process.isRunning else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider process is still running")
+        }
+        try? (process.standardOutput as? FileHandle)?.close()
+        try? (process.standardError as? FileHandle)?.close()
+        let status = process.terminationStatus
+        cleanupCapturedFiles(captured)
+        try await reap(pid: captured.identity.pid)
+        return status
+    }
+
+    /// Cancels a captured process with a bounded TERM/KILL escalation and
+    /// removes all private capture files. Linux uses the isolated process group
+    /// (or delegated cgroup) so descendants cannot outlive the transaction.
+    public func cancelCapturedProcess(_ captured: CapturedProcess, graceMilliseconds: Int = 1_000) async {
+        closeInput(captured)
+        guard let process = processes[captured.identity.pid] else {
+            cleanupCapturedFiles(captured)
+            return
+        }
+        if process.isRunning {
+            #if os(Linux)
+                let family = [captured.identity] + ((try? await descendants(of: captured.identity.pid)) ?? [])
+                if (try? await terminateContainedFamily(leader: captured.identity)) != true {
+                    try? await signal(SIGTERM, processGroupID: captured.identity.processGroupID, verifiedMembers: family)
+                }
+            #else
+                process.terminate()
+            #endif
+            let attempts = max(1, graceMilliseconds / 50)
+            for _ in 0 ..< attempts where process.isRunning {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            if process.isRunning {
+                #if os(Linux)
+                    let family = [captured.identity] + ((try? await descendants(of: captured.identity.pid)) ?? [])
+                    try? await signal(SIGKILL, processGroupID: captured.identity.processGroupID, verifiedMembers: family)
+                #else
+                    _ = systemKill(captured.identity.pid, SIGKILL)
+                #endif
+                for _ in 0 ..< 20 where process.isRunning {
+                    try? await Task.sleep(for: .milliseconds(25))
+                }
+            }
+        }
+        try? (process.standardOutput as? FileHandle)?.close()
+        try? (process.standardError as? FileHandle)?.close()
+        cleanupCapturedFiles(captured)
+        try? await reap(pid: captured.identity.pid)
+    }
+
     public func closeInput(_ captured: CapturedProcess) {
         try? standardInputs.removeValue(forKey: captured.identity.pid)?.close()
         standardInputPipes[captured.identity.pid] = nil
@@ -164,6 +234,20 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider command failed: \(String(decoding: stderr.prefix(8192), as: UTF8.self))")
         }
         return String(decoding: stdout.prefix(max(1, maximumBytes)), as: UTF8.self)
+    }
+
+    private nonisolated static func readBoundedFile(_ path: String, maximumBytes: Int) throws -> Data {
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        guard let size = (attributes[.size] as? NSNumber)?.intValue, size <= maximumBytes else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider output exceeded the bounded capture limit")
+        }
+        let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+        defer { try? handle.close() }
+        let data = try handle.read(upToCount: maximumBytes + 1) ?? Data()
+        guard data.count <= maximumBytes else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider output exceeded the bounded capture limit")
+        }
+        return data
     }
 
     private nonisolated static func prepareOutputDirectory(_ path: String) throws {
