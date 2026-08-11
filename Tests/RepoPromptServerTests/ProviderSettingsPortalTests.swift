@@ -42,6 +42,8 @@ final class ProviderSettingsPortalTests: XCTestCase {
         let service = PortalDesktopSettingsService(store: store)
 
         let initial = try await service.snapshot()
+        let operational = try await store.operationalSnapshot()
+        XCTAssertTrue(operational.migrationsValid, "the latest persisted settings migration must keep server readiness healthy")
         XCTAssertEqual(initial.revision, 0)
         XCTAssertEqual(initial.values[PortalDesktopSettingKey.codexPermissionLevel.rawValue], "autoReview")
         XCTAssertNil(initial.values["appearanceMode"])
