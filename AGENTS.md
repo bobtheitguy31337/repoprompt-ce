@@ -42,6 +42,20 @@ For Degentlemen provider or deployment work, also read `/Users/jared/Projects/de
 - Do not create a new sandbox ownership model, use an alternate deployment pipeline, invoke the chat-ops deployment script directly, or manually deploy over SSH.
 - Monitor the `Deploy sandbox` workflow and verify ordinary live health/readiness before reporting delivery complete.
 
+### Required completed-worktree cleanup
+
+Delivery is not complete until the agent has cleaned its own disposable local state. After validation, complete these steps in order:
+
+1. Commit the completed change in its isolated worktree.
+2. Merge or cherry-pick that commit into this repository's existing `sandbox` branch.
+3. Push `sandbox` and verify that the remote branch includes the integrated commit.
+4. From the owning repository, remove the completed isolated worktree with `git worktree remove <worktree-path>`.
+5. Remove any disposable integration clone or temporary directory created for the task.
+6. Run `git worktree prune` in the owning repository.
+7. Verify `git worktree list` and disk state confirm the disposable worktree and temporary state are gone.
+
+Agents must perform this cleanup automatically; it is not deferred to the workspace owner. Never remove an active, unmerged, or dirty worktree, a shared source checkout, credentials, or an intentional shared cache. If a worktree is not safely removable, preserve it and report the blocker instead of forcing removal.
+
 ## Run
 
 ```bash
