@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'">
+  <title>RepoPrompt Server</title>
+  <link rel="icon" href="/portal/assets/repoprompt-icon.png">
+  <link rel="stylesheet" href="/portal/assets/portal.css">
+</head>
+<body>
+  <div id="app" class="app-frame">
+    <header class="titlebar">
+      <div class="titlebar-leading">
+        <img class="app-icon" src="/portal/assets/repoprompt-icon.png" alt="">
+        <div class="workspace-title">
+          <strong id="active-workspace-name">RepoPrompt Server</strong>
+          <span id="service-caption">Standalone workspace authority</span>
+        </div>
+      </div>
+      <div class="window-title" aria-label="Current surface">
+        <span class="status-dot" id="service-dot"></span>
+        <span id="window-title-text">Agent Mode</span>
+      </div>
+      <nav class="titlebar-actions" aria-label="Window controls">
+        <button class="icon-button" id="refresh-button" data-icon="refresh" aria-label="Refresh server state"></button>
+        <a class="icon-button" id="settings-button" data-icon="settings" href="#settings/cli-providers" aria-label="Open Settings"></a>
+      </nav>
+    </header>
+
+    <main id="agent-shell" class="agent-shell">
+      <aside class="session-sidebar native-material" aria-label="Sessions">
+        <div class="sidebar-topbar">
+          <label class="search-control">
+            <span data-icon="search" aria-hidden="true"></span>
+            <input id="session-search" type="search" placeholder="Search" autocomplete="off">
+          </label>
+          <button class="icon-button compact" data-icon="collapse" aria-label="Collapse all session threads"></button>
+        </div>
+        <div class="session-scroll">
+          <section class="sidebar-section">
+            <div class="section-label">Today</div>
+            <div id="session-list" class="session-list">
+              <button class="session-row selected" type="button">
+                <span class="session-glyph" data-icon="message"></span>
+                <span class="session-copy"><strong>New Agent Session</strong><small>Ready to build</small></span>
+              </button>
+            </div>
+          </section>
+        </div>
+        <section class="workspace-roots">
+          <div class="section-label row-label"><span>Workspace Roots</span><button class="text-icon" data-icon="more" aria-label="Manage workspaces"></button></div>
+          <div id="workspace-root-list" class="root-list">
+            <div class="root-row"><span data-icon="folder"></span><span>Open a project to begin</span></div>
+          </div>
+        </section>
+      </aside>
+
+      <section class="transcript-pane" aria-label="Agent transcript">
+        <div class="transcript-toolbar">
+          <div class="session-heading">
+            <strong id="active-session-title">New Agent Session</strong>
+            <span id="active-provider-label">Choose a provider in Settings</span>
+          </div>
+          <div class="toolbar-pills">
+            <button class="chrome-pill"><span data-icon="workflow"></span><span>Workflow</span></button>
+            <button class="chrome-pill"><span data-icon="model"></span><span id="model-pill-label">Model</span></button>
+            <button class="chrome-pill"><span data-icon="shield"></span><span>Workspace Write</span></button>
+          </div>
+        </div>
+
+        <div class="transcript-scroll">
+          <div class="empty-state" id="empty-state">
+            <div class="empty-title"><span data-icon="oracle"></span><h1>What are we building?</h1></div>
+            <div class="workflow-grid" aria-label="Featured workflows">
+              <button class="workflow-card blue"><span data-icon="hammer"></span><strong>Plan &amp; Build</strong><small>Researches the code, makes a plan, and implements the change step by step.</small></button>
+              <button class="workflow-card purple"><span data-icon="eye"></span><strong>Review</strong><small>Deeply reviews the code for subtle bugs, regressions, risks, and missed edge cases.</small></button>
+              <button class="workflow-card teal"><span data-icon="search"></span><strong>Investigate</strong><small>Digs into bugs, crashes, security concerns, or research questions and reports the evidence.</small></button>
+              <button class="workflow-card green"><span data-icon="workflow"></span><strong>Orchestrate</strong><small>Breaks a complex request into smaller tasks, sends agents to do the work, and checks each result.</small></button>
+            </div>
+            <div class="tip-card"><span class="tip-icon" data-icon="oracle"></span><div><strong>“Ask the oracle” for a second opinion</strong><p>Use the selected reading context for a plan, review, or fresh perspective from a separate model.</p></div></div>
+            <div class="tool-card-example" aria-label="RepoPrompt tool card example">
+              <div class="tool-card-header"><span class="tool-icon" data-icon="code"></span><strong>RepoPrompt context</strong><span class="tool-status">Ready</span><span data-icon="chevron"></span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="composer-wrap">
+          <div class="composer-chrome">
+            <textarea aria-label="Message" placeholder="Message RepoPrompt…" rows="2" disabled></textarea>
+            <div class="composer-footer">
+              <div class="composer-actions"><button data-icon="attach" aria-label="Attach files"></button><span class="disabled-note">Session creation arrives in the next slice</span></div>
+              <button class="send-button" data-icon="send" aria-label="Send" disabled></button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="runtime-sidebar" aria-label="Runtime context">
+        <div class="runtime-header"><strong>Runtime</strong><span class="status-capsule"><i></i> Idle</span></div>
+        <div class="runtime-scroll">
+          <section class="runtime-card">
+            <h2><span data-icon="context"></span> Context</h2>
+            <div class="metric-row"><span>Selected files</span><strong>0</strong></div>
+            <div class="metric-row"><span>Estimated tokens</span><strong>0</strong></div>
+            <div class="token-meter"><span></span></div>
+            <button class="secondary-button" disabled>Open Context Drawer</button>
+          </section>
+          <section class="runtime-card">
+            <h2><span data-icon="oracle"></span> Oracle</h2>
+            <p>Reads the agent’s selected context for plans, reviews, and deep questions.</p>
+            <span class="muted-status">Not running</span>
+          </section>
+          <section class="runtime-card">
+            <h2><span data-icon="branch"></span> Execution</h2>
+            <div class="metric-row"><span>Location</span><strong>Workspace</strong></div>
+            <div class="metric-row"><span>Worktree</span><strong>None</strong></div>
+          </section>
+        </div>
+      </aside>
+    </main>
+
+    <main id="settings-shell" class="settings-shell" hidden>
+      <aside class="settings-sidebar native-material">
+        <div class="settings-search-wrap"><label class="search-control"><span data-icon="search"></span><input id="settings-search" type="search" placeholder="Search Settings" autocomplete="off"></label></div>
+        <nav id="settings-nav" class="settings-nav" aria-label="Settings sections">
+          <section><h2>Agent Mode</h2><a href="#settings/overview" data-route="overview" data-icon="agent">Overview</a><a href="#settings/cli-providers" data-route="cli-providers" data-icon="terminal">CLI Providers</a><a href="#settings/agent-models" data-route="agent-models" data-icon="model">Agent Models</a><a href="#settings/agent-permissions" data-route="agent-permissions" data-icon="shield">Agent Permissions</a><a href="#settings/agent-workflows" data-route="agent-workflows" data-icon="workflow">Agent Workflows</a><a href="#settings/context-builder" data-route="context-builder" data-icon="context">Context Builder</a></section>
+          <section><h2>General</h2><a href="#settings/appearance" data-route="appearance" data-icon="appearance">Appearance</a><a href="#settings/updates" data-route="updates" data-icon="refresh">Updates</a><a href="#settings/keyboard" data-route="keyboard" data-icon="keyboard">Keyboard Shortcuts</a><a href="#settings/advanced" data-route="advanced" data-icon="sliders">Advanced</a><a href="#settings/telemetry" data-route="telemetry" data-icon="chart">Telemetry</a></section>
+          <section><h2>MCP</h2><a href="#settings/mcp" data-route="mcp" data-icon="server">MCP Server</a><a href="#settings/tools" data-route="tools" data-icon="tools">Tools</a><a href="#settings/workspace-approvals" data-route="workspace-approvals" data-icon="check">Workspace Approvals</a><a href="#settings/model-presets" data-route="model-presets" data-icon="preset">Model Presets</a></section>
+          <section><h2>Models &amp; Providers</h2><a href="#settings/api-providers" data-route="api-providers" data-icon="cloud">API Providers</a><a href="#settings/model-config" data-route="model-config" data-icon="sliders">Model Config</a></section>
+          <section><h2>Workspaces</h2><a href="#settings/manage-workspaces" data-route="manage-workspaces" data-icon="folder">Manage Workspaces</a><a href="#settings/manage-presets" data-route="manage-presets" data-icon="preset">Manage Presets</a></section>
+          <section><h2>Copy &amp; Chat</h2><a href="#settings/chat-settings" data-route="chat-settings" data-icon="message">Chat Settings</a><a href="#settings/workflow-presets" data-route="workflow-presets" data-icon="workflow">Workflow Presets</a><a href="#settings/copy-order" data-route="copy-order" data-icon="list">Copy Prompt Order</a></section>
+        </nav>
+      </aside>
+      <section class="settings-detail">
+        <div class="settings-detail-toolbar"><a class="back-link" href="#agent"><span data-icon="back"></span>Agent Mode</a><span id="settings-detail-title">CLI Providers</span></div>
+        <div class="settings-scroll">
+          <div id="settings-content" class="settings-content" aria-live="polite"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <script src="/portal/assets/portal.js" defer></script>
+</body>
+</html>

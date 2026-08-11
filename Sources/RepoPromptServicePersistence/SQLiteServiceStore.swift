@@ -1227,6 +1227,52 @@ public actor SQLiteServiceStore {
         )
     }
 
+    public func providerSettings() async throws -> [ProviderSettingsPreference] {
+        try await connection.query(
+            "SELECT provider_id,enabled,default_model,reasoning_effort,speed_mode,service_tier,revision FROM provider_settings ORDER BY provider_id"
+        ).map { row in
+            guard let rawID = row.column("provider_id")?.string,
+                  let providerID = ProviderSettingsID(rawValue: rawID)
+            else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Provider settings contain an unknown provider identifier", retryable: false)
+            }
+            return ProviderSettingsPreference(
+                providerID: providerID,
+                enabled: row.column("enabled")?.bool ?? false,
+                defaultModel: row.column("default_model")?.string,
+                reasoningEffort: row.column("reasoning_effort")?.string,
+                speedMode: row.column("speed_mode")?.string,
+                serviceTier: row.column("service_tier")?.string,
+                revision: Int64(row.column("revision")?.integer ?? 1)
+            )
+        }
+    }
+
+    @discardableResult
+    public func upsertProviderSettings(
+        _ value: ProviderSettingsPreference,
+        expectedRevision: Int64
+    ) async throws -> ProviderSettingsPreference {
+        try await transaction {
+            let observed = Int64(try await connection.query(
+                "SELECT revision FROM provider_settings WHERE provider_id=?",
+                [.text(value.providerID.rawValue)]
+            ).first?.column("revision")?.integer ?? 0)
+            guard observed == expectedRevision, value.revision == expectedRevision + 1 else {
+                throw ServiceAPIError(code: .staleRevision, message: "Provider settings revision is stale", currentRevision: observed)
+            }
+            let defaultModel: SQLiteData = value.defaultModel.map(SQLiteData.text) ?? .null
+            let reasoningEffort: SQLiteData = value.reasoningEffort.map(SQLiteData.text) ?? .null
+            let speedMode: SQLiteData = value.speedMode.map(SQLiteData.text) ?? .null
+            let serviceTier: SQLiteData = value.serviceTier.map(SQLiteData.text) ?? .null
+            _ = try await connection.query(
+                "INSERT INTO provider_settings(provider_id,schema_version,enabled,default_model,reasoning_effort,speed_mode,service_tier,revision,updated_at) VALUES(?,1,?,?,?,?,?,?,?) ON CONFLICT(provider_id) DO UPDATE SET enabled=excluded.enabled,default_model=excluded.default_model,reasoning_effort=excluded.reasoning_effort,speed_mode=excluded.speed_mode,service_tier=excluded.service_tier,revision=excluded.revision,updated_at=excluded.updated_at",
+                [.text(value.providerID.rawValue), .integer(value.enabled ? 1 : 0), defaultModel, reasoningEffort, speedMode, serviceTier, .integer(Int(value.revision)), .float(Date().timeIntervalSince1970)]
+            )
+            return value
+        }
+    }
+
     private func migrate() async throws {
         _ = try await connection.query("PRAGMA foreign_keys=ON")
         _ = try await connection.query("PRAGMA journal_mode=WAL")
@@ -1254,6 +1300,9 @@ public actor SQLiteServiceStore {
         for statement in SchemaV2.statements {
             _ = try await connection.query(statement)
         }
+        for statement in SchemaV3.statements {
+            _ = try await connection.query(statement)
+        }
         let count = try await connection.query("SELECT COUNT(*) AS count FROM service_metadata").first?.column("count")?.integer ?? 0
         if count == 0 {
             _ = try await connection.query("INSERT INTO service_metadata(fixed_id,store_id,schema_version,created_at,last_clean_shutdown,current_boot_epoch,next_global_sequence,replay_floor) VALUES(1,?,1,CURRENT_TIMESTAMP,0,1,1,0)", [.text(UUID().uuidString)])
@@ -1269,6 +1318,15 @@ public actor SQLiteServiceStore {
             _ = try await connection.query("INSERT OR IGNORE INTO session_event_counters(session_id,event_count,last_sequence) SELECT session_id,COUNT(*),MAX(global_sequence) FROM events WHERE session_id IS NOT NULL GROUP BY session_id")
             _ = try await connection.query("UPDATE service_metadata SET schema_version=2,last_event_timestamp=COALESCE((SELECT MAX(timestamp) FROM events),0) WHERE fixed_id=1")
             _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v2',2,'owned resources, immutable archives, protected checkpoints, and restore activation',?,CURRENT_TIMESTAMP)", [.text(SchemaV2.digest)])
+        }
+        let v3 = try await connection.query("SELECT digest FROM schema_migrations WHERE version=3").first
+        if let v3 {
+            guard v3.column("digest")?.string == SchemaV3.digest else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Schema v3 migration digest mismatch", retryable: false)
+            }
+        } else {
+            _ = try await connection.query("UPDATE service_metadata SET schema_version=3 WHERE fixed_id=1")
+            _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v3',3,'provider settings and browser-safe portal preferences',?,CURRENT_TIMESTAMP)", [.text(SchemaV3.digest)])
         }
     }
 

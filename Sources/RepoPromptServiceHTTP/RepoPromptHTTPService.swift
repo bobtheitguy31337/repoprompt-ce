@@ -20,6 +20,7 @@ public struct RepoPromptHTTPService: Sendable {
     private let readiness: RepoPromptReadinessService
     private let drainController: MutationDrainController
     private let durabilityOperations: DurabilityOperationsService?
+    private let providerSettings: ProviderSettingsService?
 
     public init(
         authority: RepoPromptHeadlessAuthority,
@@ -29,7 +30,8 @@ public struct RepoPromptHTTPService: Sendable {
         certificateRoleResolver: CertificateIdentityRoleResolver? = nil,
         readiness: RepoPromptReadinessService? = nil,
         drainController: MutationDrainController = MutationDrainController(),
-        durabilityOperations: DurabilityOperationsService? = nil
+        durabilityOperations: DurabilityOperationsService? = nil,
+        providerSettings: ProviderSettingsService? = nil
     ) {
         self.authority = authority
         self.store = store
@@ -38,6 +40,7 @@ public struct RepoPromptHTTPService: Sendable {
         self.certificateRoleResolver = certificateRoleResolver
         self.drainController = drainController
         self.durabilityOperations = durabilityOperations
+        self.providerSettings = providerSettings
         self.readiness = readiness ?? RepoPromptReadinessService(
             authority: authority,
             store: store,
@@ -54,6 +57,54 @@ public struct RepoPromptHTTPService: Sendable {
 
     public func internalRouter() -> Router<RepoPromptRequestContext> {
         let router = Router<RepoPromptRequestContext>(context: RepoPromptRequestContext.self)
+        router.get("/portal") { request, context in await portalRespond(request) {
+            try await authenticatePortal(context: context)
+            return try RepoPromptPortalAssets.response(for: .index)
+        } }
+        router.get("/portal/assets/:name") { request, context in await portalRespond(request) {
+            try await authenticatePortal(context: context)
+            let name = try context.parameters.require("name")
+            guard let asset = RepoPromptPortalAssets.Asset(routeName: name) else {
+                throw ServiceAPIError(code: .notFound, message: "Portal asset not found")
+            }
+            return try RepoPromptPortalAssets.response(for: asset)
+        } }
+        router.get("/portal/api/v1/bootstrap") { request, context in await portalRespond(request) {
+            try await authenticatePortal(context: context)
+            let bootstrap = try await portalBootstrap()
+            return try portalJSON(bootstrap)
+        } }
+        router.get("/portal/api/v1/provider-settings") { request, context in await portalRespond(request) {
+            try await authenticatePortal(context: context)
+            let service = try requireProviderSettings()
+            let refresh = request.uri.queryParameters.get("refresh", as: Bool.self) ?? false
+            let catalog = try await service.catalog(refreshCLI: refresh)
+            return try portalJSON(catalog)
+        } }
+        router.patch("/portal/api/v1/provider-settings/:id") { request, context in await portalRespond(request) {
+            try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let id = try context.parameters.require("id")
+            guard let providerID = ProviderSettingsID(rawValue: id) else {
+                throw ServiceAPIError(code: .notFound, message: "Provider settings not found")
+            }
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(UpdateProviderSettingsRequest.self, from: data)
+            let snapshot = try await requireProviderSettings().update(providerID: providerID, request: input)
+            return try portalJSON(snapshot)
+        } }
+        router.post("/portal/api/v1/provider-settings/:id/auth-flows") { request, context in await portalRespond(request) {
+            try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let id = try context.parameters.require("id")
+            guard let providerID = ProviderSettingsID(rawValue: id) else {
+                throw ServiceAPIError(code: .notFound, message: "Provider settings not found")
+            }
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(StartProviderAuthFlowRequest.self, from: data)
+            let challenge = try await requireProviderSettings().startAuthFlow(providerID: providerID, request: input)
+            return try portalJSON(challenge, status: .accepted)
+        } }
         router.get("/internal/v1/capabilities") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp, .goblinSync], operation: "capabilities")
             let meta = try await store.metadata()
             return try HTTPResponses.json(ServiceCapabilitiesResponse(
@@ -514,6 +565,118 @@ public struct RepoPromptHTTPService: Sendable {
         }
         await drainController.finishMutation()
         return responseSigner.sign(response, requestPathAndQuery: path)
+    }
+
+    private func portalRespond(_ request: Request, _ operation: () async throws -> Response) async -> Response {
+        let method = String(describing: request.method).uppercased()
+        let isMutation = method == "POST" || method == "PUT" || method == "PATCH" || method == "DELETE"
+        if isMutation, !(await drainController.beginMutation()) {
+            return portalError(ServiceAPIError(code: .quiescing, message: "Service is draining mutations", retryable: true))
+        }
+        let response: Response
+        do { response = try await operation() } catch { response = portalError(error) }
+        if isMutation { await drainController.finishMutation() }
+        return response
+    }
+
+    private func authenticatePortal(context: RepoPromptRequestContext) async throws {
+        guard let certificateRoleResolver,
+              let certificate = try await context.channel.nioSSL_peerCertificate().get(),
+              try certificateRoleResolver.role(certificate: certificate) == .operatorRole
+        else {
+            throw ServiceAPIError(code: .internalAuthFailed, message: "An operator client certificate is required")
+        }
+    }
+
+    private func requireProviderSettings() throws -> ProviderSettingsService {
+        guard let providerSettings else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider settings are unavailable", retryable: true)
+        }
+        return providerSettings
+    }
+
+    private func portalJSON(_ value: some Encodable, status: HTTPResponse.Status = .ok) throws -> Response {
+        let data = try JSONEncoder.serviceEncoder.encode(value)
+        var headers = RepoPromptPortalAssets.securityHeaders(contentType: "application/json; charset=utf-8")
+        headers[.cacheControl] = "private, no-store"
+        return Response(status: status, headers: headers, body: .init(byteBuffer: ByteBuffer(bytes: data)))
+    }
+
+    private func portalError(_ error: Error) -> Response {
+        let apiError = error as? ServiceAPIError ?? ServiceAPIError(code: .dependencyUnavailable, message: "Portal dependency failed", retryable: true)
+        let status: HTTPResponse.Status = switch apiError.code {
+        case .invalidRequest: .badRequest
+        case .internalAuthFailed: .unauthorized
+        case .authorizationDecisionRejected: .forbidden
+        case .notFound: .notFound
+        case .staleRevision, .controllerChanged: .conflict
+        case .rateLimited: .tooManyRequests
+        case .dependencyUnavailable, .quiescing, .persistenceUnavailable: .serviceUnavailable
+        default: .unprocessableContent
+        }
+        return (try? portalJSON(apiError, status: status)) ?? Response(status: .internalServerError)
+    }
+
+    private func validatePortalMutation(_ request: Request) throws {
+        try RepoPromptPortalRequestProtection.validateMutation(
+            origin: request.headers[.init("Origin")!],
+            host: request.head.authority,
+            fetchSite: request.headers[.init("Sec-Fetch-Site")!],
+            contentType: request.headers[.contentType],
+            csrfHeader: request.headers[.init("X-RepoPrompt-Portal-CSRF")!]
+        )
+    }
+
+    private struct PortalBootstrap: Encodable {
+        let projects: [PortalProject]
+        let sessions: [PortalSession]
+        let workflows: [PortalWorkflow]
+    }
+
+    private struct PortalProject: Encodable {
+        let projectID: UUID
+        let name: String
+        let state: ProjectLifecycleState
+        let rootNames: [String]
+    }
+
+    private struct PortalSession: Encodable {
+        let sessionID: UUID
+        let projectID: UUID
+        let parentSessionID: UUID?
+        let title: String
+        let provider: ProviderKind
+        let model: String?
+        let state: SessionLifecycleState
+        let lastActivityAt: Date?
+    }
+
+    private struct PortalWorkflow: Encodable {
+        let workflowID: String
+        let name: String
+        let enabled: Bool
+    }
+
+    private func portalBootstrap() async throws -> PortalBootstrap {
+        let projects = await authority.projectSnapshots().map {
+            PortalProject(projectID: $0.projectID, name: $0.name, state: $0.state, rootNames: $0.roots.map(\.logicalName))
+        }
+        let sessions = try await authority.sessionSnapshots().map { session in
+            PortalSession(
+                sessionID: session.sessionID,
+                projectID: session.projectID,
+                parentSessionID: session.parentSessionID,
+                title: "Agent Session",
+                provider: session.provider,
+                model: session.model,
+                state: session.state,
+                lastActivityAt: session.transcript.last?.timestamp
+            )
+        }
+        let workflows = try await authority.workflowSnapshots().map {
+            PortalWorkflow(workflowID: $0.workflowID, name: $0.name, enabled: $0.enabled)
+        }
+        return PortalBootstrap(projects: projects, sessions: sessions, workflows: workflows)
     }
 
     private struct PageToken: Codable {

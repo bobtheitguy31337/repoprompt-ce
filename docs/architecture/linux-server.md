@@ -70,3 +70,115 @@ Ubuntu 24.04 runs the same build and focused tests in `.github/workflows/linux-s
 ## Known extraction boundary
 
 This baseline establishes the reusable target, persistence, protocol, supervision, and service boundaries. The existing macOS `AgentModeViewModel` and direct-headless MCP implementation have not yet been cut over to these targets; see the fork-delta ledger for the explicit remaining convergence work. No Goblin collaboration policy is evaluated here.
+
+
+# RepoPrompt Server web portal
+
+The standalone portal is a RepoPrompt-owned operator surface served by
+`RepoPromptServer` at `/portal` on the existing operator-mTLS listener. It is
+independently usable; later Goblin integration can use API, SSO, or deep links
+without becoming the portal's UI or orchestration authority.
+
+## Desktop-to-web product map
+
+The macOS application remains the product and visual source of truth. This
+first server slice maps the following surfaces rather than introducing a
+generic administration dashboard:
+
+| Portal surface | Desktop source | Ported hierarchy/treatment |
+| --- | --- | --- |
+| Window shell and toolbar | `AgentModeView.swift`, `ContentViewToolbarContent.swift` | Compact title bar; sessions, transcript, and runtime-context regions; toolbar control groups |
+| Workspace entry | `WorkspaceLandingView.swift`, `ManageWorkspacesView.swift` | Recent-workspace language, translucent cards, 16/20/32 spacing, 16-point outer radius |
+| Agent sessions | `AgentSessionsSidebarView.swift`, `AgentModeDetailWithSidebarView.swift` | Search, dated session groups, workspace roots, transcript-centered detail |
+| Empty transcript | `AgentEmptyStateViews.swift` | “What are we building?” and the RepoPrompt workflow cards |
+| Tool activity | `ToolCardContainer.swift`, `CompressedToolGroupCard.swift` | Dense 12-point tool cards, status tint, compressed grouped rows |
+| Composer | `ComposerChrome.swift` | Rounded input chrome and attached model/context controls |
+| Settings navigation | `SettingsView.swift` | Fixed searchable sidebar and detail pane in canonical order: Agent Mode, General, MCP, Models & Providers/API, Workspaces, Copy & Chat |
+| Provider cards | `CLIProvidersSettingsView.swift` | Collapsible Codex, Claude Code, OpenCode, and Cursor cards with compact connection capsules |
+| Model defaults | `AgentModelsSettingsView.swift`, `AIModelDropDown.swift` | One server-owned model/default source, grouped providers, unavailable states, capability-gated controls |
+
+The CSS spacing scale is deliberately limited to 4, 6, 8, 10, 12, 16, 20,
+24, and 32 pixels. Typography follows `FontPreset.swift`: system-rounded body
+faces at 14/16/18-point bases and a platform monospace stack for code. Status,
+transcript, user-bubble, reasoning, and tool colors are semantic ports of
+`BubbleColors.swift`, including light and dark appearances.
+
+## Asset and platform substitution ledger
+
+| Desktop material | Web result | Reason |
+| --- | --- | --- |
+| `AppResources/AppIcon.icns` | `Resources/Portal/repoprompt-icon.png` (1024×1024) | Export of the repository artwork, not an approximation |
+| SF Symbols | Small hand-authored semantic line SVGs in `portal.js` | SF Symbols are platform assets and are not claimed as portable. Equivalents preserve glyph meaning, 16-pixel sizing, rounded line caps, and approximately 1.75-point visual weight. No third-party icon package is used. |
+| SwiftUI/macOS materials | `backdrop-filter` translucent surfaces plus semantic opaque fallbacks | Preserves native-material depth without depending on AppKit |
+| Apple system-rounded/monospace | `ui-rounded`/system and `ui-monospace` stacks | Faithful web-native fallback when the platform fonts are unavailable |
+
+No screenshots or generated imitation artwork are part of this port.
+
+## Runtime and browser contract
+
+Portal pages and APIs require a client certificate mapped to
+`repoprompt-operator`. Browser code never receives an internal HMAC key. The
+browser is a thin renderer over Swift-owned services and does not persist state
+in local or session storage. Mutations additionally require an exact HTTPS
+same-origin match against the request authority, same-origin Fetch Metadata
+when supplied, JSON content, and the portal's non-secret custom CSRF header;
+cross-origin forms cannot create provider or auth-flow mutations. All HTML,
+JSON, and error metadata is served with `private, no-store`.
+
+Current endpoints:
+
+- `GET /portal/api/v1/bootstrap` — sanitized project, session, and workflow
+  navigation summaries. Project root paths and transcript bodies are omitted.
+- `GET /portal/api/v1/provider-settings` — browser-safe provider status,
+  executable health/version, model catalogs, and capabilities.
+- `PATCH /portal/api/v1/provider-settings/:id` — revisioned replacement of
+  non-secret enabled/default/effort/speed/tier preferences.
+- `POST /portal/api/v1/provider-settings/:id/auth-flows` — narrow server-side
+  auth-flow seam. A device code, if an adapter is installed later, is returned
+  only in the initiating operator response with `no-store` and is held only in
+  transient DOM.
+
+Provider secrets, access and refresh tokens, API keys, credential files, key
+helper output, raw CLI logs, and raw provider authentication endpoints are not
+represented by the DTOs, SQLite schema, events, transcripts, URLs, or browser
+persistence. Authentication status can be supplied through an explicitly
+sanitized server-side status document; its path and source contents are never
+returned.
+
+Optional absolute-path inputs are
+`REPOPROMPT_{CODEX,CLAUDE,OPENCODE,CURSOR,XAI}_AUTH_STATUS_FILE` and
+`REPOPROMPT_{CODEX,CLAUDE,OPENCODE,CURSOR,XAI}_MODEL_CATALOG_FILE`. Auth status
+documents accept only authenticated/method/account label/expiry/detail fields;
+model documents accept only the browser-safe catalog DTO. They are projections
+generated by trusted server provisioning, never provider credential files or
+raw provider responses.
+
+Provider homes remain isolated through the native runtime configuration:
+Codex uses a separate `CODEX_HOME`, Claude Code uses a separate
+`CLAUDE_CONFIG_DIR`, and ACP providers retain their isolated process homes.
+OpenCode models and optional variants/effort/tier are admitted only from the
+sanitized capability catalog; the portal does not proxy OpenCode auth. xAI is
+catalogued as API-key-only and cannot be enabled until its Swift runtime exists.
+Deployment configuration is an immutable provider ceiling. Effective admission
+requires deployment permission, the operator's revisioned enablement, and a
+successful runtime preflight; the browser displays those states separately.
+`REPOPROMPT_ENABLED_PROVIDERS` defines that ceiling, so a portal operator may
+disable and later re-enable an allowed provider but cannot activate a runtime
+the deployment did not approve.
+
+## Deliberate first-slice boundaries
+
+- Native browser OAuth/device-flow coordinators are seams, not mock flows; the
+  UI describes unavailable flows until a server adapter is installed.
+- Codex defaults and ACP model selection are applied by the Swift provider
+  dispatcher. Claude effort is passed through its isolated environment.
+- Claude fast-mode wiring, live provider model discovery, and the xAI execution
+  runtime remain open.
+- Project/workspace creation, live transcript streaming, context selection,
+  workflow execution, MCP settings, and the remaining settings detail pages are
+  represented in navigation but are not yet editable.
+
+The next executable slice is the transcript vertical: session selection and
+creation, replay plus live event streaming, desktop-fidelity transcript/tool
+groups, composer submission, and runtime-context inspection, all backed by the
+existing Swift authority and event stream.

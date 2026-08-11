@@ -25,13 +25,18 @@ public struct ProviderCLIConfiguration: Codable, Hashable, Sendable {
 public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, InteractionDeliveryPort {
     private let runtimes: [ProviderKind: any AgentProviderRuntime]
     private let cataloguedConfigurations: [ProviderKind: ProviderCLIConfiguration]
-    private let enabledProviders: Set<ProviderKind>
+    private var enabledProviders: Set<ProviderKind>
+    private var runtimeDefaults: [ProviderKind: ProviderRuntimeDefaults]
     private var knownRuns: [UUID: ProviderKind] = [:]
 
     public init(runtimes: [any AgentProviderRuntime], cataloguedConfigurations: [ProviderCLIConfiguration] = [], enabledProviders: Set<ProviderKind>? = nil) {
+        let initialEnabled = enabledProviders ?? Set(runtimes.map(\.kind))
         self.runtimes = Dictionary(uniqueKeysWithValues: runtimes.map { ($0.kind, $0) })
         self.cataloguedConfigurations = Dictionary(uniqueKeysWithValues: cataloguedConfigurations.map { ($0.kind, $0) })
-        self.enabledProviders = enabledProviders ?? Set(runtimes.map(\.kind))
+        self.enabledProviders = initialEnabled
+        runtimeDefaults = Dictionary(uniqueKeysWithValues: runtimes.map {
+            ($0.kind, ProviderRuntimeDefaults(enabled: initialEnabled.contains($0.kind)))
+        })
     }
 
     public func capabilities() async -> [ProviderCapability] {
@@ -64,6 +69,20 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
         }
     }
 
+    public func applyRuntimeDefaults(kind: ProviderKind, defaults: ProviderRuntimeDefaults) throws {
+        guard runtimes[kind] != nil, cataloguedConfigurations.isEmpty || cataloguedConfigurations[kind] != nil else {
+            throw ServiceAPIError(code: .providerUnavailable, message: "Provider is not configured")
+        }
+        runtimeDefaults[kind] = defaults
+        if defaults.enabled {
+            enabledProviders.insert(kind)
+        } else {
+            // Existing runs retain their native controller. New admission is
+            // rejected immediately without terminating in-flight work.
+            enabledProviders.remove(kind)
+        }
+    }
+
     public func execute(kind: ProviderKind, model: String?, prompt: String, workingDirectory: String, maximumBytes: Int, runID: UUID?, resumeProviderSessionID: String?, onProviderSessionIdentity: @escaping @Sendable (String) async -> Void) async throws -> ProviderExecutionResult {
         let actualRunID = runID ?? UUID()
         return try await executeStreaming(.init(kind: kind, model: model, prompt: prompt, workingDirectory: workingDirectory, maximumBytes: maximumBytes, runID: actualRunID, resumeProviderSessionID: resumeProviderSessionID)) { event in
@@ -79,7 +98,8 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
             throw ServiceAPIError(code: .providerUnavailable, message: message)
         }
         knownRuns[request.runID] = request.kind
-        return try await runtime.execute(request, onEvent: onEvent)
+        let defaults = runtimeDefaults[request.kind] ?? ProviderRuntimeDefaults(enabled: true)
+        return try await runtime.execute(request.applying(defaults: defaults), onEvent: onEvent)
     }
 
     public func steer(runID: UUID, text: String, targetTurnEpoch: Int64) async throws {
@@ -181,6 +201,10 @@ public actor ProviderCLIAdapter: AgentProviderDispatcher, InteractionDeliveryPor
 
     public func recoverProcessFamilies() async throws {
         try await dispatcher.recoverProcessFamilies()
+    }
+
+    public func applyRuntimeDefaults(kind: ProviderKind, defaults: ProviderRuntimeDefaults) async throws {
+        try await dispatcher.applyRuntimeDefaults(kind: kind, defaults: defaults)
     }
 
     public func cancel(runID: UUID) async throws {

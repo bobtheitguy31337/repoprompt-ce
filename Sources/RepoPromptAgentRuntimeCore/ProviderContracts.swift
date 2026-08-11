@@ -85,6 +85,25 @@ public struct ProviderExecutionPolicy: Codable, Hashable, Sendable {
     }
 }
 
+/// Server-owned defaults used only when a session request does not provide an
+/// explicit value. Keys are normalized into the existing provider policy bag,
+/// keeping native orchestration in Swift rather than the web client.
+public struct ProviderRuntimeDefaults: Codable, Hashable, Sendable {
+    public let enabled: Bool
+    public let model: String?
+    public let reasoningEffort: String?
+    public let speedMode: String?
+    public let serviceTier: String?
+
+    public init(enabled: Bool, model: String? = nil, reasoningEffort: String? = nil, speedMode: String? = nil, serviceTier: String? = nil) {
+        self.enabled = enabled
+        self.model = model
+        self.reasoningEffort = reasoningEffort
+        self.speedMode = speedMode
+        self.serviceTier = serviceTier
+    }
+}
+
 public struct ProviderExecutionRequest: Sendable {
     public let kind: ProviderKind
     public let model: String?
@@ -110,6 +129,25 @@ public struct ProviderExecutionRequest: Sendable {
 
     public func validateLaunch() throws {
         try launchValidation()
+    }
+
+    public func applying(defaults: ProviderRuntimeDefaults) -> ProviderExecutionRequest {
+        var settings: [String: String] = [:]
+        if let reasoningEffort = defaults.reasoningEffort { settings["provider.reasoningEffort"] = reasoningEffort }
+        if let speedMode = defaults.speedMode { settings["provider.speedMode"] = speedMode }
+        if let serviceTier = defaults.serviceTier { settings["provider.serviceTier"] = serviceTier }
+        settings.merge(policy.providerSettings) { _, requestValue in requestValue }
+        return ProviderExecutionRequest(
+            kind: kind,
+            model: model ?? defaults.model,
+            prompt: prompt,
+            workingDirectory: workingDirectory,
+            maximumBytes: maximumBytes,
+            runID: runID,
+            resumeProviderSessionID: resumeProviderSessionID,
+            policy: ProviderExecutionPolicy(mode: policy.mode, writableRoots: policy.writableRoots, providerSettings: settings),
+            launchValidation: launchValidation
+        )
     }
 }
 

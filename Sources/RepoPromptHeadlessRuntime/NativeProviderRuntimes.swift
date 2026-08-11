@@ -89,9 +89,9 @@ private struct NativeProviderProcessSupport {
         }
     }
 
-    func makeSession(runID: UUID, arguments: [String], workingDirectory: String, launchValidation: @escaping @Sendable () throws -> Void = {}) async throws -> NativeJSONLineProcess {
+    func makeSession(runID: UUID, arguments: [String], workingDirectory: String, policy: ProviderExecutionPolicy = .init(), launchValidation: @escaping @Sendable () throws -> Void = {}) async throws -> NativeJSONLineProcess {
         let preparedHome = try await prepareEphemeralHome(runID: runID)
-        let environment = providerEnvironment(home: preparedHome.url, workingDirectory: workingDirectory)
+        let environment = providerEnvironment(home: preparedHome.url, workingDirectory: workingDirectory, policy: policy)
         let supervisor = ProviderProcessSupervisor(processPort: processPort, store: processStore)
         do {
             return try await NativeJSONLineProcess.launch(
@@ -129,7 +129,7 @@ private struct NativeProviderProcessSupport {
         try await ProviderProcessSupervisor(processPort: processPort, store: processStore).recoverPersistedFamilies()
     }
 
-    private func providerEnvironment(home: URL, workingDirectory: String) -> [String: String] {
+    private func providerEnvironment(home: URL, workingDirectory: String, policy: ProviderExecutionPolicy) -> [String: String] {
         let source = ProcessInfo.processInfo.environment
         let inheritedKeys = ["PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]
         var environment = Dictionary(uniqueKeysWithValues: inheritedKeys.compactMap { key in source[key].map { (key, $0) } })
@@ -140,6 +140,12 @@ private struct NativeProviderProcessSupport {
         environment["CLAUDE_CONFIG_DIR"] = home.appendingPathComponent(".claude", isDirectory: true).path
         environment["DISABLE_AUTOUPDATER"] = "1"
         environment["CURSOR_AGENT_DISABLE_AUTO_UPDATE"] = "1"
+        if configuration.kind == .claudeCompatible,
+           let effort = policy.providerSettings["provider.reasoningEffort"],
+           ["low", "medium", "high", "xhigh", "max"].contains(effort)
+        {
+            environment["CLAUDE_CODE_EFFORT_LEVEL"] = effort
+        }
         if configuration.kind == .mcp,
            URL(fileURLWithPath: configuration.executable).lastPathComponent.hasPrefix("repoprompt-mcp")
         {
@@ -493,6 +499,8 @@ private actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             let policy = Self.codexPolicy(request.policy, workingDirectory: request.workingDirectory)
             var threadParams: [String: Any] = ["cwd": request.workingDirectory, "approvalPolicy": policy.approvalPolicy, "sandbox": policy.sandbox]
             if let model = request.model { threadParams["model"] = model }
+            if let effort = request.policy.providerSettings["provider.reasoningEffort"] { threadParams["effort"] = effort }
+            if let tier = request.policy.providerSettings["provider.serviceTier"] { threadParams["serviceTier"] = tier }
             let threadMethod: String
             if let existing = request.resumeProviderSessionID {
                 threadMethod = "thread/resume"
@@ -507,7 +515,11 @@ private actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             }
             threadIDs[request.runID] = threadID
             await onEvent(.providerIdentity(threadID))
-            let turnData = try await process.request(method: "turn/start", params: ["threadId": threadID, "input": [["type": "text", "text": request.prompt]], "cwd": request.workingDirectory, "approvalPolicy": policy.approvalPolicy, "sandboxPolicy": policy.sandboxPolicy], onFrame: { line in try await Self.forward(line, output: onEvent) })
+            var turnParams: [String: Any] = ["threadId": threadID, "input": [["type": "text", "text": request.prompt]], "cwd": request.workingDirectory, "approvalPolicy": policy.approvalPolicy, "sandboxPolicy": policy.sandboxPolicy]
+            if let model = request.model { turnParams["model"] = model }
+            if let effort = request.policy.providerSettings["provider.reasoningEffort"] { turnParams["effort"] = effort }
+            if let tier = request.policy.providerSettings["provider.serviceTier"] { turnParams["serviceTier"] = tier }
+            let turnData = try await process.request(method: "turn/start", params: turnParams, onFrame: { line in try await Self.forward(line, output: onEvent) })
             let turnResult = try Self.object(turnData)
             turnIDs[request.runID] = Self.string(in: turnResult, paths: [["turn", "id"], ["turnId"], ["id"]])
             var output = ""
@@ -703,6 +715,7 @@ private actor ACPProviderRuntime: AgentProviderRuntime {
                 sessionID = id
             }
             try await Self.configureExecutionMode(request.policy, sessionID: sessionID, sessionOpenResult: sessionOpenResult, process: process, output: onEvent)
+            try await Self.configureModel(request.model, sessionID: sessionID, sessionOpenResult: sessionOpenResult, process: process, output: onEvent)
             providerSessionIDs[request.runID] = sessionID
             await onEvent(.providerIdentity(sessionID))
             let output = ProviderOutputAccumulator()
@@ -791,6 +804,34 @@ private actor ACPProviderRuntime: AgentProviderRuntime {
         }
     }
 
+    private nonisolated static func configureModel(
+        _ requestedModel: String?,
+        sessionID: String,
+        sessionOpenResult: [String: Any],
+        process: NativeJSONLineProcess,
+        output: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
+    ) async throws {
+        guard let requestedModel = requestedModel?.trimmingCharacters(in: .whitespacesAndNewlines), !requestedModel.isEmpty else { return }
+        let options = sessionOpenResult["configOptions"] as? [[String: Any]] ?? []
+        guard let model = options.first(where: { ($0["category"] as? String)?.caseInsensitiveCompare("model") == .orderedSame }),
+              let configID = model["id"] as? String
+        else { throw ServiceAPIError(code: .capabilityMissing, message: "ACP provider does not advertise model selection") }
+        let choices = model["options"] as? [[String: Any]] ?? []
+        let canonical = choices.compactMap { ($0["value"] ?? $0["id"]) as? String }
+            .first { $0.caseInsensitiveCompare(requestedModel) == .orderedSame }
+        guard let canonical else { throw ServiceAPIError(code: .providerUnavailable, message: "Requested ACP model is not advertised by the provider") }
+        if (model["currentValue"] as? String)?.caseInsensitiveCompare(canonical) == .orderedSame { return }
+        let response = try await process.request(
+            method: "session/set_config_option",
+            params: ["sessionId": sessionID, "configId": configID, "value": canonical],
+            onFrame: { line in try await forward(line, output: output) }
+        )
+        let updated = try CodexAppServerProviderRuntime.object(response)["configOptions"] as? [[String: Any]] ?? []
+        guard updated.contains(where: { ($0["id"] as? String) == configID && (($0["currentValue"] as? String)?.caseInsensitiveCompare(canonical) == .orderedSame) }) else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "ACP provider did not acknowledge the selected model")
+        }
+    }
+
     private nonisolated static func forward(_ line: Data, output: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws {
         for event in try normalize(line) {
             await output(event)
@@ -873,7 +914,7 @@ private actor ClaudeNativeProviderRuntime: AgentProviderRuntime {
         }
         if let resume = request.resumeProviderSessionID { arguments += ["--resume", resume] }
         if let model = request.model { arguments += ["--model", model] }
-        let process = try await support.makeSession(runID: request.runID, arguments: arguments, workingDirectory: request.workingDirectory, launchValidation: { try request.validateLaunch() })
+        let process = try await support.makeSession(runID: request.runID, arguments: arguments, workingDirectory: request.workingDirectory, policy: request.policy, launchValidation: { try request.validateLaunch() })
         sessions[request.runID] = process
         defer { sessions[request.runID] = nil }
         do {

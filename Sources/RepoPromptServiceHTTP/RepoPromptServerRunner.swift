@@ -27,6 +27,8 @@ public struct RepoPromptServerConfiguration: Sendable {
     public let providerVersions: [ProviderKind: String]
     public let providerProtocols: [ProviderKind: String]
     public let providerCredentialSources: [ProviderKind: String]
+    public let providerAuthenticationStatusFiles: [ProviderSettingsID: String]
+    public let providerModelCatalogFiles: [ProviderSettingsID: String]
     public let minimumFreeBytes: Int64
     public let minimumFreeNodes: Int64
     public let maximumActiveSessions: Int
@@ -90,6 +92,27 @@ public struct RepoPromptServerConfiguration: Sendable {
             (.openCodeACP, environment["REPOPROMPT_OPENCODE_CREDENTIAL_HOME"]),
             (.cursorACP, environment["REPOPROMPT_CURSOR_CREDENTIAL_HOME"])
         ].reduce(into: [ProviderKind: String]()) { result, value in if let path = value.1, !path.isEmpty { result[value.0] = path } }
+        func optionalAbsoluteFiles(_ values: [(ProviderSettingsID, String?)], label: String) throws -> [ProviderSettingsID: String] {
+            try values.reduce(into: [:]) { result, value in
+                guard let path = value.1, !path.isEmpty else { return }
+                guard path.hasPrefix("/") else { throw ConfigurationError.invalid("\(label) paths must be absolute") }
+                result[value.0] = path
+            }
+        }
+        let authenticationStatusFiles = try optionalAbsoluteFiles([
+            (.codex, environment["REPOPROMPT_CODEX_AUTH_STATUS_FILE"]),
+            (.claudeCompatible, environment["REPOPROMPT_CLAUDE_AUTH_STATUS_FILE"]),
+            (.openCodeACP, environment["REPOPROMPT_OPENCODE_AUTH_STATUS_FILE"]),
+            (.cursorACP, environment["REPOPROMPT_CURSOR_AUTH_STATUS_FILE"]),
+            (.xAI, environment["REPOPROMPT_XAI_AUTH_STATUS_FILE"])
+        ], label: "Provider authentication status")
+        let modelCatalogFiles = try optionalAbsoluteFiles([
+            (.codex, environment["REPOPROMPT_CODEX_MODEL_CATALOG_FILE"]),
+            (.claudeCompatible, environment["REPOPROMPT_CLAUDE_MODEL_CATALOG_FILE"]),
+            (.openCodeACP, environment["REPOPROMPT_OPENCODE_MODEL_CATALOG_FILE"]),
+            (.cursorACP, environment["REPOPROMPT_CURSOR_MODEL_CATALOG_FILE"]),
+            (.xAI, environment["REPOPROMPT_XAI_MODEL_CATALOG_FILE"])
+        ], label: "Provider model catalog")
         let stateDatabase = environment["REPOPROMPT_STATE_DB"] ?? "/var/lib/repoprompt/state/repoprompt.sqlite"
         let projectSourcePolicy: ProjectSourcePolicy
         if let path = environment["REPOPROMPT_PROJECT_SOURCE_POLICY_FILE"], !path.isEmpty {
@@ -118,6 +141,8 @@ public struct RepoPromptServerConfiguration: Sendable {
             providerVersions: versions,
             providerProtocols: protocols,
             providerCredentialSources: credentialSources,
+            providerAuthenticationStatusFiles: authenticationStatusFiles,
+            providerModelCatalogFiles: modelCatalogFiles,
             minimumFreeBytes: Int64(environment["REPOPROMPT_MINIMUM_FREE_BYTES"] ?? "268435456") ?? 268_435_456,
             minimumFreeNodes: Int64(environment["REPOPROMPT_MINIMUM_FREE_NODES"] ?? "1024") ?? 1024,
             maximumActiveSessions: Int(environment["REPOPROMPT_MAX_ACTIVE_SESSIONS"] ?? "64") ?? 64,
@@ -264,6 +289,15 @@ public enum RepoPromptServerRunner {
             outputDirectory: processOutput,
             ephemeralHomeRoot: configuration.providerHomeDirectory
         )
+        let providerSettings = ProviderSettingsService(
+            store: store,
+            adapter: providers,
+            configurations: providerConfigurations,
+            initiallyEnabled: configuration.enabledProviders,
+            authenticationStatusFiles: configuration.providerAuthenticationStatusFiles,
+            modelCatalogFiles: configuration.providerModelCatalogFiles
+        )
+        try await providerSettings.bootstrap()
         let authority = RepoPromptHeadlessAuthority(
             store: store,
             worktreeService: worktrees,
@@ -301,7 +335,8 @@ public enum RepoPromptServerRunner {
             certificateRoleResolver: certificateRoles,
             readiness: readiness,
             drainController: drainController,
-            durabilityOperations: durabilityOperations
+            durabilityOperations: durabilityOperations,
+            providerSettings: providerSettings
         )
         let internalApplication = try Application(
             router: service.internalRouter(),

@@ -50,9 +50,10 @@ public extension SQLiteServiceStore {
             return (version, digest)
         })
         let metadata = try await metadata()
-        let migrationsValid = metadata.schemaVersion == SchemaV2.version
+        let migrationsValid = metadata.schemaVersion == SchemaV3.version
             && migrationMap[1] == "v1"
             && migrationMap[SchemaV2.version] == SchemaV2.digest
+            && migrationMap[SchemaV3.version] == SchemaV3.digest
         let liveEventCount = try await scalarInt("SELECT COUNT(*) AS value FROM events")
         let archiveSegmentCount = try await scalarInt("SELECT COUNT(*) AS value FROM event_archive_blobs")
         let archivedEventCount = try await scalarInt("SELECT COALESCE(SUM(event_count),0) AS value FROM event_archive_blobs")
