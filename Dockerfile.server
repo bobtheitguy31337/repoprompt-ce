@@ -18,6 +18,8 @@ COPY Sources/RepoPromptLinuxSupport Sources/RepoPromptLinuxSupport
 COPY Sources/RepoPromptServiceHTTP Sources/RepoPromptServiceHTTP
 COPY Sources/RepoPromptMCPAdapter Sources/RepoPromptMCPAdapter
 COPY Sources/RepoPromptServerExecutable Sources/RepoPromptServerExecutable
+COPY Tests/RepoPromptDomainRuntimeTests Tests/RepoPromptDomainRuntimeTests
+COPY Tests/RepoPromptServerTests Tests/RepoPromptServerTests
 RUN --mount=type=cache,target=/root/.cache/org.swift.swiftpm \
     --mount=type=cache,target=/src/.build \
     REPOPROMPT_SERVER_ONLY=1 swift build --disable-automatic-resolution -c release --product RepoPromptServer && \
