@@ -14,11 +14,15 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let session = await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         session.isMCPOriginated = false
+        session.runState = .running
+        let priorOwnership = session.beginRunAttempt(source: "test.steerResume.prior")
+        XCTAssertTrue(session.endRunAttempt(ifCurrent: priorOwnership, source: "test.steerResume.prior.completed"))
         session.runState = .completed
 
         var service = makeService(window: window)
         var observedText: String?
         var observedEpoch: AgentRunTurnEpoch?
+        var observedAttemptID: UUID?
         service.testDispatchSteerInstruction = { dispatchedSessionID, text, _, agentModeVM in
             observedText = text
             let controlledSession = try XCTUnwrap(agentModeVM.mcpControlledSession(sessionID: dispatchedSessionID))
@@ -28,6 +32,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             await agentModeVM.prepareMCPWaitTrackingForRunStart(session: controlledSession)
             let context = try XCTUnwrap(controlledSession.mcpControlContext)
             observedEpoch = try XCTUnwrap(context.currentEpoch)
+            observedAttemptID = controlledSession.beginRunAttempt(source: "test.steerResume.successor").attemptID
             controlledSession.runState = .running
             agentModeVM.publishMCPStateChange(for: controlledSession)
             return .startedRun
@@ -48,6 +53,8 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertEqual(epoch, observedEpoch)
         XCTAssertEqual(epoch.transitionKind, .steering)
         XCTAssertEqual(epoch.ordinal, 1)
+        XCTAssertNotEqual(observedAttemptID, priorOwnership.attemptID)
+        XCTAssertEqual(session.activeRunAttemptID, observedAttemptID)
         XCTAssertNil(context.pendingEpochTransition)
         let currentRegistration = await AgentRunSessionStore.currentRegistration(for: sessionID)
         XCTAssertEqual(currentRegistration, context.registration)

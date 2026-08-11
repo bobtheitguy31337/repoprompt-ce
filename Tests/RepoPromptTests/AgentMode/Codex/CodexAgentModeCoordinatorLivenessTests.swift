@@ -436,6 +436,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         )
         let runID = UUID()
         let session = preparedCodexSession(in: viewModel, controller: controller, runID: runID)
+        let originalControllerGeneration = session.codexControllerGeneration
         session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-20)
         let attemptA = try XCTUnwrap(session.activeRunOwnership)
         let aliasedProgressGeneration = session.codexWatchdogState.progressGeneration
@@ -449,16 +450,18 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
 
         XCTAssertTrue(session.endRunAttempt(ifCurrent: attemptA, source: "test.watchdog.attemptA.terminal"))
         let attemptB = session.beginRunAttempt(source: "test.watchdog.attemptB")
+        let successorController = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         session.installRunID(runID)
         session.runState = .running
-        session.codexController = controller
+        session.codexController = successorController
         session.codexWatchdogState = .init()
         XCTAssertEqual(session.codexWatchdogState.progressGeneration, aliasedProgressGeneration)
+        XCTAssertNotEqual(session.codexControllerGeneration, originalControllerGeneration)
         session.codexAuthoritativeActiveTurn = .init(
             threadID: "fake",
             turnID: "turn-b",
             turnKind: .user,
-            controllerInstanceID: ObjectIdentifier(controller),
+            controllerInstanceID: ObjectIdentifier(successorController),
             controllerGeneration: session.codexControllerGeneration,
             runID: runID,
             runAttemptID: attemptB.attemptID
@@ -472,7 +475,10 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.runID, runID)
         XCTAssertEqual(session.activeRunAttemptID, attemptB.attemptID)
         XCTAssertEqual(session.runState, .running)
-        XCTAssertNotNil(session.codexController)
+        XCTAssertEqual(
+            session.codexController.map(ObjectIdentifier.init),
+            ObjectIdentifier(successorController)
+        )
         XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
         XCTAssertEqual(controller.shutdownCountSync(), 0)
         XCTAssertNil(session.lastTerminalCommitRevision)
@@ -1913,13 +1919,86 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testRepeatedNoActiveSnapshotWithoutTerminalStatusReturnsControlWithoutModelInput() async throws {
         let controller = LivenessFakeCodexController(snapshot: .idle, activeTurnIDs: [])
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let sessionID = UUID()
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: nil,
+            startPending: true
+        )
+        await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+        let firstEpoch = try XCTUnwrap(session.mcpControlContext?.currentEpoch)
+        let firstRunID = UUID()
+        session.installRunID(firstRunID)
+        session.runState = .running
+        let firstOwnership = session.beginRunAttempt(source: "test.codexLiveness.nilIdle")
+        viewModel.setMCPFollowUpRunPending(sessionID: sessionID, false)
+        session.codexController = controller
+        session.codexControllerPermissionProfile = session.permissionProfile
+        session.codexControllerTaskLabelKind = session.mcpControlContext?.taskLabelKind
+        session.codexControllerWorkspacePaths = .uniform(nil)
+        session.codexConversationID = "fake"
+        session.codexAuthoritativeActiveTurn = .init(
+            threadID: "fake",
+            turnID: "turn",
+            turnKind: .user,
+            controllerInstanceID: ObjectIdentifier(controller),
+            controllerGeneration: session.codexControllerGeneration,
+            runID: firstRunID,
+            runAttemptID: firstOwnership.attemptID
+        )
+        session.codexRoutingObservedTurnID = "turn"
+        session.codexControllerFeatureState = .init(
+            computerUseEnabled: false,
+            goalSupportEnabled: CodexGoalSupport.isEnabled,
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled,
+            memoriesEnabled: CodexMemories.isEnabled
+        )
+        let firstControllerGeneration = session.codexControllerGeneration
+        var publishedRevisions: [AgentRunTerminalCommitRevision] = []
+        viewModel.test_setTerminalPublicationOverride { revision, successorKind, publishedSession in
+            publishedRevisions.append(revision)
+            guard let envelope = revision.mcpPublicationEnvelope,
+                  let registration = publishedSession.mcpControlContext?.registration
+            else {
+                return .rejected(reason: "missing_test_publication_context")
+            }
+            return await AgentRunSessionStore.publishTerminal(
+                envelope,
+                registration: registration,
+                commitID: revision.commitID,
+                successorKind: successorKind
+            )
+        }
+        defer { viewModel.test_setTerminalPublicationOverride(nil) }
 
-        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(.assistantDelta("progress"), session: session)
-        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+        let invocationID = UUID()
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(
+                name: "lookup",
+                invocationID: invocationID,
+                argsJSON: #"{"query":"recovery"}"#
+            ),
+            session: session,
+            sourceController: controller
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolResult(
+                name: "lookup",
+                invocationID: invocationID,
+                argsJSON: #"{"query":"recovery"}"#,
+                resultJSON: #"{"status":"completed","content":"preserved result"}"#,
+                isError: false
+            ),
+            session: session,
+            sourceController: controller
+        )
 
         try await waitUntil(timeout: 10) {
-            session.runState == .cancelled
+            session.runState == .failed
         }
 
         XCTAssertEqual(controller.shutdownCountSync(), 1)
@@ -1928,11 +2007,139 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(controller.startUserTurnCountSync(), 0)
         XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
         XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertNil(session.codexController)
+        XCTAssertNotEqual(session.codexControllerGeneration, firstControllerGeneration)
+        let preservedToolResult = try XCTUnwrap(session.items.first(where: {
+            $0.kind == .toolResult && $0.toolInvocationID == invocationID
+        }))
+        XCTAssertEqual(preservedToolResult.toolIsError, false)
+        XCTAssertTrue(preservedToolResult.toolResultJSON?.contains(#""status":"success""#) == true)
+        XCTAssertTrue(
+            viewModel.rawToolResultPayloadForRendering(
+                tabID: session.tabID,
+                itemID: preservedToolResult.id
+            )?.contains("preserved result") == true
+        )
         XCTAssertTrue(session.items.contains {
-            $0.kind == .system && $0.text.contains("Send a message to continue")
+            $0.kind == .error && $0.text.contains("preserved the available output")
         })
-        XCTAssertFalse(session.items.contains { $0.kind == .error })
-        XCTAssertNotNil(session.lastTerminalCommitRevision)
+        let failedRevision = try XCTUnwrap(session.lastTerminalCommitRevision)
+        XCTAssertEqual(failedRevision.terminalState, .failed)
+        XCTAssertEqual(failedRevision.failureReason, .agentError)
+        XCTAssertEqual(publishedRevisions.map(\.terminalState), [.failed])
+        let firstStoredSnapshot = try await AgentRunSessionStore.snapshot(
+            for: .init(
+                registration: XCTUnwrap(session.mcpControlContext?.registration),
+                epoch: firstEpoch
+            )
+        )
+        XCTAssertEqual(firstStoredSnapshot?.status, .failed)
+        XCTAssertEqual(firstStoredSnapshot?.failureReason, .agentError)
+
+        // Model inactive MCP steering: advance the exact epoch, consume it into a
+        // fresh run attempt, and install a replacement provider controller.
+        viewModel.setMCPFollowUpRunPending(sessionID: sessionID, true)
+        let successorController = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let successorRunID = UUID()
+        var successorOwnership: AgentRunOwnership?
+        try await viewModel.withMCPRunEpochTransition(
+            sessionID: sessionID,
+            kind: .steering
+        ) {
+            await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+            session.installRunID(successorRunID)
+            successorOwnership = session.beginRunAttempt(source: "test.codexLiveness.nilIdle.steer")
+            session.runState = .running
+            viewModel.setMCPFollowUpRunPending(sessionID: sessionID, false)
+            session.codexController = successorController
+            session.codexControllerPermissionProfile = session.permissionProfile
+            session.codexControllerTaskLabelKind = session.mcpControlContext?.taskLabelKind
+            session.codexControllerWorkspacePaths = .uniform(nil)
+            session.codexControllerFeatureState = .init(
+                computerUseEnabled: false,
+                goalSupportEnabled: CodexGoalSupport.isEnabled,
+                reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled,
+                memoriesEnabled: CodexMemories.isEnabled
+            )
+            session.codexNeedsReconnect = false
+            session.codexAuthoritativeActiveTurn = try .init(
+                threadID: "fake",
+                turnID: "successor-turn",
+                turnKind: .user,
+                controllerInstanceID: ObjectIdentifier(successorController),
+                controllerGeneration: session.codexControllerGeneration,
+                runID: successorRunID,
+                runAttemptID: XCTUnwrap(successorOwnership?.attemptID)
+            )
+            session.codexRoutingObservedTurnID = "successor-turn"
+        }
+        let successorAttempt = try XCTUnwrap(successorOwnership)
+        let successorEpoch = try XCTUnwrap(successorAttempt.turnEpoch)
+        XCTAssertNotEqual(successorAttempt.attemptID, firstOwnership.attemptID)
+        XCTAssertNotEqual(successorEpoch, firstEpoch)
+        XCTAssertEqual(successorEpoch.ordinal, firstEpoch.ordinal + 1)
+        XCTAssertEqual(successorEpoch.transitionKind, .steering)
+        XCTAssertNotEqual(session.codexControllerGeneration, firstControllerGeneration)
+
+        // A predecessor callback arriving after the steering boundary must not
+        // settle or otherwise mutate the successor attempt.
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .interrupted),
+            session: session,
+            sourceController: controller
+        )
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(session.activeRunAttemptID, successorAttempt.attemptID)
+        XCTAssertEqual(publishedRevisions.map(\.terminalState), [.failed])
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("successor final answer"),
+            session: session,
+            sourceController: successorController
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "successor-turn", status: .completed),
+            session: session,
+            sourceController: successorController
+        )
+
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertEqual(publishedRevisions.map(\.terminalState), [.failed, .completed])
+        XCTAssertEqual(publishedRevisions.count(where: { $0.terminalState == .completed }), 1)
+        XCTAssertFalse(publishedRevisions.contains { $0.terminalState == .cancelled })
+        XCTAssertEqual(session.items.filter { $0.kind == .assistant }.map(\.text), ["successor final answer"])
+        let successorStoredSnapshot = try await AgentRunSessionStore.snapshot(
+            for: .init(
+                registration: XCTUnwrap(session.mcpControlContext?.registration),
+                epoch: successorEpoch
+            )
+        )
+        XCTAssertEqual(successorStoredSnapshot?.status, .completed)
+
+        // Explicit provider interruption is still a real cancellation.
+        let interruptedController = LivenessFakeCodexController(
+            snapshot: .idle,
+            activeTurnIDs: [],
+            latestTurnStatus: .interrupted
+        )
+        let interruptedViewModel = makeViewModel(controller: interruptedController)
+        let interruptedSession = preparedCodexSession(
+            in: interruptedViewModel,
+            controller: interruptedController
+        )
+        await interruptedViewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("partial interrupted output"),
+            session: interruptedSession
+        )
+        try await waitUntil(timeout: 10) {
+            interruptedSession.runState == .cancelled
+        }
+        XCTAssertEqual(interruptedSession.lastTerminalCommitRevision?.terminalState, .cancelled)
+
+        await viewModel.mcpDeactivateControlContext(
+            sessionID: sessionID,
+            cleanupSessionStore: true
+        )
     }
 
     func testWatchdogFlushesCachedExplicitErrorWhenProbeFindsNoActiveTurn() async throws {
