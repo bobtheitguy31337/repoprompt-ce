@@ -120,7 +120,7 @@ public struct RepoPromptHTTPService: Sendable {
             }
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(StartProviderAuthFlowRequest.self, from: data)
-            let challenge = try await requireProviderSettings().startAuthFlow(providerID: providerID, request: input, ownerID: attribution.actorID)
+            let challenge = try await requireProviderSettings().startAuthFlow(providerID: providerID, request: input, attribution: attribution)
             return try portalJSON(challenge, status: .accepted)
         } }
         router.post("/portal/api/v1/provider-settings/:id/connect") { request, context in await portalRespond(request) {
@@ -218,7 +218,7 @@ public struct RepoPromptHTTPService: Sendable {
             _ = try requireIdempotency(request)
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerAuthStart")
             let input = try JSONDecoder.serviceDecoder.decode(StartProviderAuthFlowRequest.self, from: data)
-            let status = try await requireProviderSettings().startAuthFlow(providerID: providerSettingsID(context), request: input, ownerID: providerAttribution(auth).actorID)
+            let status = try await requireProviderSettings().startAuthFlow(providerID: providerSettingsID(context), request: input, attribution: providerAttribution(auth))
             return try HTTPResponses.json(status, status: .accepted)
         } }
         router.get("/internal/v1/provider-auth-flows/:flowID") { request, context in await respond(request) {

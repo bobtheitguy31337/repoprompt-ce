@@ -173,11 +173,12 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
 public actor ProviderCLIAdapter: AgentProviderDispatcher, InteractionDeliveryPort {
     private let dispatcher: PortableAgentProviderDispatcher
 
-    public init(configurations: [ProviderCLIConfiguration], enabledProviders: Set<ProviderKind>? = nil, runner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(), processPort: PortableProcessSupervisionPort? = nil, processStore: SQLiteServiceStore? = nil, outputDirectory: String = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-provider-output").path, ephemeralHomeRoot: String = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-provider-homes").path, credentialEnvironment: any ProviderProcessEnvironmentProviding = EmptyProviderProcessEnvironment()) {
+    public init(configurations: [ProviderCLIConfiguration], enabledProviders: Set<ProviderKind>? = nil, runner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(), processPort: PortableProcessSupervisionPort? = nil, processStore: SQLiteServiceStore? = nil, outputDirectory: String = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-provider-output").path, ephemeralHomeRoot: String = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-provider-homes").path, credentialEnvironment: any ProviderProcessEnvironmentProviding = EmptyProviderProcessEnvironment(), credentialSource: (any ProviderCredentialSourceProviding)? = nil) {
         let enabledProviders = enabledProviders ?? Set(configurations.map(\.kind))
+        let credentialSource = credentialSource ?? StaticProviderCredentialSource(configurations: configurations)
         let runtimes: [any AgentProviderRuntime] = if let processPort {
             configurations.map {
-                NativeProviderRuntimeFactory.make(configuration: $0, processPort: processPort, processStore: processStore, outputDirectory: outputDirectory, ephemeralHomeRoot: ephemeralHomeRoot, credentialEnvironment: credentialEnvironment)
+                NativeProviderRuntimeFactory.make(configuration: $0, processPort: processPort, processStore: processStore, outputDirectory: outputDirectory, ephemeralHomeRoot: ephemeralHomeRoot, credentialEnvironment: credentialEnvironment, credentialSource: credentialSource)
             }
         } else {
             // Kept only for deterministic unit tests and legacy embedded callers

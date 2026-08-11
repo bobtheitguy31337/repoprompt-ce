@@ -1475,7 +1475,7 @@ public actor SQLiteServiceStore {
     private nonisolated static func validateProviderConnection(_ value: StoredProviderConnection) throws {
         let record = value.record
         let allowedMethods: Set<ProviderAuthenticationMethod> = switch record.providerID {
-        case .codex: [.apiKey, .enterpriseAccessToken]
+        case .codex: [.deviceCodeBeta, .apiKey, .enterpriseAccessToken]
         case .claudeCompatible: [.apiKey, .authToken]
         case .cursorACP: [.apiKey, .browserLogin]
         case .openCodeACP: [.providerSpecific]

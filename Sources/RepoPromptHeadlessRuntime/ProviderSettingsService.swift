@@ -30,6 +30,12 @@ public struct UnavailableProviderAuthFlowCoordinator: ProviderAuthFlowCoordinati
 /// preferences and browser-safe projections; native process/session authority
 /// remains in `ProviderCLIAdapter`.
 public actor ProviderSettingsService {
+    private struct AuthFlowContext: Sendable {
+        let attribution: ProviderMutationAttribution
+        let providerID: ProviderSettingsID
+        let expectedConnectionRevision: Int64
+    }
+
     private struct SanitizedAuthenticationDocument: Decodable {
         let authenticated: Bool
         let method: ProviderAuthenticationMethod?
@@ -43,6 +49,7 @@ public actor ProviderSettingsService {
     private let authenticationStatusFiles: [ProviderSettingsID: String]
     private let modelCatalogFiles: [ProviderSettingsID: String]
     private let authFlows: any ProviderAuthFlowCoordinating
+    private let managedAuthentication: any ProviderManagedAuthenticationDriving
     private let vault: ProviderCredentialVault?
     private let credentialTester: any ProviderCredentialTesting
     private let runner: any WorkspaceCommandRunning
@@ -52,6 +59,8 @@ public actor ProviderSettingsService {
     private var supportedAuthenticationMethods: [ProviderSettingsID: Set<ProviderAuthenticationMethod>] = [:]
     private var modelCatalogs: [ProviderSettingsID: [ProviderModelCatalogEntry]] = [:]
     private var connections: [ProviderSettingsID: SQLiteServiceStore.StoredProviderConnection] = [:]
+    private var managedAuthFlowDescriptors: [ProviderSettingsID: [ProviderAuthFlowDescriptor]] = [:]
+    private var authFlowContexts: [UUID: AuthFlowContext] = [:]
 
     public init(
         store: SQLiteServiceStore,
@@ -61,6 +70,7 @@ public actor ProviderSettingsService {
         authenticationStatusFiles: [ProviderSettingsID: String] = [:],
         modelCatalogFiles: [ProviderSettingsID: String] = [:],
         authFlows: any ProviderAuthFlowCoordinating = UnavailableProviderAuthFlowCoordinator(),
+        managedAuthentication: any ProviderManagedAuthenticationDriving = UnavailableProviderManagedAuthenticationDriver(),
         vault: ProviderCredentialVault? = nil,
         credentialTester: any ProviderCredentialTesting = UnavailableProviderCredentialTester(),
         runner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner()
@@ -72,6 +82,7 @@ public actor ProviderSettingsService {
         self.authenticationStatusFiles = authenticationStatusFiles
         self.modelCatalogFiles = modelCatalogFiles
         self.authFlows = authFlows
+        self.managedAuthentication = managedAuthentication
         self.vault = vault
         self.credentialTester = credentialTester
         self.runner = runner
@@ -133,11 +144,17 @@ public actor ProviderSettingsService {
             try await applyRuntimePreference(providerID)
         }
         await refreshCLIHealth()
+        await refreshManagedAuthenticationCapabilities(forceRefresh: true)
+        try await reconcileManagedAuthentication(attribution: Self.lifecycleAttribution)
         await refreshRuntimePreflight()
     }
 
     public func catalog(refreshCLI: Bool = false, refreshRuntime: Bool = true) async throws -> ProviderSettingsCatalogResponse {
-        if refreshCLI { await refreshCLIHealth() }
+        if refreshCLI {
+            await refreshCLIHealth()
+            await refreshManagedAuthenticationCapabilities(forceRefresh: true)
+        }
+        try await reconcileManagedAuthentication(attribution: Self.lifecycleAttribution)
         if refreshRuntime { await refreshRuntimePreflight() }
         let snapshots = try ProviderSettingsID.allCases.map { try snapshot(for: $0) }
         return ProviderSettingsCatalogResponse(providers: snapshots)
@@ -210,20 +227,60 @@ public actor ProviderSettingsService {
         )
     }
 
-    public func startAuthFlow(providerID: ProviderSettingsID, request: StartProviderAuthFlowRequest, ownerID: String) async throws -> ProviderAuthTransactionStatus {
-        let descriptor = Self.definition(providerID).capabilities.authFlows.first { $0.kind == request.kind }
+    public func startAuthFlow(providerID: ProviderSettingsID, request: StartProviderAuthFlowRequest, attribution: ProviderMutationAttribution) async throws -> ProviderAuthTransactionStatus {
+        await refreshManagedAuthenticationCapabilities(forceRefresh: true)
+        let descriptor = managedAuthFlowDescriptors[providerID, default: []].first { $0.kind == request.kind }
         guard descriptor?.startable == true else {
             throw ServiceAPIError(code: .capabilityMissing, message: descriptor?.detail ?? "Provider authentication flow is unavailable")
         }
-        return try await authFlows.start(providerID: providerID, kind: request.kind, ownerID: ownerID)
+        let status = try await authFlows.start(providerID: providerID, kind: request.kind, ownerID: attribution.actorID)
+        authFlowContexts[status.flowID] = AuthFlowContext(
+            attribution: attribution,
+            providerID: providerID,
+            expectedConnectionRevision: connections[providerID]?.record.revision ?? 0
+        )
+        try await store.appendProviderConnectionAudit(
+            providerID: providerID,
+            connectionID: connections[providerID]?.record.connectionID,
+            operation: "authFlowStart",
+            attribution: attribution,
+            authenticationMethod: .deviceCodeBeta,
+            result: "started"
+        )
+        return status
     }
 
     public func pollAuthFlow(flowID: UUID, ownerID: String) async throws -> ProviderAuthTransactionStatus {
-        try await authFlows.poll(flowID: flowID, ownerID: ownerID)
+        let status = try await authFlows.poll(flowID: flowID, ownerID: ownerID)
+        guard status.state != .pending else { return status }
+        guard let context = authFlowContexts.removeValue(forKey: flowID) else { return status }
+        if status.state == .completed {
+            try await completeManagedAuthFlow(context)
+        } else {
+            try await store.appendProviderConnectionAudit(
+                providerID: context.providerID,
+                connectionID: connections[context.providerID]?.record.connectionID,
+                operation: "authFlowFinish",
+                attribution: context.attribution,
+                authenticationMethod: .deviceCodeBeta,
+                result: status.state.rawValue
+            )
+        }
+        return status
     }
 
     public func cancelAuthFlow(flowID: UUID, ownerID: String) async throws {
         try await authFlows.cancel(flowID: flowID, ownerID: ownerID)
+        if let context = authFlowContexts.removeValue(forKey: flowID) {
+            try await store.appendProviderConnectionAudit(
+                providerID: context.providerID,
+                connectionID: connections[context.providerID]?.record.connectionID,
+                operation: "authFlowCancel",
+                attribution: context.attribution,
+                authenticationMethod: .deviceCodeBeta,
+                result: "cancelled"
+            )
+        }
     }
 
     public func connect(providerID: ProviderSettingsID, request: ConnectProviderRequest, attribution: ProviderMutationAttribution) async throws -> ProviderSettingsSnapshot {
@@ -259,6 +316,14 @@ public actor ProviderSettingsService {
         let credentialReference = secret.map { _ in UUID() }
         if let secret, let credentialReference {
             try await vault?.store(secret: secret, providerID: providerID, connectionID: credentialReference)
+        }
+        if old?.record.authenticationMethod == .deviceCodeBeta {
+            do {
+                try await managedAuthentication.logout(providerID: providerID)
+            } catch {
+                if let credentialReference { try? await vault?.delete(providerID: providerID, connectionID: credentialReference) }
+                throw error
+            }
         }
         let detail = external
             ? "External credential source is mounted; the provider verifies it at session launch"
@@ -309,6 +374,11 @@ public actor ProviderSettingsService {
         guard let stored = connections[providerID] else {
             throw ServiceAPIError(code: .notFound, message: "Provider connection is not configured")
         }
+        if stored.record.authenticationMethod == .deviceCodeBeta {
+            try await reconcileManagedAuthentication(attribution: attribution)
+            await refreshRuntimePreflight()
+            return try snapshot(for: providerID)
+        }
         let secret: Data?
         if let reference = stored.credentialReference {
             guard let vault else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider credential vault is unavailable") }
@@ -345,6 +415,9 @@ public actor ProviderSettingsService {
 
     public func disconnect(providerID: ProviderSettingsID, attribution: ProviderMutationAttribution, revoke: Bool = false) async throws -> ProviderSettingsSnapshot {
         guard let stored = connections[providerID] else { return try snapshot(for: providerID) }
+        if stored.record.authenticationMethod == .deviceCodeBeta {
+            try await managedAuthentication.logout(providerID: providerID)
+        }
         try await store.deleteProviderConnection(
             providerID: providerID,
             expectedRevision: stored.record.revision,
@@ -363,6 +436,132 @@ public actor ProviderSettingsService {
         await refreshRuntimePreflight()
         return try snapshot(for: providerID)
     }
+
+    private func refreshManagedAuthenticationCapabilities(forceRefresh: Bool) async {
+        for providerID in ProviderSettingsID.allCases {
+            if let descriptor = await managedAuthentication.authFlowDescriptor(providerID: providerID, forceRefresh: forceRefresh), descriptor.startable {
+                managedAuthFlowDescriptors[providerID] = [descriptor]
+            } else {
+                managedAuthFlowDescriptors[providerID] = []
+            }
+        }
+    }
+
+    private func completeManagedAuthFlow(_ context: AuthFlowContext) async throws {
+        let current = connections[context.providerID]
+        guard (current?.record.revision ?? 0) == context.expectedConnectionRevision else {
+            try? await managedAuthentication.logout(providerID: context.providerID)
+            throw ServiceAPIError(code: .staleRevision, message: "Provider connection changed while authentication was in progress", currentRevision: current?.record.revision)
+        }
+        guard case let .authenticated(accountLabel) = await managedAuthentication.authenticationState(providerID: context.providerID) else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Codex did not retain the completed server authentication")
+        }
+        let label = try safeLabel(accountLabel)
+        let now = Date()
+        let record = ProviderConnectionRecord(
+            connectionID: current?.record.connectionID ?? UUID(),
+            providerID: context.providerID,
+            authenticationMethod: .deviceCodeBeta,
+            state: .connected,
+            accountLabel: label,
+            lastTestedAt: now,
+            testState: .valid,
+            detail: "ChatGPT account authenticated by the server",
+            keyHelperConfigured: false,
+            workloadIdentityConfigured: false,
+            createdAt: current?.record.createdAt ?? now,
+            updatedAt: now,
+            revision: context.expectedConnectionRevision + 1
+        )
+        let stored = SQLiteServiceStore.StoredProviderConnection(record: record, credentialReference: nil)
+        connections[context.providerID] = try await store.upsertProviderConnection(
+            stored,
+            expectedRevision: context.expectedConnectionRevision,
+            audit: .init(
+                operation: "authFlowFinish",
+                attribution: context.attribution,
+                authenticationMethod: .deviceCodeBeta,
+                result: "completed"
+            )
+        )
+        if let oldReference = current?.credentialReference {
+            try? await vault?.delete(providerID: context.providerID, connectionID: oldReference)
+        }
+        await refreshRuntimePreflight()
+    }
+
+    private func reconcileManagedAuthentication(attribution: ProviderMutationAttribution) async throws {
+        let providerID = ProviderSettingsID.codex
+        let state = await managedAuthentication.authenticationState(providerID: providerID)
+        let current = connections[providerID]
+        if current == nil, case let .authenticated(accountLabel) = state {
+            let now = Date()
+            let record = ProviderConnectionRecord(
+                connectionID: UUID(),
+                providerID: providerID,
+                authenticationMethod: .deviceCodeBeta,
+                state: .connected,
+                accountLabel: try safeLabel(accountLabel),
+                lastTestedAt: now,
+                testState: .valid,
+                detail: "ChatGPT account authenticated by the server",
+                keyHelperConfigured: false,
+                workloadIdentityConfigured: false,
+                createdAt: now,
+                updatedAt: now,
+                revision: 1
+            )
+            let stored = SQLiteServiceStore.StoredProviderConnection(record: record, credentialReference: nil)
+            connections[providerID] = try await store.upsertProviderConnection(
+                stored,
+                expectedRevision: 0,
+                audit: .init(operation: "authReconcile", attribution: attribution, authenticationMethod: .deviceCodeBeta, result: "recovered")
+            )
+            return
+        }
+        guard let current, current.record.authenticationMethod == .deviceCodeBeta else { return }
+        let projection: (ProviderConnectionState, ProviderCredentialTestState, String?, String?) = switch state {
+        case let .authenticated(accountLabel):
+            (.connected, .valid, try safeLabel(accountLabel) ?? current.record.accountLabel, "ChatGPT account authenticated by the server")
+        case .notAuthenticated:
+            (.attention, .invalid, current.record.accountLabel, "ChatGPT authentication is no longer present on the server")
+        case .unavailable:
+            (.attention, .unavailable, current.record.accountLabel, "Codex authentication status is temporarily unavailable")
+        }
+        guard current.record.state != projection.0
+            || current.record.testState != projection.1
+            || current.record.accountLabel != projection.2
+            || current.record.detail != projection.3
+        else { return }
+        let now = Date()
+        let updated = ProviderConnectionRecord(
+            connectionID: current.record.connectionID,
+            providerID: providerID,
+            authenticationMethod: .deviceCodeBeta,
+            state: projection.0,
+            accountLabel: projection.2,
+            expiresAt: current.record.expiresAt,
+            lastTestedAt: now,
+            testState: projection.1,
+            detail: projection.3,
+            keyHelperConfigured: false,
+            workloadIdentityConfigured: false,
+            createdAt: current.record.createdAt,
+            updatedAt: now,
+            revision: current.record.revision + 1
+        )
+        connections[providerID] = try await store.upsertProviderConnection(
+            .init(record: updated, credentialReference: nil),
+            expectedRevision: current.record.revision,
+            audit: .init(operation: "authReconcile", attribution: attribution, authenticationMethod: .deviceCodeBeta, result: projection.1.rawValue)
+        )
+    }
+
+    private static let lifecycleAttribution = ProviderMutationAttribution(
+        actorID: "repoprompt-server",
+        actorLabel: "RepoPrompt Server",
+        channel: "provider-lifecycle"
+    )
 
     private func credentialMaterial(_ request: ConnectProviderRequest, providerID: ProviderSettingsID) throws -> Data? {
         switch request.authenticationMethod {
@@ -659,14 +858,16 @@ public actor ProviderSettingsService {
         _ capabilities: ProviderSettingsCapabilities,
         providerID: ProviderSettingsID
     ) -> ProviderSettingsCapabilities {
-        let supported = supportedAuthenticationMethods[providerID, default: []]
+        var supported = supportedAuthenticationMethods[providerID, default: []]
+        let flows = managedAuthFlowDescriptors[providerID, default: []].filter(\.startable)
+        if flows.contains(where: { $0.kind == .deviceCodeBeta }) { supported.insert(.deviceCodeBeta) }
         return .init(
             supportsModelSelection: capabilities.supportsModelSelection,
             supportsReasoningEffort: capabilities.supportsReasoningEffort,
             supportsSpeedMode: capabilities.supportsSpeedMode,
             supportsServiceTier: capabilities.supportsServiceTier,
             authenticationMethods: ProviderAuthenticationMethod.allCases.filter(supported.contains),
-            authFlows: []
+            authFlows: flows
         )
     }
 

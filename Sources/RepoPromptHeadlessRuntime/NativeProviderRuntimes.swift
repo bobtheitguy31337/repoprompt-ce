@@ -11,7 +11,8 @@ enum NativeProviderRuntimeFactory {
         processStore: SQLiteServiceStore?,
         outputDirectory: String,
         ephemeralHomeRoot: String,
-        credentialEnvironment: any ProviderProcessEnvironmentProviding
+        credentialEnvironment: any ProviderProcessEnvironmentProviding,
+        credentialSource: any ProviderCredentialSourceProviding
     ) -> any AgentProviderRuntime {
         let support = NativeProviderProcessSupport(
             configuration: configuration,
@@ -19,7 +20,8 @@ enum NativeProviderRuntimeFactory {
             processStore: processStore,
             outputDirectory: outputDirectory,
             ephemeralHomeRoot: ephemeralHomeRoot,
-            credentialEnvironment: credentialEnvironment
+            credentialEnvironment: credentialEnvironment,
+            credentialSource: credentialSource
         )
         switch configuration.kind {
         case .codex:
@@ -56,6 +58,7 @@ private struct NativeProviderProcessSupport {
     let outputDirectory: String
     let ephemeralHomeRoot: String
     let credentialEnvironment: any ProviderProcessEnvironmentProviding
+    let credentialSource: any ProviderCredentialSourceProviding
 
     func capability(supportsResume: Bool, supportsSteering: Bool) -> ProviderCapability {
         let executable = FileManager.default.isExecutableFile(atPath: configuration.executable)
@@ -92,11 +95,11 @@ private struct NativeProviderProcessSupport {
         }
     }
 
-    func makeSession(runID: UUID, arguments: [String], workingDirectory: String, policy: ProviderExecutionPolicy = .init(), launchValidation: @escaping @Sendable () throws -> Void = {}) async throws -> NativeJSONLineProcess {
-        let preparedHome = try await prepareEphemeralHome(runID: runID)
+    func makeSession(runID: UUID, arguments: [String], workingDirectory: String, policy: ProviderExecutionPolicy = .init(), includeCredentials: Bool = true, launchValidation: @escaping @Sendable () throws -> Void = {}) async throws -> NativeJSONLineProcess {
+        let preparedHome = try await prepareEphemeralHome(runID: runID, includeCredentials: includeCredentials)
         var environment = providerEnvironment(home: preparedHome.url, workingDirectory: workingDirectory, policy: policy)
-        let injected = try await credentialEnvironment.environment(for: configuration.kind)
-        let reserved = Set(["HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "PATH", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD"])
+        let injected = includeCredentials ? try await credentialEnvironment.environment(for: configuration.kind) : [:]
+        let reserved = Set(["HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "CODEX_HOME", "CODEX_SQLITE_HOME", "CLAUDE_CONFIG_DIR", "PATH", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD"])
         guard injected.keys.allSatisfy({ !reserved.contains($0) }) else {
             throw ServiceAPIError(code: .invalidRequest, message: "Provider credential environment attempted to override an isolated runtime key")
         }
@@ -146,6 +149,7 @@ private struct NativeProviderProcessSupport {
         environment["XDG_CONFIG_HOME"] = home.appendingPathComponent(".config", isDirectory: true).path
         environment["XDG_CACHE_HOME"] = home.appendingPathComponent(".cache", isDirectory: true).path
         environment["CODEX_HOME"] = home.appendingPathComponent(".codex", isDirectory: true).path
+        environment["CODEX_SQLITE_HOME"] = home.appendingPathComponent(".codex-sqlite", isDirectory: true).path
         environment["CLAUDE_CONFIG_DIR"] = home.appendingPathComponent(".claude", isDirectory: true).path
         environment["DISABLE_AUTOUPDATER"] = "1"
         environment["CURSOR_AGENT_DISABLE_AUTO_UPDATE"] = "1"
@@ -168,7 +172,7 @@ private struct NativeProviderProcessSupport {
         return environment
     }
 
-    private func prepareEphemeralHome(runID: UUID) async throws -> PreparedHome {
+    private func prepareEphemeralHome(runID: UUID, includeCredentials: Bool) async throws -> PreparedHome {
         let root = URL(fileURLWithPath: ephemeralHomeRoot, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let home = root.appendingPathComponent(runID.uuidString, isDirectory: true)
@@ -187,7 +191,7 @@ private struct NativeProviderProcessSupport {
         records.append(homeRecord)
         do {
             try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            for child in [".config", ".cache", ".codex", ".claude"] {
+            for child in [".config", ".cache", ".codex", ".codex-sqlite", ".claude"] {
                 try FileManager.default.createDirectory(at: home.appendingPathComponent(child, isDirectory: true), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             }
         } catch {
@@ -195,7 +199,7 @@ private struct NativeProviderProcessSupport {
             throw error
         }
 
-        if let sourcePath = configuration.credentialSourceDirectory {
+        if includeCredentials, let sourcePath = try await credentialSource.sourceDirectory(for: configuration.kind) {
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: sourcePath, isDirectory: &isDirectory), isDirectory.boolValue else {
                 try? FileManager.default.removeItem(at: home)
@@ -475,7 +479,7 @@ private actor CodexAppServerProviderRuntime: AgentProviderRuntime {
         let runID = UUID()
         var preflightProcess: NativeJSONLineProcess?
         do {
-            let process = try await support.makeSession(runID: runID, arguments: ["app-server"], workingDirectory: FileManager.default.currentDirectoryPath)
+            let process = try await support.makeSession(runID: runID, arguments: ["app-server"], workingDirectory: FileManager.default.currentDirectoryPath, includeCredentials: false)
             preflightProcess = process
             _ = try await process.request(method: "initialize", params: ["clientInfo": ["name": "repoprompt-server-preflight", "title": "RepoPrompt Server Preflight", "version": "1"], "capabilities": ["experimentalApi": true]], onFrame: { _ in })
             try await process.notify(method: "initialized")
