@@ -6,6 +6,7 @@ import Foundation
 import RepoPromptAgentRuntimeCore
 @testable import RepoPromptHeadlessRuntime
 @testable import RepoPromptServicePersistence
+import RepoPromptServiceHTTP
 import RepoPromptServiceProtocol
 import RepoPromptWorkspaceRuntimeCore
 import XCTest
@@ -17,6 +18,51 @@ final class ProviderManagementBackendTests: XCTestCase {
         XCTAssertFalse(redacted.contains("xai-1234567890"))
         XCTAssertFalse(redacted.contains(known))
         XCTAssertTrue(redacted.contains("<redacted>"))
+    }
+
+    func testReadinessSeparatesRuntimeAvailabilityFromDisconnectedAuthentication() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let configuration = ProviderCLIConfiguration(
+            kind: .codex,
+            executable: "/usr/bin/swift",
+            expectedVersion: "6.2",
+            protocolVersion: "app-server-v2"
+        )
+        let adapter = ProviderCLIAdapter(
+            configurations: [configuration],
+            enabledProviders: [.codex],
+            runner: StaticVersionRunner()
+        )
+        let providerSettings = ProviderSettingsService(
+            store: store,
+            adapter: adapter,
+            configurations: [configuration],
+            initiallyEnabled: [.codex],
+            runner: StaticVersionRunner()
+        )
+        try await providerSettings.bootstrap()
+        let catalog = try await providerSettings.catalog()
+        let codexSettings = try XCTUnwrap(catalog.providers.first { $0.providerID == .codex })
+        XCTAssertTrue(codexSettings.runtimePreflightVerified)
+        XCTAssertEqual(codexSettings.preflight.reason, .missingCredential)
+
+        let readiness = RepoPromptReadinessService(
+            authority: RepoPromptHeadlessAuthority(store: store, providerAdapter: adapter),
+            store: store,
+            requiredProviders: [.codex],
+            expectedProviderProtocols: [.codex: "app-server-v2"],
+            minimumFreeBytes: 0,
+            minimumFreeNodes: 0,
+            maximumActiveSessions: 10,
+            cacheDuration: 0,
+            providerSettings: providerSettings
+        )
+        let snapshot = await readiness.snapshot(forceRefresh: true)
+        XCTAssertTrue(snapshot.ready)
+        let codexReadiness = try XCTUnwrap(snapshot.providers.first { $0.kind == .codex })
+        XCTAssertTrue(codexReadiness.ready)
+        XCTAssertEqual(codexReadiness.detail, "ready")
+        try await store.close()
     }
 
     func testVaultEncryptsAtomicallyMigratesAndRotatesWithoutPlaintext() async throws {

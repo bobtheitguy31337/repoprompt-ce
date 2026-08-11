@@ -148,15 +148,15 @@ public actor RepoPromptReadinessService {
             let required = requiredProviders.contains(capability.kind)
             let expectedProtocol = expectedProviderProtocols[capability.kind]
             let protocolMatches = expectedProtocol == nil || capability.protocolVersion == expectedProtocol
-            let providerPreflight = settingsByKind[capability.kind]?.preflight
-            let runtimeReady = capability.enabled && protocolMatches && (providerPreflight?.ready ?? true)
+            let providerSettings = settingsByKind[capability.kind]
+            let runtimeReady = capability.enabled && protocolMatches && (providerSettings?.runtimePreflightVerified ?? true)
             let ready = !required || runtimeReady
-            let detail: String = if let providerPreflight, !providerPreflight.ready {
-                providerPreflight.reason.rawValue
-            } else if !capability.enabled {
+            let detail: String = if !capability.enabled {
                 capability.reasonUnavailable ?? "disabled"
             } else if !protocolMatches {
                 "protocol-mismatch"
+            } else if let providerSettings, !providerSettings.runtimePreflightVerified {
+                providerSettings.cli?.detail ?? "runtime-unavailable"
             } else {
                 "ready"
             }
