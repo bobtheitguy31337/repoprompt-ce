@@ -301,35 +301,27 @@
   }
 
   function providerStatus(provider) {
-    if (!provider.deploymentAllowed)
-      return { label: "Unavailable · deployment disabled", tone: "" };
-    if (!provider.preference?.enabled) return { label: "Disabled", tone: "" };
-    if (
-      provider.connection?.testState === "invalid" ||
+    const connectionFailed =
+      provider.connection?.state === "attention" ||
+      ["invalid", "unavailable"].includes(provider.connection?.testState) ||
       provider.authentication?.state === "attention" ||
-      provider.preflight?.reason === "invalidCredential"
-    ) {
-      return { label: "Validation failed", tone: "attention" };
+      provider.preflight?.reason === "invalidCredential";
+    if (connectionFailed) {
+      return {
+        label:
+          provider.connection?.detail ||
+          provider.authentication?.detail ||
+          "Connection failed",
+        tone: "attention",
+      };
     }
     if (
       provider.authentication?.authenticated &&
-      (provider.connection?.testState === "valid" || provider.preflight?.ready)
+      provider.connection?.testState === "valid"
     ) {
       return { label: "Connected", tone: "connected" };
     }
-    if (provider.authentication?.authenticated)
-      return { label: "Connected · validation required", tone: "available" };
-    if (provider.cli?.healthy || provider.runtimePreflightVerified)
-      return {
-        label: "Available · authentication required",
-        tone: "available",
-      };
-    if (provider.cli && !provider.cli.installed)
-      return { label: "Unavailable · executable missing", tone: "attention" };
-    return {
-      label: humanize(provider.preflight?.reason || "Unavailable"),
-      tone: "attention",
-    };
+    return { label: "Not configured", tone: "" };
   }
 
   function setDisabledReason(control, disabled, reason) {
@@ -962,7 +954,7 @@
       : !state.online
         ? "The server connection is unavailable."
         : unavailable
-          ? "Select a project and connect a validated CLI provider first."
+          ? "Select a project and connect a CLI provider first."
           : empty
             ? "Enter a message to send."
             : "";
@@ -1135,7 +1127,7 @@
         renderProviders(
           "apiProvider",
           "API Providers",
-          "Configure direct providers advertised by the server. Portable runtime availability is reported honestly by preflight.",
+          "Configure authentication and defaults for direct providers.",
         );
       } else renderAgentModels();
     }
@@ -1193,31 +1185,14 @@
     content.append(
       pageHeader(
         "Provider Settings",
-        "Server-owned runtime availability, model defaults, and authenticated connection state in one place.",
+        "Manage provider models, preferences, and connections.",
         "agent",
       ),
     );
 
-    const providers = orderedProviders();
-    const validated = providers.filter(
-      (provider) => provider.preflight?.ready || provider.effectiveEnabled,
-    ).length;
-    const enabled = providers.filter(
-      (provider) => provider.preference?.enabled,
-    ).length;
-    const connected = providers.filter(
-      (provider) => provider.authentication?.authenticated,
-    ).length;
-    const summary = element("section", "settings-card provider-status-grid");
-    [
-      ["Advertised", String(providers.length), "Server catalog entries"],
-      ["Enabled", String(enabled), "Administrative preference"],
-      ["Authenticated", String(connected), "Sanitized connection state"],
-      ["Validated", String(validated), "Passed provider preflight"],
-    ].forEach(([label, value, detail]) =>
-      summary.append(statusTile(label, value, detail)),
+    const providers = orderedProviders().filter(
+      (provider) => provider.deploymentAllowed,
     );
-    content.append(summary);
 
     if (!providers.length) {
       const empty = element("div", "empty-state-panel");
@@ -1226,7 +1201,7 @@
         element(
           "p",
           "",
-          "Refresh after the provider settings service becomes available.",
+          "Refresh after the provider catalog loads.",
         ),
       );
       content.append(empty);
@@ -1235,11 +1210,11 @@
 
     const card = element("section", "settings-card");
     card.append(
-      element("h2", "", "Provider status"),
+      element("h2", "", "Providers"),
       element(
         "p",
         "card-subtitle",
-        "Open the relevant settings page to resolve an availability reason.",
+        "Open a provider settings page to manage its models and connection.",
       ),
     );
     const list = element("div", "glance-list");
@@ -1250,7 +1225,7 @@
       const status = providerStatus(provider);
       link.append(
         element("strong", "", provider.displayName),
-        element("small", "", provider.preflight?.detail || provider.summary),
+        element("small", "", provider.summary),
       );
       const badge = element("span", `glance-status ${status.tone}`.trim());
       badge.append(element("i"), document.createTextNode(status.label));
@@ -1279,7 +1254,8 @@
     );
     const stack = element("div", "provider-stack");
     const providers = orderedProviders().filter(
-      (provider) => provider.category === category,
+      (provider) =>
+        provider.category === category && provider.deploymentAllowed,
     );
     if (!providers.length) {
       const empty = element("div", "empty-state-panel");
@@ -1317,7 +1293,9 @@
       ),
     );
     const stack = element("div", "provider-stack");
-    const providers = orderedProviders();
+    const providers = orderedProviders().filter(
+      (provider) => provider.deploymentAllowed,
+    );
     if (!providers.length) {
       const empty = element("div", "empty-state-panel");
       empty.append(
@@ -1362,7 +1340,6 @@
       iconNode("chevron"),
     );
     const body = element("div", "provider-card-body");
-    if (!modelsOnly) body.append(statusGrid(provider));
     body.append(settingsSection(provider));
     if (!modelsOnly) body.append(authenticationSection(provider));
     details.append(summary, body);
@@ -1377,48 +1354,6 @@
       element("small", "", detail || "—"),
     );
     return tile;
-  }
-
-  function statusGrid(provider) {
-    const grid = element("div", "provider-status-grid");
-    const cli = provider.cli;
-    const authentication = provider.authentication || {};
-    const connection = provider.connection;
-    const cliValue = cli
-      ? cli.healthy
-        ? "Healthy"
-        : cli.installed
-          ? "Attention"
-          : "Not installed"
-      : "API provider";
-    const cliDetail = cli
-      ? cli.version || cli.expectedVersion || cli.detail
-      : "No CLI executable is required";
-    const authValue = authentication.authenticated
-      ? "Authenticated"
-      : humanize(authentication.state || "notConfigured");
-    const authDetail =
-      authentication.accountLabel ||
-      authentication.detail ||
-      "No sanitized account status";
-    const testValue = connection
-      ? humanize(connection.testState)
-      : "Not configured";
-    const testDetail = connection?.lastTestedAt
-      ? `Last tested ${formatDate(connection.lastTestedAt)}`
-      : connection?.detail || "Connect a credential to test";
-    const availability = providerStatus(provider);
-    grid.append(
-      statusTile("Runtime", cliValue, cliDetail),
-      statusTile("Authentication", authValue, authDetail),
-      statusTile("Credential test", testValue, testDetail),
-      statusTile(
-        "Availability",
-        availability.label,
-        provider.preflight?.detail || "No preflight detail",
-      ),
-    );
-    return grid;
   }
 
   function sectionHeading(title, detail) {

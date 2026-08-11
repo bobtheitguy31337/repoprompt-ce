@@ -1198,7 +1198,7 @@ test("composer creates sessions and sends revision-checked follow-ups through po
   await settle();
 });
 
-test("provider status separates runtime availability and authentication methods remain peers", async (t) => {
+test("provider settings show connection outcomes and authentication methods remain peers", async (t) => {
   const codex = providerFixture();
   const connected = providerFixture({
     providerID: "claudeCompatible",
@@ -1212,46 +1212,31 @@ test("provider status separates runtime availability and authentication methods 
       providerID: "openCodeACP",
       state: "attention",
       testState: "invalid",
+      detail: "Credential rejected",
     }),
     authentication: { state: "attention", authenticated: false },
   });
-  const disabled = providerFixture({
+  const unsupported = providerFixture({
     providerID: "cursorACP",
     displayName: "Cursor",
+    deploymentAllowed: false,
     preference: { enabled: false },
   });
   const harness = await createHarness({
-    providers: [codex, connected, failed, disabled],
+    providers: [codex, connected, failed, unsupported],
   });
   t.after(() => harness.close());
   const { document } = harness;
   const card = document.querySelector('[data-provider-id="codex"]');
   const choices = [...card.querySelectorAll(".auth-choice")];
 
-  assert.match(
-    card.querySelector(".connection-badge").textContent,
-    /Available · authentication required/,
+  assert.deepEqual(
+    [...document.querySelectorAll(".connection-badge")].map((badge) =>
+      badge.textContent.trim(),
+    ),
+    ["Not configured", "Connected", "Credential rejected"],
   );
-  assert.doesNotMatch(
-    card.querySelector(".connection-badge").textContent,
-    /^Ready$/i,
-  );
-  assert.match(
-    document.querySelector(
-      '[data-provider-id="claudeCompatible"] .connection-badge',
-    ).textContent,
-    /^Connected$/,
-  );
-  assert.match(
-    document.querySelector('[data-provider-id="openCodeACP"] .connection-badge')
-      .textContent,
-    /^Validation failed$/,
-  );
-  assert.match(
-    document.querySelector('[data-provider-id="cursorACP"] .connection-badge')
-      .textContent,
-    /^Disabled$/,
-  );
+  assert.equal(document.querySelector('[data-provider-id="cursorACP"]'), null);
   assert.deepEqual(
     choices.map((choice) => choice.querySelector("strong").textContent),
     [
