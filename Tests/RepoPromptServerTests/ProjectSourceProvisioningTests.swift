@@ -970,7 +970,7 @@ private struct Fixture {
     let cloneRoot: URL
 
     init() throws {
-        directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-project-source-\(UUID().uuidString)", isDirectory: true)
         cloneRoot = directory.appendingPathComponent("projects", isDirectory: true)
         try FileManager.default.createDirectory(at: cloneRoot, withIntermediateDirectories: true)
     }

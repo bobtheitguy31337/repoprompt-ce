@@ -6,7 +6,7 @@ import XCTest
 
 final class ResourceReconciliationTests: XCTestCase {
     func testReconciliationDeletesOnlyRecordedExpiredArtifactsAndPreservesDirtyWorktrees() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-resource-reconciliation-\(UUID().uuidString)", isDirectory: true)
         let artifacts = directory.appendingPathComponent("artifacts", isDirectory: true)
         let worktrees = directory.appendingPathComponent("worktrees", isDirectory: true)
         let source = directory.appendingPathComponent("source", isDirectory: true)
@@ -120,7 +120,7 @@ final class ResourceReconciliationTests: XCTestCase {
     }
 
     func testStartupReconciliationRejectsReplacedSymlinkProjectRootWithoutDeletingOutsideVolume() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-resource-reconciliation-\(UUID().uuidString)", isDirectory: true)
         let artifacts = directory.appendingPathComponent("artifacts", isDirectory: true)
         let worktrees = directory.appendingPathComponent("worktrees", isDirectory: true)
         let projects = directory.appendingPathComponent("projects", isDirectory: true)
@@ -165,7 +165,7 @@ final class ResourceReconciliationTests: XCTestCase {
     }
 
     func testPinnedProjectRootRemovalCannotBeRedirectedByReplacementRace() throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-resource-reconciliation-\(UUID().uuidString)", isDirectory: true)
         let projects = directory.appendingPathComponent("projects", isDirectory: true)
         let original = directory.appendingPathComponent("projects-original", isDirectory: true)
         let outside = directory.appendingPathComponent("outside", isDirectory: true)

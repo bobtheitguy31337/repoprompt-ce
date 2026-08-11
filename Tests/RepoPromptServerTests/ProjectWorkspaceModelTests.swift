@@ -33,7 +33,7 @@ final class ProjectWorkspaceModelTests: XCTestCase {
     }
 
     func testEmptyProjectStartsSessionAndAddsMultipleManagedRepositoriesIdempotently() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-project-workspace-\(UUID().uuidString)", isDirectory: true)
         let cloneRoot = directory.appendingPathComponent("projects", isDirectory: true)
         try FileManager.default.createDirectory(at: cloneRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -133,7 +133,7 @@ final class ProjectWorkspaceModelTests: XCTestCase {
     }
 
     func testActiveProviderRunBlocksRepositoryPublication() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-project-workspace-\(UUID().uuidString)", isDirectory: true)
         let cloneRoot = directory.appendingPathComponent("projects", isDirectory: true)
         try FileManager.default.createDirectory(at: cloneRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -193,7 +193,7 @@ final class ProjectWorkspaceModelTests: XCTestCase {
     }
 
     func testDisabledGitPolicyStillStartsProviderInEmptyManagedWorkspace() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-project-workspace-\(UUID().uuidString)", isDirectory: true)
         let cloneRoot = directory.appendingPathComponent("projects", isDirectory: true)
         try FileManager.default.createDirectory(at: cloneRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }

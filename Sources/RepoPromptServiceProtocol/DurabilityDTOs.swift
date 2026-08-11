@@ -290,10 +290,36 @@ public struct OwnedResourceHealthSnapshot: Codable, Hashable, Sendable {
     }
 }
 
+public struct ActiveOwnedWorktreeSnapshot: Hashable, Sendable {
+    public let bindingID: UUID
+    public let projectID: UUID
+    public let rootID: UUID
+    public let sessionID: UUID
+    public let physicalPath: String
+    public let sourceRoot: String
+    public let branch: String
+
+    public init(bindingID: UUID, projectID: UUID, rootID: UUID, sessionID: UUID, physicalPath: String, sourceRoot: String, branch: String) {
+        self.bindingID = bindingID
+        self.projectID = projectID
+        self.rootID = rootID
+        self.sessionID = sessionID
+        self.physicalPath = physicalPath
+        self.sourceRoot = sourceRoot
+        self.branch = branch
+    }
+}
+
 public protocol OwnedResourceRepository: Sendable {
     func reserveOwnedResource(_ record: OwnedResourceRecord) async throws
     func ownedResource(externalID: UUID, kind: OwnedResourceKind) async throws -> OwnedResourceRecord?
     func ownedResources(states: Set<OwnedResourceLifecycleState>?) async throws -> [OwnedResourceRecord]
+    func activeOwnedWorktree(bindingID: UUID) async throws -> ActiveOwnedWorktreeSnapshot?
+    func backfillActiveWorktreeContentDigest(
+        resourceID: UUID,
+        authority: ActiveOwnedWorktreeSnapshot,
+        contentDigest: String
+    ) async throws -> OwnedResourceRecord
     func transitionOwnedResource(
         resourceID: UUID,
         expectedStates: Set<OwnedResourceLifecycleState>,

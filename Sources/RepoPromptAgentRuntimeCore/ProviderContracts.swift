@@ -94,8 +94,9 @@ public struct ProviderExecutionRequest: Sendable {
     public let runID: UUID
     public let resumeProviderSessionID: String?
     public let policy: ProviderExecutionPolicy
+    private let launchValidation: @Sendable () throws -> Void
 
-    public init(kind: ProviderKind, model: String?, prompt: String, workingDirectory: String, maximumBytes: Int = 8_388_608, runID: UUID, resumeProviderSessionID: String? = nil, policy: ProviderExecutionPolicy = .init()) {
+    public init(kind: ProviderKind, model: String?, prompt: String, workingDirectory: String, maximumBytes: Int = 8_388_608, runID: UUID, resumeProviderSessionID: String? = nil, policy: ProviderExecutionPolicy = .init(), launchValidation: @escaping @Sendable () throws -> Void = {}) {
         self.kind = kind
         self.model = model
         self.prompt = prompt
@@ -104,6 +105,11 @@ public struct ProviderExecutionRequest: Sendable {
         self.runID = runID
         self.resumeProviderSessionID = resumeProviderSessionID
         self.policy = policy
+        self.launchValidation = launchValidation
+    }
+
+    public func validateLaunch() throws {
+        try launchValidation()
     }
 }
 
@@ -158,6 +164,7 @@ public extension AgentProviderDispatcher {
         _ request: ProviderExecutionRequest,
         onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
     ) async throws -> ProviderExecutionResult {
+        try request.validateLaunch()
         let result = try await execute(
             kind: request.kind,
             model: request.model,

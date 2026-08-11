@@ -64,7 +64,7 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
 
     /// Launches a bidirectional provider protocol while retaining the same
     /// subreaper/process-family identity and captured-output guarantees.
-    public func launchInteractiveCaptured(executable: String, arguments: [String], environment: [String: String], workingDirectory: String, helperToken: String, outputDirectory: String, captureID: UUID = UUID()) async throws -> CapturedProcess {
+    public func launchInteractiveCaptured(executable: String, arguments: [String], environment: [String: String], workingDirectory: String, helperToken: String, outputDirectory: String, captureID: UUID = UUID(), launchValidation: @escaping @Sendable () throws -> Void = {}) async throws -> CapturedProcess {
         try FileManager.default.createDirectory(atPath: outputDirectory, withIntermediateDirectories: true)
         let id = captureID.uuidString
         let stdoutPath = URL(fileURLWithPath: outputDirectory).appendingPathComponent("\(id).stdout").path
@@ -80,7 +80,7 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
             _ = fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
         #endif
         do {
-            let identity = try await launchProcess(executable: executable, arguments: arguments, environment: environment, workingDirectory: workingDirectory, helperToken: helperToken, stdin: input, stdout: stdout, stderr: stderr)
+            let identity = try await launchProcess(executable: executable, arguments: arguments, environment: environment, workingDirectory: workingDirectory, helperToken: helperToken, stdin: input, stdout: stdout, stderr: stderr, launchValidation: launchValidation)
             standardInputs[identity.pid] = input.fileHandleForWriting
             // Foundation's Linux Process implementation does not retain the
             // Pipe object after extracting its descriptor. Keep the complete
@@ -160,7 +160,7 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         return String(decoding: stdout.prefix(max(1, maximumBytes)), as: UTF8.self)
     }
 
-    private func launchProcess(executable: String, arguments: [String], environment: [String: String], workingDirectory: String, helperToken: String, stdin: Any, stdout: FileHandle, stderr: FileHandle) async throws -> ProcessIdentity {
+    private func launchProcess(executable: String, arguments: [String], environment: [String: String], workingDirectory: String, helperToken: String, stdin: Any, stdout: FileHandle, stderr: FileHandle, launchValidation: @escaping @Sendable () throws -> Void = {}) async throws -> ProcessIdentity {
         guard FileManager.default.isExecutableFile(atPath: executable) else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider executable is unavailable") }
         let process = Process()
         #if os(Linux)
@@ -189,6 +189,7 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         process.standardInput = stdin
         process.standardOutput = stdout
         process.standardError = stderr
+        try launchValidation()
         try process.run()
         let pid = process.processIdentifier
         processes[pid] = process

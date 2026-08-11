@@ -49,7 +49,7 @@ public actor OwnedResourceReconciliationService {
     ) throws {
         self.repository = repository
         self.artifactRoot = URL(fileURLWithPath: artifactRoot).standardizedFileURL.path
-        self.worktreeRoot = URL(fileURLWithPath: worktreeRoot).standardizedFileURL.path
+        self.worktreeRoot = URL(fileURLWithPath: worktreeRoot).standardized.path
         self.providerHomeRoot = providerHomeRoot.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
         self.providerOutputRoot = providerOutputRoot.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
         if let projectRoot {
@@ -155,7 +155,7 @@ public actor OwnedResourceReconciliationService {
         case .preparing:
             if exists {
                 if record.kind == .artifact, artifactMatches(record) { return .prepared }
-                if record.kind == .worktree, try await worktreeMatches(record) { return .prepared }
+                if record.kind == .worktree, try await worktreeMatches(record, allowLegacyBackfill: false) { return .prepared }
                 if isProviderResource(record), providerResourceIsSafe(record) { return .prepared }
                 if record.kind == .cloneStaging, try cloneResourceIsSafe(record) {
                     if recoverInterruptedPreparation {
@@ -195,7 +195,11 @@ public actor OwnedResourceReconciliationService {
                 return .corrupt
             }
             if record.kind == .artifact, !artifactMatches(record) { return .corrupt }
-            if record.kind == .worktree, try await !worktreeMatches(record) { return .corrupt }
+            if record.kind == .worktree,
+               try await !worktreeMatches(record, allowLegacyBackfill: recoverInterruptedPreparation)
+            {
+                return .corrupt
+            }
             if record.kind == .cloneStaging, try !cloneResourceIsSafe(record) { return .corrupt }
             return .active
         case .missing, .corrupt, .conflicted:
@@ -217,17 +221,53 @@ public actor OwnedResourceReconciliationService {
             && (record.contentDigest == nil || record.contentDigest == CanonicalSigning.bodyDigest(data))
     }
 
-    private func worktreeMatches(_ record: OwnedResourceRecord) async throws -> Bool {
-        guard isContained(record.internalPathIdentity, root: worktreeRoot), !isSymbolicLink(record.internalPathIdentity) else { return false }
+    private func worktreeMatches(_ record: OwnedResourceRecord, allowLegacyBackfill: Bool) async throws -> Bool {
+        guard isContained(record.internalPathIdentity, root: worktreeRoot),
+              let bindingID = record.externalID,
+              let projectID = record.projectID,
+              let sessionID = record.sessionID,
+              let sourceRoot = record.metadata["sourceRoot"],
+              let branch = record.metadata["branch"],
+              let authority = try await repository.activeOwnedWorktree(bindingID: bindingID),
+              authority.projectID == projectID,
+              authority.sessionID == sessionID,
+              authority.physicalPath == record.internalPathIdentity,
+              authority.sourceRoot == sourceRoot,
+              authority.branch == branch
+        else { return false }
+        try PinnedFilesystemRoot.validateDirectoryChain(at: worktreeRoot)
+        try PinnedFilesystemRoot.validateDirectoryChain(at: record.internalPathIdentity)
+        try PinnedFilesystemRoot.validateDirectoryChain(at: sourceRoot)
         let top = try await runner.run(
             executable: gitExecutable,
             arguments: ["-C", record.internalPathIdentity, "rev-parse", "--show-toplevel"],
             workingDirectory: record.internalPathIdentity,
             maximumBytes: 65536
         )
+        guard URL(fileURLWithPath: top.trimmingCharacters(in: .whitespacesAndNewlines)).standardizedFileURL.path == record.internalPathIdentity else {
+            return false
+        }
+        let registration = try await runner.run(
+            executable: gitExecutable,
+            arguments: ["-C", sourceRoot, "worktree", "list", "--porcelain", "-z"],
+            workingDirectory: sourceRoot,
+            maximumBytes: 1_048_576
+        )
+        let fields = registration.components(separatedBy: "\0")
+        let matchingWorktrees = fields.indices.filter { fields[$0] == "worktree \(record.internalPathIdentity)" }
+        guard matchingWorktrees.count == 1 else { return false }
+        let start = matchingWorktrees[0] + 1
+        let end = fields[start...].firstIndex(where: { $0.isEmpty || $0.hasPrefix("worktree ") }) ?? fields.endIndex
+        guard fields[start ..< end].contains("branch refs/heads/\(branch)") else { return false }
         let identityDigest = try await WorktreeRuntimeIdentity.digest(path: record.internalPathIdentity, runner: runner, gitExecutable: gitExecutable)
-        return URL(fileURLWithPath: top.trimmingCharacters(in: .whitespacesAndNewlines)).standardizedFileURL.path == record.internalPathIdentity
-            && record.contentDigest == identityDigest
+        if let persisted = record.contentDigest { return persisted == identityDigest }
+        guard allowLegacyBackfill else { return false }
+        _ = try await repository.backfillActiveWorktreeContentDigest(
+            resourceID: record.resourceID,
+            authority: authority,
+            contentDigest: identityDigest
+        )
+        return true
     }
 
     private func isProviderHomeResource(_ record: OwnedResourceRecord) -> Bool {
@@ -320,7 +360,7 @@ public actor OwnedResourceReconciliationService {
     }
 
     private func isContained(_ path: String, root: String) -> Bool {
-        let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+        let standardized = URL(fileURLWithPath: path).standardized.path
         let prefix = root.hasSuffix("/") ? root : root + "/"
         return standardized.hasPrefix(prefix) && standardized != root
     }

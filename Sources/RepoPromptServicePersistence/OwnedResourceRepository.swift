@@ -59,6 +59,89 @@ extension SQLiteServiceStore: OwnedResourceRepository {
         return records.filter { states.contains($0.lifecycleState) }
     }
 
+    public func activeOwnedWorktree(bindingID: UUID) async throws -> ActiveOwnedWorktreeSnapshot? {
+        let row = try await connection.query(
+            "SELECT w.binding_id,w.project_id,w.root_id,w.session_id,w.physical_path,w.branch,r.canonical_path AS source_root FROM worktree_bindings w JOIN project_roots r ON r.root_id=w.root_id AND r.project_id=w.project_id WHERE w.binding_id=? AND w.ownership_state='active' AND w.session_id IS NOT NULL AND r.writable=1",
+            [.text(bindingID.uuidString)]
+        ).first
+        guard let row else { return nil }
+        guard let bindingID = UUID(uuidString: row.column("binding_id")?.string ?? ""),
+              let projectID = UUID(uuidString: row.column("project_id")?.string ?? ""),
+              let rootID = UUID(uuidString: row.column("root_id")?.string ?? ""),
+              let sessionID = UUID(uuidString: row.column("session_id")?.string ?? ""),
+              let physicalPath = row.column("physical_path")?.string,
+              let sourceRoot = row.column("source_root")?.string,
+              let branch = row.column("branch")?.string
+        else {
+            throw ServiceAPIError(code: .persistenceUnavailable, message: "Persisted active worktree ownership is invalid")
+        }
+        return ActiveOwnedWorktreeSnapshot(
+            bindingID: bindingID,
+            projectID: projectID,
+            rootID: rootID,
+            sessionID: sessionID,
+            physicalPath: physicalPath,
+            sourceRoot: sourceRoot,
+            branch: branch
+        )
+    }
+
+    public func backfillActiveWorktreeContentDigest(
+        resourceID: UUID,
+        authority: ActiveOwnedWorktreeSnapshot,
+        contentDigest: String
+    ) async throws -> OwnedResourceRecord {
+        try await transaction {
+            guard let current = try await connection.query(
+                "SELECT * FROM owned_resources WHERE resource_id=?",
+                [.text(resourceID.uuidString)]
+            ).first.map(decodeOwnedResource) else {
+                throw ServiceAPIError(code: .notFound, message: "Owned worktree resource was not found")
+            }
+            if let existing = current.contentDigest {
+                guard existing == contentDigest else {
+                    throw ServiceAPIError(code: .worktreeConflict, message: "Owned worktree identity digest already differs")
+                }
+                return current
+            }
+            guard current.kind == .worktree,
+                  current.lifecycleState == .active,
+                  current.externalID == authority.bindingID,
+                  current.projectID == authority.projectID,
+                  current.sessionID == authority.sessionID,
+                  current.internalPathIdentity == authority.physicalPath,
+                  current.metadata["sourceRoot"] == authority.sourceRoot,
+                  current.metadata["branch"] == authority.branch,
+                  try await activeOwnedWorktree(bindingID: authority.bindingID) == authority
+            else {
+                throw ServiceAPIError(code: .worktreeConflict, message: "Legacy worktree ownership no longer matches its durable binding")
+            }
+            let duplicates = try await connection.query(
+                "SELECT binding_id FROM worktree_bindings WHERE project_id=? AND root_id=? AND session_id=? AND ownership_state='active' AND binding_id<>? LIMIT 1",
+                [
+                    .text(authority.projectID.uuidString),
+                    .text(authority.rootID.uuidString),
+                    .text(authority.sessionID.uuidString),
+                    .text(authority.bindingID.uuidString)
+                ]
+            )
+            guard duplicates.isEmpty else {
+                throw ServiceAPIError(code: .worktreeConflict, message: "Legacy worktree ownership is not unique")
+            }
+            _ = try await connection.query(
+                "UPDATE owned_resources SET content_digest=?,updated_at=? WHERE resource_id=? AND content_digest IS NULL AND lifecycle_state='active'",
+                [.text(contentDigest), .float(Date().timeIntervalSince1970), .text(resourceID.uuidString)]
+            )
+            guard let updated = try await connection.query(
+                "SELECT * FROM owned_resources WHERE resource_id=?",
+                [.text(resourceID.uuidString)]
+            ).first.map(decodeOwnedResource), updated.contentDigest == contentDigest else {
+                throw ServiceAPIError(code: .worktreeConflict, message: "Legacy worktree identity backfill lost its compare-and-set")
+            }
+            return updated
+        }
+    }
+
     public func transitionOwnedResource(
         resourceID: UUID,
         expectedStates: Set<OwnedResourceLifecycleState>,

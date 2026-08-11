@@ -8,6 +8,82 @@ import XCTest
 private struct InjectedPersistenceFault: Error {}
 
 final class PersistenceTests: XCTestCase {
+    func testLegacyWorktreeIdentityBackfillNeverOverwritesExistingMismatch() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let bindingID = UUID()
+        let projectID = UUID()
+        let rootID = UUID()
+        let sessionID = UUID()
+        let resource = OwnedResourceRecord(
+            kind: .worktree,
+            projectID: projectID,
+            sessionID: sessionID,
+            externalID: bindingID,
+            internalPathIdentity: "/srv/repoprompt/worktrees/p/b",
+            lifecycleState: .active,
+            contentDigest: "persisted-mismatch",
+            metadata: ["sourceRoot": "/srv/repoprompt/projects/source", "branch": "feature"]
+        )
+        try await store.reserveOwnedResource(resource)
+        let authority = ActiveOwnedWorktreeSnapshot(
+            bindingID: bindingID,
+            projectID: projectID,
+            rootID: rootID,
+            sessionID: sessionID,
+            physicalPath: resource.internalPathIdentity,
+            sourceRoot: "/srv/repoprompt/projects/source",
+            branch: "feature"
+        )
+        do {
+            _ = try await store.backfillActiveWorktreeContentDigest(
+                resourceID: resource.resourceID,
+                authority: authority,
+                contentDigest: "observed-different"
+            )
+            XCTFail("expected non-null identity mismatch rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .worktreeConflict)
+        }
+        let persisted = try await store.ownedResource(externalID: bindingID, kind: .worktree)
+        XCTAssertEqual(persisted?.contentDigest, "persisted-mismatch")
+        XCTAssertEqual(persisted?.lifecycleState, .active)
+
+        let unownedBindingID = UUID()
+        let unowned = OwnedResourceRecord(
+            kind: .worktree,
+            projectID: projectID,
+            sessionID: sessionID,
+            externalID: unownedBindingID,
+            internalPathIdentity: "/srv/repoprompt/worktrees/p/unowned",
+            lifecycleState: .active,
+            metadata: ["sourceRoot": "/srv/repoprompt/projects/source", "branch": "unowned"]
+        )
+        try await store.reserveOwnedResource(unowned)
+        let unownedAuthority = ActiveOwnedWorktreeSnapshot(
+            bindingID: unownedBindingID,
+            projectID: projectID,
+            rootID: rootID,
+            sessionID: sessionID,
+            physicalPath: unowned.internalPathIdentity,
+            sourceRoot: "/srv/repoprompt/projects/source",
+            branch: "unowned"
+        )
+        do {
+            _ = try await store.backfillActiveWorktreeContentDigest(
+                resourceID: unowned.resourceID,
+                authority: unownedAuthority,
+                contentDigest: "must-not-be-blessed"
+            )
+            XCTFail("expected missing durable ownership rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .worktreeConflict)
+        }
+        let stillUnowned = try await store.ownedResource(externalID: unownedBindingID, kind: .worktree)
+        XCTAssertNil(stillUnowned?.contentDigest)
+        XCTAssertEqual(stillUnowned?.lifecycleState, .active)
+        try await store.close()
+    }
+
     func testEventsAreSignedBeforeDurablePublication() async throws {
         let key = ServiceEventSigningKey(keyID: "event-v1", secret: Data("event-secret".utf8))
         let store = try await SQLiteServiceStore.open(storage: .memory, eventSigningKey: key)

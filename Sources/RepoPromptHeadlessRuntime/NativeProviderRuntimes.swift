@@ -89,7 +89,7 @@ private struct NativeProviderProcessSupport {
         }
     }
 
-    func makeSession(runID: UUID, arguments: [String], workingDirectory: String) async throws -> NativeJSONLineProcess {
+    func makeSession(runID: UUID, arguments: [String], workingDirectory: String, launchValidation: @escaping @Sendable () throws -> Void = {}) async throws -> NativeJSONLineProcess {
         let preparedHome = try await prepareEphemeralHome(runID: runID)
         let environment = providerEnvironment(home: preparedHome.url, workingDirectory: workingDirectory)
         let supervisor = ProviderProcessSupervisor(processPort: processPort, store: processStore)
@@ -105,7 +105,8 @@ private struct NativeProviderProcessSupport {
                 supervisor: supervisor,
                 outputDirectory: outputDirectory,
                 resourceRepository: processStore,
-                homeResources: preparedHome.resources
+                homeResources: preparedHome.resources,
+                launchValidation: launchValidation
             )
         } catch {
             try? FileManager.default.removeItem(at: preparedHome.url)
@@ -245,7 +246,7 @@ private actor NativeJSONLineProcess {
         self.ownedResources = ownedResources
     }
 
-    static func launch(runID: UUID, executable: String, arguments: [String], environment: [String: String], workingDirectory: String, home: URL, processPort: PortableProcessSupervisionPort, supervisor: ProviderProcessSupervisor, outputDirectory: String, resourceRepository: (any OwnedResourceRepository)?, homeResources: [OwnedResourceRecord]) async throws -> NativeJSONLineProcess {
+    static func launch(runID: UUID, executable: String, arguments: [String], environment: [String: String], workingDirectory: String, home: URL, processPort: PortableProcessSupervisionPort, supervisor: ProviderProcessSupervisor, outputDirectory: String, resourceRepository: (any OwnedResourceRepository)?, homeResources: [OwnedResourceRecord], launchValidation: @escaping @Sendable () throws -> Void) async throws -> NativeJSONLineProcess {
         let captureID = UUID()
         let outputRoot = URL(fileURLWithPath: outputDirectory, isDirectory: true)
         let outputRecord = OwnedResourceRecord(
@@ -268,7 +269,8 @@ private actor NativeJSONLineProcess {
                 workingDirectory: workingDirectory,
                 helperToken: runID.uuidString,
                 outputDirectory: outputDirectory,
-                captureID: captureID
+                captureID: captureID,
+                launchValidation: launchValidation
             )
             capturedProcess = captured
             try await supervisor.register(runID: runID, leader: captured.identity)
@@ -479,7 +481,7 @@ private actor CodexAppServerProviderRuntime: AgentProviderRuntime {
     }
 
     func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
-        let process = try await support.makeSession(runID: request.runID, arguments: ["app-server"], workingDirectory: request.workingDirectory)
+        let process = try await support.makeSession(runID: request.runID, arguments: ["app-server"], workingDirectory: request.workingDirectory, launchValidation: { try request.validateLaunch() })
         sessions[request.runID] = process
         defer { sessions[request.runID] = nil
             threadIDs[request.runID] = nil
@@ -678,7 +680,7 @@ private actor ACPProviderRuntime: AgentProviderRuntime {
     }
 
     func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
-        let process = try await support.makeSession(runID: request.runID, arguments: arguments, workingDirectory: request.workingDirectory)
+        let process = try await support.makeSession(runID: request.runID, arguments: arguments, workingDirectory: request.workingDirectory, launchValidation: { try request.validateLaunch() })
         sessions[request.runID] = process
         defer { sessions[request.runID] = nil
             providerSessionIDs[request.runID] = nil
@@ -871,7 +873,7 @@ private actor ClaudeNativeProviderRuntime: AgentProviderRuntime {
         }
         if let resume = request.resumeProviderSessionID { arguments += ["--resume", resume] }
         if let model = request.model { arguments += ["--model", model] }
-        let process = try await support.makeSession(runID: request.runID, arguments: arguments, workingDirectory: request.workingDirectory)
+        let process = try await support.makeSession(runID: request.runID, arguments: arguments, workingDirectory: request.workingDirectory, launchValidation: { try request.validateLaunch() })
         sessions[request.runID] = process
         defer { sessions[request.runID] = nil }
         do {
@@ -967,7 +969,7 @@ private actor NormalizedHeadlessProviderRuntime: AgentProviderRuntime {
     }
 
     func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
-        let process = try await support.makeSession(runID: request.runID, arguments: ["--headless-provider-json"], workingDirectory: request.workingDirectory)
+        let process = try await support.makeSession(runID: request.runID, arguments: ["--headless-provider-json"], workingDirectory: request.workingDirectory, launchValidation: { try request.validateLaunch() })
         sessions[request.runID] = process
         defer { sessions[request.runID] = nil }
         try await process.sendRaw(JSONSerialization.data(withJSONObject: [
@@ -1086,7 +1088,7 @@ private actor MCPStdioProviderRuntime: AgentProviderRuntime {
     }
 
     func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
-        let process = try await support.makeSession(runID: request.runID, arguments: arguments, workingDirectory: request.workingDirectory)
+        let process = try await support.makeSession(runID: request.runID, arguments: arguments, workingDirectory: request.workingDirectory, launchValidation: { try request.validateLaunch() })
         sessions[request.runID] = process
         defer { sessions[request.runID] = nil }
         _ = try await process.request(method: "initialize", params: ["protocolVersion": "2025-03-26", "capabilities": [:], "clientInfo": ["name": "RepoPromptServer", "version": "1"]], onFrame: { _ in })

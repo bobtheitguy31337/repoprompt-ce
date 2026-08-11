@@ -248,7 +248,13 @@ private actor CommandCompatibilityProviderRuntime: AgentProviderRuntime {
         activeRuns.insert(request.runID)
         defer { activeRuns.remove(request.runID) }
         let arguments = compatibilityArguments(request)
-        let raw = try await runner.run(executable: configuration.executable, arguments: arguments, workingDirectory: request.workingDirectory, maximumBytes: request.maximumBytes)
+        let raw = try await runner.run(
+            executable: configuration.executable,
+            arguments: arguments,
+            workingDirectory: request.workingDirectory,
+            maximumBytes: request.maximumBytes,
+            launchValidation: { try request.validateLaunch() }
+        )
         let parsed = Self.parse(raw, kind: kind)
         if let identity = parsed.providerSessionID { await onEvent(.providerIdentity(identity)) }
         await onEvent(.assistantFinal(parsed.output))

@@ -171,7 +171,8 @@ final class WorkspaceAuthorityTests: XCTestCase {
 
     func testWorktreeServiceUsesValidatedGitArguments() async throws {
         let runner = RecordingWorkspaceRunner()
-        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let base = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-worktree-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: base) }
         let service = try WorktreeRuntimeService(baseDirectory: base.path, runner: runner)
         let root = ProjectRootSnapshot(rootID: UUID(), logicalName: "source", canonicalPath: "/repo", writable: true)
@@ -220,8 +221,8 @@ final class WorkspaceAuthorityTests: XCTestCase {
     }
 
     func testContextBuilderOracleAndContextArtifactsUseConfiguredProvider() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let artifacts = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-context-builder-root-\(UUID().uuidString)")
+        let artifacts = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-context-builder-artifacts-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try "important context".write(to: root.appendingPathComponent("important.txt"), atomically: true, encoding: .utf8)
         defer {
@@ -264,8 +265,8 @@ final class WorkspaceAuthorityTests: XCTestCase {
     }
 
     func testContextBuilderStaleCommitRetainsInspectableProposalArtifact() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let artifacts = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-context-builder-root-\(UUID().uuidString)")
+        let artifacts = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-context-builder-artifacts-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try "context".write(to: root.appendingPathComponent("Context.swift"), atomically: true, encoding: .utf8)
         defer {
@@ -307,8 +308,8 @@ final class WorkspaceAuthorityTests: XCTestCase {
     }
 
     func testContextBuilderClarifyingQuestionUsesDurableAuthorityInteraction() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let artifacts = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-context-builder-root-\(UUID().uuidString)")
+        let artifacts = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-context-builder-artifacts-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer {
             try? FileManager.default.removeItem(at: root)
@@ -351,15 +352,290 @@ final class WorkspaceAuthorityTests: XCTestCase {
         try await store.close()
     }
 
+    func testReadOnlyRootReplacementIsRejectedBeforeProviderRouting() async throws {
+        let base = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-read-only-routing-\(UUID().uuidString)", isDirectory: true)
+        let source = base.appendingPathComponent("source", isDirectory: true)
+        let displacedSource = base.appendingPathComponent("source-original", isDirectory: true)
+        let outside = base.appendingPathComponent("outside", isDirectory: true)
+        let worktrees = base.appendingPathComponent("worktrees", isDirectory: true)
+        let artifacts = base.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try "trusted".write(to: source.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        try "outside".write(to: outside.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let provider = MultiRootWorkspaceProvider()
+        let worktreeService = try WorktreeRuntimeService(baseDirectory: worktrees.path, resources: store)
+        let authority = try RepoPromptHeadlessAuthority(
+            store: store,
+            worktreeService: worktreeService,
+            artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path, resources: store),
+            providerAdapter: provider
+        )
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(
+            input: .init(name: "Read only", roots: [.init(logicalName: "docs", path: source.path, writable: false)]),
+            externalActor: actor,
+            idempotencyKey: "read-only-project",
+            requestDigest: "read-only-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "inspect", startImmediately: false),
+            externalActor: actor,
+            idempotencyKey: "read-only-session",
+            requestDigest: "read-only-session"
+        )
+        try FileManager.default.moveItem(at: source, to: displacedSource)
+        try FileManager.default.createSymbolicLink(at: source, withDestinationURL: outside)
+        do {
+            _ = try await authority.execute(
+                command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh),
+                sessionID: session.sessionID,
+                externalActor: actor,
+                idempotencyKey: "read-only-resume",
+                requestDigest: "read-only-resume"
+            )
+            XCTFail("expected read-only root identity rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .rootUnauthorized)
+        }
+        let routedRequests = await provider.requests()
+        let persistedRun = try await store.latestRun(sessionID: session.sessionID)
+        XCTAssertTrue(routedRequests.isEmpty)
+        XCTAssertNil(persistedRun)
+        try await worktreeService.removeOrphanedExecutionWorkspaces(validOwnerSessionIDs: [])
+        try await store.close()
+        try FileManager.default.removeItem(at: base)
+    }
+
+    func testReadOnlyRootSwapAfterRunPersistenceIsRejectedAtProviderLaunchBoundary() async throws {
+        let base = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-launch-boundary-\(UUID().uuidString)", isDirectory: true)
+        let source = base.appendingPathComponent("source", isDirectory: true)
+        let displacedSource = base.appendingPathComponent("source-original", isDirectory: true)
+        let outside = base.appendingPathComponent("outside", isDirectory: true)
+        let worktrees = base.appendingPathComponent("worktrees", isDirectory: true)
+        let artifacts = base.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try "trusted".write(to: source.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let provider = LaunchBoundaryWorkspaceProvider()
+        let worktreeService = try WorktreeRuntimeService(baseDirectory: worktrees.path, resources: store)
+        let authority = try RepoPromptHeadlessAuthority(
+            store: store,
+            worktreeService: worktreeService,
+            artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path, resources: store),
+            providerAdapter: provider
+        )
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(
+            input: .init(name: "Launch boundary", roots: [.init(logicalName: "docs", path: source.path, writable: false)]),
+            externalActor: actor,
+            idempotencyKey: "launch-boundary-project",
+            requestDigest: "launch-boundary-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "inspect", startImmediately: false),
+            externalActor: actor,
+            idempotencyKey: "launch-boundary-session",
+            requestDigest: "launch-boundary-session"
+        )
+        _ = try await authority.execute(
+            command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh),
+            sessionID: session.sessionID,
+            externalActor: actor,
+            idempotencyKey: "launch-boundary-resume",
+            requestDigest: "launch-boundary-resume"
+        )
+        for _ in 0 ..< 200 {
+            if await provider.hasReceivedRequest() { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let receivedAtLaunchBoundary = await provider.hasReceivedRequest()
+        XCTAssertTrue(receivedAtLaunchBoundary)
+        try FileManager.default.moveItem(at: source, to: displacedSource)
+        try FileManager.default.createSymbolicLink(at: source, withDestinationURL: outside)
+        await provider.releaseLaunch()
+        await authority.waitForProviderRunsToSettle()
+        let providerLaunched = await provider.didLaunch()
+        let failedRun = try await store.latestRun(sessionID: session.sessionID)
+        XCTAssertFalse(providerLaunched)
+        XCTAssertEqual(failedRun?.state, "failed")
+        try FileManager.default.removeItem(at: source)
+        try FileManager.default.moveItem(at: displacedSource, to: source)
+        try await worktreeService.removeOrphanedExecutionWorkspaces(validOwnerSessionIDs: [])
+        try await store.close()
+        try FileManager.default.removeItem(at: base)
+    }
+
+    func testExecutionWorkspaceBaseAndAncestorSwapsCannotStageOrDeleteOutsidePinnedRoot() async throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-workspace-swap-\(UUID().uuidString)", isDirectory: true)
+        let parent = root.appendingPathComponent("parent", isDirectory: true)
+        let displacedParent = root.appendingPathComponent("parent-original", isDirectory: true)
+        let base = parent.appendingPathComponent("worktrees", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        let outsideWorktrees = outside.appendingPathComponent("worktrees", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outsideWorktrees, withIntermediateDirectories: true)
+
+        let service = try WorktreeRuntimeService(baseDirectory: base.path)
+        let project = ProjectSnapshot(
+            projectID: UUID(),
+            name: "Empty",
+            creator: .init(goblinUserID: "u", username: "u", displayName: "U"),
+            state: .active,
+            roots: [],
+            revision: 1,
+            cursor: .init(storeID: UUID(), globalSequence: 1)
+        )
+        let ownerSessionID = UUID()
+        try FileManager.default.moveItem(at: parent, to: displacedParent)
+        try FileManager.default.createSymbolicLink(at: parent, withDestinationURL: outside)
+        do {
+            _ = try await service.materializeExecutionWorkspace(
+                project: project,
+                ownerSessionID: ownerSessionID,
+                bindings: [],
+                readOnlyRootIdentities: [:]
+            )
+            XCTFail("expected execution workspace ancestor rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .rootUnauthorized)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outsideWorktrees.appendingPathComponent(".execution-workspaces").path))
+
+        try FileManager.default.removeItem(at: parent)
+        try FileManager.default.moveItem(at: displacedParent, to: parent)
+        let workspace = try await service.materializeExecutionWorkspace(
+            project: project,
+            ownerSessionID: ownerSessionID,
+            bindings: [],
+            readOnlyRootIdentities: [:]
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workspace.directory))
+
+        let displacedBase = parent.appendingPathComponent("worktrees-original", isDirectory: true)
+        let outsideBase = root.appendingPathComponent("outside-base", isDirectory: true)
+        try FileManager.default.moveItem(at: base, to: displacedBase)
+        try FileManager.default.createDirectory(at: outsideBase, withIntermediateDirectories: true)
+        let outsideSentinel = outsideBase.appendingPathComponent("sentinel")
+        try "keep".write(to: outsideSentinel, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(at: base, withDestinationURL: outsideBase)
+        do {
+            try await service.removeExecutionWorkspace(projectID: project.projectID, ownerSessionID: ownerSessionID)
+            XCTFail("expected execution workspace base rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .rootUnauthorized)
+        }
+        XCTAssertEqual(try String(contentsOf: outsideSentinel, encoding: .utf8), "keep")
+        let pinnedWorkspace = displacedBase
+            .appendingPathComponent(".execution-workspaces", isDirectory: true)
+            .appendingPathComponent(project.projectID.uuidString.lowercased(), isDirectory: true)
+            .appendingPathComponent(ownerSessionID.uuidString.lowercased(), isDirectory: true)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: pinnedWorkspace.path))
+        try FileManager.default.removeItem(at: base)
+        try FileManager.default.moveItem(at: displacedBase, to: base)
+        let restoredWorkspace = base
+            .appendingPathComponent(".execution-workspaces", isDirectory: true)
+            .appendingPathComponent(project.projectID.uuidString.lowercased(), isDirectory: true)
+            .appendingPathComponent(ownerSessionID.uuidString.lowercased(), isDirectory: true)
+        let displacedWorkspace = restoredWorkspace.deletingLastPathComponent()
+            .appendingPathComponent("\(ownerSessionID.uuidString.lowercased())-original", isDirectory: true)
+        try FileManager.default.moveItem(at: restoredWorkspace, to: displacedWorkspace)
+        try FileManager.default.createSymbolicLink(at: restoredWorkspace, withDestinationURL: outsideBase)
+        do {
+            try await service.removeExecutionWorkspace(projectID: project.projectID, ownerSessionID: ownerSessionID)
+            XCTFail("expected execution workspace entry rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .rootUnauthorized)
+        }
+        XCTAssertEqual(try String(contentsOf: outsideSentinel, encoding: .utf8), "keep")
+        try FileManager.default.removeItem(at: restoredWorkspace)
+        try FileManager.default.moveItem(at: displacedWorkspace, to: restoredWorkspace)
+        try await service.removeExecutionWorkspace(projectID: project.projectID, ownerSessionID: ownerSessionID)
+        try FileManager.default.removeItem(at: root)
+    }
+
+    func testMergeRejectsWhileChildProviderRunIsActiveAndPreservesBinding() async throws {
+        let base = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-child-merge-\(UUID().uuidString)", isDirectory: true)
+        let source = base.appendingPathComponent("source", isDirectory: true)
+        let worktrees = base.appendingPathComponent("worktrees", isDirectory: true)
+        let artifacts = base.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let command = LocalWorkspaceCommandRunner()
+        try "source".write(to: source.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        _ = try await command.run(executable: "/usr/bin/git", arguments: ["init", "-b", "main", source.path], workingDirectory: base.path, maximumBytes: 65536)
+        _ = try await command.run(executable: "/usr/bin/git", arguments: ["-C", source.path, "add", "README.md"], workingDirectory: source.path, maximumBytes: 65536)
+        _ = try await command.run(executable: "/usr/bin/git", arguments: ["-C", source.path, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial"], workingDirectory: source.path, maximumBytes: 65536)
+
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let provider = BlockingWorkspaceProvider()
+        let worktreeService = try WorktreeRuntimeService(baseDirectory: worktrees.path, resources: store)
+        let authority = try RepoPromptHeadlessAuthority(
+            store: store,
+            worktreeService: worktreeService,
+            artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path, resources: store),
+            providerAdapter: provider
+        )
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(
+            input: .init(name: "Merge fence", roots: [.init(logicalName: "source", path: source.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "merge-fence-project",
+            requestDigest: "merge-fence-project"
+        )
+        let rootSession = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "root", startImmediately: false),
+            externalActor: actor,
+            idempotencyKey: "merge-fence-root",
+            requestDigest: "merge-fence-root"
+        )
+        let child = try await authority.spawnChildSession(parentSessionID: rootSession.sessionID, initialPrompt: "child run")
+        _ = try await authority.startChildAgentRun(sessionID: child.sessionID)
+        for _ in 0 ..< 200 {
+            if await provider.hasStarted() { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let childRunStarted = await provider.hasStarted()
+        XCTAssertTrue(childRunStarted)
+        let projectBindings = try await authority.worktreeSnapshots(projectID: project.projectID)
+        let binding = try XCTUnwrap(projectBindings.first { $0.sessionID == rootSession.sessionID })
+        do {
+            _ = try await authority.mergeWorktree(
+                sessionID: rootSession.sessionID,
+                bindingID: binding.bindingID,
+                strategy: "merge",
+                expectedRevision: binding.revision,
+                actor: actor,
+                idempotencyKey: "merge-fence-attempt",
+                requestDigest: "merge-fence-attempt"
+            )
+            XCTFail("expected active child run to fence merge")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .runAlreadyActive)
+        }
+        let preservedBinding = try await store.worktree(bindingID: binding.bindingID)
+        let mergeLeases = try await store.worktreeMergeLeases(nonterminalOnly: false)
+        let childStillRunning = await provider.hasStarted()
+        XCTAssertEqual(preservedBinding, binding)
+        XCTAssertTrue(mergeLeases.isEmpty)
+        XCTAssertTrue(childStillRunning)
+        _ = try await authority.cancelChildAgentRun(sessionID: child.sessionID)
+        await authority.waitForProviderRunsToSettle()
+        try await worktreeService.removeOrphanedExecutionWorkspaces(validOwnerSessionIDs: [])
+        try await store.close()
+        try FileManager.default.removeItem(at: base)
+    }
+
     func testProjectExecutionWorkspaceRoutesEveryWritableRepositoryAcrossRestartAndResume() async throws {
-        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let base = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-multi-root-\(UUID().uuidString)", isDirectory: true)
         let sourceA = base.appendingPathComponent("source-a", isDirectory: true)
         let sourceB = base.appendingPathComponent("source-b", isDirectory: true)
         let worktrees = base.appendingPathComponent("worktrees", isDirectory: true)
         let artifacts = base.appendingPathComponent("artifacts", isDirectory: true)
         let database = base.appendingPathComponent("state.sqlite")
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: base) }
         let command = LocalWorkspaceCommandRunner()
         for (root, content) in [(sourceA, "source checkout A"), (sourceB, "source checkout B")] {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -371,9 +647,10 @@ final class WorkspaceAuthorityTests: XCTestCase {
 
         let provider = MultiRootWorkspaceProvider()
         var store = try await SQLiteServiceStore.open(storage: .file(database.path))
+        var worktreeService = try WorktreeRuntimeService(baseDirectory: worktrees.path, resources: store)
         var authority = try RepoPromptHeadlessAuthority(
             store: store,
-            worktreeService: WorktreeRuntimeService(baseDirectory: worktrees.path, resources: store),
+            worktreeService: worktreeService,
             artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path, resources: store),
             providerAdapter: provider
         )
@@ -444,11 +721,37 @@ final class WorkspaceAuthorityTests: XCTestCase {
         let reusedWorkspaceIdentity = try FileManager.default.attributesOfItem(atPath: firstRequest.workingDirectory)[.systemFileNumber] as? NSNumber
         XCTAssertEqual(reusedWorkspaceIdentity, initialWorkspaceIdentity)
 
+        let currentResources = try await store.ownedResources(states: [.active])
+        let currentWorktreeResources = currentResources.filter { $0.kind == .worktree && bindings.map(\.bindingID).contains($0.externalID) }
+        XCTAssertEqual(currentWorktreeResources.count, 2)
+        XCTAssertTrue(currentWorktreeResources.allSatisfy { $0.contentDigest != nil })
         try await store.close()
+        _ = try await command.run(
+            executable: "/usr/bin/sqlite3",
+            arguments: [database.path, "UPDATE owned_resources SET content_digest=NULL WHERE kind='worktree' AND lifecycle_state='active'"],
+            workingDirectory: base.path,
+            maximumBytes: 65536
+        )
         store = try await SQLiteServiceStore.open(storage: .file(database.path))
+        let legacyResources = try await store.ownedResources(states: [.active]).filter { $0.kind == .worktree }
+        XCTAssertEqual(legacyResources.count, 2)
+        XCTAssertTrue(legacyResources.allSatisfy { $0.contentDigest == nil })
+        let reconciler = try OwnedResourceReconciliationService(
+            repository: store,
+            artifactRoot: artifacts.path,
+            worktreeRoot: worktrees.path,
+            runner: command
+        )
+        let reconciliation = try await reconciler.reconcileStartup()
+        XCTAssertEqual(reconciliation.failed, 0)
+        XCTAssertEqual(reconciliation.quarantined, 0)
+        let backfilledResources = try await store.ownedResources(states: [.active]).filter { $0.kind == .worktree }
+        XCTAssertEqual(backfilledResources.count, 2)
+        XCTAssertTrue(backfilledResources.allSatisfy { $0.contentDigest != nil })
+        worktreeService = try WorktreeRuntimeService(baseDirectory: worktrees.path, resources: store)
         authority = try RepoPromptHeadlessAuthority(
             store: store,
-            worktreeService: WorktreeRuntimeService(baseDirectory: worktrees.path, resources: store),
+            worktreeService: worktreeService,
             artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path, resources: store),
             providerAdapter: provider
         )
@@ -468,9 +771,101 @@ final class WorkspaceAuthorityTests: XCTestCase {
         let recoveredBindings = try await authority.authoritySessionSnapshot(sessionID: session.sessionID).worktrees
         XCTAssertEqual(Set(recoveredBindings.map(\.bindingID)), Set(bindings.map(\.bindingID)))
         let resources = try await store.ownedResources(states: [.active])
-        XCTAssertEqual(resources.filter { $0.kind == .worktree && bindings.map(\.bindingID).contains($0.externalID) }.count, 2)
+        let recoveredResources = resources.filter { $0.kind == .worktree && bindings.map(\.bindingID).contains($0.externalID) }
+        XCTAssertEqual(recoveredResources.count, 2)
+        XCTAssertEqual(Set(recoveredResources.compactMap(\.contentDigest)), Set(backfilledResources.compactMap(\.contentDigest)))
+        _ = try await reconciler.reconcileStartup()
+        let repeatedResources = try await store.ownedResources(states: [.active]).filter { $0.kind == .worktree }
+        XCTAssertEqual(Set(repeatedResources.compactMap(\.contentDigest)), Set(backfilledResources.compactMap(\.contentDigest)))
+        try await worktreeService.removeOrphanedExecutionWorkspaces(validOwnerSessionIDs: [])
         try await store.close()
+        try FileManager.default.removeItem(at: base)
     }
+}
+
+private actor LaunchBoundaryWorkspaceProvider: AgentProviderDispatcher {
+    private var receivedRequest = false
+    private var launched = false
+    private var launchContinuation: CheckedContinuation<Void, Never>?
+
+    func capabilities() -> [ProviderCapability] {
+        [.init(kind: .codex, enabled: true, executable: "/usr/bin/true", supportsResume: false, supportsSteering: false)]
+    }
+
+    func preflight() -> [ProviderCapability] { capabilities() }
+    func recoverProcessFamilies() throws {}
+    func cancel(runID _: UUID) throws {}
+
+    func execute(
+        kind _: ProviderKind,
+        model _: String?,
+        prompt _: String,
+        workingDirectory _: String,
+        maximumBytes _: Int,
+        runID _: UUID?,
+        resumeProviderSessionID _: String?,
+        onProviderSessionIdentity _: @escaping @Sendable (String) async -> Void
+    ) async throws -> ProviderExecutionResult {
+        ProviderExecutionResult(output: "unused", providerSessionID: nil)
+    }
+
+    func executeStreaming(
+        _ request: ProviderExecutionRequest,
+        onEvent _: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
+    ) async throws -> ProviderExecutionResult {
+        receivedRequest = true
+        await withCheckedContinuation { launchContinuation = $0 }
+        try request.validateLaunch()
+        launched = true
+        return ProviderExecutionResult(output: "launched", providerSessionID: nil)
+    }
+
+    func hasReceivedRequest() -> Bool { receivedRequest }
+    func didLaunch() -> Bool { launched }
+
+    func releaseLaunch() {
+        launchContinuation?.resume()
+        launchContinuation = nil
+    }
+}
+
+private actor BlockingWorkspaceProvider: AgentProviderDispatcher {
+    private var started = false
+
+    func capabilities() -> [ProviderCapability] {
+        [.init(kind: .codex, enabled: true, executable: "/usr/bin/true", supportsResume: false, supportsSteering: false)]
+    }
+
+    func preflight() -> [ProviderCapability] { capabilities() }
+    func recoverProcessFamilies() throws {}
+    func cancel(runID _: UUID) throws {}
+
+    func execute(
+        kind _: ProviderKind,
+        model _: String?,
+        prompt _: String,
+        workingDirectory _: String,
+        maximumBytes _: Int,
+        runID _: UUID?,
+        resumeProviderSessionID _: String?,
+        onProviderSessionIdentity _: @escaping @Sendable (String) async -> Void
+    ) async throws -> ProviderExecutionResult {
+        ProviderExecutionResult(output: "unused", providerSessionID: nil)
+    }
+
+    func executeStreaming(
+        _ request: ProviderExecutionRequest,
+        onEvent _: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
+    ) async throws -> ProviderExecutionResult {
+        try request.validateLaunch()
+        started = true
+        while !Task.isCancelled {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        throw CancellationError()
+    }
+
+    func hasStarted() -> Bool { started }
 }
 
 private actor MultiRootWorkspaceProvider: AgentProviderDispatcher {
@@ -506,6 +901,7 @@ private actor MultiRootWorkspaceProvider: AgentProviderDispatcher {
         _ request: ProviderExecutionRequest,
         onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
     ) async throws -> ProviderExecutionResult {
+        try request.validateLaunch()
         captured.append(.init(workingDirectory: request.workingDirectory, writableRoots: request.policy.writableRoots))
         let routes = URL(fileURLWithPath: request.workingDirectory).appendingPathComponent("roots", isDirectory: true)
         let roots = try FileManager.default.contentsOfDirectory(at: routes, includingPropertiesForKeys: nil).sorted { $0.lastPathComponent < $1.lastPathComponent }

@@ -7,12 +7,11 @@ import XCTest
 
 final class MergeRecoveryTests: XCTestCase {
     func testAuthorityRoutesFencedConflictedMergeAbort() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-merge-recovery-\(UUID().uuidString)", isDirectory: true)
         let target = directory.appendingPathComponent("target", isDirectory: true)
         let owned = directory.appendingPathComponent("owned", isDirectory: true)
         try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: owned, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
         addTeardownBlock { try await store.close() }
@@ -20,7 +19,7 @@ final class MergeRecoveryTests: XCTestCase {
         let service = try WorktreeRuntimeService(baseDirectory: owned.path, runner: ConflictingMergeRunner(preMergeHead: "abc123"), resources: store)
         let authority = RepoPromptHeadlessAuthority(store: store, worktreeService: service)
         let project = try await authority.createProject(
-            input: .init(name: "Project", roots: [.init(logicalName: "source", path: target.path, writable: true)]),
+            input: .init(name: "Project", roots: [.init(logicalName: "source", path: target.path, writable: false)]),
             externalActor: actor,
             idempotencyKey: "project",
             requestDigest: "project"
@@ -72,10 +71,12 @@ final class MergeRecoveryTests: XCTestCase {
         XCTAssertEqual(recovered.revision, 2)
         let allLeases = try await store.worktreeMergeLeases(nonterminalOnly: false)
         XCTAssertEqual(allLeases.first?.state, .aborted)
+        try await service.removeOrphanedExecutionWorkspaces(validOwnerSessionIDs: [])
+        try FileManager.default.removeItem(at: directory)
     }
 
     func testMergeConflictLeasePublishesArtifactAndSupportsVerifiedAbortRecovery() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-merge-recovery-\(UUID().uuidString)", isDirectory: true)
         let target = directory.appendingPathComponent("target", isDirectory: true)
         let owned = directory.appendingPathComponent("owned", isDirectory: true)
         try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)

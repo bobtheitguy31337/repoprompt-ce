@@ -10,6 +10,18 @@ public actor RepoPromptHeadlessAuthority {
         var waiters: [UUID: CheckedContinuation<ProjectSourceOperationWireSnapshot, Error>]
     }
 
+    private struct ProviderExecutionLocation: Sendable {
+        let workingDirectory: String
+        let writableRoots: [String]
+        let pinnedPaths: [PinnedFilesystemRoot]
+
+        func validateLaunch() throws {
+            for pinnedPath in pinnedPaths {
+                try pinnedPath.validateReachableIdentity()
+            }
+        }
+    }
+
     private let store: SQLiteServiceStore
     private let clock: any RuntimeClock
     private let ids: any RuntimeIDGenerator
@@ -948,7 +960,12 @@ public actor RepoPromptHeadlessAuthority {
                     let branch = "repoprompt/session-\(sessionPrefix)-\(rootPrefix)"
                     initialWorktrees.append(try await worktreeService.create(project: project, root: root, sessionID: sessionID, baseRef: "HEAD", branch: branch))
                 }
-                _ = try await worktreeService.materializeExecutionWorkspace(project: project, ownerSessionID: sessionID, bindings: initialWorktrees)
+                _ = try await worktreeService.materializeExecutionWorkspace(
+                    project: project,
+                    ownerSessionID: sessionID,
+                    bindings: initialWorktrees,
+                    readOnlyRootIdentities: try await validatedReadOnlyRootIdentities(project: project)
+                )
             } catch {
                 await discardPreparedWorktrees(initialWorktrees, project: project, ownerSessionID: sessionID)
                 throw error
@@ -1017,7 +1034,12 @@ public actor RepoPromptHeadlessAuthority {
             let project = try await projectSnapshot(projectID: snapshot.projectID)
             if !project.roots.isEmpty {
                 let bindings = try await effectiveWorktreeBindings(session: snapshot)
-                _ = try await worktreeService.materializeExecutionWorkspace(project: project, ownerSessionID: snapshot.sessionID, bindings: bindings)
+                _ = try await worktreeService.materializeExecutionWorkspace(
+                    project: project,
+                    ownerSessionID: snapshot.sessionID,
+                    bindings: bindings,
+                    readOnlyRootIdentities: try await validatedReadOnlyRootIdentities(project: project)
+                )
             }
         }
         return snapshot
@@ -1760,8 +1782,25 @@ public actor RepoPromptHeadlessAuthority {
         if let idempotency, let prior: WorktreeBindingSnapshot = try await priorResult(idempotency) { return prior }
         guard let worktreeService else { throw ServiceAPIError(code: .capabilityMissing, message: "Worktree storage is not configured") }
         let session = try await sessionSnapshot(sessionID: sessionID)
-        guard let binding = try await store.worktree(bindingID: bindingID), binding.projectID == session.projectID, binding.sessionID == sessionID else { throw ServiceAPIError(code: .notFound, message: "Worktree binding not found") }
-        guard binding.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Worktree revision is stale", currentRevision: binding.revision) }
+        guard let initialBinding = try await store.worktree(bindingID: bindingID),
+              initialBinding.projectID == session.projectID,
+              initialBinding.sessionID == sessionID
+        else { throw ServiceAPIError(code: .notFound, message: "Worktree binding not found") }
+        guard initialBinding.revision == expectedRevision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Worktree revision is stale", currentRevision: initialBinding.revision)
+        }
+        guard projectRepositoryMutationBarriers.insert(session.projectID).inserted else {
+            throw ServiceAPIError(code: .runAlreadyActive, message: "Project repositories or worktrees are changing")
+        }
+        defer { projectRepositoryMutationBarriers.remove(session.projectID) }
+        try await ensureProjectHasNoActiveProviderRun(projectID: session.projectID)
+        guard let binding = try await store.worktree(bindingID: bindingID),
+              binding.projectID == session.projectID,
+              binding.sessionID == sessionID
+        else { throw ServiceAPIError(code: .notFound, message: "Worktree binding not found") }
+        guard binding.revision == expectedRevision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Worktree revision is stale", currentRevision: binding.revision)
+        }
         let project = try await projectSnapshot(projectID: session.projectID)
         guard let root = project.roots.first(where: { $0.rootID == binding.rootID }) else { throw ServiceAPIError(code: .rootUnauthorized, message: "Unknown project root") }
         let merged = try await worktreeService.merge(binding, targetPath: root.canonicalPath, strategy: strategy)
@@ -2119,7 +2158,12 @@ public actor RepoPromptHeadlessAuthority {
             throw ServiceAPIError(code: .worktreeConflict, message: "A released project worktree must be rebound explicitly")
         }
         guard !missingRoots.isEmpty else {
-            _ = try await worktreeService.materializeExecutionWorkspace(project: project, ownerSessionID: session.rootSessionID, bindings: activeBindings)
+            _ = try await worktreeService.materializeExecutionWorkspace(
+                project: project,
+                ownerSessionID: session.rootSessionID,
+                bindings: activeBindings,
+                readOnlyRootIdentities: try await validatedReadOnlyRootIdentities(project: project)
+            )
             return
         }
         try await ensureProjectHasNoActiveProviderRun(projectID: project.projectID)
@@ -2140,7 +2184,12 @@ public actor RepoPromptHeadlessAuthority {
             }
             try await worktreeService.removeExecutionWorkspace(projectID: project.projectID, ownerSessionID: session.rootSessionID)
             activeBindings.append(contentsOf: prepared)
-            _ = try await worktreeService.materializeExecutionWorkspace(project: project, ownerSessionID: session.rootSessionID, bindings: activeBindings)
+            _ = try await worktreeService.materializeExecutionWorkspace(
+                project: project,
+                ownerSessionID: session.rootSessionID,
+                bindings: activeBindings,
+                readOnlyRootIdentities: try await validatedReadOnlyRootIdentities(project: project)
+            )
             let events = try await store.persistWorktrees(prepared, actor: session.creator, correlationID: ids.next())
             for event in events { await eventHub.publish(event) }
         } catch {
@@ -2320,6 +2369,8 @@ public actor RepoPromptHeadlessAuthority {
         }
         try await ensureExecutionWorkspaceLocked(session: snapshot)
         let executionLocation = try await executionLocation(session: snapshot)
+        let currentProject = try await projectSnapshot(projectID: snapshot.projectID)
+        _ = try await validatedReadOnlyRootIdentities(project: currentProject)
         let binding = try await session.beginRun(connectionGeneration: snapshot.runGeneration + 1)
         let current = await session.snapshot()
         let cursor = try await store.nextCursor()
@@ -2340,8 +2391,7 @@ public actor RepoPromptHeadlessAuthority {
                 binding: binding,
                 run: run,
                 prompt: prompt,
-                workingDirectory: executionLocation.workingDirectory,
-                writableRoots: executionLocation.writableRoots,
+                executionLocation: executionLocation,
                 permissions: permissions
             )
         }
@@ -2450,7 +2500,7 @@ public actor RepoPromptHeadlessAuthority {
         }
     }
 
-    private func performProviderRun(sessionID: UUID, binding: RunBindingIdentity, run: ProviderRunSnapshot, prompt: String, workingDirectory: String, writableRoots: [String], permissions: ExecutionPermissionSnapshot) async {
+    private func performProviderRun(sessionID: UUID, binding: RunBindingIdentity, run: ProviderRunSnapshot, prompt: String, executionLocation: ProviderExecutionLocation, permissions: ExecutionPermissionSnapshot) async {
         guard let providerAdapter, let session = sessions[sessionID] else { return }
         defer { Task { await providerAdapter.forgetRun(runID: binding.runID) } }
         let initial = await session.snapshot()
@@ -2467,11 +2517,12 @@ public actor RepoPromptHeadlessAuthority {
                     kind: initial.provider,
                     model: initial.model,
                     prompt: prompt,
-                    workingDirectory: workingDirectory,
+                    workingDirectory: executionLocation.workingDirectory,
                     maximumBytes: 8_388_608,
                     runID: binding.runID,
                     resumeProviderSessionID: run.providerSessionID,
-                    policy: .init(mode: executionMode, writableRoots: executionMode == .workspaceWrite ? writableRoots : [], providerSettings: permissions.providerSettings)
+                    policy: .init(mode: executionMode, writableRoots: executionMode == .workspaceWrite ? executionLocation.writableRoots : [], providerSettings: permissions.providerSettings),
+                    launchValidation: { try executionLocation.validateLaunch() }
                 )
             ) { event in
                 await eventState.observe(event)
@@ -2607,6 +2658,26 @@ public actor RepoPromptHeadlessAuthority {
         try await store.persistRun(ProviderRunSnapshot(runID: run.runID, sessionID: run.sessionID, provider: run.provider, providerSessionID: run.providerSessionID, state: state, generation: run.generation, turnEpoch: binding.turnEpoch, startReason: run.startReason, endReason: reason, startedAt: run.startedAt, endedAt: clock.now()))
     }
 
+    private func validatedReadOnlyRootIdentities(project: ProjectSnapshot) async throws -> [UUID: String] {
+        let persisted = try await store.projectRootIdentities(projectID: project.projectID)
+        var identities: [UUID: String] = [:]
+        for root in project.roots where !root.writable {
+            guard let identity = persisted[root.rootID],
+                  !identity.isEmpty,
+                  !["pending", "legacy-import", "unavailable"].contains(identity)
+            else {
+                throw ServiceAPIError(code: .rootUnauthorized, message: "Read-only project root identity is unavailable")
+            }
+            try PinnedFilesystemRoot.validateDirectoryChain(at: root.canonicalPath)
+            let canonical = try filesystem.canonicalizeRoot(root.canonicalPath)
+            guard canonical.path == root.canonicalPath, canonical.identity == identity else {
+                throw ServiceAPIError(code: .rootUnauthorized, message: "Read-only project root identity changed")
+            }
+            identities[root.rootID] = identity
+        }
+        return identities
+    }
+
     private func effectiveWorktreeBindings(session: SessionSnapshot) async throws -> [WorktreeBindingSnapshot] {
         let effective = try await store.worktrees(projectID: session.projectID).filter {
             $0.sessionID == session.rootSessionID && $0.ownershipState == .active
@@ -2618,43 +2689,71 @@ public actor RepoPromptHeadlessAuthority {
         return effective
     }
 
-    private func executionLocation(session: SessionSnapshot) async throws -> (workingDirectory: String, writableRoots: [String]) {
+    private func executionLocation(session: SessionSnapshot) async throws -> ProviderExecutionLocation {
         let project = try await projectSnapshot(projectID: session.projectID)
+        _ = try await validatedReadOnlyRootIdentities(project: project)
         if project.roots.isEmpty {
             guard let projectSourceService else {
                 throw ServiceAPIError(code: .capabilityMissing, message: "Empty projects require managed workspace storage")
             }
             let workspace = try await projectSourceService.projectWorkspaceDirectory(projectID: project.projectID)
-            return (workspace, [workspace])
+            return try providerExecutionLocation(workingDirectory: workspace, writableRoots: [workspace], executionRoots: [])
         }
         if let worktreeService {
             let bindings = try await effectiveWorktreeBindings(session: session)
             let workspace = try await worktreeService.materializeExecutionWorkspace(
                 project: project,
                 ownerSessionID: session.rootSessionID,
-                bindings: bindings
+                bindings: bindings,
+                readOnlyRootIdentities: try await validatedReadOnlyRootIdentities(project: project)
             )
-            return (workspace.directory, workspace.writableRoots)
+            return try providerExecutionLocation(
+                workingDirectory: workspace.directory,
+                writableRoots: workspace.writableRoots,
+                executionRoots: workspace.roots.map(\.executionPath)
+            )
         }
         if let projectSourceService {
             let workspace = try await projectSourceService.projectWorkspaceDirectory(projectID: project.projectID)
             let repositories = URL(fileURLWithPath: workspace).appendingPathComponent("repositories").path
             let prefix = repositories.hasSuffix("/") ? repositories : repositories + "/"
             if project.roots.allSatisfy({ $0.canonicalPath.hasPrefix(prefix) }) {
-                return (workspace, project.roots.filter(\.writable).map(\.canonicalPath))
+                return try providerExecutionLocation(
+                    workingDirectory: workspace,
+                    writableRoots: project.roots.filter(\.writable).map(\.canonicalPath),
+                    executionRoots: project.roots.map(\.canonicalPath)
+                )
             }
         }
         guard project.roots.count == 1, let root = project.roots.first else {
             throw ServiceAPIError(code: .capabilityMissing, message: "Multi-root execution requires managed worktree storage")
         }
-        return (root.canonicalPath, root.writable ? [root.canonicalPath] : [])
+        return try providerExecutionLocation(
+            workingDirectory: root.canonicalPath,
+            writableRoots: root.writable ? [root.canonicalPath] : [],
+            executionRoots: [root.canonicalPath]
+        )
+    }
+
+    private func providerExecutionLocation(workingDirectory: String, writableRoots: [String], executionRoots: [String]) throws -> ProviderExecutionLocation {
+        let paths = Array(Set([workingDirectory] + executionRoots)).sorted()
+        return ProviderExecutionLocation(
+            workingDirectory: workingDirectory,
+            writableRoots: writableRoots,
+            pinnedPaths: try paths.map { try PinnedFilesystemRoot.pinExisting(at: $0) }
+        )
     }
 
     private func sessionToolAuthority(session: SessionSnapshot) async throws -> ProjectToolAuthority {
         let snapshot = try await projectSnapshot(projectID: session.projectID)
         let bindings = try await effectiveWorktreeBindings(session: session)
         if let worktreeService, !snapshot.roots.isEmpty {
-            _ = try await worktreeService.materializeExecutionWorkspace(project: snapshot, ownerSessionID: session.rootSessionID, bindings: bindings)
+            _ = try await worktreeService.materializeExecutionWorkspace(
+                project: snapshot,
+                ownerSessionID: session.rootSessionID,
+                bindings: bindings,
+                readOnlyRootIdentities: try await validatedReadOnlyRootIdentities(project: snapshot)
+            )
         }
         let byRoot = Dictionary(uniqueKeysWithValues: bindings.map { ($0.rootID, $0) })
         let persistedIdentities = try await store.projectRootIdentities(projectID: snapshot.projectID)

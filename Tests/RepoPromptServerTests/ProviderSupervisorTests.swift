@@ -230,6 +230,32 @@ final class ProviderSupervisorTests: XCTestCase {
         XCTAssertNil(reaped)
     }
 
+    func testPortableProcessLaunchValidationRejectsBeforeProviderSpawn() async throws {
+        let executable = try XCTUnwrap(["/usr/bin/touch", "/bin/touch"].first { FileManager.default.isExecutableFile(atPath: $0) })
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let marker = directory.appendingPathComponent("provider-started")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let port = try PortableProcessSupervisionPort()
+        do {
+            _ = try await port.launchInteractiveCaptured(
+                executable: executable,
+                arguments: [marker.path],
+                environment: [:],
+                workingDirectory: directory.path,
+                helperToken: UUID().uuidString,
+                outputDirectory: directory.appendingPathComponent("output").path,
+                launchValidation: {
+                    throw ServiceAPIError(code: .rootUnauthorized, message: "launch path changed")
+                }
+            )
+            XCTFail("expected launch validation rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .rootUnauthorized)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
     func testNativeProviderProtocolsReceiveReadOnlyExecutionPolicy() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
