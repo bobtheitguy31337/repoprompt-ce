@@ -12,10 +12,24 @@ enum HTTPResponses {
         return Response(status: status, headers: headers, body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
     }
 
+    static func privateJSON(_ value: some Encodable, status: HTTPResponse.Status = .ok) throws -> Response {
+        var response = try json(value, status: status)
+        response.headers[.cacheControl] = "private, no-store"
+        response.headers[.vary] = "Cookie, Authorization"
+        return response
+    }
+
     static func empty(status: HTTPResponse.Status = .noContent) -> Response {
         var headers = HTTPFields()
         headers[.internalBodyDigest] = CanonicalSigning.bodyDigest(Data())
         return Response(status: status, headers: headers)
+    }
+
+    static func privateEmpty(status: HTTPResponse.Status = .noContent) -> Response {
+        var response = empty(status: status)
+        response.headers[.cacheControl] = "private, no-store"
+        response.headers[.vary] = "Cookie, Authorization"
+        return response
     }
 
     static func bytes(_ data: Data, status: HTTPResponse.Status = .ok, contentType: String) -> Response {
@@ -26,6 +40,13 @@ enum HTTPResponses {
         return Response(status: status, headers: headers, body: .init(byteBuffer: ByteBuffer(bytes: data)))
     }
 
+    static func privateBytes(_ data: Data, status: HTTPResponse.Status = .ok, contentType: String) -> Response {
+        var response = bytes(data, status: status, contentType: contentType)
+        response.headers[.cacheControl] = "private, no-store"
+        response.headers[.vary] = "Cookie, Authorization"
+        return response
+    }
+
     static func error(_ error: Error) -> Response {
         let apiError = error as? ServiceAPIError ?? ServiceAPIError(code: .dependencyUnavailable, message: "Internal dependency failed", retryable: true)
         if apiError.code == .cursorExpired, let cursor = apiError.cursor {
@@ -34,10 +55,10 @@ enum HTTPResponses {
         let status: HTTPResponse.Status = switch apiError.code {
         case .invalidRequest: .badRequest
         case .internalAuthFailed: .unauthorized
-        case .authorizationDecisionRejected: .forbidden
+        case .authorizationDecisionRejected, .resourceOwnerMismatch, .resourceContextMismatch: .forbidden
         case .notFound: .notFound
         case .staleRevision, .controllerChanged, .interactionSettled, .idempotencyConflict, .runAlreadyActive: .conflict
-        case .cursorExpired, .resourceDeleted: .gone
+        case .cursorExpired, .resourceDeleted, .expiredResource: .gone
         case .rateLimited: .tooManyRequests
         case .dependencyUnavailable, .quiescing, .persistenceUnavailable: .serviceUnavailable
         default: .unprocessableContent

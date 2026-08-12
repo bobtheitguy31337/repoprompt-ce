@@ -472,14 +472,14 @@ private actor NativeJSONLineProcess {
     }
 }
 
-private actor CodexAppServerProviderRuntime: AgentProviderRuntime {
+actor CodexAppServerProviderRuntime: AgentProviderRuntime {
     let kind = ProviderKind.codex
     private let support: NativeProviderProcessSupport
     private var sessions: [UUID: NativeJSONLineProcess] = [:]
     private var threadIDs: [UUID: String] = [:]
     private var turnIDs: [UUID: String] = [:]
 
-    init(support: NativeProviderProcessSupport) {
+    fileprivate init(support: NativeProviderProcessSupport) {
         self.support = support
     }
 
@@ -544,7 +544,9 @@ private actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             }
             threadIDs[request.runID] = threadID
             await onEvent(.providerIdentity(threadID))
-            var turnParams: [String: Any] = ["threadId": threadID, "input": [["type": "text", "text": request.prompt]], "cwd": request.workingDirectory, "approvalPolicy": policy.approvalPolicy, "sandboxPolicy": policy.sandboxPolicy]
+            var turnInput: [[String: Any]] = [["type": "text", "text": request.prompt]]
+            turnInput += request.structuredInput?.nativeImages.map { ["type": "localImage", "path": $0.filePath] } ?? []
+            var turnParams: [String: Any] = ["threadId": threadID, "input": turnInput, "cwd": request.workingDirectory, "approvalPolicy": policy.approvalPolicy, "sandboxPolicy": policy.sandboxPolicy]
             if let model = request.model { turnParams["model"] = model }
             if let effort = request.policy.providerSettings["provider.reasoningEffort"] { turnParams["effort"] = effort }
             if let tier = request.policy.providerSettings["provider.serviceTier"] { turnParams["serviceTier"] = tier }
@@ -649,7 +651,7 @@ private actor CodexAppServerProviderRuntime: AgentProviderRuntime {
         }
     }
 
-    private nonisolated static func normalize(_ data: Data) throws -> (events: [ProviderRuntimeEvent], completed: Bool) {
+    nonisolated static func normalize(_ data: Data) throws -> (events: [ProviderRuntimeEvent], completed: Bool) {
         guard let frame = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return ([], false) }
         let method = frame["method"] as? String ?? ""
         let params = frame["params"] as? [String: Any] ?? [:]
@@ -665,7 +667,7 @@ private actor CodexAppServerProviderRuntime: AgentProviderRuntime {
         case "item/reasoning/summaryTextDelta", "item/reasoning/textDelta":
             return ([.reasoning(string(in: params, paths: [["delta"], ["text"]]) ?? "")], false)
         case "turn/started", "codex/event/turn_started":
-            return ([.progress("turn started")], false)
+            return ([.runStatusChanged(phase: .thinking, statusCode: "turn_started", statusText: nil)], false)
         case "item/started":
             let item = params["item"] as? [String: Any] ?? params
             let id = item["id"] as? String ?? UUID().uuidString
@@ -987,7 +989,13 @@ private actor ClaudeNativeProviderRuntime: AgentProviderRuntime {
         sessions[request.runID] = process
         defer { sessions[request.runID] = nil }
         do {
-            try await process.sendRaw(JSONSerialization.data(withJSONObject: ["type": "user", "message": ["role": "user", "content": [["type": "text", "text": request.prompt]]], "parent_tool_use_id": NSNull()]))
+            var content: [[String: Any]] = [["type": "text", "text": request.prompt]]
+            for image in request.structuredInput?.nativeImages ?? [] {
+                let bytes = try Data(contentsOf: URL(fileURLWithPath: image.filePath), options: [.mappedIfSafe])
+                guard bytes.count == image.byteSize, CanonicalSigning.bodyDigest(bytes) == image.digest else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Accepted image changed before provider dispatch") }
+                content.append(["type": "image", "source": ["type": "base64", "media_type": image.mediaType, "data": bytes.base64EncodedString()]])
+            }
+            try await process.sendRaw(JSONSerialization.data(withJSONObject: ["type": "user", "message": ["role": "user", "content": content], "parent_tool_use_id": NSNull()]))
             var output = ""
             var identity = request.resumeProviderSessionID
             while true {

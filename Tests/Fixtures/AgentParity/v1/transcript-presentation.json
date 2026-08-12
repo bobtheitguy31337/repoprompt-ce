@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "suppressExactLegacyProgress": ["turn started", "Turn started."],
+  "retainMeaningfulProgress": ["Indexed 4 files", "Waiting for approval"],
+  "blockOrder": ["request", "activityCluster", "standaloneAssistant", "conclusion"],
+  "legacyRowsAreStandalone": true
+}

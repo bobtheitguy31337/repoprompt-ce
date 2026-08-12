@@ -228,37 +228,52 @@ public actor SQLiteServiceStore {
         initialWorktrees: [WorktreeBindingSnapshot] = []
     ) async throws -> (session: EventEnvelope, agent: EventEnvelope, worktrees: [EventEnvelope]) {
         try await transaction {
-            let sessionEvent = try await persistSessionInTransaction(snapshot, eventType: .sessionCreated, actor: actor, correlationID: correlationID, idempotency: idempotency, idempotencyResponse: nil, initialSelection: initialSelection)
-            try await upsertPermissions(initialPermissions)
-            try await upsertCollaboration(initialCollaboration)
-            let agentEvent = try await persistAgentInTransaction(agent, projectID: snapshot.projectID, actor: snapshot.parentSessionID == nil ? actor : nil, correlationID: agentCorrelationID, eventType: .agentStarted)
-            var worktreeEvents: [EventEnvelope] = []
-            for worktree in initialWorktrees {
-                guard worktree.projectID == snapshot.projectID, worktree.sessionID == snapshot.sessionID else {
-                    throw ServiceAPIError(code: .worktreeConflict, message: "Initial worktree does not belong to the new session")
-                }
-                try await ensureUniqueActiveWorktree(worktree)
-                _ = try await connection.query(
-                    "INSERT INTO worktree_bindings(binding_id,project_id,root_id,session_id,schema_version,base_ref,branch,physical_path,ownership_state,merge_state,revision) VALUES(?,?,?,?,1,?,?,?,?,?,?)",
-                    [.text(worktree.bindingID.uuidString), .text(worktree.projectID.uuidString), .text(worktree.rootID.uuidString), .text(snapshot.sessionID.uuidString), .text(worktree.baseRef), .text(worktree.branch), .text(worktree.physicalPath), .text(worktree.ownershipState.rawValue), .text(worktree.mergeState.rawValue), .integer(Int(worktree.revision))]
-                )
-                try await activatePreparedOwnedResourceIfPresent(externalID: worktree.bindingID, kind: .worktree, path: worktree.physicalPath)
-                try await worktreeEvents.append(appendEvent(
-                    projectID: snapshot.projectID,
-                    sessionID: snapshot.sessionID,
-                    rootSessionID: snapshot.rootSessionID,
-                    runID: nil,
-                    sessionSequence: nil,
-                    type: .worktreeCreated,
-                    generation: snapshot.runGeneration,
-                    turnEpoch: snapshot.turnEpoch,
-                    actor: actor,
-                    correlationID: correlationID,
-                    payload: encoder.encode(worktree)
-                ))
-            }
-            return (sessionEvent, agentEvent, worktreeEvents)
+            try await persistNewSessionInTransaction(snapshot, agent: agent, actor: actor, correlationID: correlationID, agentCorrelationID: agentCorrelationID, idempotency: idempotency, initialSelection: initialSelection, initialPermissions: initialPermissions, initialCollaboration: initialCollaboration, initialWorktrees: initialWorktrees)
         }
+    }
+
+    func persistNewSessionInTransaction(
+        _ snapshot: SessionSnapshot,
+        agent: AgentSnapshot,
+        actor: ExternalActor,
+        correlationID: UUID,
+        agentCorrelationID: UUID,
+        idempotency: IdempotencyInput?,
+        initialSelection: SelectionSnapshot,
+        initialPermissions: ExecutionPermissionSnapshot,
+        initialCollaboration: CollaborationMetadataSnapshot,
+        initialWorktrees: [WorktreeBindingSnapshot]
+    ) async throws -> (session: EventEnvelope, agent: EventEnvelope, worktrees: [EventEnvelope]) {
+        let sessionEvent = try await persistSessionInTransaction(snapshot, eventType: .sessionCreated, actor: actor, correlationID: correlationID, idempotency: idempotency, idempotencyResponse: nil, initialSelection: initialSelection)
+        try await upsertPermissions(initialPermissions)
+        try await upsertCollaboration(initialCollaboration)
+        let agentEvent = try await persistAgentInTransaction(agent, projectID: snapshot.projectID, actor: snapshot.parentSessionID == nil ? actor : nil, correlationID: agentCorrelationID, eventType: .agentStarted)
+        var worktreeEvents: [EventEnvelope] = []
+        for worktree in initialWorktrees {
+            guard worktree.projectID == snapshot.projectID, worktree.sessionID == snapshot.sessionID else {
+                throw ServiceAPIError(code: .worktreeConflict, message: "Initial worktree does not belong to the new session")
+            }
+            try await ensureUniqueActiveWorktree(worktree)
+            _ = try await connection.query(
+                "INSERT INTO worktree_bindings(binding_id,project_id,root_id,session_id,schema_version,base_ref,branch,physical_path,ownership_state,merge_state,revision) VALUES(?,?,?,?,1,?,?,?,?,?,?)",
+                [.text(worktree.bindingID.uuidString), .text(worktree.projectID.uuidString), .text(worktree.rootID.uuidString), .text(snapshot.sessionID.uuidString), .text(worktree.baseRef), .text(worktree.branch), .text(worktree.physicalPath), .text(worktree.ownershipState.rawValue), .text(worktree.mergeState.rawValue), .integer(Int(worktree.revision))]
+            )
+            try await activatePreparedOwnedResourceIfPresent(externalID: worktree.bindingID, kind: .worktree, path: worktree.physicalPath)
+            try await worktreeEvents.append(appendEvent(
+                projectID: snapshot.projectID,
+                sessionID: snapshot.sessionID,
+                rootSessionID: snapshot.rootSessionID,
+                runID: nil,
+                sessionSequence: nil,
+                type: .worktreeCreated,
+                generation: snapshot.runGeneration,
+                turnEpoch: snapshot.turnEpoch,
+                actor: actor,
+                correlationID: correlationID,
+                payload: encoder.encode(worktree)
+            ))
+        }
+        return (sessionEvent, agentEvent, worktreeEvents)
     }
 
     public func persistImportedProject(_ snapshot: ProjectSnapshot, sourceDigest: String, actor: ExternalActor) async throws -> Bool {
@@ -1164,7 +1179,7 @@ public actor SQLiteServiceStore {
         _ = try await connection.query("INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,1,?,?,CURRENT_TIMESTAMP)", [.text(UUID().uuidString), .text(kind), .text(digest)])
     }
 
-    private func persistSessionInTransaction(
+    func persistSessionInTransaction(
         _ snapshot: SessionSnapshot,
         eventType: EventType,
         actor: ExternalActor?,
@@ -1682,12 +1697,19 @@ public actor SQLiteServiceStore {
         }
         let v6 = try await connection.query("SELECT digest FROM schema_migrations WHERE version=6").first
         if let v6 {
-            guard v6.column("digest")?.string == SchemaV6.digest else {
-                throw ServiceAPIError(code: .persistenceUnavailable, message: "Schema v6 migration digest mismatch", retryable: false)
+            let observedDigest = v6.column("digest")?.string
+            if observedDigest != SchemaV6.digest {
+                guard let observedDigest, SchemaV6.compatiblePriorDigests.contains(observedDigest) else {
+                    throw ServiceAPIError(code: .persistenceUnavailable, message: "Schema v6 migration digest mismatch", retryable: false)
+                }
+                _ = try await connection.query(
+                    "UPDATE schema_migrations SET description='typed revisioned server settings plus agent composer transactional acceptance and semantic presentation',digest=?,applied_at=CURRENT_TIMESTAMP WHERE version=6",
+                    [.text(SchemaV6.digest)]
+                )
             }
         } else {
             _ = try await connection.query("UPDATE service_metadata SET schema_version=6 WHERE fixed_id=1")
-            _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v6',6,'typed revisioned server settings and digest-only audit',?,CURRENT_TIMESTAMP)", [.text(SchemaV6.digest)])
+            _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v6',6,'typed revisioned server settings plus agent composer transactional acceptance and semantic presentation',?,CURRENT_TIMESTAMP)", [.text(SchemaV6.digest)])
         }
     }
 

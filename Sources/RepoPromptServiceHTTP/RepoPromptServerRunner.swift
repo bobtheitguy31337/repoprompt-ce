@@ -444,6 +444,37 @@ public enum RepoPromptServerRunner {
             directProviderDefaults: portalDesktopSettings
         )
         try await authority.recover()
+        let composerWorkflows = try await authority.workflowSnapshots().filter(\.enabled).map {
+            AgentComposerWorkflowDescriptor(id: $0.workflowID, displayName: $0.name, description: $0.source, guidance: String($0.definition.prefix(16_384)))
+        }
+        let composerSuggestions: [ComposerSuggestionDescriptor] = [
+            .init(kind: .nativeCommand, id: "compact", insertionText: "/compact", displayName: "Compact context", detailText: "Ask Codex to compact the current context.", providerIDs: [.codex], expansion: "/compact")
+        ]
+        let composerCatalog = AgentComposerCatalogService(
+            providerSettings: providerSettings,
+            store: store,
+            workflows: composerWorkflows,
+            suggestions: composerSuggestions,
+            emptyState: .init(featuredWorkflowIDs: Array(composerWorkflows.prefix(4).map(\.id)), tips: ["Tag a file to add its current contents to only this turn.", "Choose a concrete model before sending.", "Use Shift+Return to add a new line."])
+        )
+        let composerAttachments = try AgentComposerAttachmentStore(
+            store: store,
+            configuration: .init(acceptedRoot: URL(fileURLWithPath: stateDirectory, isDirectory: true).appendingPathComponent("agent-attachments/accepted", isDirectory: true).path)
+        )
+        try await composerAttachments.recover()
+        let turnCompiler = AgentTurnIntentCompiler(taggedFiles: AuthorityAgentTurnTaggedFileResolver(authority: authority), suggestions: StaticAgentTurnSuggestionResolver(descriptors: composerSuggestions))
+        let submissionCoordinator = AgentSubmissionCoordinator(store: store, catalog: composerCatalog, compiler: turnCompiler, attachments: composerAttachments)
+        let transcriptPresentation = AgentTranscriptPresentationService(store: store)
+        for pending in try await submissionCoordinator.recover() {
+            do {
+                let accepted = try await submissionCoordinator.acceptedForRecovery(pending)
+                let actor = ExternalActor(goblinUserID: pending.actorID, username: "recovered-submission", displayName: "Recovered submission")
+                try await authority.dispatchAcceptedFollowup(accepted, actor: actor, requestDigest: pending.requestDigest)
+                try await submissionCoordinator.markDispatched(submissionID: pending.submissionID)
+            } catch {
+                try? await submissionCoordinator.markLaunchFailed(submissionID: pending.submissionID, message: "Accepted provider dispatch recovery failed")
+            }
+        }
 
         let drainController = MutationDrainController()
         let authenticator = InternalRequestAuthenticator(keys: configuration.signingKeys, store: store)
@@ -477,6 +508,10 @@ public enum RepoPromptServerRunner {
             durabilityOperations: durabilityOperations,
             providerSettings: providerSettings,
             serverSettings: serverSettings,
+            composerCatalog: composerCatalog,
+            composerAttachments: composerAttachments,
+            submissionCoordinator: submissionCoordinator,
+            transcriptPresentation: transcriptPresentation,
             portalDesktopSettings: portalDesktopSettings
         )
         let internalApplication = try Application(

@@ -265,17 +265,40 @@ public struct ProviderCatalogItem: Codable, Hashable, Sendable {
 public struct ModelCatalogItem: Codable, Hashable, Sendable {
     public let id: String
     public let provider: ProviderKind
+    public let providerID: ProviderSettingsID?
     public let displayName: String
     public let enabled: Bool
+    public let description: String?
+    public let supportedEffortIDs: [String]?
+    public let defaultEffortID: String?
 
-    public init(id: String, provider: ProviderKind, displayName: String, enabled: Bool) {
+    public init(
+        id: String,
+        provider: ProviderKind,
+        providerID: ProviderSettingsID? = nil,
+        displayName: String,
+        enabled: Bool,
+        description: String? = nil,
+        supportedEffortIDs: [String]? = nil,
+        defaultEffortID: String? = nil
+    ) {
         self.id = id
         self.provider = provider
+        self.providerID = providerID
         self.displayName = displayName
         self.enabled = enabled
+        self.description = description
+        self.supportedEffortIDs = supportedEffortIDs
+        self.defaultEffortID = defaultEffortID
     }
 
-    private enum CodingKeys: String, CodingKey { case id, provider, displayName, enabled }
+    private enum CodingKeys: String, CodingKey {
+        case id, provider
+        case providerID = "providerId"
+        case displayName, enabled, description
+        case supportedEffortIDs = "supportedEffortIds"
+        case defaultEffortID = "defaultEffortId"
+    }
 }
 
 public struct ExecutionModeCatalogItem: Codable, Hashable, Sendable {

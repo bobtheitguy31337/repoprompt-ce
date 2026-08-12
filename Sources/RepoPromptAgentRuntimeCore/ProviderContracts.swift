@@ -59,6 +59,7 @@ public enum ProviderRuntimeEvent: Sendable, Equatable {
     case assistantFinal(String)
     case reasoning(String)
     case progress(String)
+    case runStatusChanged(phase: RunPresentationPhase, statusCode: String?, statusText: String?)
     case toolStarted(providerToolID: String, name: String, arguments: Data?)
     case toolUpdated(providerToolID: String, output: String)
     case toolCompleted(providerToolID: String, name: String, output: String?, failed: Bool)
@@ -117,10 +118,40 @@ public struct EmptyProviderProcessEnvironment: ProviderProcessEnvironmentProvidi
     }
 }
 
+public struct ProviderNativeImageDescriptor: Codable, Hashable, Sendable {
+    public let attachmentID: UUID
+    public let mediaType: String
+    public let byteSize: Int
+    public let digest: String
+    /// Service-owned accepted path. This type never crosses the browser wire.
+    public let filePath: String
+
+    public init(attachmentID: UUID, mediaType: String, byteSize: Int, digest: String, filePath: String) {
+        self.attachmentID = attachmentID
+        self.mediaType = mediaType
+        self.byteSize = byteSize
+        self.digest = digest
+        self.filePath = filePath
+    }
+}
+
+public struct CompiledProviderTurnInput: Codable, Hashable, Sendable {
+    public let prompt: String
+    public let nativeImages: [ProviderNativeImageDescriptor]
+    public let identity: CanonicalTurnIdentity
+
+    public init(prompt: String, nativeImages: [ProviderNativeImageDescriptor] = [], identity: CanonicalTurnIdentity) {
+        self.prompt = prompt
+        self.nativeImages = nativeImages
+        self.identity = identity
+    }
+}
+
 public struct ProviderExecutionRequest: Sendable {
     public let kind: ProviderKind
     public let model: String?
     public let prompt: String
+    public let structuredInput: CompiledProviderTurnInput?
     public let workingDirectory: String
     public let maximumBytes: Int
     public let runID: UUID
@@ -128,10 +159,11 @@ public struct ProviderExecutionRequest: Sendable {
     public let policy: ProviderExecutionPolicy
     private let launchValidation: @Sendable () throws -> Void
 
-    public init(kind: ProviderKind, model: String?, prompt: String, workingDirectory: String, maximumBytes: Int = 8_388_608, runID: UUID, resumeProviderSessionID: String? = nil, policy: ProviderExecutionPolicy = .init(), launchValidation: @escaping @Sendable () throws -> Void = {}) {
+    public init(kind: ProviderKind, model: String?, prompt: String, structuredInput: CompiledProviderTurnInput? = nil, workingDirectory: String, maximumBytes: Int = 8_388_608, runID: UUID, resumeProviderSessionID: String? = nil, policy: ProviderExecutionPolicy = .init(), launchValidation: @escaping @Sendable () throws -> Void = {}) {
         self.kind = kind
         self.model = model
-        self.prompt = prompt
+        self.prompt = structuredInput?.prompt ?? prompt
+        self.structuredInput = structuredInput
         self.workingDirectory = workingDirectory
         self.maximumBytes = maximumBytes
         self.runID = runID
@@ -154,6 +186,7 @@ public struct ProviderExecutionRequest: Sendable {
             kind: kind,
             model: model ?? defaults.model,
             prompt: prompt,
+            structuredInput: structuredInput,
             workingDirectory: workingDirectory,
             maximumBytes: maximumBytes,
             runID: runID,

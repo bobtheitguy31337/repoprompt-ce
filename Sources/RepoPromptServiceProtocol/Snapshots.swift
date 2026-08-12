@@ -222,8 +222,11 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
     public let transcript: [TranscriptEntry]
     public let interactions: [InteractionSnapshot]
     public let cursor: ServiceCursor
+    public let effectiveTurnConfiguration: EffectiveTurnConfigurationWireSnapshot?
+    public let nextTurnDefaults: SessionNextTurnDefaultsWireSnapshot?
+    public let runPresentation: RunPresentationWireSnapshot?
 
-    public init(sessionID: UUID, projectID: UUID, parentSessionID: UUID?, rootSessionID: UUID, creator: ExternalActor, provider: ProviderKind, providerSettingsID: ProviderSettingsID? = nil, model: String?, visibility: Visibility, state: SessionLifecycleState, runGeneration: Int64, turnEpoch: Int64, revision: Int64, transcript: [TranscriptEntry], interactions: [InteractionSnapshot], cursor: ServiceCursor) {
+    public init(sessionID: UUID, projectID: UUID, parentSessionID: UUID?, rootSessionID: UUID, creator: ExternalActor, provider: ProviderKind, providerSettingsID: ProviderSettingsID? = nil, model: String?, visibility: Visibility, state: SessionLifecycleState, runGeneration: Int64, turnEpoch: Int64, revision: Int64, transcript: [TranscriptEntry], interactions: [InteractionSnapshot], cursor: ServiceCursor, effectiveTurnConfiguration: EffectiveTurnConfigurationWireSnapshot? = nil, nextTurnDefaults: SessionNextTurnDefaultsWireSnapshot? = nil, runPresentation: RunPresentationWireSnapshot? = nil) {
         schemaVersion = 1
         self.sessionID = sessionID
         self.projectID = projectID
@@ -241,6 +244,9 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
         self.transcript = transcript
         self.interactions = interactions
         self.cursor = cursor
+        self.effectiveTurnConfiguration = effectiveTurnConfiguration
+        self.nextTurnDefaults = nextTurnDefaults
+        self.runPresentation = runPresentation
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -261,6 +267,9 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
         case transcript
         case interactions
         case cursor
+        case effectiveTurnConfiguration
+        case nextTurnDefaults
+        case runPresentation
     }
 }
 

@@ -202,7 +202,7 @@ private func makeServerPackage() -> Package {
                 swiftSettings: swift6LanguageMode
             ),
             .target(name: "RepoPromptWorkspaceRuntimeCore", dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptCodeMapCore", "RepoPromptC"], path: "Sources/RepoPromptWorkspaceRuntimeCore", resources: [.copy("Resources")], swiftSettings: swift6LanguageMode),
-            .target(name: "RepoPromptServicePersistence", dependencies: ["RepoPromptServiceProtocol", .product(name: "Crypto", package: "swift-crypto"), .product(name: "SQLiteNIO", package: "sqlite-nio")], path: "Sources/RepoPromptServicePersistence", swiftSettings: swift6LanguageMode),
+            .target(name: "RepoPromptServicePersistence", dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", .product(name: "Crypto", package: "swift-crypto"), .product(name: "SQLiteNIO", package: "sqlite-nio")], path: "Sources/RepoPromptServicePersistence", swiftSettings: swift6LanguageMode),
             .target(name: "RepoPromptHeadlessRuntime", dependencies: ["RepoPromptServiceProtocol", "RepoPromptServicePersistence", "RepoPromptAgentRuntimeCore", "RepoPromptWorkspaceRuntimeCore", "RepoPromptDomainRuntime", "RepoPromptLinuxSupport", "RepoPromptC", .product(name: "NIOCore", package: "swift-nio"), .product(name: "NIOPosix", package: "swift-nio"), .product(name: "NIOHTTP1", package: "swift-nio"), .product(name: "NIOSSL", package: "swift-nio-ssl")], path: "Sources/RepoPromptHeadlessRuntime", swiftSettings: swift6LanguageMode),
             .target(name: "RepoPromptServiceHTTP", dependencies: ["RepoPromptServiceProtocol", "RepoPromptServicePersistence", "RepoPromptHeadlessRuntime", "RepoPromptAgentRuntimeCore", "RepoPromptDomainRuntime", .product(name: "Crypto", package: "swift-crypto"), .product(name: "Hummingbird", package: "hummingbird"), .product(name: "HummingbirdTLS", package: "hummingbird"), .product(name: "NIOSSL", package: "swift-nio-ssl"), .product(name: "X509", package: "swift-certificates")], path: "Sources/RepoPromptServiceHTTP", resources: [.process("Resources")], swiftSettings: swift6LanguageMode),
             .target(name: "RepoPromptMCPAdapter", dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptHeadlessRuntime", "RepoPromptDomainRuntime", .product(name: "MCP", package: "swift-sdk")], path: "Sources/RepoPromptMCPAdapter", swiftSettings: swift6LanguageMode),
@@ -333,6 +333,7 @@ private func makeServerPackage() -> Package {
                     name: "RepoPromptServicePersistence",
                     dependencies: [
                         "RepoPromptServiceProtocol",
+                        "RepoPromptAgentRuntimeCore",
                         .product(name: "Crypto", package: "swift-crypto"),
                         .product(name: "SQLiteNIO", package: "sqlite-nio")
                     ],

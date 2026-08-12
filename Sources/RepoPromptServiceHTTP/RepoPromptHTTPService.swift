@@ -23,6 +23,10 @@ public struct RepoPromptHTTPService: Sendable {
     private let durabilityOperations: DurabilityOperationsService?
     private let providerSettings: ProviderSettingsService?
     private let serverSettings: ServerSettingsService?
+    private let composerCatalog: AgentComposerCatalogService?
+    private let composerAttachments: AgentComposerAttachmentStore?
+    private let submissionCoordinator: AgentSubmissionCoordinator?
+    private let transcriptPresentation: AgentTranscriptPresentationService?
     private let portalDesktopSettings: PortalDesktopSettingsService
 
     public init(
@@ -36,6 +40,10 @@ public struct RepoPromptHTTPService: Sendable {
         durabilityOperations: DurabilityOperationsService? = nil,
         providerSettings: ProviderSettingsService? = nil,
         serverSettings: ServerSettingsService? = nil,
+        composerCatalog: AgentComposerCatalogService? = nil,
+        composerAttachments: AgentComposerAttachmentStore? = nil,
+        submissionCoordinator: AgentSubmissionCoordinator? = nil,
+        transcriptPresentation: AgentTranscriptPresentationService? = nil,
         portalDesktopSettings: PortalDesktopSettingsService? = nil
     ) {
         self.authority = authority
@@ -47,6 +55,10 @@ public struct RepoPromptHTTPService: Sendable {
         self.durabilityOperations = durabilityOperations
         self.providerSettings = providerSettings
         self.serverSettings = serverSettings
+        self.composerCatalog = composerCatalog
+        self.composerAttachments = composerAttachments
+        self.submissionCoordinator = submissionCoordinator
+        self.transcriptPresentation = transcriptPresentation
         self.portalDesktopSettings = portalDesktopSettings ?? PortalDesktopSettingsService(store: store)
         self.readiness = readiness ?? RepoPromptReadinessService(
             authority: authority,
@@ -580,18 +592,56 @@ public struct RepoPromptHTTPService: Sendable {
         } }
         router.get("/internal/v1/capabilities") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp, .goblinSync], operation: "capabilities")
             let meta = try await store.metadata()
+            let models = try await composerCatalog?.compatibilityModels() ?? []
             return try await HTTPResponses.json(ServiceCapabilitiesResponse(
                 protocolRange: .init(minimum: 1, maximum: 1),
                 schemaVersion: meta.schemaVersion,
                 storeID: meta.storeID,
                 replayFloor: meta.replayFloor,
                 providers: providerCatalog(),
-                models: [],
+                models: models,
                 workflows: authority.workflowSnapshots(),
                 executionModes: executionModeCatalog(),
                 eventTypes: EventType.allCases,
                 projectSources: authority.projectSourceCapabilities()
             ))
+        } }
+        router.get("/internal/v1/catalog/composer") { request, context in await respond(request) {
+            let projectID = request.uri.queryParameters["projectId"].flatMap { UUID(uuidString: String($0)) }
+            let sessionID = request.uri.queryParameters["sessionId"].flatMap { UUID(uuidString: String($0)) }
+            guard (projectID != nil) != (sessionID != nil) else { throw ServiceAPIError(code: .invalidRequest, message: "Exactly one projectId or sessionId is required") }
+            if let projectID {
+                let auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getComposerCatalog", projectID: projectID)
+                _ = try await authority.projectSnapshot(projectID: projectID)
+                let actor = try requireActor(auth)
+                return try await HTTPResponses.privateJSON(requireComposerCatalog().snapshot(context: .init(kind: .project, projectID: projectID, actorID: actor.goblinUserID)))
+            }
+            let resolvedSessionID = sessionID!
+            let auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getComposerCatalog", sessionID: resolvedSessionID)
+            let actor = try requireActor(auth)
+            let snapshot = try await authority.authoritySessionSnapshot(sessionID: resolvedSessionID)
+            let active = snapshot.activeRun.map { $0.endedAt == nil && $0.state == "running" } ?? false
+            return try await HTTPResponses.privateJSON(requireComposerCatalog().snapshot(context: .init(kind: .session, projectID: snapshot.session.projectID, sessionID: resolvedSessionID, actorID: actor.goblinUserID, activeRun: active)))
+        } }
+        router.get("/internal/v1/catalog/composer-suggestions") { request, context in await respond(request) {
+            let projectID = request.uri.queryParameters["projectId"].flatMap { UUID(uuidString: String($0)) }
+            let sessionID = request.uri.queryParameters["sessionId"].flatMap { UUID(uuidString: String($0)) }
+            guard (projectID != nil) != (sessionID != nil) else { throw ServiceAPIError(code: .invalidRequest, message: "Exactly one projectId or sessionId is required") }
+            let query = String(request.uri.queryParameters["query"] ?? "")
+            let kinds = Set(String(request.uri.queryParameters["kinds"] ?? "nativeCommand,skill,file").split(separator: ",").compactMap { ComposerSuggestionWire.Kind(rawValue: String($0)) })
+            guard !kinds.isEmpty, kinds.count <= 3 else { throw ServiceAPIError(code: .invalidRequest, message: "Suggestion kinds are invalid") }
+            if let projectID {
+                let auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getComposerSuggestions", projectID: projectID)
+                _ = try await authority.projectSnapshot(projectID: projectID)
+                let actor = try requireActor(auth)
+                return try await HTTPResponses.privateJSON(requireComposerCatalog().suggestions(context: .init(kind: .project, projectID: projectID, actorID: actor.goblinUserID), query: query, kinds: kinds))
+            }
+            let resolvedSessionID = sessionID!
+            let auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getComposerSuggestions", sessionID: resolvedSessionID)
+            let actor = try requireActor(auth)
+            let snapshot = try await authority.authoritySessionSnapshot(sessionID: resolvedSessionID)
+            let active = snapshot.activeRun.map { $0.endedAt == nil && $0.state == "running" } ?? false
+            return try await HTTPResponses.privateJSON(requireComposerCatalog().suggestions(context: .init(kind: .session, projectID: snapshot.session.projectID, sessionID: resolvedSessionID, actorID: actor.goblinUserID, activeRun: active), query: query, kinds: kinds))
         } }
         router.get("/internal/v1/diagnostics") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.operatorRole], operation: "diagnostics")
             let meta = try await store.metadata()
@@ -698,6 +748,49 @@ public struct RepoPromptHTTPService: Sendable {
             try await authority.removeProject(projectID: id, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data))
             return HTTPResponses.empty()
         } }
+        router.post("/internal/v1/projects/:id/composer-attachments") { request, context in await respond(request) {
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request, maximumBytes: 10 * 1_024 * 1_024 + 64 * 1_024)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "createComposerAttachment", projectID: projectID)
+            let actor = try requireActor(auth)
+            let upload = try composerAttachmentUpload(data: data, contentType: request.headers[.contentType], fallbackDisplayName: String(request.uri.queryParameters["displayName"] ?? "image"))
+            guard upload.displayName.utf8.count <= 256 else { throw ServiceAPIError(code: .invalidRequest, message: "Attachment display name exceeds its bound") }
+            let attachment = try await requireComposerAttachments().stage(data: upload.data, displayName: upload.displayName, declaredMediaType: upload.mediaType, actorID: actor.goblinUserID, projectID: projectID)
+            return try HTTPResponses.privateJSON(attachment, status: .created)
+        } }
+        router.post("/internal/v1/projects/:id/composer-attachments/resolve") { request, context in await respond(request) {
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "resolveComposerAttachments", projectID: projectID)
+            let input = try JSONDecoder.serviceDecoder.decode(ComposerAttachmentResolveRequest.self, from: data)
+            let actor = try requireActor(auth)
+            return try await HTTPResponses.privateJSON(requireComposerAttachments().resolve(attachmentIDs: input.attachmentIDs, actorID: actor.goblinUserID, projectID: projectID))
+        } }
+        router.get("/internal/v1/projects/:id/composer-attachments/:attachmentId/preview") { request, context in await respond(request) {
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let attachmentID = try context.parameters.require("attachmentId", as: UUID.self)
+            let visibleSessionID = request.uri.queryParameters["sessionId"].flatMap { UUID(uuidString: String($0)) }
+            let auth: AuthenticatedInternalRequest
+            if let visibleSessionID {
+                let session = try await authority.sessionSnapshot(sessionID: visibleSessionID)
+                guard session.projectID == projectID else { throw ServiceAPIError(code: .notFound, message: "Attachment is unavailable") }
+                auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "previewComposerAttachment", sessionID: visibleSessionID)
+            } else {
+                auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "previewComposerAttachment", projectID: projectID)
+            }
+            let actor = try requireActor(auth)
+            let preview = try await requireComposerAttachments().preview(attachmentID: attachmentID, actorID: actor.goblinUserID, projectID: projectID, visibleSessionID: visibleSessionID)
+            return HTTPResponses.privateBytes(preview.1, contentType: preview.0.mediaType)
+        } }
+        router.delete("/internal/v1/projects/:id/composer-attachments/:attachmentId") { request, context in await respond(request) {
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let attachmentID = try context.parameters.require("attachmentId", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "deleteComposerAttachment", projectID: projectID)
+            let actor = try requireActor(auth)
+                try await requireComposerAttachments().delete(attachmentID: attachmentID, actorID: actor.goblinUserID, projectID: projectID)
+                return HTTPResponses.privateEmpty()
+        } }
         router.get("/internal/v1/projects/:id/snapshot") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getProject", projectID: id)
             return try await HTTPResponses.json(ProjectWireSnapshot(authority.projectSnapshot(projectID: id)))
@@ -772,20 +865,71 @@ public struct RepoPromptHTTPService: Sendable {
             return try await HTTPResponses.json(page(sessions, request: request, defaultLimit: 100, maximumLimit: 500) { $0.sessionID.uuidString })
         } }
         router.post("/internal/v1/sessions") { request, context in await respond(request) { let data = try await bodyData(request)
+            let requestDigest = CanonicalSigning.bodyDigest(data)
+            let key = try requireIdempotency(request)
+            if let structured = try? JSONDecoder.serviceDecoder.decode(AgentStartSessionWire.self, from: data) {
+                guard let provider = structured.turn.configuration.providerID.runtimeKind else {
+                    throw ServiceAPIError(code: .capabilityMissing, message: "Selected provider has no execution adapter")
+                }
+                let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "startSession", projectID: structured.projectID)
+                let actor = try requireActor(auth)
+                let selectedMessageContext = try structured.selectedMessageContext?.validated()
+                let shell = CreateSessionInput(projectID: structured.projectID, provider: provider, model: structured.turn.configuration.modelID, visibility: structured.visibility, startImmediately: false)
+                let accepted = try await authority.acceptStructuredSession(input: shell, coordinator: requireSubmissionCoordinator(), actor: actor, publicSubmissionKey: key, requestDigest: requestDigest, submission: structured.turn, selectedMessageContext: selectedMessageContext)
+                if !accepted.replayed {
+                    do {
+                        try await authority.dispatchAcceptedFollowup(accepted, actor: actor, requestDigest: requestDigest)
+                        try await requireSubmissionCoordinator().markDispatched(submissionID: accepted.receipt.submissionID)
+                    } catch {
+                        try await requireSubmissionCoordinator().markLaunchFailed(submissionID: accepted.receipt.submissionID, message: String(describing: error))
+                    }
+                }
+                return try HTTPResponses.privateJSON(accepted.receipt, status: .accepted)
+            }
             let input = try JSONDecoder.serviceDecoder.decode(CreateSessionInput.self, from: data)
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "startSession", projectID: input.projectID)
             guard input.parentSessionID == nil else { throw ServiceAPIError(code: .invalidRequest, message: "Public session creation cannot specify parentSessionID; child agents are created by agent_manage") }
-            let snapshot = try await authority.createSession(input: input, externalActor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data))
-            return try HTTPResponses.json(snapshot, status: .accepted)
+            let snapshot = try await authority.createSession(input: input, externalActor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest)
+            return try HTTPResponses.privateJSON(snapshot, status: .accepted)
         } }
         router.get("/internal/v1/sessions/:id/snapshot") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getSession", sessionID: id)
-            return try await HTTPResponses.json(authority.sessionSnapshot(sessionID: id))
+            return try await HTTPResponses.privateJSON(authority.sessionDetailSnapshot(sessionID: id))
         } }
         router.get("/internal/v1/sessions/:id/transcript") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getTranscript", sessionID: id)
             let transcript = try await authority.sessionSnapshot(sessionID: id).transcript
             return try await HTTPResponses.json(page(transcript, request: request, defaultLimit: 200, maximumLimit: 1000) { String(format: "%020lld", $0.sessionSequence) })
+        } }
+        router.get("/internal/v1/sessions/:id/transcript/presentation") { request, context in await respond(request) {
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getTranscriptPresentation", sessionID: sessionID)
+            let actor = try requireActor(auth)
+            let session = try await authority.sessionSnapshot(sessionID: sessionID)
+            let metadata = try await authority.collaborationMetadata(sessionID: sessionID)
+            let token = request.uri.queryParameters["pageToken"].map(String.init)
+            let limit = request.uri.queryParameters.get("limit", as: Int.self) ?? 25
+            let page = try await requireTranscriptPresentation().page(sessionID: sessionID, actorID: actor.goblinUserID, legacyTranscript: session.transcript, interactions: session.interactions, pageToken: token, limit: limit, mutableInteractions: metadata.controllerUserID == actor.goblinUserID)
+            return try HTTPResponses.privateJSON(page)
+        } }
+        router.post("/internal/v1/sessions/:id/turns") { request, context in await respond(request) {
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "submitTurn", sessionID: sessionID)
+            let actor = try requireActor(auth)
+            let key = try requireIdempotency(request)
+            let input = try JSONDecoder.serviceDecoder.decode(AgentTurnSubmissionWire.self, from: data)
+            let snapshot = try await authority.authoritySessionSnapshot(sessionID: sessionID)
+            let accepted = try await requireSubmissionCoordinator().acceptFollowup(session: snapshot.session, activeRun: snapshot.activeRun, actor: actor, publicSubmissionKey: key, requestDigest: CanonicalSigning.bodyDigest(data), submission: input)
+            if !accepted.replayed {
+                do {
+                    try await authority.dispatchAcceptedFollowup(accepted, actor: actor, requestDigest: CanonicalSigning.bodyDigest(data))
+                    try await requireSubmissionCoordinator().markDispatched(submissionID: accepted.receipt.submissionID)
+                } catch {
+                    try? await requireSubmissionCoordinator().markLaunchFailed(submissionID: accepted.receipt.submissionID, message: "Accepted provider dispatch failed")
+                }
+            }
+            return try HTTPResponses.privateJSON(accepted.receipt, status: .accepted)
         } }
         router.post("/internal/v1/sessions/:id/commands") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
@@ -934,7 +1078,8 @@ public struct RepoPromptHTTPService: Sendable {
         } }
         router.get("/internal/v1/catalog/models") { request, context in await respond(request) {
             _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "listModels")
-            return try await HTTPResponses.json(page([ModelCatalogItem](), request: request, defaultLimit: 100, maximumLimit: 500) { $0.id })
+            let models = try await requireComposerCatalog().compatibilityModels()
+            return try await HTTPResponses.json(page(models, request: request, defaultLimit: 100, maximumLimit: 500) { "\($0.providerID?.rawValue ?? $0.provider.rawValue):\($0.id)" })
         } }
         router.get("/internal/v1/catalog/execution-modes") { request, context in await respond(request) {
             _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "listExecutionModes")
@@ -1112,6 +1257,26 @@ public struct RepoPromptHTTPService: Sendable {
         return serverSettings
     }
 
+    private func requireComposerCatalog() throws -> AgentComposerCatalogService {
+        guard let composerCatalog else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Agent composer catalog is unavailable", retryable: true) }
+        return composerCatalog
+    }
+
+    private func requireComposerAttachments() throws -> AgentComposerAttachmentStore {
+        guard let composerAttachments else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Agent composer attachments are unavailable", retryable: true) }
+        return composerAttachments
+    }
+
+    private func requireSubmissionCoordinator() throws -> AgentSubmissionCoordinator {
+        guard let submissionCoordinator else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Agent submission coordinator is unavailable", retryable: true) }
+        return submissionCoordinator
+    }
+
+    private func requireTranscriptPresentation() throws -> AgentTranscriptPresentationService {
+        guard let transcriptPresentation else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Agent transcript presentation is unavailable", retryable: true) }
+        return transcriptPresentation
+    }
+
     private func providerAttribution(_ auth: AuthenticatedInternalRequest) -> ProviderMutationAttribution {
         if let actor = auth.decision?.actor {
             return .init(actorID: actor.goblinUserID, actorLabel: actor.username, channel: "goblin-app")
@@ -1260,9 +1425,42 @@ public struct RepoPromptHTTPService: Sendable {
         ]
     }
 
-    private func bodyData(_ request: Request) async throws -> Data {
-        let buffer = try await request.body.collect(upTo: 1_048_576)
+    private func bodyData(_ request: Request, maximumBytes: Int = 1_048_576) async throws -> Data {
+        let buffer = try await request.body.collect(upTo: maximumBytes)
         return Data(buffer.readableBytesView)
+    }
+
+    private func composerAttachmentUpload(data: Data, contentType: String?, fallbackDisplayName: String) throws -> (data: Data, mediaType: String?, displayName: String) {
+        guard let contentType, contentType.lowercased().hasPrefix("multipart/form-data") else {
+            return (data, contentType?.split(separator: ";", maxSplits: 1).first.map(String.init), fallbackDisplayName)
+        }
+        let parameters = contentType.split(separator: ";").dropFirst().map { $0.trimmingCharacters(in: .whitespaces) }
+        guard let boundaryParameter = parameters.first(where: { $0.lowercased().hasPrefix("boundary=") }) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Multipart attachment boundary is missing")
+        }
+        var boundary = String(boundaryParameter.dropFirst("boundary=".count))
+        if boundary.hasPrefix("\"") && boundary.hasSuffix("\"") { boundary = String(boundary.dropFirst().dropLast()) }
+        guard !boundary.isEmpty, boundary.utf8.count <= 200 else { throw ServiceAPIError(code: .invalidRequest, message: "Multipart attachment boundary is invalid") }
+        let headerTerminator = Data("\r\n\r\n".utf8)
+        let nextBoundary = Data("\r\n--\(boundary)".utf8)
+        guard let headerEnd = data.range(of: headerTerminator), headerEnd.lowerBound <= 16 * 1_024,
+              let bodyEnd = data.range(of: nextBoundary, in: headerEnd.upperBound ..< data.endIndex),
+              let headerText = String(data: data[..<headerEnd.lowerBound], encoding: .utf8)
+        else { throw ServiceAPIError(code: .invalidRequest, message: "Multipart attachment body is malformed") }
+        let lines = headerText.components(separatedBy: "\r\n")
+        let disposition = lines.first { $0.lowercased().hasPrefix("content-disposition:") } ?? ""
+        guard disposition.lowercased().contains("form-data"), disposition.lowercased().contains("name=\"file\"") else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Multipart attachment requires one file field")
+        }
+        let filename = disposition.range(of: "filename=\"").flatMap { start -> String? in
+            let suffix = disposition[start.upperBound...]
+            guard let end = suffix.firstIndex(of: "\"") else { return nil }
+            return String(suffix[..<end])
+        }
+        let mediaType = lines.first { $0.lowercased().hasPrefix("content-type:") }.map { String($0.dropFirst("content-type:".count)).trimmingCharacters(in: .whitespaces) }
+        let payload = Data(data[headerEnd.upperBound ..< bodyEnd.lowerBound])
+        guard payload.count <= 10 * 1_024 * 1_024 else { throw ServiceAPIError(code: .invalidRequest, message: "Image exceeds the 10 MiB item limit") }
+        return (payload, mediaType, filename ?? fallbackDisplayName)
     }
 
     private func authenticate(_ request: Request, context: RepoPromptRequestContext, body: Data, roles: Set<InternalRouteRole>, operation: String, projectID: UUID? = nil, sessionID: UUID? = nil, pathAndQuery: String? = nil) async throws -> AuthenticatedInternalRequest {

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "liveDiscoveryFreshnessSeconds": 900,
+  "persistedDiscoveryMaximumAgeSeconds": 86400,
+  "providers": [
+    {"id":"codex","modelSource":"live-registry,persisted-dynamic-cache,recommended-static-after-preflight","persistedFallback":true,"staticFallbackAfterPreflight":true,"discoveryReplacesStatic":false,"failurePolicy":"omit-stale;preserve-selected-unavailable;refresh-on-model-rejection","nativeImages":"adapter-required"},
+    {"id":"claudeCompatible","modelSource":"provider-supported-static-catalog-after-preflight","persistedFallback":false,"staticFallbackAfterPreflight":true,"discoveryReplacesStatic":false,"failurePolicy":"omit-on-preflight-failure;preserve-selected-unavailable","nativeImages":"adapter-required"},
+    {"id":"claudeGLM","modelSource":"normalized-backend-configuration","persistedFallback":false,"staticFallbackAfterPreflight":false,"discoveryReplacesStatic":false,"failurePolicy":"omit-on-invalid-backend-or-preflight-failure","nativeImages":"adapter-required"},
+    {"id":"claudeKimi","modelSource":"normalized-backend-configuration","persistedFallback":false,"staticFallbackAfterPreflight":false,"discoveryReplacesStatic":false,"failurePolicy":"omit-on-invalid-backend-or-preflight-failure","nativeImages":"adapter-required"},
+    {"id":"claudeCustom","modelSource":"normalized-backend-configuration","persistedFallback":false,"staticFallbackAfterPreflight":false,"discoveryReplacesStatic":false,"failurePolicy":"omit-on-invalid-backend-or-preflight-failure","nativeImages":"adapter-required"},
+    {"id":"openCodeACP","modelSource":"provider-base-model-variant-discovery,bounded-approved-fallback","persistedFallback":true,"staticFallbackAfterPreflight":true,"discoveryReplacesStatic":true,"failurePolicy":"omit-without-fresh-permitted-source;preserve-selected-unavailable","nativeImages":"adapter-required"},
+    {"id":"cursorACP","modelSource":"authoritative-auto-composer-plus-discovered-nonduplicates","persistedFallback":true,"staticFallbackAfterPreflight":true,"discoveryReplacesStatic":false,"failurePolicy":"retain-authoritative-static-only-after-preflight;age-out-discovery","nativeImages":"adapter-required"},
+    {"id":"xAI","modelSource":"none-until-explicit-adapter","persistedFallback":false,"staticFallbackAfterPreflight":false,"discoveryReplacesStatic":true,"failurePolicy":"omit","nativeImages":"adapter-required"}
+  ]
+}
