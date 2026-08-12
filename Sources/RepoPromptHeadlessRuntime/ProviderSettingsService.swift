@@ -36,6 +36,13 @@ public actor ProviderSettingsService {
         let expectedConnectionRevision: Int64
     }
 
+    private struct BootstrapSelection: Equatable, Sendable {
+        let defaultModel: String?
+        let reasoningEffort: String?
+        let speedMode: String?
+        let serviceTier: String?
+    }
+
     private struct SanitizedAuthenticationDocument: Decodable {
         let authenticated: Bool
         let method: ProviderAuthenticationMethod?
@@ -116,21 +123,22 @@ public actor ProviderSettingsService {
         let persisted = try await store.providerSettings()
         preferences = Dictionary(uniqueKeysWithValues: persisted.map { ($0.providerID, $0) })
         for preference in persisted {
-            guard preference.revision > 0 else {
+            guard preference.revision > 0, preference.revision < Int64.max else {
                 throw ServiceAPIError(code: .persistenceUnavailable, message: "Provider settings revision is invalid", retryable: false)
             }
-            try validateSelection(
-                .init(
+            if let reconciled = try reconciledBootstrapPreference(preference) {
+                let audit = SQLiteServiceStore.ProviderConnectionAuditMutation(
+                    operation: "bootstrapReconcileSettings",
+                    attribution: Self.lifecycleAttribution,
+                    authenticationMethod: nil,
+                    result: "reconciled"
+                )
+                preferences[preference.providerID] = try await store.upsertProviderSettings(
+                    reconciled,
                     expectedRevision: preference.revision,
-                    enabled: preference.enabled,
-                    defaultModel: preference.defaultModel,
-                    reasoningEffort: preference.reasoningEffort,
-                    speedMode: preference.speedMode,
-                    serviceTier: preference.serviceTier
-                ),
-                providerID: preference.providerID,
-                definition: Self.definition(preference.providerID)
-            )
+                    audit: audit
+                )
+            }
         }
         connections = try await Dictionary(uniqueKeysWithValues: store.providerConnections().map { ($0.record.providerID, $0) })
         let credentialReferences = Dictionary(uniqueKeysWithValues: connections.compactMap { providerID, stored in
@@ -169,10 +177,20 @@ public actor ProviderSettingsService {
                 supportedAuthenticationMethods[providerID] = []
             }
             if preferences[providerID] == nil {
+                let selection = try bootstrapSelection(
+                    providerID: providerID,
+                    defaultModel: nil,
+                    reasoningEffort: nil,
+                    speedMode: nil,
+                    serviceTier: nil
+                )
                 let initial = ProviderSettingsPreference(
                     providerID: providerID,
                     enabled: false,
-                    defaultModel: modelCatalogs[providerID]?.first(where: \.isProviderDefault)?.id,
+                    defaultModel: selection.defaultModel,
+                    reasoningEffort: selection.reasoningEffort,
+                    speedMode: selection.speedMode,
+                    serviceTier: selection.serviceTier,
                     revision: 1
                 )
                 preferences[providerID] = try await store.upsertProviderSettings(initial, expectedRevision: 0)
@@ -1093,6 +1111,90 @@ public actor ProviderSettingsService {
         guard capability, allowed.contains(value) else {
             throw ServiceAPIError(code: .invalidRequest, message: "Selected \(label) is not supported by this model")
         }
+    }
+
+    /// Provider catalogs are account-scoped and can legitimately change while
+    /// non-secret defaults remain persisted. Reconcile only that semantic drift
+    /// during bootstrap; interactive settings mutations continue through the
+    /// strict `validateSelection` path above.
+    private func reconciledBootstrapPreference(_ preference: ProviderSettingsPreference) throws -> ProviderSettingsPreference? {
+        let selection = try bootstrapSelection(
+            providerID: preference.providerID,
+            defaultModel: preference.defaultModel,
+            reasoningEffort: preference.reasoningEffort,
+            speedMode: preference.speedMode,
+            serviceTier: preference.serviceTier
+        )
+        let current = BootstrapSelection(
+            defaultModel: preference.defaultModel,
+            reasoningEffort: preference.reasoningEffort,
+            speedMode: preference.speedMode,
+            serviceTier: preference.serviceTier
+        )
+        let request = UpdateProviderSettingsRequest(
+            expectedRevision: preference.revision,
+            enabled: preference.enabled,
+            defaultModel: selection.defaultModel,
+            reasoningEffort: selection.reasoningEffort,
+            speedMode: selection.speedMode,
+            serviceTier: selection.serviceTier
+        )
+        try validateSelection(request, providerID: preference.providerID, definition: Self.definition(preference.providerID))
+        guard selection != current else { return nil }
+        return ProviderSettingsPreference(
+            providerID: preference.providerID,
+            enabled: preference.enabled,
+            defaultModel: selection.defaultModel,
+            reasoningEffort: selection.reasoningEffort,
+            speedMode: selection.speedMode,
+            serviceTier: selection.serviceTier,
+            revision: preference.revision + 1
+        )
+    }
+
+    private func bootstrapSelection(
+        providerID: ProviderSettingsID,
+        defaultModel: String?,
+        reasoningEffort: String?,
+        speedMode: String?,
+        serviceTier: String?
+    ) throws -> BootstrapSelection {
+        let definition = Self.definition(providerID)
+        let normalizedModel = try normalized(defaultModel)
+        let normalizedReasoning = try normalized(reasoningEffort)
+        let normalizedSpeed = try normalized(speedMode)
+        let normalizedTier = try normalized(serviceTier)
+        let models = modelCatalogs[providerID] ?? []
+        let selectedModel: ProviderModelCatalogEntry? = if definition.capabilities.supportsModelSelection {
+            if let normalizedModel, let exact = models.first(where: { $0.id == normalizedModel }) {
+                exact
+            } else {
+                models.first(where: \.isProviderDefault) ?? models.first
+            }
+        } else {
+            nil
+        }
+        let reasoning: String? = if definition.capabilities.supportsReasoningEffort, let selectedModel {
+            if let normalizedReasoning, selectedModel.reasoningEfforts.contains(normalizedReasoning) {
+                normalizedReasoning
+            } else {
+                selectedModel.defaultReasoningEffort ?? selectedModel.reasoningEfforts.first
+            }
+        } else {
+            nil
+        }
+        let speed = definition.capabilities.supportsSpeedMode
+            ? normalizedSpeed.flatMap { selectedModel?.speedModes.contains($0) == true ? $0 : nil }
+            : nil
+        let tier = definition.capabilities.supportsServiceTier
+            ? normalizedTier.flatMap { selectedModel?.serviceTiers.contains($0) == true ? $0 : nil }
+            : nil
+        return BootstrapSelection(
+            defaultModel: selectedModel?.id,
+            reasoningEffort: reasoning,
+            speedMode: speed,
+            serviceTier: tier
+        )
     }
 
     private func loadModelCatalogs() throws -> [ProviderSettingsID: [ProviderModelCatalogEntry]] {

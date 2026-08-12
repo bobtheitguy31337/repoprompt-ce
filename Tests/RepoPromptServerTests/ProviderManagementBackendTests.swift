@@ -12,6 +12,117 @@ import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 final class ProviderManagementBackendTests: XCTestCase {
+    func testBootstrapReconcilesRetiredModelToConcreteCatalogDefaultsAndPersistsRestartSafeSelection() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let currentDefault = ProviderModelCatalogEntry(
+            id: "gpt-5.6-terra",
+            providerRawValue: "gpt-5.6-terra",
+            displayName: "GPT-5.6 Terra",
+            isProviderDefault: true,
+            reasoningEfforts: ["medium", "high", "xhigh"],
+            defaultReasoningEffort: "high",
+            supportsNativeImages: true,
+            supportsSteering: true
+        )
+        _ = try await store.replaceProviderModelCatalog(
+            providerID: .codex,
+            models: [currentDefault],
+            expectedRevision: 0
+        )
+        _ = try await store.upsertProviderSettings(
+            ProviderSettingsPreference(
+                providerID: .codex,
+                enabled: true,
+                defaultModel: "retired-model",
+                reasoningEffort: "retired-effort",
+                speedMode: "fast",
+                serviceTier: "fast",
+                revision: 1
+            ),
+            expectedRevision: 0
+        )
+
+        let configuration = ProviderCLIConfiguration(kind: .codex, executable: "/usr/bin/swift")
+        let first = ProviderSettingsService(
+            store: store,
+            adapter: ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.codex], runner: StaticVersionRunner()),
+            configurations: [configuration],
+            initiallyEnabled: [.codex],
+            runner: StaticVersionRunner()
+        )
+        try await first.bootstrap()
+        let firstCatalog = try await first.catalog()
+        let firstCodex = try XCTUnwrap(firstCatalog.providers.first { $0.providerID == .codex })
+        XCTAssertEqual(firstCodex.preference.defaultModel, currentDefault.id)
+        XCTAssertEqual(firstCodex.preference.reasoningEffort, "high")
+        XCTAssertNil(firstCodex.preference.speedMode)
+        XCTAssertNil(firstCodex.preference.serviceTier)
+        XCTAssertEqual(firstCodex.preference.revision, 2)
+
+        let persistedSettings = try await store.providerSettings()
+        let persisted = try XCTUnwrap(persistedSettings.first { $0.providerID == .codex })
+        XCTAssertEqual(persisted, firstCodex.preference)
+
+        let second = ProviderSettingsService(
+            store: store,
+            adapter: ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.codex], runner: StaticVersionRunner()),
+            configurations: [configuration],
+            initiallyEnabled: [.codex],
+            runner: StaticVersionRunner()
+        )
+        try await second.bootstrap()
+        let secondCatalog = try await second.catalog()
+        let secondCodex = try XCTUnwrap(secondCatalog.providers.first { $0.providerID == .codex })
+        XCTAssertEqual(secondCodex.preference, firstCodex.preference)
+    }
+
+    func testBootstrapClearsRetiredSelectionWhenCatalogIsUnavailable() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        _ = try await store.upsertProviderSettings(
+            ProviderSettingsPreference(
+                providerID: .codex,
+                enabled: true,
+                defaultModel: "retired-model",
+                reasoningEffort: "retired-effort",
+                speedMode: "fast",
+                serviceTier: "fast",
+                revision: 1
+            ),
+            expectedRevision: 0
+        )
+
+        let configuration = ProviderCLIConfiguration(kind: .codex, executable: "/usr/bin/swift")
+        let first = ProviderSettingsService(
+            store: store,
+            adapter: ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.codex], runner: StaticVersionRunner()),
+            configurations: [configuration],
+            initiallyEnabled: [.codex],
+            runner: StaticVersionRunner()
+        )
+        try await first.bootstrap()
+        let firstCatalog = try await first.catalog()
+        let firstCodex = try XCTUnwrap(firstCatalog.providers.first { $0.providerID == .codex })
+        XCTAssertNil(firstCodex.preference.defaultModel)
+        XCTAssertNil(firstCodex.preference.reasoningEffort)
+        XCTAssertNil(firstCodex.preference.speedMode)
+        XCTAssertNil(firstCodex.preference.serviceTier)
+        XCTAssertEqual(firstCodex.preference.revision, 2)
+
+        let second = ProviderSettingsService(
+            store: store,
+            adapter: ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.codex], runner: StaticVersionRunner()),
+            configurations: [configuration],
+            initiallyEnabled: [.codex],
+            runner: StaticVersionRunner()
+        )
+        try await second.bootstrap()
+        let secondCatalog = try await second.catalog()
+        let secondCodex = try XCTUnwrap(secondCatalog.providers.first { $0.providerID == .codex })
+        XCTAssertEqual(secondCodex.preference, firstCodex.preference)
+    }
+
     func testProviderRedactionRemovesKnownAndTokenShapedSecrets() {
         let known = "opaque-credential-value"
         let redacted = ProviderSecretRedaction.redact("Authorization bearer xai-1234567890 and \(known)", knownSecrets: [known])
