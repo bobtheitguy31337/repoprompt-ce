@@ -1476,7 +1476,7 @@ public actor SQLiteServiceStore {
         let record = value.record
         let allowedMethods: Set<ProviderAuthenticationMethod> = switch record.providerID {
         case .codex: [.deviceCodeBeta, .apiKey, .enterpriseAccessToken]
-        case .claudeCompatible: [.apiKey, .authToken]
+        case .claudeCompatible: [.apiKey, .authToken, .providerSpecific]
         case .claudeGLM, .claudeKimi: [.apiKey, .authToken]
         case .claudeCustom: [.apiKey, .authToken]
         case .cursorACP: [.apiKey, .browserLogin]

@@ -243,6 +243,38 @@ final class ProviderSettingsPortalTests: XCTestCase {
         ))
     }
 
+    func testPortalBootstrapSerializesCanonicalMCPToolCatalogAndDecodesLegacyPayloads() throws {
+        let expectedNames = [
+            "app_settings", "bind_context", "manage_workspaces",
+            "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search",
+            "workspace_context", "prompt", "apply_edits", "oracle_utils", "ask_oracle", "oracle_send",
+            "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore",
+            "agent_run", "agent_manage", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"
+        ]
+        let tools = RepoPromptPortalSessionProjection.tools()
+        XCTAssertEqual(tools.map(\.name), expectedNames)
+        XCTAssertEqual(Set(tools.map(\.name)).count, expectedNames.count)
+        XCTAssertTrue(tools.allSatisfy {
+            !$0.scope.isEmpty && !$0.capability.isEmpty && !$0.admissionClass.isEmpty
+        })
+
+        let response = PortalBootstrapResponse(projects: [], sessions: [], workflows: [], tools: tools)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder.serviceEncoder.encode(response)) as? [String: Any]
+        )
+        let serializedTools = try XCTUnwrap(object["tools"] as? [[String: Any]])
+        XCTAssertEqual(serializedTools.compactMap { $0["name"] as? String }, expectedNames)
+        XCTAssertTrue(serializedTools.allSatisfy {
+            Set($0.keys) == ["name", "scope", "capability", "admissionClass"]
+        })
+
+        let legacy = try JSONDecoder.serviceDecoder.decode(
+            PortalBootstrapResponse.self,
+            from: Data(#"{"projects":[],"sessions":[],"workflows":[]}"#.utf8)
+        )
+        XCTAssertTrue(legacy.tools.isEmpty)
+    }
+
     func testPortalAssetsPreserveDesktopHierarchyAndNeverPersistBrowserState() throws {
         let html = try String(decoding: RepoPromptPortalAssets.data(for: .index), as: UTF8.self)
         let css = try String(decoding: RepoPromptPortalAssets.data(for: .stylesheet), as: UTF8.self)

@@ -38,6 +38,46 @@ function sessionFixture(overrides = {}) {
   };
 }
 
+function toolCatalog() {
+  const applicationTools = [
+    "app_settings",
+    "bind_context",
+    "manage_workspaces",
+  ];
+  const windowTools = [
+    "manage_selection",
+    "file_actions",
+    "get_code_structure",
+    "get_file_tree",
+    "read_file",
+    "file_search",
+    "workspace_context",
+    "prompt",
+    "apply_edits",
+    "oracle_utils",
+    "ask_oracle",
+    "oracle_send",
+    "oracle_chat_log",
+    "git",
+    "manage_worktree",
+    "context_builder",
+    "ask_user",
+    "agent_explore",
+    "agent_run",
+    "agent_manage",
+    "share_thoughts",
+    "set_status",
+    "wait_for_next_user_instruction",
+    "history",
+  ];
+  return [...applicationTools, ...windowTools].map((name) => ({
+    name,
+    scope: applicationTools.includes(name) ? "application" : "window",
+    capability: name.includes("file") ? "file_read" : "agent_external_control",
+    admissionClass: name === "file_search" ? "file_search" : "control",
+  }));
+}
+
 function bootstrapFixture(overrides = {}) {
   return {
     projects: [
@@ -50,6 +90,7 @@ function bootstrapFixture(overrides = {}) {
     ],
     sessions: [],
     workflows: [],
+    tools: toolCatalog(),
     ...overrides,
   };
 }
@@ -198,12 +239,7 @@ function providerCatalog() {
     providerFixture({
       providerID: "claudeCompatible",
       displayName: "Claude Code",
-      authenticationMethods: [
-        "apiKey",
-        "authToken",
-        "keyHelper",
-        "workloadIdentityFederation",
-      ],
+      authenticationMethods: ["providerSpecific", "apiKey"],
       authFlows: [
         {
           kind: "externalProvisioning",
@@ -216,7 +252,7 @@ function providerCatalog() {
     providerFixture({
       providerID: "claudeGLM",
       displayName: "CC Zai",
-      authenticationMethods: ["apiKey", "authToken"],
+      authenticationMethods: ["authToken"],
       authFlows: [],
       models: [model("glm-4.5-air"), model("glm-4.7"), model("glm-5.2[1m]")],
       preference: { enabled: false },
@@ -224,7 +260,7 @@ function providerCatalog() {
     providerFixture({
       providerID: "claudeKimi",
       displayName: "CC Moonshot",
-      authenticationMethods: ["apiKey", "authToken"],
+      authenticationMethods: ["apiKey"],
       authFlows: [],
       models: [model("kimi-code")],
       preference: { enabled: false },
@@ -259,7 +295,7 @@ function providerCatalog() {
     providerFixture({
       providerID: "cursorACP",
       displayName: "Cursor",
-      authenticationMethods: ["browserLogin", "apiKey"],
+      authenticationMethods: ["browserLogin"],
       authFlows: [
         {
           kind: "externalProvisioning",
@@ -501,6 +537,35 @@ async function createHarness({
       };
       return jsonResponse(provider);
     }
+    const connectMatch = call.path.match(
+      /^api\/v1\/provider-settings\/([^/]+)\/connect$/,
+    );
+    if (connectMatch && call.method === "POST") {
+      const provider = context.providers.find(
+        (item) => item.providerID === decodeURIComponent(connectMatch[1]),
+      );
+      const payload = JSON.parse(call.body);
+      provider.connection = connectionFixture({
+        providerID: provider.providerID,
+        authenticationMethod: payload.authenticationMethod,
+        accountLabel: null,
+        detail: "External credential source is mounted",
+      });
+      provider.authentication = {
+        ...provider.authentication,
+        state: "authenticated",
+        authenticated: true,
+        method: payload.authenticationMethod,
+        detail: "Authenticated",
+      };
+      provider.preflight = {
+        ready: true,
+        reason: "ready",
+        detail: "Provider is ready",
+      };
+      provider.effectiveEnabled = provider.preference.enabled;
+      return jsonResponse(provider);
+    }
     throw new Error(`Unexpected request: ${call.method} ${call.path}`);
   };
 
@@ -594,11 +659,15 @@ test("filtered Desktop settings hierarchy deep-links, searches, and excludes des
   );
   assert.match(
     document.getElementById("settings-content").textContent,
-    /Oracle Model/,
+    /Recommended Setup/,
+  );
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /Provider Defaults/,
   );
   assert.doesNotMatch(
     document.getElementById("settings-content").textContent,
-    /Provider defaults/,
+    /Workspace overrides inherit/,
   );
 
   const search = document.getElementById("settings-search");
@@ -661,6 +730,259 @@ test("narrow settings navigation uses an accessible focus-trapped drawer", async
   assert.equal(document.activeElement, toggle);
 });
 
+test("unconfigured Claude Code, OpenCode, and Cursor use one mounted-account Connect action", async (t) => {
+  const harness = await createHarness();
+  t.after(() => harness.close());
+  const { calls, document, window } = harness;
+
+  for (const providerID of ["claudeCompatible", "openCodeACP", "cursorACP"]) {
+    const card = document.querySelector(`[data-provider-id="${providerID}"]`);
+    card.open = true;
+    const connectButtons = [...card.querySelectorAll("button")].filter(
+      (button) => button.textContent.trim() === "Connect",
+    );
+    assert.equal(
+      connectButtons.length,
+      1,
+      `${providerID} should have one Connect`,
+    );
+    assert.equal(card.querySelector(".credential-form"), null);
+    assert.equal(card.querySelector(".credential-card"), null);
+    assert.equal(
+      card.querySelector('select[name="authenticationMethod"]'),
+      null,
+    );
+    assert.equal(card.querySelector('input[type="password"]'), null);
+  }
+
+  const claude = document.querySelector(
+    '[data-provider-id="claudeCompatible"]',
+  );
+  click(
+    window,
+    [...claude.querySelectorAll("button")].find(
+      (button) => button.textContent.trim() === "Connect",
+    ),
+  );
+  await waitFor(() =>
+    document
+      .querySelector('[data-provider-id="claudeCompatible"]')
+      ?.textContent.includes("Mounted CLI login"),
+  );
+  const connectCall = calls.find(
+    (call) => call.path === "api/v1/provider-settings/claudeCompatible/connect",
+  );
+  assert.deepEqual(JSON.parse(connectCall.body), {
+    authenticationMethod: "providerSpecific",
+  });
+  const refreshed = document.querySelector(
+    '[data-provider-id="claudeCompatible"]',
+  );
+  refreshed.open = true;
+  assert.match(refreshed.textContent, /Mounted CLI login/);
+  assert.match(refreshed.textContent, /Disconnect/);
+  assert.doesNotMatch(refreshed.textContent, /Authentication method\s*Api Key/);
+});
+
+test("connected CLI recommendation Check Now opens a live desktop-style assessment", async (t) => {
+  const providers = providerCatalog();
+  const connection = connectionFixture({
+    authenticationMethod: "deviceCodeBeta",
+  });
+  providers[0] = providerFixture({
+    connection,
+    models: [
+      model("gpt-5.6-sol", {
+        displayName: "GPT-5.6 Sol",
+        reasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      }),
+    ],
+    authentication: {
+      authenticated: true,
+      state: "authenticated",
+      method: "deviceCodeBeta",
+      accountLabel: "sandbox team",
+    },
+  });
+  const harness = await createHarness({ providers });
+  t.after(() => harness.close());
+  const { document, window } = harness;
+
+  assert.match(
+    document.querySelector(".recommendation-banner").textContent,
+    /Check recommendations to optimize your setup/,
+  );
+  const check = [...document.querySelectorAll("button")].find(
+    (button) => button.textContent.trim() === "Check Now",
+  );
+  assert.ok(check);
+  click(window, check);
+  await waitFor(
+    () =>
+      document.getElementById("settings-detail-title").textContent ===
+      "Agent Models",
+  );
+  const text = document.getElementById("settings-content").textContent;
+  assert.match(text, /Recommendation check complete/);
+  assert.match(text, /Oracle Model.*Codex CLI · GPT-5\.6 Sol · High/s);
+  assert.match(text, /Context Builder Agent.*Codex CLI · GPT-5\.6 Sol · Low/s);
+  assert.match(text, /Explore.*Codex CLI · GPT-5\.6 Sol · Low/s);
+  assert.match(text, /Engineer.*Codex CLI · GPT-5\.6 Sol · Medium/s);
+  assert.match(text, /Pair.*Codex CLI · GPT-5\.6 Sol · High/s);
+  assert.match(text, /Design.*Codex CLI · GPT-5\.6 Sol · Medium/s);
+  assert.match(text, /desktop 2026-08 profile/);
+  assert.match(text, /Provider Defaults/);
+  assert.match(text, /does not yet expose that routing authority/);
+});
+
+test("desktop recommendation assessment explains OpenCode-only connections without inventing role assignments", async (t) => {
+  const providers = providerCatalog();
+  const connection = connectionFixture({
+    providerID: "openCodeACP",
+    authenticationMethod: "providerSpecific",
+  });
+  providers[5] = providerFixture({
+    providerID: "openCodeACP",
+    displayName: "OpenCode",
+    authenticationMethods: ["providerSpecific"],
+    authFlows: [],
+    models: [],
+    connection,
+    preference: {
+      defaultModel: null,
+      reasoningEffort: null,
+      serviceTier: null,
+    },
+    authentication: {
+      authenticated: true,
+      state: "authenticated",
+      method: "providerSpecific",
+    },
+  });
+  const harness = await createHarness({ providers });
+  t.after(() => harness.close());
+  const { document, window } = harness;
+
+  const check = [...document.querySelectorAll("button")].find(
+    (button) => button.textContent.trim() === "Check Now",
+  );
+  assert.ok(check);
+  click(window, check);
+  await waitFor(
+    () =>
+      document.getElementById("settings-detail-title").textContent ===
+      "Agent Models",
+  );
+  const text = document.getElementById("settings-content").textContent;
+  assert.match(text, /No desktop recommendation target available/);
+  assert.match(
+    text,
+    /OpenCode is not assigned to desktop recommendation roles/,
+  );
+  assert.doesNotMatch(text, /Oracle Model/);
+});
+
+test("MCP Tools renders and searches the complete canonical server catalog without fake toggles", async (t) => {
+  const harness = await createHarness({ hash: "#settings/mcp-tools" });
+  t.after(() => harness.close());
+  const { document, window } = harness;
+
+  assert.equal(document.querySelectorAll(".tool-catalog-row").length, 27);
+  const text = document.getElementById("settings-content").textContent;
+  for (const name of [
+    "app_settings",
+    "file_actions",
+    "oracle_send",
+    "agent_run",
+    "history",
+  ]) {
+    assert.match(text, new RegExp(name));
+  }
+  assert.equal(
+    document.querySelector('.tool-catalog-list input[type="checkbox"]'),
+    null,
+  );
+  const search = document.querySelector('input[aria-label="Search MCP tools"]');
+  search.value = "oracle";
+  search.dispatchEvent(new window.Event("input", { bubbles: true }));
+  assert.equal(document.querySelectorAll(".tool-catalog-row").length, 4);
+  assert.match(document.querySelector(".tool-count").textContent, /4 of 27/);
+});
+
+test("Agent Permissions exposes every runtime-backed desktop direct-provider control", async (t) => {
+  const harness = await createHarness({ hash: "#settings/agent-permissions" });
+  t.after(() => harness.close());
+  const { document } = harness;
+  const content = document.getElementById("settings-content");
+  const text = content.textContent;
+
+  for (const expected of [
+    "Default Execution Mode",
+    "Codex Direct Agent",
+    "Permission Level",
+    "Core tools",
+    "Bash",
+    "Search",
+    "Goals",
+    "Reasoning Summaries",
+    "Local Memories",
+    "RepoPrompt · Required",
+    "Claude Code Direct Agent",
+    "RepoPrompt Only (Strict MCP)",
+    "Lazy Tool Loading",
+    "Sys Prompt Packaging",
+    "User Message (Keep Native)",
+    "OpenCode Direct Agent",
+    "ACP Session Mode",
+    "Cursor Direct Agent",
+    "ACP Auto-Approve",
+    "Safe Managed",
+    "Inherit Provider Settings",
+    "Custom",
+  ]) {
+    assert.ok(text.includes(expected), `missing ${expected}`);
+  }
+  assert.equal(content.querySelectorAll("select").length, 5);
+  assert.equal(content.querySelectorAll('input[type="checkbox"]').length, 8);
+  assert.match(text, /does not yet expose a mutation authority/);
+});
+
+test("unsupported desktop authorities are explicit and do not expose inert controls", async (t) => {
+  const harness = await createHarness({
+    bootstrap: bootstrapFixture({
+      workflows: [{ workflowID: "build", name: "Build", enabled: true }],
+    }),
+  });
+  t.after(() => harness.close());
+  const { document, window } = harness;
+
+  const cases = [
+    ["workspace-approvals", /Auto-approve All Operations/, /write operations/],
+    [
+      "model-presets",
+      /real server-side preset authority/i,
+      /No model presets configured/,
+    ],
+    ["openrouter", /Validate & Fetch/, /Include OpenRouter defaults/],
+    [
+      "custom-api",
+      /Base URL \+ write-only API key/,
+      /Include Content-Type header/,
+    ],
+    ["context-builder", /10k–200k · default 160k/, /Optional model override/],
+    ["manage-presets", /Workspace Selection Presets/, /Build/],
+  ];
+  for (const [route, expected, forbidden] of cases) {
+    window.location.hash = `#settings/${route}`;
+    window.dispatchEvent(new window.HashChangeEvent("hashchange"));
+    await settle();
+    const content = document.getElementById("settings-content");
+    assert.match(content.textContent, expected);
+    assert.doesNotMatch(content.textContent, forbidden);
+    assert.equal(content.querySelectorAll("input, select, textarea").length, 0);
+  }
+});
+
 test("compatible backends remain visible and save non-secret Linux runtime settings", async (t) => {
   const harness = await createHarness();
   t.after(() => harness.close());
@@ -669,8 +991,13 @@ test("compatible backends remain visible and save non-secret Linux runtime setti
   group.open = true;
   const glm = group.querySelector('[data-provider-id="claudeGLM"]');
   glm.open = true;
-  assert.match(glm.textContent, /Backend Settings/);
-  assert.match(glm.textContent, /Choose a sign-in method/);
+  assert.match(glm.textContent, /Backend Behavior/);
+  assert.match(glm.textContent, /Z.ai API Key/);
+  assert.doesNotMatch(glm.textContent, /Choose a sign-in method/);
+  assert.equal(
+    glm.querySelector('.secret-form select[name="authenticationMethod"]'),
+    null,
+  );
   assert.doesNotMatch(glm.textContent, /readiness|availability|vault|DTO/i);
 
   const form = glm.querySelector(".compatible-backend-form");

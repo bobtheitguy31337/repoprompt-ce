@@ -77,15 +77,58 @@ public struct PortalWorkflowSummary: Codable, Hashable, Sendable {
     }
 }
 
+/// Browser-safe projection of the canonical MCP tool catalog. Availability is
+/// service-managed; this DTO deliberately carries no client-side enable toggle.
+public struct PortalToolSummary: Codable, Hashable, Sendable {
+    public let name: String
+    public let scope: String
+    public let capability: String
+    public let admissionClass: String
+
+    public init(name: String, scope: String, capability: String, admissionClass: String) {
+        self.name = name
+        self.scope = scope
+        self.capability = capability
+        self.admissionClass = admissionClass
+    }
+}
+
 public struct PortalBootstrapResponse: Codable, Sendable {
     public let projects: [PortalProjectSummary]
     public let sessions: [PortalSessionSummary]
     public let workflows: [PortalWorkflowSummary]
+    public let tools: [PortalToolSummary]
 
-    public init(projects: [PortalProjectSummary], sessions: [PortalSessionSummary], workflows: [PortalWorkflowSummary]) {
+    public init(
+        projects: [PortalProjectSummary],
+        sessions: [PortalSessionSummary],
+        workflows: [PortalWorkflowSummary],
+        tools: [PortalToolSummary] = []
+    ) {
         self.projects = projects
         self.sessions = sessions
         self.workflows = workflows
+        self.tools = tools
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case projects, sessions, workflows, tools
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        projects = try container.decode([PortalProjectSummary].self, forKey: .projects)
+        sessions = try container.decode([PortalSessionSummary].self, forKey: .sessions)
+        workflows = try container.decode([PortalWorkflowSummary].self, forKey: .workflows)
+        tools = try container.decodeIfPresent([PortalToolSummary].self, forKey: .tools) ?? []
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(projects, forKey: .projects)
+        try container.encode(sessions, forKey: .sessions)
+        try container.encode(workflows, forKey: .workflows)
+        try container.encode(tools, forKey: .tools)
     }
 }
 

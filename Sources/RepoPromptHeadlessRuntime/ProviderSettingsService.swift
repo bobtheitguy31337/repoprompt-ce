@@ -42,6 +42,11 @@ public actor ProviderSettingsService {
         let expiresAt: Date?
     }
 
+    private struct ExternalAuthenticationValidation: Sendable {
+        let valid: Bool
+        let detail: String
+    }
+
     private let store: SQLiteServiceStore
     private let adapter: ProviderCLIAdapter
     private let configurations: [ProviderKind: ProviderCLIConfiguration]
@@ -127,13 +132,17 @@ public actor ProviderSettingsService {
         }
         for providerID in ProviderSettingsID.allCases {
             let validatorMethods = await credentialTester.supportedAuthenticationMethods(for: providerID)
-            if vault != nil,
-               let runtimeKind = providerID.runtimeKind,
+            if let runtimeKind = providerID.runtimeKind,
                let configuration = configurations[runtimeKind],
                initiallyEnabled.contains(runtimeKind),
                FileManager.default.isExecutableFile(atPath: configuration.executable)
             {
-                supportedAuthenticationMethods[providerID] = validatorMethods
+                let vaultMethods: Set<ProviderAuthenticationMethod> = [.apiKey, .enterpriseAccessToken, .authToken]
+                var methods = Set(validatorMethods.filter { vault != nil || !vaultMethods.contains($0) })
+                if let externalMethod = Self.externalAuthenticationMethod(for: providerID), externallyProvisioned(providerID) {
+                    methods.insert(externalMethod)
+                }
+                supportedAuthenticationMethods[providerID] = methods
             } else {
                 supportedAuthenticationMethods[providerID] = []
             }
@@ -303,9 +312,16 @@ public actor ProviderSettingsService {
         if needsVault, vault == nil {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider credential vault is unavailable")
         }
-        let external = !needsVault
-        if external, !externallyProvisioned(providerID) {
-            throw ServiceAPIError(code: .dependencyUnavailable, message: "Configured external provider credential source is unavailable")
+        let external = !needsVault && [.browserLogin, .providerSpecific].contains(request.authenticationMethod)
+        let externalValidation: ExternalAuthenticationValidation?
+        if external {
+            let validation = await validateExternalAuthentication(providerID)
+            guard validation.valid else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: validation.detail)
+            }
+            externalValidation = validation
+        } else {
+            externalValidation = nil
         }
         let credentialReference = secret.map { _ in UUID() }
         if let secret, let credentialReference {
@@ -319,9 +335,7 @@ public actor ProviderSettingsService {
                 throw error
             }
         }
-        let detail = external
-            ? "External credential source is mounted; the provider verifies it at session launch"
-            : "Credential stored; explicit validation is required"
+        let detail = externalValidation?.detail ?? "Credential stored; explicit validation is required"
         let initialTestState: ProviderCredentialTestState = external ? .valid : .notTested
         let initialState: ProviderConnectionState = external ? .connected : .attention
         let record = ProviderConnectionRecord(
@@ -372,6 +386,41 @@ public actor ProviderSettingsService {
         }
         if stored.record.authenticationMethod == .deviceCodeBeta {
             try await reconcileManagedAuthentication(attribution: attribution)
+            await refreshProviderStatus(providerID: providerID, force: true)
+            return try snapshot(for: providerID)
+        }
+        if stored.credentialReference == nil,
+           [.browserLogin, .providerSpecific].contains(stored.record.authenticationMethod)
+        {
+            let validation = await validateExternalAuthentication(providerID)
+            let available = validation.valid
+            let now = Date()
+            let updated = ProviderConnectionRecord(
+                connectionID: stored.record.connectionID,
+                providerID: providerID,
+                authenticationMethod: stored.record.authenticationMethod,
+                state: available ? .connected : .attention,
+                accountLabel: stored.record.accountLabel,
+                expiresAt: stored.record.expiresAt,
+                lastTestedAt: now,
+                testState: available ? .valid : .invalid,
+                detail: validation.detail,
+                keyHelperConfigured: false,
+                workloadIdentityConfigured: false,
+                createdAt: stored.record.createdAt,
+                updatedAt: now,
+                revision: stored.record.revision + 1
+            )
+            connections[providerID] = try await store.upsertProviderConnection(
+                .init(record: updated, credentialReference: nil),
+                expectedRevision: stored.record.revision,
+                audit: .init(
+                    operation: "test",
+                    attribution: attribution,
+                    authenticationMethod: stored.record.authenticationMethod,
+                    result: available ? ProviderCredentialTestState.valid.rawValue : ProviderCredentialTestState.invalid.rawValue
+                )
+            )
             await refreshProviderStatus(providerID: providerID, force: true)
             return try snapshot(for: providerID)
         }
@@ -571,8 +620,8 @@ public actor ProviderSettingsService {
         case .keyHelper, .workloadIdentityFederation:
             throw ServiceAPIError(code: .capabilityMissing, message: "This authentication method is not runtime-wired")
         case .providerSpecific:
-            guard providerID == .openCodeACP, request.credential == nil else {
-                throw ServiceAPIError(code: .invalidRequest, message: "OpenCode raw credential endpoints are not proxied")
+            guard [.claudeCompatible, .openCodeACP].contains(providerID), request.credential == nil else {
+                throw ServiceAPIError(code: .invalidRequest, message: "CLI provider credentials are not proxied through the portal")
             }
             return nil
         case .browserLogin:
@@ -603,6 +652,14 @@ public actor ProviderSettingsService {
         return value
     }
 
+    private nonisolated static func externalAuthenticationMethod(for providerID: ProviderSettingsID) -> ProviderAuthenticationMethod? {
+        switch providerID {
+        case .claudeCompatible, .openCodeACP: .providerSpecific
+        case .cursorACP: .browserLogin
+        case .codex, .claudeGLM, .claudeKimi, .claudeCustom, .xAI: nil
+        }
+    }
+
     private func externallyProvisioned(_ providerID: ProviderSettingsID) -> Bool {
         guard ![ProviderSettingsID.claudeGLM, .claudeKimi, .claudeCustom].contains(providerID) else { return false }
         guard let kind = providerID.runtimeKind,
@@ -610,6 +667,58 @@ public actor ProviderSettingsService {
         else { return false }
         var isDirectory: ObjCBool = false
         return FileManager.default.fileExists(atPath: source, isDirectory: &isDirectory) && isDirectory.boolValue
+    }
+
+    private func validateExternalAuthentication(_ providerID: ProviderSettingsID) async -> ExternalAuthenticationValidation {
+        guard externallyProvisioned(providerID),
+              let kind = providerID.runtimeKind,
+              let configuration = configurations[kind],
+              let source = configuration.credentialSourceDirectory
+        else {
+            return .init(valid: false, detail: "The dedicated CLI credential directory is unavailable")
+        }
+
+        if providerID == .claudeCompatible {
+            do {
+                var environment = try ProviderCLIProbeEnvironment.prepare(for: kind)
+                environment["CLAUDE_CONFIG_DIR"] = source
+                environment["ANTHROPIC_API_KEY"] = ""
+                environment["ANTHROPIC_AUTH_TOKEN"] = ""
+                environment["CLAUDE_CODE_OAUTH_TOKEN"] = ""
+                let output = try await runner.run(
+                    executable: configuration.executable,
+                    arguments: ["auth", "status", "--json"],
+                    workingDirectory: FileManager.default.currentDirectoryPath,
+                    maximumBytes: 8192,
+                    environment: environment
+                )
+                guard let data = output.data(using: .utf8),
+                      let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let loggedIn = payload["loggedIn"] as? Bool
+                else {
+                    return .init(valid: false, detail: "Claude Code could not report a valid authentication status")
+                }
+                return loggedIn
+                    ? .init(valid: true, detail: "Claude Code account authorization verified")
+                    : .init(valid: false, detail: "Claude Code is not authenticated; run 'claude login' in the dedicated server account")
+            } catch {
+                return .init(valid: false, detail: "Claude Code authentication status could not be verified")
+            }
+        }
+
+        if providerID == .openCodeACP || providerID == .cursorACP {
+            let capability = await adapter.preflight(kind: kind)
+            let valid = capability.enabled && capability.reasonUnavailable == nil
+            let name = providerID == .openCodeACP ? "OpenCode" : "Cursor"
+            return .init(
+                valid: valid,
+                detail: valid
+                    ? "\(name) ACP account preflight completed"
+                    : "\(name) could not initialize ACP with the dedicated server account"
+            )
+        }
+
+        return .init(valid: false, detail: "This provider does not support an external CLI connection")
     }
 
     private func applyRuntimePreference(_ providerID: ProviderSettingsID) async throws {

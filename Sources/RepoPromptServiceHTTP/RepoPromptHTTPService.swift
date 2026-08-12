@@ -869,7 +869,12 @@ public struct RepoPromptHTTPService: Sendable {
         let workflows = try await authority.workflowSnapshots().map {
             PortalWorkflowSummary(workflowID: $0.workflowID, name: $0.name, enabled: $0.enabled)
         }
-        return PortalBootstrapResponse(projects: projects, sessions: sessions, workflows: workflows)
+        return PortalBootstrapResponse(
+            projects: projects,
+            sessions: sessions,
+            workflows: workflows,
+            tools: RepoPromptPortalSessionProjection.tools()
+        )
     }
 
     private struct PageToken: Codable {

@@ -1234,17 +1234,41 @@
     return header;
   }
 
-  function recommendation(icon, title, detail) {
+  function recommendation(icon, title, detail, action = null) {
     const banner = element("div", "recommendation-banner");
     banner.append(iconNode(icon));
-    const copy = element("div");
+    const copy = element("div", "recommendation-copy");
     copy.append(
       element("strong", "", title),
       document.createElement("br"),
       document.createTextNode(detail),
     );
     banner.append(copy);
+    if (action) {
+      const button = element(
+        "button",
+        "secondary-button recommendation-action",
+        action.label,
+      );
+      button.type = "button";
+      button.dataset.action = action.id || "recommendation-action";
+      button.addEventListener("click", action.handler);
+      banner.append(button);
+    }
     return banner;
+  }
+
+  function isConnectedProvider(provider) {
+    return Boolean(
+      provider?.authentication?.authenticated &&
+        provider?.connection?.state === "connected" &&
+        provider?.connection?.testState === "valid",
+    );
+  }
+
+  function navigateToSettings(page) {
+    state.focusAfterRoute = true;
+    window.location.hash = `#settings/${page}`;
   }
 
   function settingValue(key, fallback = "") {
@@ -1382,6 +1406,16 @@
     return choices;
   }
 
+  function informationalCard(title, detail, rows = []) {
+    const card = desktopCard(title, detail);
+    rows.forEach(([label, value, rowDetail = ""]) =>
+      card.append(
+        desktopRow(label, rowDetail, element("span", "read-only-value", value)),
+      ),
+    );
+    return card;
+  }
+
   function settingsPage(title, subtitle, icon, cards = [], banner = null) {
     const content = document.getElementById("settings-content");
     disposeSensitiveInputs(content);
@@ -1397,19 +1431,34 @@
     content.replaceChildren(
       pageHeader(
         "CLI Providers",
-        "Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, or Cursor to leverage your existing subscriptions — OpenCode can also proxy any API key.",
+        "Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, or Cursor to use the dedicated server account for each installed CLI.",
         "terminal",
       ),
-      recommendation(
-        "check",
-        "CLI providers connected.",
-        "Check recommendations to optimize your setup.",
-      ),
     );
-    const stack = element("div", "desktop-provider-list");
     const byID = Object.fromEntries(
       orderedProviders().map((provider) => [provider.providerID, provider]),
     );
+    const connectedMainProviders = [
+      byID.codex,
+      byID.claudeCompatible,
+      byID.openCodeACP,
+      byID.cursorACP,
+    ].filter(isConnectedProvider);
+    if (connectedMainProviders.length) {
+      content.append(
+        recommendation(
+          "check",
+          "CLI providers connected.",
+          "Check recommendations to optimize your setup.",
+          {
+            label: "Check Now",
+            id: "check-agent-model-recommendations",
+            handler: () => navigateToSettings("agent-models"),
+          },
+        ),
+      );
+    }
+    const stack = element("div", "desktop-provider-list");
     if (byID.codex) stack.append(cliProviderCard(byID.codex));
     if (byID.claudeCompatible)
       stack.append(cliProviderCard(byID.claudeCompatible));
@@ -1423,6 +1472,12 @@
     content.append(stack);
     installIcons(content);
   }
+
+  const externalCLIAuthenticationMethods = {
+    claudeCompatible: "providerSpecific",
+    openCodeACP: "providerSpecific",
+    cursorACP: "browserLogin",
+  };
 
   function cliProviderCard(provider) {
     const presentation = desktopProviderPresentation(provider);
@@ -1449,41 +1504,74 @@
       "claudeKimi",
       "claudeCustom",
     ].includes(provider.providerID);
-    if (compatibleBackend) body.append(compatibleBackendSettingsCard(provider));
-    const connected =
-      provider.authentication?.authenticated &&
-      provider.connection?.state === "connected";
-    if (connected) {
-      body.append(connectedProviderSummary(provider));
-      if (!compatibleBackend) body.append(providerRuntimeControls(provider));
-    } else {
-      if (provider.providerID === "codex") {
-        const note = element("p", "codex-auth-note");
-        note.append(
-          document.createTextNode(
-            "ChatGPT may require identity verification (KYC) to access Codex. ",
-          ),
-        );
-        const link = element("a", "", "Learn more");
-        link.href = "https://chatgpt.com/cyber";
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        note.append(link);
+    const connected = isConnectedProvider(provider);
+
+    if (compatibleBackend) {
+      body.append(compatibleBackendPrerequisite(provider));
+      const directMethods = (
+        provider.capabilities.authenticationMethods || []
+      ).filter((method) => directAuthenticationMethods.has(method));
+      if (directMethods.length) {
+        const labels = {
+          claudeGLM: [
+            "Z.ai API Key",
+            "Save the key for the Z.ai coding-plan backend. The same Claude CLI binary runs this route; a Claude account login is not required.",
+          ],
+          claudeKimi: [
+            "Kimi API Key",
+            "Save the key for Kimi's coding backend. Kimi manages model selection, so RepoPrompt does not pass --model.",
+          ],
+        };
         body.append(
-          note,
-          element(
-            "p",
-            "card-subtitle",
-            "Permissions and runtime controls appear here after Codex is connected.",
-          ),
+          credentialForm(provider, directMethods, {
+            title: labels[provider.providerID]?.[0],
+            subtitle: labels[provider.providerID]?.[1],
+          }),
         );
       }
+      body.append(compatibleBackendSettingsCard(provider));
+      if (connected) body.append(connectedProviderSummary(provider));
+      else if (!directMethods.length)
+        body.append(
+          element(
+            "p",
+            "unavailable-panel",
+            providerActionUnavailableReason(provider),
+          ),
+        );
+      details.append(summary, body);
+      return details;
+    }
+
+    if (connected) {
+      body.append(connectedProviderSummary(provider));
+      body.append(providerRuntimeControls(provider));
+    } else if (provider.providerID === "codex") {
+      const note = element("p", "codex-auth-note");
+      note.append(
+        document.createTextNode(
+          "ChatGPT may require identity verification (KYC) to access Codex. ",
+        ),
+      );
+      const link = element("a", "", "Learn more");
+      link.href = "https://chatgpt.com/cyber";
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      note.append(link);
+      body.append(
+        note,
+        element(
+          "p",
+          "card-subtitle",
+          "Permissions and runtime controls appear here after Codex is connected.",
+        ),
+      );
       const methods = provider.capabilities.authenticationMethods || [];
       if (methods.length) {
         const message = element(
           "div",
           "inline-message info",
-          "Choose a sign-in method to connect this provider.",
+          "Choose a sign-in method to connect Codex.",
         );
         message.setAttribute("role", "status");
         body.append(authenticationMethodChoices(provider, message));
@@ -1504,9 +1592,100 @@
           ),
         );
       }
+    } else if (externalCLIAuthenticationMethods[provider.providerID]) {
+      body.append(externalCLIConnectPanel(provider));
+    } else {
+      body.append(
+        element(
+          "p",
+          "unavailable-panel",
+          providerActionUnavailableReason(provider),
+        ),
+      );
     }
     details.append(summary, body);
     return details;
+  }
+
+  function externalCLIConnectPanel(provider) {
+    const method = externalCLIAuthenticationMethods[provider.providerID];
+    const methods = provider.capabilities.authenticationMethods || [];
+    const guidance = {
+      claudeCompatible: [
+        "Connect the dedicated Claude Code CLI account mounted for this server.",
+        "If the account is not signed in, an operator can run claude login inside the isolated server account. Compatible backends below use their own API keys and do not require this login.",
+      ],
+      openCodeACP: [
+        "Connect the dedicated OpenCode CLI account mounted for this server.",
+        "If authentication is missing, an operator can run opencode auth login inside the isolated server account.",
+      ],
+      cursorACP: [
+        "Connect the dedicated Cursor CLI account mounted for this server.",
+        "If authentication is missing, an operator can complete Cursor login inside the isolated server account.",
+      ],
+    }[provider.providerID];
+    const card = desktopCard("Connection", guidance[0]);
+    card.append(
+      element("p", "card-subtitle external-login-guidance", guidance[1]),
+    );
+    const message = element(
+      "div",
+      "inline-message info",
+      "The portal records use of the mounted CLI account; it never receives or copies the provider's login files.",
+    );
+    message.setAttribute("role", "status");
+    const actions = element("div", "form-actions");
+    const button = element("button", "primary-button", "Connect");
+    button.type = "button";
+    button.dataset.action = "connect-external-cli-provider";
+    const available =
+      provider.deploymentAllowed &&
+      provider.cli?.installed !== false &&
+      methods.includes(method);
+    if (!available)
+      setDisabledReason(
+        button,
+        true,
+        providerActionUnavailableReason(provider),
+      );
+    else
+      button.addEventListener("click", () =>
+        connectExternalCLIProvider(provider, method, button, message),
+      );
+    actions.append(
+      element("span", "form-note", "No credential fields are sent."),
+      button,
+    );
+    card.append(actions, message);
+    return card;
+  }
+
+  async function connectExternalCLIProvider(provider, method, button, message) {
+    const originalLabel = button.textContent;
+    button.textContent = "Connecting…";
+    setDisabledReason(button, true, "Connection request is in progress.");
+    message.textContent = "Checking the mounted CLI account…";
+    try {
+      const updated = await api(
+        `api/v1/provider-settings/${encodeURIComponent(provider.providerID)}/connect`,
+        {
+          method: "POST",
+          body: JSON.stringify({ authenticationMethod: method }),
+        },
+      );
+      replaceProvider(updated);
+      renderHomeProviders();
+      renderRoute();
+      toast(`${provider.displayName} connected`);
+      announce(`${provider.displayName} connected`);
+    } catch (error) {
+      message.textContent = error.message;
+      message.className = "inline-message error";
+      message.focus({ preventScroll: true });
+      button.textContent = originalLabel;
+      setDisabledReason(button, false, "");
+      toast(error.message, true);
+    }
   }
 
   function providerActionUnavailableReason(provider) {
@@ -1516,63 +1695,94 @@
       return "The provider command is not installed on this server.";
     if (provider.providerID === "claudeCustom")
       return "Custom endpoint credentials require an operator-managed connection until a safe endpoint validator is configured.";
-    if (["openCodeACP", "cursorACP"].includes(provider.providerID))
-      return "Complete this provider's sign-in in its isolated server account; the portal does not proxy browser credentials.";
+    if (
+      ["claudeCompatible", "openCodeACP", "cursorACP"].includes(
+        provider.providerID,
+      )
+    )
+      return "The dedicated CLI credential directory is not mounted or is unavailable. Complete sign-in in the isolated server account, then refresh.";
     return "No connection method is available for this provider on the server.";
   }
 
   function connectedProviderSummary(provider) {
+    const external = ["providerSpecific", "browserLogin"].includes(
+      provider.connection?.authenticationMethod,
+    );
+    const compatibleBackend = [
+      "claudeGLM",
+      "claudeKimi",
+      "claudeCustom",
+    ].includes(provider.providerID);
     const card = desktopCard(
       provider.providerID === "codex" ? "Signed in to Codex" : "Connected",
     );
     const summary = provider.authentication || {};
     const rows = element("dl", "desktop-account-summary");
-    [
-      [
-        "Account",
-        summary.accountLabel ||
-          provider.connection?.accountLabel ||
-          "Connected account",
-      ],
-      ["Plan", summary.planLabel || "Plan not provided"],
-      [
-        "Authentication",
+    const account =
+      summary.accountLabel ||
+      provider.connection?.accountLabel ||
+      (external ? "Dedicated server CLI account" : "Connected account");
+    rows.append(element("dt", "", "Account"), element("dd", "", account));
+    if (provider.providerID === "codex" || summary.planLabel)
+      rows.append(
+        element("dt", "", "Plan"),
+        element("dd", "", summary.planLabel || "Plan not provided"),
+      );
+    rows.append(
+      element("dt", "", "Authentication"),
+      element(
+        "dd",
+        "",
         summary.authenticationLabel ||
-          humanize(summary.method || provider.connection?.authenticationMethod),
-      ],
-    ].forEach(([label, value]) => {
-      rows.append(element("dt", "", label), element("dd", "", value));
-    });
+          (external
+            ? "Mounted CLI login"
+            : humanize(
+                summary.method || provider.connection?.authenticationMethod,
+              )),
+      ),
+    );
     const actions = element("div", "button-row desktop-connection-actions");
     const message = element(
       "div",
       "inline-message info",
-      "Connection is ready.",
+      external
+        ? provider.connection?.detail ||
+            "The dedicated CLI account passed server validation."
+        : "Connection is ready.",
     );
     const test = element("button", "secondary-button", "Test Connection");
     test.type = "button";
+    test.dataset.action = "test-connection";
     test.addEventListener("click", () =>
       runConnectionAction(provider, "test", test, message),
     );
-    const signOut = element("button", "danger-button subtle", "Sign Out");
-    signOut.type = "button";
-    signOut.addEventListener("click", async () => {
+    const removalLabel = external
+      ? "Disconnect"
+      : compatibleBackend
+        ? "Delete Key"
+        : "Sign Out";
+    const remove = element("button", "danger-button subtle", removalLabel);
+    remove.type = "button";
+    remove.dataset.action = "request-disconnect";
+    remove.addEventListener("click", async () => {
       const accepted = await confirmAction({
-        title: `Sign out of ${provider.displayName}?`,
-        message: "New agent runs will no longer use this account.",
-        label: "Sign Out",
-        returnFocus: signOut,
+        title: `${removalLabel} ${provider.displayName}?`,
+        message: external
+          ? "New agent runs will stop using this mounted account. The operator-managed CLI login files are not modified."
+          : "The stored connection will be removed and new agent runs will no longer use it.",
+        label: removalLabel,
+        returnFocus: remove,
       });
       if (accepted)
-        await runConnectionAction(provider, "disconnect", signOut, message);
+        await runConnectionAction(provider, "disconnect", remove, message);
     });
-    actions.append(test, signOut);
+    actions.append(test, remove);
     card.append(rows, actions, message);
     return card;
   }
 
-  function providerRuntimeControls(provider) {
-    const card = desktopCard("Permissions & Runtime");
+  function providerRuntimeControls(provider, title = "Permissions & Runtime") {
+    const card = desktopCard(title);
     if (provider.providerID === "codex") {
       card.append(
         selectSetting(
@@ -1658,6 +1868,11 @@
           "Claude searches for each tool before use; this saves context but adds latency.",
           true,
         ),
+        desktopRow(
+          "Sys Prompt Packaging",
+          "Desktop also offers Replace System Prompt and User Message (No Native). The shared Claude runtime currently sends RepoPrompt instructions as a user message and keeps Claude Code's native prompt.",
+          element("span", "required-pill", "User Message (Keep Native)"),
+        ),
       );
     } else {
       const key =
@@ -1680,6 +1895,23 @@
       );
     }
     return card;
+  }
+
+  function compatibleBackendPrerequisite(provider) {
+    const installed = provider.cli?.installed !== false;
+    const panel = element(
+      "div",
+      installed ? "inline-message success" : "inline-message warning",
+    );
+    panel.append(
+      iconNode(installed ? "check" : "warning"),
+      document.createTextNode(
+        installed
+          ? "Claude CLI is installed. This backend uses its own API key; a Claude account login is not required."
+          : "Claude CLI is missing. Install the packaged Claude Code CLI before testing this backend.",
+      ),
+    );
+    return panel;
   }
 
   function compatibleBackendsCard(providers) {
@@ -1763,16 +1995,25 @@
       },
     };
     const definition = definitions[provider.providerID];
-    const card = desktopCard("Backend Settings");
-    const enabledRow = desktopRow(
-      "Enable backend",
-      "Makes this configured backend available for new server sessions.",
-      providerEnabledToggle(provider),
+    const custom = provider.providerID === "claudeCustom";
+    const card = desktopCard(
+      custom ? "Custom Backend" : "Backend Behavior",
+      custom
+        ? "Define an Anthropic-compatible endpoint. Credential entry remains unavailable until the server can validate the configured host safely."
+        : "These runtime settings mirror the desktop backend behavior. Provider credentials are managed in the key section above.",
     );
-    card.append(enabledRow);
+    card.append(
+      desktopRow(
+        "Available for new sessions",
+        "Enable this backend in the server provider catalog.",
+        providerEnabledToggle(provider),
+      ),
+    );
+
     const form = element("form", "compatible-backend-form");
-    const fields = element("div", "settings-form");
-    function field(name, label, type = "text") {
+    const primaryFields = element("div", "settings-form");
+    const advancedFields = element("div", "settings-form");
+    function field(container, name, label, type = "text") {
       const key = definition.keys[name];
       const wrapper = element("label", "field");
       wrapper.append(element("span", "", label));
@@ -1781,27 +2022,40 @@
       );
       input.name = name;
       input.dataset.settingKey = key;
-      if (type !== "select") input.type = type;
-      input.value = settingValue(key);
+      if (type !== "select") {
+        input.type = type;
+        input.value = settingValue(key);
+      }
       wrapper.append(input);
-      fields.append(wrapper);
+      container.append(wrapper);
       return input;
     }
-    field("displayName", "Display name");
-    field("baseURL", "Base URL", "url");
-    const auth = field("auth", "Auth header", "select");
-    [
-      ["anthropicAPIKey", "ANTHROPIC_API_KEY"],
-      ["anthropicAuthToken", "ANTHROPIC_AUTH_TOKEN"],
-    ].forEach(([value, label]) => {
-      const option = element("option", "", label);
-      option.value = value;
-      option.selected = value === settingValue(definition.keys.auth);
-      auth.append(option);
-    });
+
+    function addAuthField(container) {
+      const auth = field(container, "auth", "Auth header", "select");
+      [
+        ["anthropicAPIKey", "ANTHROPIC_API_KEY"],
+        ["anthropicAuthToken", "ANTHROPIC_AUTH_TOKEN"],
+      ].forEach(([value, label]) => {
+        const option = element("option", "", label);
+        option.value = value;
+        option.selected = value === settingValue(definition.keys.auth);
+        auth.append(option);
+      });
+    }
+
     let behavior = definition.behavior;
-    if (definition.keys.behavior) {
-      const select = field("behavior", "Model behavior", "select");
+    let behaviorSelect = null;
+    if (custom) {
+      field(primaryFields, "displayName", "Display name");
+      field(primaryFields, "baseURL", "Base URL", "url");
+      addAuthField(primaryFields);
+      behaviorSelect = field(
+        primaryFields,
+        "behavior",
+        "Model behavior",
+        "select",
+      );
       [
         ["noModel", "No model flag"],
         ["claudeSlotMapping", "Claude slot mappings"],
@@ -1809,13 +2063,10 @@
         const option = element("option", "", label);
         option.value = value;
         option.selected = value === behavior;
-        select.append(option);
-      });
-      select.addEventListener("change", () => {
-        behavior = select.value;
-        slots.hidden = behavior !== "claudeSlotMapping";
+        behaviorSelect.append(option);
       });
     }
+
     const slots = element("fieldset", "compatible-slot-fields");
     slots.append(element("legend", "", "Claude slot → backend model ID"));
     if (definition.keys.haiku) {
@@ -1834,8 +2085,43 @@
         slots.append(wrapper);
       });
       slots.hidden = behavior !== "claudeSlotMapping";
-      fields.append(slots);
+      primaryFields.append(slots);
     }
+    if (behaviorSelect)
+      behaviorSelect.addEventListener("change", () => {
+        behavior = behaviorSelect.value;
+        slots.hidden = behavior !== "claudeSlotMapping";
+      });
+
+    if (provider.providerID === "claudeKimi") {
+      primaryFields.append(
+        element(
+          "p",
+          "field-wide compatible-behavior-note",
+          "Model behavior: no --model flag. Kimi's coding backend manages model selection and does not use Claude effort levels.",
+        ),
+      );
+    }
+
+    if (!custom) {
+      field(advancedFields, "displayName", "Display name");
+      field(advancedFields, "baseURL", "Base URL", "url");
+      addAuthField(advancedFields);
+      const advanced = element("details", "compatible-advanced");
+      advanced.append(
+        element("summary", "", "Advanced"),
+        element(
+          "p",
+          "card-subtitle",
+          "Override the desktop preset's display name, fixed compatible base URL, or authentication header.",
+        ),
+        advancedFields,
+      );
+      form.append(primaryFields, advanced);
+    } else {
+      form.append(primaryFields);
+    }
+
     const message = element(
       "div",
       "inline-message info",
@@ -1845,11 +2131,12 @@
     const actions = element("div", "form-actions");
     const save = element("button", "primary-button", "Save Settings");
     save.type = "submit";
+    save.dataset.action = "save-compatible-backend-settings";
     actions.append(
       element("span", "form-note", "Applies to future sessions."),
       save,
     );
-    form.append(fields, message, actions);
+    form.append(message, actions);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const changes = {};
@@ -1903,83 +2190,315 @@
   }
 
   function renderDesktopAgentModels() {
-    const routing = desktopCard(
-      "Agent Model Routing",
-      "Set global models for Oracle, Context Builder, and Agent roles. Workspace overrides inherit these values.",
+    const connected = orderedProviders().filter(
+      (provider) =>
+        provider.category === "cliProvider" && isConnectedProvider(provider),
     );
-    routing.append(
-      selectSetting(
-        "oracleModel",
-        "Oracle Model",
-        "Used for Oracle chat, planning, and review.",
-        modelChoices(),
-        "",
-      ),
-      selectSetting(
-        "contextBuilderAgent",
-        "Context Builder Agent",
-        "Agent used for discovery and prompt enhancement.",
-        [
-          ["codexExec", "Codex"],
-          ["claudeCode", "Claude Code"],
-          ["openCode", "OpenCode"],
-          ["cursor", "Cursor"],
-        ],
-        "codexExec",
-      ),
-      selectSetting(
-        "contextBuilderModel",
-        "Context Builder Model",
-        "Optional model override for Context Builder.",
-        modelChoices(),
-        "",
-      ),
+    const recommendations = agentModelRecommendations(connected);
+    const recommendationCard = desktopCard(
+      "Recommended Setup",
+      recommendations.length
+        ? "A live assessment of the CLI providers connected to this server using the desktop 2026-08 recommendation candidate chains."
+        : connected.length
+          ? "The connected providers do not produce a desktop recommendation target. Codex, Claude Code, or Cursor must be connected before the desktop recommender assigns models."
+          : "Connect at least one CLI provider to calculate desktop-style recommendations.",
     );
-    const roles = desktopCard(
-      "Agent Role Defaults",
-      "Role labels keep workflow and MCP discovery stable while models change.",
+    if (recommendations.length) {
+      recommendations.forEach(([label, value, detail]) =>
+        recommendationCard.append(
+          desktopRow(
+            label,
+            detail,
+            element("span", "recommended-value", value),
+          ),
+        ),
+      );
+      recommendationCard.append(
+        element(
+          "p",
+          "scope-footnote",
+          "Desktop RepoPrompt can apply Oracle, Context Builder, and role mappings globally or per workspace. The shared server does not yet expose that routing authority, so the portal reports recommendations instead of saving inert role values.",
+        ),
+      );
+    } else {
+      const action = element(
+        "button",
+        "secondary-button",
+        "Open CLI Providers",
+      );
+      action.type = "button";
+      action.dataset.action = "open-cli-providers";
+      action.addEventListener("click", () =>
+        navigateToSettings("cli-providers"),
+      );
+      recommendationCard.append(
+        element(
+          "p",
+          "empty-inline",
+          connected.length
+            ? "No desktop recommendation target is available for the connected provider set. OpenCode is not assigned to desktop recommendation roles, and compatible backends participate in role fallbacks only when Codex, Claude Code, or Cursor is ready."
+            : "No connected CLI providers.",
+        ),
+        action,
+      );
+    }
+
+    const providerDefaults = element("div", "provider-stack");
+    const providersWithModels = orderedProviders().filter(
+      (provider) =>
+        provider.deploymentAllowed &&
+        provider.category === "cliProvider" &&
+        (provider.models || []).length,
     );
-    [
-      ["exploreRoleModel", "Explore"],
-      ["engineerRoleModel", "Engineer"],
-      ["pairRoleModel", "Pair"],
-      ["designRoleModel", "Design"],
-    ].forEach(([key, label]) =>
-      roles.append(
-        selectSetting(key, label, `${label} agent model.`, modelChoices(), ""),
-      ),
+    providersWithModels.forEach((provider, index) =>
+      providerDefaults.append(providerCard(provider, index === 0, true)),
     );
-    roles.append(
-      toggleSetting(
-        "restrictAgentDiscoveryToRoles",
-        "Hide non-role models from MCP agents",
-        "Restrict agent discovery to configured role labels.",
-        false,
-      ),
+    if (!providersWithModels.length)
+      providerDefaults.append(
+        informationalCard(
+          "No Model Catalogs",
+          "The server has not advertised a selectable model catalog.",
+        ),
+      );
+
+    const runtime = desktopCard(
+      "Provider Defaults",
+      "These controls are runtime-backed. They set each provider's default model and advertised options for new portal sessions when the session does not choose an explicit model.",
     );
+    runtime.append(providerDefaults);
     settingsPage(
       "Agent Models",
-      "Choose model routing for direct agents, sub-agents, Oracle, and Context Builder.",
+      "Check desktop-style recommendations and configure the provider defaults the shared server can actually enforce.",
       "model",
-      [routing, roles],
+      [recommendationCard, runtime],
       recommendation(
         "model",
-        "Shared server defaults",
-        "All portal users and server agents use this profile unless a session supplies an explicit model.",
+        recommendations.length
+          ? "Recommendation check complete"
+          : connected.length
+            ? "No desktop recommendation target available"
+            : "Recommendations need a connected CLI provider",
+        recommendations.length
+          ? `${connected.length} connected CLI provider${connected.length === 1 ? "" : "s"} evaluated against the desktop 2026-08 profile.`
+          : connected.length
+            ? "The connected provider set is not a desktop recommendation driver; connect Codex, Claude Code, or Cursor."
+            : "Connect Claude Code, Codex, OpenCode, or Cursor, then return here.",
       ),
     );
   }
 
-  function renderAgentPermissions() {
-    const direct = desktopCard(
-      "Direct Agents",
-      "Provider-specific controls are shared with each connected CLI provider.",
+  function agentModelRecommendations(connectedProviders) {
+    const compatibleBackendIDs = new Set([
+      "claudeGLM",
+      "claudeKimi",
+      "claudeCustom",
+    ]);
+    const byID = Object.fromEntries(
+      connectedProviders
+        .filter(
+          (provider) =>
+            !compatibleBackendIDs.has(provider.providerID) ||
+            provider.preference?.enabled,
+        )
+        .map((provider) => [provider.providerID, provider]),
     );
-    direct.append(
+    const hasRecommendationDriver = [
+      "codex",
+      "claudeCompatible",
+      "cursorACP",
+    ].some((providerID) => byID[providerID]);
+    if (!hasRecommendationDriver) return [];
+
+    const slotKeys = {
+      claudeGLM: {
+        haiku: "claudeGLMHaikuModel",
+        sonnet: "claudeGLMSonnetModel",
+        opus: "claudeGLMOpusModel",
+      },
+      claudeCustom: {
+        haiku: "claudeCustomHaikuModel",
+        sonnet: "claudeCustomSonnetModel",
+        opus: "claudeCustomOpusModel",
+      },
+    };
+
+    function target(candidate) {
+      const provider = byID[candidate.providerID];
+      if (!provider) return null;
+      const title = desktopProviderPresentation(provider).title;
+      if (candidate.backendManaged)
+        return {
+          value: `${title} · Backend-managed model`,
+          exactTargetAdvertised: true,
+          targetLabel: "Backend-managed model",
+        };
+      if (candidate.slot) {
+        if (
+          candidate.providerID === "claudeCustom" &&
+          settingValue("claudeCustomModelBehavior", "noModel") !==
+            "claudeSlotMapping"
+        )
+          return {
+            value: `${title} · Backend-managed model`,
+            exactTargetAdvertised: true,
+            targetLabel: "Backend-managed model",
+          };
+        const mapped = settingValue(
+          slotKeys[candidate.providerID]?.[candidate.slot],
+        );
+        const slot = `${humanize(candidate.slot)} slot`;
+        return {
+          value: `${title} · ${slot}${mapped ? ` → ${mapped}` : ""}`,
+          exactTargetAdvertised: Boolean(mapped),
+          targetLabel: slot,
+        };
+      }
+
+      const models = provider.models || [];
+      const advertised =
+        models.find((model) => candidate.ids?.includes(model.id)) ||
+        models.find((model) => {
+          const haystack = `${model.id} ${model.displayName}`.toLowerCase();
+          return candidate.contains?.every((token) =>
+            haystack.includes(token.toLowerCase()),
+          );
+        });
+      const effortAdvertised =
+        !candidate.effort ||
+        advertised?.reasoningEfforts?.includes(candidate.effort);
+      const pieces = [title, advertised?.displayName || candidate.label];
+      if (candidate.effort) pieces.push(humanize(candidate.effort));
+      return {
+        value: pieces.join(" · "),
+        exactTargetAdvertised: Boolean(advertised && effortAdvertised),
+        targetLabel: `${candidate.label}${candidate.effort ? ` ${humanize(candidate.effort)}` : ""}`,
+      };
+    }
+
+    function choose(candidates) {
+      let informationalFallback = null;
+      for (const candidate of candidates) {
+        const resolved = target(candidate);
+        if (!resolved) continue;
+        if (resolved.exactTargetAdvertised) return resolved;
+        informationalFallback ||= resolved;
+      }
+      return informationalFallback;
+    }
+
+    function row(label, resolved, detail) {
+      if (!resolved) return null;
+      const catalogDetail = resolved.exactTargetAdvertised
+        ? ""
+        : ` The desktop target is ${resolved.targetLabel}; this server has not advertised that exact model/effort, so the assessment is informational.`;
+      return [label, resolved.value, `${detail}${catalogDetail}`];
+    }
+
+    const codex = (effort) => ({
+      providerID: "codex",
+      ids: ["gpt-5.6-sol", `gpt-5.6-sol-${effort}`],
+      contains: ["gpt-5.6", "sol"],
+      label: "GPT-5.6 Sol",
+      effort,
+    });
+    const claude = (family, effort = null) => ({
+      providerID: "claudeCompatible",
+      ids: [`claude-${family}-5`, `claude-${family}`],
+      contains: [family],
+      label: humanize(family),
+      effort,
+    });
+    const glm = (slot) => ({ providerID: "claudeGLM", slot });
+    const kimi = { providerID: "claudeKimi", backendManaged: true };
+    const custom = (slot) => ({ providerID: "claudeCustom", slot });
+    const legacyCodex = (id, label) => ({
+      providerID: "codex",
+      ids: [id],
+      contains: [id],
+      label,
+    });
+    const cursor = (composer = false) => ({
+      providerID: "cursorACP",
+      ids: composer ? ["composer-2", "composer2"] : ["auto"],
+      contains: composer ? ["composer", "2"] : ["auto"],
+      label: composer ? "Composer 2" : "Auto",
+    });
+
+    return [
+      row(
+        "Oracle Model",
+        choose([codex("high"), claude("opus")]),
+        "Desktop priority: Codex GPT-5.6 Sol High, OpenAI API when configured, then Claude Opus.",
+      ),
+      row(
+        "Context Builder Agent",
+        choose([codex("low"), claude("sonnet"), cursor(true)]),
+        "Desktop priority: Codex GPT-5.6 Sol Low, Claude Sonnet, then Cursor Composer 2.",
+      ),
+      row(
+        "Explore",
+        choose([
+          codex("low"),
+          claude("sonnet", "high"),
+          claude("haiku"),
+          glm("haiku"),
+          kimi,
+          custom("haiku"),
+          legacyCodex("gpt-5.4-mini-medium", "GPT-5.4 Mini Medium"),
+          legacyCodex("gpt-5.1-codex-mini", "GPT-5.1 Codex Mini"),
+          cursor(false),
+        ]),
+        "Desktop role chain for fast exploration and codebase mapping.",
+      ),
+      row(
+        "Engineer",
+        choose([
+          codex("medium"),
+          claude("sonnet"),
+          glm("sonnet"),
+          kimi,
+          custom("sonnet"),
+          cursor(true),
+        ]),
+        "Desktop role chain for balanced implementation work.",
+      ),
+      row(
+        "Pair",
+        choose([
+          codex("high"),
+          claude("opus"),
+          glm("opus"),
+          kimi,
+          custom("opus"),
+          cursor(true),
+        ]),
+        "Desktop role chain for highest-quality interactive engineering.",
+      ),
+      row(
+        "Design",
+        choose([
+          claude("opus"),
+          glm("opus"),
+          kimi,
+          custom("opus"),
+          cursor(true),
+          codex("medium"),
+        ]),
+        "Desktop role chain for architecture and extended analysis.",
+      ),
+    ].filter(Boolean);
+  }
+
+  function renderAgentPermissions() {
+    const fallback = desktopCard(
+      "Direct Agents",
+      "These settings are runtime-backed and apply to new portal sessions. Provider-specific controls override the shared fallback where applicable.",
+    );
+    fallback.append(
       selectSetting(
         "serverDefaultExecutionMode",
         "Default Execution Mode",
-        "Fallback mode for providers without a more specific permission setting.",
+        "Fallback sandbox mode for OpenCode, Cursor, and providers without a more specific mapping.",
         [
           ["readOnly", "Read Only"],
           ["workspaceWrite", "Workspace Write"],
@@ -1987,399 +2506,460 @@
         ],
         "workspaceWrite",
       ),
-      selectSetting(
-        "codexPermissionLevel",
-        "Codex",
-        "Direct Codex agent permissions.",
-        [
-          ["readOnly", "Read Only"],
-          ["defaultPermission", "Default Permission"],
-          ["autoReview", "Auto Review"],
-          ["fullAccess", "Full Access"],
-        ],
-        "autoReview",
-      ),
-      selectSetting(
-        "claudePermissionLevel",
-        "Claude Code",
-        "Direct Claude Code agent permissions.",
-        [
-          ["requireApproval", "Require Approval"],
-          ["autoApproveEdits", "Auto-Approve Edits"],
-          ["auto", "Auto"],
-          ["fullAccess", "Full Access"],
-        ],
-        "requireApproval",
-      ),
     );
-    const subagents = desktopCard(
+    const byID = Object.fromEntries(
+      orderedProviders().map((provider) => [provider.providerID, provider]),
+    );
+    const providerCards = [
+      [byID.codex, "Codex Direct Agent"],
+      [byID.claudeCompatible, "Claude Code Direct Agent"],
+      [byID.openCodeACP, "OpenCode Direct Agent"],
+      [byID.cursorACP, "Cursor Direct Agent"],
+    ]
+      .filter(([provider]) => provider)
+      .map(([provider, title]) => providerRuntimeControls(provider, title));
+    const subagents = informationalCard(
       "Sub-Agents",
-      "Safe Managed is recommended and keeps delegated agents inside bounded permissions.",
-    );
-    subagents.append(
-      selectSetting(
-        "subagentPolicy",
-        "Permission Policy",
-        "Controls how sub-agents derive provider permissions.",
+      "Desktop RepoPrompt exposes Safe Managed, Inherit Provider Settings, and Custom policies for Codex, Claude Code, OpenCode, and Cursor. The shared server does not yet expose a mutation authority for that policy, so the portal does not save decorative values.",
+      [
         [
-          ["safeManaged", "Safe Managed"],
-          ["inheritProviderSettings", "Inherit Provider Settings"],
-          ["custom", "Custom"],
+          "Current authority",
+          "Server runtime policy",
+          "Delegated-agent permissions are resolved by the Agent Mode runtime that launches the sub-agent.",
         ],
-        "safeManaged",
-      ),
+        [
+          "Desktop recommendation",
+          "Safe Managed",
+          "Use bounded permissions unless an explicit workflow requires broader access.",
+        ],
+      ],
     );
-    if (settingValue("subagentPolicy", "safeManaged") === "custom") {
-      subagents.append(
-        selectSetting(
-          "subagentCodexPermissionLevel",
-          "Codex",
-          "Custom sub-agent permission.",
-          [
-            ["readOnly", "Read Only"],
-            ["defaultPermission", "Default Permission"],
-            ["autoReview", "Auto Review"],
-            ["fullAccess", "Full Access"],
-          ],
-          "autoReview",
-        ),
-        selectSetting(
-          "subagentClaudePermissionLevel",
-          "Claude Code",
-          "Custom sub-agent permission.",
-          [
-            ["requireApproval", "Require Approval"],
-            ["autoApproveEdits", "Auto-Approve Edits"],
-            ["auto", "Auto"],
-            ["fullAccess", "Full Access"],
-          ],
-          "requireApproval",
-        ),
-      );
-    }
     settingsPage(
       "Agent Permissions",
-      "Configure direct-agent and sub-agent permission policies.",
+      "Configure runtime-backed direct-agent permissions and review the shared-server sub-agent boundary.",
       "shield",
-      [direct, subagents],
+      [fallback, ...providerCards, subagents],
       recommendation(
         "shield",
-        "Safe Managed",
-        "Sub-agents can read and reason broadly while destructive or unrestricted actions remain bounded.",
+        "Direct permissions apply to new sessions",
+        "Codex, Claude Code, OpenCode, and Cursor controls now match the desktop provider map.",
       ),
     );
   }
 
   function renderAgentWorkflows() {
-    const card = desktopCard(
-      "Featured Workflows",
-      "Choose which built-in workflows appear and arrange their order.",
-    );
-    card.append(
-      toggleSetting(
-        "includeWorkflowCleanupGuidance",
-        "Include cleanup guidance",
-        "Tell workflow agents to clean completed temporary worktrees and artifacts.",
-        true,
-      ),
+    const workflows = state.bootstrap?.workflows || [];
+    const catalog = desktopCard(
+      "Server Workflow Catalog",
+      "Workflows actually advertised by the Agent Mode runtime. This is a live, read-only projection rather than a second browser-side workflow registry.",
     );
     const list = element("div", "workflow-settings-list");
-    const labels = {
-      build: "Build",
-      investigate: "Investigate",
-      oracleExport: "Oracle Export",
-      orchestrate: "Orchestrate",
-      optimize: "Optimize",
-      deepPlan: "Deep Plan",
-    };
-    settingArray("featuredWorkflows").forEach((workflow, index, workflows) => {
+    workflows.forEach((workflow) => {
       const row = element("div", "desktop-setting-row compact");
-      row.append(element("strong", "", labels[workflow] || humanize(workflow)));
-      const buttons = element("div", "button-row");
-      [
-        ["↑", index - 1],
-        ["↓", index + 1],
-      ].forEach(([label, target]) => {
-        const button = element("button", "small-icon-button text-icon", label);
-        button.type = "button";
-        button.disabled = target < 0 || target >= workflows.length;
-        button.addEventListener("click", () => {
-          const next = [...workflows];
-          [next[index], next[target]] = [next[target], next[index]];
-          saveSetting("featuredWorkflows", JSON.stringify(next), button);
-        });
-        buttons.append(button);
-      });
-      row.append(buttons);
+      const copy = element("div", "desktop-setting-copy");
+      copy.append(
+        element("strong", "", workflow.name),
+        element("small", "", workflow.workflowID),
+      );
+      row.append(
+        copy,
+        element(
+          "span",
+          workflow.enabled ? "connection-badge connected" : "connection-badge",
+          workflow.enabled ? "Enabled" : "Disabled",
+        ),
+      );
       list.append(row);
     });
-    card.append(list);
-    const custom = desktopCard(
-      "Custom Workflows",
-      "Custom workflow documents are stored on the server and shared with portal agents.",
-    );
-    const workflows = settingArray("customWorkflows");
-    custom.append(
-      element(
-        "p",
-        workflows.length ? "card-subtitle" : "empty-inline",
-        workflows.length
-          ? `${workflows.length} custom workflow${workflows.length === 1 ? "" : "s"}.`
-          : "No custom workflows.",
-      ),
+    if (!workflows.length)
+      list.append(
+        element(
+          "p",
+          "empty-inline",
+          "No workflows are advertised by the server.",
+        ),
+      );
+    catalog.append(list);
+    const desktopBoundary = informationalCard(
+      "Desktop Management Boundary",
+      "The desktop page can mutate local markdown workflow files. The web server currently exposes workflow discovery, not safe CRUD for that filesystem.",
+      [
+        [
+          "Cleanup guidance",
+          "Runtime-managed",
+          "Desktop can append session-cleanup instructions to built-in prompts.",
+        ],
+        [
+          "Featured order",
+          "Not portal-editable",
+          "Desktop can add, remove, and reorder featured workflows.",
+        ],
+        [
+          "Built-in workflows",
+          "Catalog only",
+          "Desktop can show, hide, feature, and clone built-ins.",
+        ],
+        [
+          "Custom workflows",
+          "Not portal-editable",
+          "Desktop can create, reload, reveal, clone, and delete markdown files.",
+        ],
+      ],
     );
     settingsPage(
       "Agent Workflows",
-      "Control built-in workflow recommendations and shared custom workflows.",
+      "Review the workflow catalog the shared server can execute and the desktop-only authoring boundary.",
       "workflow",
-      [card, custom],
+      [catalog, desktopBoundary],
     );
   }
 
   function renderContextBuilder() {
     const about = desktopCard(
       "About",
-      "Context Builder discovers relevant code, curates file context, and can improve the prompt before an agent begins.",
+      "Context Builder explores the codebase, curates relevant files, and can rewrite, augment, or preserve the prompt before an agent begins.",
     );
-    const agent = desktopCard("Context Builder Agent");
-    agent.append(
-      selectSetting(
-        "contextBuilderAgent",
-        "Agent",
-        "Provider used for Context Builder.",
-        [
-          ["codexExec", "Codex"],
-          ["claudeCode", "Claude Code"],
-          ["openCode", "OpenCode"],
-          ["cursor", "Cursor"],
-        ],
-        "codexExec",
+    const models = element("button", "secondary-button", "Open Agent Models");
+    models.type = "button";
+    models.dataset.action = "open-agent-models";
+    models.addEventListener("click", () => navigateToSettings("agent-models"));
+    about.append(
+      element(
+        "p",
+        "card-subtitle",
+        "As on desktop, agent and model selection belong in Agent Models rather than being duplicated here.",
       ),
-      selectSetting(
-        "contextBuilderModel",
-        "Model",
-        "Optional model override.",
-        modelChoices(),
-        "",
-      ),
+      models,
     );
-    const shared = desktopCard("Shared Settings");
-    shared.append(
-      numberSetting(
-        "contextBuilderBudget",
-        "Context Budget",
-        "Maximum selected-context token budget.",
-        8000,
-        240000,
-        1000,
-      ),
-      selectSetting(
-        "contextBuilderEnhancementMode",
-        "Prompt Enhancement",
-        "Choose whether Context Builder rewrites, augments, or preserves the prompt.",
+    const shared = informationalCard(
+      "Desktop Shared Settings",
+      "The desktop controls below are documented here for parity. The portal will not persist them until the shared Context Builder runtime exposes a revisioned settings authority.",
+      [
         [
-          ["fullRewrite", "Rewrite"],
-          ["augment", "Augment"],
-          ["preserve", "Preserve"],
+          "Context Budget",
+          "10k–200k · default 160k",
+          "Target selected-context size in 5k steps.",
         ],
-        "fullRewrite",
-      ),
-      selectSetting(
-        "contextBuilderQuestionTimeout",
-        "Question Timeout",
-        "How long server clarification prompts wait.",
         [
-          ["30", "30 seconds"],
-          ["60", "1 minute"],
-          ["120", "2 minutes"],
-          ["300", "5 minutes"],
+          "Prompt Enhancement",
+          "Rewrite / Augment / Preserve",
+          "Controls whether the submitted prompt is replaced, extended, or left intact.",
         ],
-        "60",
-      ),
-      toggleSetting(
-        "contextBuilderUIClarifyingQuestions",
-        "UI clarifying questions",
-        "Allow Context Builder to ask the portal user focused questions.",
-        true,
-      ),
-      toggleSetting(
-        "contextBuilderFollowUpAnalysis",
-        "Follow-up analysis",
-        "Run an Oracle-backed analysis after context discovery.",
-        false,
-      ),
-      numberSetting(
-        "contextBuilderAnalysisBudget",
-        "Analysis Budget",
-        "Maximum analysis token budget.",
-        8000,
-        240000,
-        1000,
-      ),
-      toggleSetting(
-        "contextBuilderMCPClarifyingQuestions",
-        "MCP clarifying questions",
-        "Allow clarification when Context Builder is invoked through MCP.",
-        false,
-      ),
-      textSetting(
-        "contextBuilderCustomInstructions",
-        "Custom Instructions",
-        "Additional shared guidance for Context Builder.",
-        "Optional instructions",
-      ),
+        [
+          "Question Timeout",
+          "30 sec / 1 min / 2 min / 5 min",
+          "Used by clarifying questions and Agent Mode ask_user interactions.",
+        ],
+      ],
+    );
+    const uiRuns = informationalCard(
+      "UI Runs",
+      "Controls used when Context Builder starts from the desktop UI.",
+      [
+        [
+          "Allow Clarifying Questions",
+          "Desktop-managed",
+          "Agent may ask focused questions before continuing.",
+        ],
+        [
+          "Follow-up Analysis",
+          "Desktop-managed",
+          "Optionally runs a separate Oracle plan, review, or question call.",
+        ],
+        [
+          "Analysis Budget",
+          "40k–200k",
+          "Appears only when follow-up analysis is enabled; uses the Oracle model from Agent Models.",
+        ],
+        [
+          "Custom Instructions",
+          "Prompt collection",
+          "Desktop manages selectable prompts, not one undifferentiated text field.",
+        ],
+      ],
+    );
+    const mcpRuns = informationalCard(
+      "MCP Runs",
+      "Controls used when another agent invokes the Context Builder MCP tool.",
+      [
+        [
+          "Allow Clarifying Questions",
+          "Runtime-managed",
+          "The caller must be watching RepoPrompt and respond before the shared question timeout.",
+        ],
+      ],
     );
     settingsPage(
       "Context Builder",
-      "Configure context discovery, prompt enhancement, and optional follow-up analysis.",
+      "Review the canonical desktop settings map and the current shared-server authority boundary.",
       "context",
-      [about, agent, shared],
+      [about, shared, uiRuns, mcpRuns],
+      recommendation(
+        "info",
+        "No decorative Context Builder controls",
+        "Previous portal fields were stored but never consumed by Context Builder; they are now shown honestly as pending runtime support.",
+      ),
     );
   }
 
   function renderMCPServer() {
+    const tools = state.bootstrap?.tools || [];
     const status = desktopCard(
       "MCP Server",
-      "RepoPrompt's MCP server exposes approved tools to connected agents.",
+      "RepoPrompt's MCP surface is part of the shared service lifecycle. Browser users cannot start, stop, or reconfigure the process independently.",
     );
+    const toolsLink = element(
+      "a",
+      "secondary-button compact-link",
+      `${tools.length} tools`,
+    );
+    toolsLink.href = "#settings/mcp-tools";
+    toolsLink.dataset.routeLink = "";
     status.append(
       desktopRow(
         "Server Status",
-        "Managed by the shared RepoPrompt service.",
+        "Deployment-managed and shared by connected agents.",
         element(
           "span",
-          "required-pill",
+          state.online ? "required-pill" : "connection-badge attention",
           state.online ? "Running" : "Unavailable",
         ),
       ),
-      toggleSetting(
-        "mcpToolsEnabled",
-        "Tools enabled",
-        "Allow approved MCP tools for server agents.",
-        true,
+      desktopRow(
+        "Tools",
+        "Canonical catalog advertised by this server build.",
+        toolsLink,
       ),
-      toggleSetting(
-        "mcpUseModelPresets",
-        "Oracle Model Presets",
-        "Expose shared model presets to Oracle operations.",
-        true,
+      desktopRow(
+        "Context Builder route",
+        "The context_builder tool owns shared discovery runs.",
+        element("code", "read-only-value", "context_builder"),
       ),
+    );
+    const desktopBoundary = informationalCard(
+      "Desktop Management Boundary",
+      "Desktop RepoPrompt owns a per-window MCP process and can expose controls that are not meaningful for this deployment-managed service.",
+      [
+        [
+          "Start / stop / force stop",
+          "Deployment-managed",
+          "The sandbox service lifecycle is controlled by the deployment workflow.",
+        ],
+        [
+          "Auto-start",
+          "Always service-managed",
+          "There is no browser window lifecycle to follow.",
+        ],
+        [
+          "Connections dashboard",
+          "Not exposed",
+          "Client connection details remain server-operational data.",
+        ],
+        [
+          "Quick setup / CLI installer",
+          "Desktop-only",
+          "Installers modify a local user's tool configuration and filesystem.",
+        ],
+        [
+          "Oracle model presets",
+          "No server CRUD authority",
+          "The portal does not store inert preset toggles.",
+        ],
+      ],
     );
     settingsPage(
       "MCP Server",
-      "Manage shared MCP availability and model behavior.",
+      "Inspect live shared-server MCP status and the desktop-only process-management boundary.",
       "server",
-      [status],
+      [status, desktopBoundary],
     );
   }
 
   function renderMCPTools() {
+    const tools = state.bootstrap?.tools || [];
     const card = desktopCard(
-      "MCP Tools",
-      "Enable tools for the shared server. Disabled tools remain unavailable to all portal agents.",
+      "Advertised MCP Tools",
+      "The canonical tool catalog comes from the same server runtime that registers the tools. Portal toggles are intentionally absent until server admission policy exposes a real mutation API.",
     );
-    const disabled = new Set(settingArray("mcpDisabledTools"));
-    [
-      ["file_search", "File Search"],
-      ["read_file", "Read File"],
-      ["get_file_tree", "File Tree"],
-      ["apply_edits", "Apply Edits"],
-      ["manage_selection", "Manage Selection"],
-      ["manage_worktree", "Worktrees"],
-      ["ask_oracle", "Oracle"],
-    ].forEach(([id, label]) => {
-      const toggle = element("label", "toggle desktop-toggle");
-      const input = document.createElement("input");
-      input.type = "checkbox";
-      input.checked = !disabled.has(id);
-      input.setAttribute("aria-label", label);
-      input.addEventListener("change", () => {
-        const next = new Set(disabled);
-        if (input.checked) next.delete(id);
-        else next.add(id);
-        saveSetting(
-          "mcpDisabledTools",
-          JSON.stringify([...next].sort()),
-          input,
+    const toolbar = element("div", "tool-catalog-toolbar");
+    const searchLabel = element("label", "tool-search-field");
+    searchLabel.append(element("span", "sr-only", "Search MCP tools"));
+    const search = document.createElement("input");
+    search.type = "search";
+    search.placeholder = "Search tools";
+    search.setAttribute("aria-label", "Search MCP tools");
+    searchLabel.append(search);
+    const count = element("span", "tool-count");
+    count.setAttribute("role", "status");
+    toolbar.append(searchLabel, count);
+    const list = element("div", "tool-catalog-list");
+
+    function renderToolList() {
+      const query = search.value.trim().toLowerCase();
+      const filtered = tools.filter((tool) =>
+        [tool.name, tool.scope, tool.capability, tool.admissionClass]
+          .filter(Boolean)
+          .some((value) => String(value).toLowerCase().includes(query)),
+      );
+      count.textContent = `${filtered.length} of ${tools.length} advertised`;
+      list.replaceChildren();
+      filtered.forEach((tool) => {
+        const row = element("div", "tool-catalog-row");
+        const copy = element("div", "tool-catalog-copy");
+        copy.append(
+          element("code", "tool-name", tool.name),
+          element(
+            "small",
+            "",
+            `${humanize(tool.capability)} capability · ${humanize(tool.admissionClass)} admission`,
+          ),
         );
+        const badges = element("div", "tool-badges");
+        badges.append(
+          element("span", "required-pill", humanize(tool.scope)),
+          element("span", "read-only-pill", "Service-managed"),
+        );
+        row.append(copy, badges);
+        list.append(row);
       });
-      toggle.append(input, element("span"));
-      card.append(desktopRow(label, `Allow the ${label} MCP tool.`, toggle));
-    });
+      if (!filtered.length)
+        list.append(
+          element(
+            "p",
+            "empty-inline",
+            "No advertised tools match this search.",
+          ),
+        );
+    }
+    search.addEventListener("input", renderToolList);
+    renderToolList();
+    card.append(toolbar, list);
     settingsPage(
       "Tools",
-      "Choose which RepoPrompt MCP tools agents can call.",
+      "Search every MCP tool advertised by the shared RepoPrompt runtime.",
       "sliders",
       [card],
+      recommendation(
+        "check",
+        `${tools.length} tools advertised`,
+        "This list is generated from MCPDomainToolCatalog rather than a partial browser-maintained list.",
+      ),
     );
   }
 
   function renderWorkspaceApprovals() {
-    const card = desktopCard(
-      "Workspace Approvals",
-      "Set server-wide defaults for operations that require explicit workspace approval.",
+    const server = informationalCard(
+      "Shared Server Authorization",
+      "The web service authenticates portal requests and applies server-side mutation policy. It does not inherit the desktop app's per-MCP-client trust database.",
+      [
+        [
+          "Portal mutations",
+          "Authenticated + CSRF-protected",
+          "Authorization is enforced by the HTTP service and project/session authority.",
+        ],
+        [
+          "MCP mutations",
+          "Server policy",
+          "Tool admission and mutation boundaries are evaluated by the shared runtime.",
+        ],
+        [
+          "Trusted desktop clients",
+          "Not applicable",
+          "There is no local macOS client identity to approve or revoke in the browser.",
+        ],
+      ],
     );
-    card.append(
-      toggleSetting(
-        "workspaceApprovalsGlobal",
-        "Require workspace approvals",
-        "Apply approval rules to all shared projects.",
-        false,
-      ),
+    const desktop = informationalCard(
+      "Desktop Workspace Approvals",
+      "For comparison, the canonical desktop page controls automatic approval of four workspace-management operations; it is not a generic write/git/worktree permission page.",
+      [
+        [
+          "Master control",
+          "Auto-approve All Operations",
+          "Bypasses prompts for the four desktop workspace-management mutations.",
+        ],
+        [
+          "Create Workspace",
+          "Per-operation approval",
+          "Create a desktop workspace.",
+        ],
+        [
+          "Delete Workspace",
+          "Per-operation approval",
+          "Delete a desktop workspace.",
+        ],
+        [
+          "Add Folder",
+          "Per-operation approval",
+          "Attach a folder to a desktop workspace.",
+        ],
+        [
+          "Remove Folder",
+          "Per-operation approval",
+          "Detach a folder from a desktop workspace.",
+        ],
+        [
+          "Trusted clients",
+          "Revoke / reset",
+          "Desktop tracks which external MCP clients received approval.",
+        ],
+      ],
     );
-    const selected = new Set(settingArray("workspaceApprovalOperations"));
-    ["write", "move", "delete", "git", "worktree"].forEach((operation) => {
-      const toggle = element("label", "toggle desktop-toggle");
-      const input = document.createElement("input");
-      input.type = "checkbox";
-      input.checked = selected.has(operation);
-      input.addEventListener("change", () => {
-        const next = new Set(selected);
-        if (input.checked) next.add(operation);
-        else next.delete(operation);
-        saveSetting(
-          "workspaceApprovalOperations",
-          JSON.stringify([...next].sort()),
-          input,
-        );
-      });
-      toggle.append(input, element("span"));
-      card.append(
-        desktopRow(
-          humanize(operation),
-          `Require approval for ${operation} operations.`,
-          toggle,
-        ),
-      );
-    });
     settingsPage(
       "Workspace Approvals",
-      "Configure approval boundaries for shared project operations.",
+      "Understand the shared-server authorization boundary and the distinct desktop approval map.",
       "shield",
-      [card],
+      [server, desktop],
+      recommendation(
+        "shield",
+        "No invented approval toggles",
+        "The previous portal controls had different semantics and were not consumed by server policy.",
+      ),
     );
   }
 
   function renderModelPresets() {
-    const card = desktopCard(
-      "Model Presets",
-      "Reusable Oracle and agent model selections shared by the server.",
-    );
-    const presets = settingArray("modelPresets");
-    card.append(
-      element(
-        "p",
-        presets.length ? "card-subtitle" : "empty-inline",
-        presets.length
-          ? `${presets.length} model preset${presets.length === 1 ? "" : "s"}.`
-          : "No model presets configured.",
-      ),
+    const card = informationalCard(
+      "Desktop Model Presets",
+      "Desktop RepoPrompt owns a revisioned preset store. The shared server does not currently advertise that store or a CRUD contract, so the portal no longer counts an unused JSON setting as if presets existed.",
+      [
+        [
+          "Preset fields",
+          "Name, model, description",
+          "Each preset can also map supported Oracle/chat modes.",
+        ],
+        [
+          "Create",
+          "Add / Create Default",
+          "Desktop validates and persists a new preset.",
+        ],
+        [
+          "Edit",
+          "Rename and reconfigure",
+          "Desktop edits model, description, and mode mappings.",
+        ],
+        [
+          "Delete",
+          "Supported",
+          "Desktop removes the selected preset with confirmation.",
+        ],
+        [
+          "Temporary hidden state",
+          "Desktop banner",
+          "Desktop explains when presets are temporarily unavailable.",
+        ],
+      ],
     );
     settingsPage(
       "Model Presets",
-      "Manage shared model presets used by MCP and Oracle.",
+      "Review the canonical desktop preset feature and the current shared-server boundary.",
       "model",
       [card],
+      recommendation(
+        "info",
+        "Preset management is not available on this server",
+        "A real server-side preset authority is required before editable controls can be exposed.",
+      ),
     );
   }
 
@@ -2410,260 +2990,384 @@
     });
     if (!cards.length)
       cards.push(
-        desktopCard(
-          "No API Providers",
-          "No direct API provider runtime is currently advertised by this server.",
+        informationalCard(
+          "No Direct API Provider Runtimes",
+          "The portal only renders providers backed by a deployed server runtime. Desktop supports a broader local API-provider catalog that cannot be emulated with inert key fields.",
+          [
+            [
+              "Desktop cloud providers",
+              "Anthropic, OpenAI, DeepSeek, Fireworks, xAI, Groq, Z.AI, Gemini",
+              "Each has provider-specific validation and model discovery.",
+            ],
+            [
+              "Desktop enterprise/local",
+              "Azure and Ollama",
+              "Azure has deployment settings; Ollama uses local model discovery.",
+            ],
+            [
+              "Current server catalog",
+              "None enabled",
+              "The packaged xAI definition remains disabled until its portable runtime exists.",
+            ],
+          ],
         ),
       );
     settingsPage(
       "API Providers",
-      "Configure direct API provider authentication. Model routing remains in Agent Models and Model Config.",
+      "Configure only direct API providers backed by an advertised shared-server runtime.",
       "cloud",
       cards,
     );
   }
 
   function renderOpenRouter() {
-    const card = desktopCard(
-      "OpenRouter",
-      "Control server model catalog behavior for OpenRouter-backed configurations.",
-    );
-    card.append(
-      toggleSetting(
-        "openRouterIncludeDefaults",
-        "Include OpenRouter defaults",
-        "Show the default OpenRouter model catalog.",
-        true,
-      ),
-      toggleSetting(
-        "openRouterUseCustomSettings",
-        "Use custom settings",
-        "Override the default maximum output tokens.",
-        false,
-      ),
-      numberSetting(
-        "openRouterMaxTokens",
-        "Maximum Output Tokens",
-        "Zero uses the provider default.",
-        0,
-        2000000,
-        1000,
-      ),
+    const card = informationalCard(
+      "Desktop OpenRouter Setup",
+      "OpenRouter is not advertised by the shared-server provider catalog. The portal therefore does not accept an API key or save catalog controls that no runtime consumes.",
+      [
+        [
+          "API key",
+          "Validate & Fetch / Delete",
+          "Desktop validates the key and fetches the account's model catalog.",
+        ],
+        [
+          "Default models",
+          "Include or exclude",
+          "Desktop can mix curated defaults with fetched models.",
+        ],
+        [
+          "Custom settings",
+          "Optional",
+          "Maximum output tokens and custom request headers can be overridden.",
+        ],
+        [
+          "Registered models",
+          "Add / remove",
+          "Desktop searches fetched models and manages which models appear.",
+        ],
+        [
+          "Refresh",
+          "Supported on desktop",
+          "Re-fetches provider metadata from OpenRouter.",
+        ],
+      ],
     );
     settingsPage(
       "OpenRouter",
-      "Configure shared OpenRouter catalog defaults.",
+      "OpenRouter requires a real shared-server provider runtime before browser configuration is safe or effective.",
       "cloud",
       [card],
     );
   }
 
   function renderCustomAPI() {
-    const card = desktopCard(
-      "Custom API",
-      "Configure portable request behavior for server-managed custom API providers.",
-    );
-    card.append(
-      toggleSetting(
-        "customProviderIncludeContentType",
-        "Include Content-Type header",
-        "Send application/json when the provider does not add it automatically.",
-        true,
-      ),
+    const card = informationalCard(
+      "Desktop Custom API Setup",
+      "No generic custom-API runtime is advertised by this server. Endpoint and credential fields stay unavailable rather than implying that a Content-Type toggle alone configures a provider.",
+      [
+        [
+          "Connection",
+          "Base URL + write-only API key",
+          "Desktop validates the endpoint before saving.",
+        ],
+        [
+          "Preferred model",
+          "Selectable",
+          "Desktop stores a preferred model and maximum output-token limit.",
+        ],
+        [
+          "Validation",
+          "Validate & Save / Delete",
+          "The connection lifecycle is explicit.",
+        ],
+        [
+          "Request headers",
+          "Content-Type option",
+          "This is one advanced request behavior, not the entire provider setup.",
+        ],
+        [
+          "Fetched models",
+          "Search + enable",
+          "Desktop discovers models from the validated endpoint.",
+        ],
+      ],
     );
     settingsPage(
       "Custom API",
-      "Set shared behavior for custom API connections.",
+      "A safe endpoint validator and portable request runtime are required before web configuration can be enabled.",
       "sliders",
       [card],
     );
   }
 
   function renderModelConfig() {
-    const card = desktopCard(
-      "Model Config",
-      "Per-model overrides are shared by Agent Models, Oracle, and Context Builder.",
+    const catalog = desktopCard(
+      "Advertised Model Catalog",
+      "Read-only models and option families supplied by the live provider settings service.",
     );
-    const overrides = settingArray("modelOverrides");
-    card.append(
-      selectSetting(
-        "openAIServiceTier",
-        "OpenAI Service Tier",
-        "Default tier for direct OpenAI API model requests; CLI provider connections do not use this control.",
+    const list = element("div", "model-config-list");
+    orderedProviders().forEach((provider) =>
+      (provider.models || []).forEach((model) => {
+        const row = element("div", "model-config-row");
+        const copy = element("div", "desktop-setting-copy");
+        copy.append(
+          element("strong", "", model.displayName),
+          element("small", "", `${provider.displayName} · ${model.id}`),
+        );
+        const options = [
+          ...(model.reasoningEfforts || []).map(
+            (value) => `reasoning:${value}`,
+          ),
+          ...(model.speedModes || []).map((value) => `speed:${value}`),
+          ...(model.serviceTiers || []).map((value) => `tier:${value}`),
+        ];
+        row.append(
+          copy,
+          element(
+            "span",
+            "model-option-summary",
+            options.length ? options.join(" · ") : "Provider defaults",
+          ),
+        );
+        list.append(row);
+      }),
+    );
+    if (!list.childElementCount)
+      list.append(element("p", "empty-inline", "No models are advertised."));
+    catalog.append(list);
+    const desktop = informationalCard(
+      "Desktop Per-Model Overrides",
+      "The desktop model registry can mutate capabilities that the shared-server DTO does not yet expose. OpenAI service tier belongs to API Providers, not this page.",
+      [
+        ["Allow Diff", "Per model", "Controls diff-based edit support."],
+        ["Streaming", "Per model", "Overrides streaming capability."],
         [
-          ["auto", "Auto"],
-          ["default", "Default"],
-          ["flex", "Flex"],
-          ["priority", "Priority"],
+          "Responses API",
+          "Custom providers",
+          "Selects the OpenAI Responses transport when applicable.",
         ],
-        "auto",
-      ),
-      toggleSetting(
-        "openAIShowServiceTierVariants",
-        "Show service tier variants",
-        "Expose tier variants in shared model selection.",
-        false,
-      ),
-      element(
-        "p",
-        overrides.length ? "card-subtitle" : "empty-inline",
-        overrides.length
-          ? `${overrides.length} model override${overrides.length === 1 ? "" : "s"}.`
-          : "No model overrides configured.",
-      ),
+        ["Temperature", "Slider + reset", "Overrides the model temperature."],
+      ],
     );
     settingsPage(
       "Model Config",
-      "Manage shared model capability overrides.",
+      "Inspect live model capabilities and the desktop-only override boundary.",
       "model",
-      [card],
+      [catalog, desktop],
     );
   }
 
   function renderManageWorkspaces() {
     const projects = state.bootstrap?.projects || [];
     const card = desktopCard(
-      "Manage Workspaces",
-      "Projects available to this shared server.",
+      "Server Projects",
+      "Live projects provisioned for this shared service. Root paths are reduced to browser-safe root names.",
     );
-    const list = element("div", "glance-list");
+    const list = element("div", "workspace-project-list");
     projects.forEach((project) => {
-      const row = element("div", "glance-item static");
-      row.append(
-        element("strong", "", project.name || project.projectId),
-        element(
-          "small",
-          "",
-          `${project.rootCount ?? project.roots?.length ?? 0} roots`,
+      const roots = project.rootNames || [];
+      list.append(
+        desktopRow(
+          project.name || project.projectId,
+          roots.length ? roots.join(" · ") : "No roots advertised",
+          element("span", "required-pill", humanize(project.state)),
         ),
       );
-      list.append(row);
     });
     if (!projects.length)
       list.append(
         element("p", "empty-inline", "No server projects are available."),
       );
     card.append(list);
-    const worktrees = desktopCard(
-      "Worktrees",
-      "Defaults for server-owned session worktrees.",
-    );
-    worktrees.append(
-      selectSetting(
-        "defaultWorktreeMode",
-        "Default Worktree Mode",
-        "Create an isolated worktree for each root session or use the current checkout.",
+    const desktop = informationalCard(
+      "Desktop Workspace Management",
+      "Desktop RepoPrompt can select arbitrary local folders and manage window workspaces. A browser cannot safely mirror those local filesystem operations on the server.",
+      [
         [
-          ["isolated", "Isolated Worktree"],
-          ["currentCheckout", "Current Checkout"],
-          ["disabled", "Disabled"],
+          "Auto-restore",
+          "Desktop-only",
+          "Restores local windows and workspace state.",
         ],
-        "isolated",
-      ),
-      textSetting(
-        "worktreeBaseRef",
-        "Base Reference",
-        "Optional Git ref used when creating isolated worktrees.",
-        "Repository default branch",
-      ),
-      toggleSetting(
-        "removeCompletedWorktrees",
-        "Remove completed worktrees",
-        "Clean server-owned worktrees after successful workflow completion.",
-        false,
-      ),
+        [
+          "Global storage / duplicate cleanup",
+          "Desktop-only",
+          "Manages the local workspace database.",
+        ],
+        [
+          "Create workspace / add folders",
+          "Operator-provisioned here",
+          "Server project roots are configured outside the portal.",
+        ],
+        [
+          "Switch / rename / hide / delete",
+          "No portal mutation API",
+          "The portal consumes project snapshots but does not own their lifecycle.",
+        ],
+        [
+          "Session worktrees",
+          "Per-session runtime API",
+          "Worktree behavior is selected when agents run; the removed portal defaults were never consumed.",
+        ],
+      ],
     );
     settingsPage(
       "Manage Workspaces",
-      "Review shared projects and configure server worktree defaults.",
+      "Review live shared projects and the desktop-only local-workspace boundary.",
       "folder",
-      [card, worktrees],
+      [card, desktop],
     );
   }
 
   function renderManagePresets() {
-    const card = desktopCard(
-      "Manage Presets",
-      "Workflow presets advertised by the shared server.",
+    const card = informationalCard(
+      "Workspace Selection Presets",
+      "The desktop destination manages saved file-selection presets for a workspace. It is unrelated to Agent Workflows; the portal previously displayed the wrong data here.",
+      [
+        [
+          "List and switch",
+          "Desktop workspace state",
+          "Activates a saved file selection in the current workspace.",
+        ],
+        [
+          "Reorder",
+          "Supported on desktop",
+          "Changes preset order and keyboard shortcut assignment.",
+        ],
+        [
+          "Rename",
+          "Supported on desktop",
+          "Updates the selected workspace preset.",
+        ],
+        [
+          "Delete",
+          "Supported on desktop",
+          "Removes a workspace selection preset.",
+        ],
+        [
+          "Shared server",
+          "No preset snapshot or CRUD API",
+          "The portal cannot display or mutate selection presets until the workspace authority exposes them.",
+        ],
+      ],
     );
-    const workflows = state.bootstrap?.workflows || [];
-    const list = element("div", "glance-list");
-    workflows.forEach((workflow) => {
-      const row = element("div", "glance-item static");
-      row.append(
-        element("strong", "", workflow.name),
-        element("small", "", workflow.enabled ? "Enabled" : "Disabled"),
-      );
-      list.append(row);
-    });
-    if (!workflows.length)
-      list.append(
-        element(
-          "p",
-          "empty-inline",
-          "No server workflow presets are available.",
-        ),
-      );
-    card.append(list);
     settingsPage(
       "Manage Presets",
-      "Review workflow presets available to shared agents.",
+      "Review the exact desktop workspace-preset semantics and current server boundary.",
       "workflow",
       [card],
+      recommendation(
+        "info",
+        "Workspace presets are not workflow presets",
+        "Workflow catalog data now remains on Agent Workflows, where it belongs.",
+      ),
     );
   }
 
   function renderOverview() {
     const content = document.getElementById("settings-content");
     disposeSensitiveInputs(content);
-    content.replaceChildren();
-    content.append(
+    content.replaceChildren(
       pageHeader(
         "Agent Mode",
-        "Configure shared agent behavior, provider connections, models, permissions, workflows, and Context Builder.",
+        "Oracle reasons, Context Builder gathers files, and agents do the work. Each row links to the canonical page that owns the available server setting.",
         "agent",
       ),
     );
 
-    const providers = orderedProviders().filter(
-      (provider) => provider.deploymentAllowed,
+    const byID = Object.fromEntries(
+      orderedProviders().map((provider) => [provider.providerID, provider]),
     );
-
-    if (!providers.length) {
-      const empty = element("div", "empty-state-panel");
-      empty.append(
-        element("h2", "", "No provider catalog"),
-        element("p", "", "Refresh after the provider catalog loads."),
+    const mainCLIProviders = [
+      byID.codex,
+      byID.claudeCompatible,
+      byID.openCodeACP,
+      byID.cursorACP,
+    ].filter(Boolean);
+    const connected = mainCLIProviders.filter(isConnectedProvider);
+    const routes = desktopCard(
+      "Agent Setup",
+      "Canonical destinations and live shared-server status.",
+    );
+    function routeRow(title, detail, route, statusText) {
+      const link = element("a", "overview-route-row");
+      link.href = `#settings/${route}`;
+      link.dataset.routeLink = "";
+      const copy = element("div", "desktop-setting-copy");
+      copy.append(element("strong", "", title), element("small", "", detail));
+      link.append(
+        copy,
+        element("span", "read-only-value", statusText),
+        iconNode("chevron"),
       );
-      content.append(empty);
-      return;
+      routes.append(link);
     }
+    routeRow(
+      "Agent Models",
+      "Desktop-style recommendation check plus runtime-backed provider defaults.",
+      "agent-models",
+      connected.length ? "Recommendations ready" : "Connect a CLI provider",
+    );
+    routeRow(
+      "CLI Providers",
+      "Codex, Claude Code, compatible backends, OpenCode, and Cursor.",
+      "cli-providers",
+      `${connected.length} of ${mainCLIProviders.length} connected`,
+    );
+    routeRow(
+      "Context Builder",
+      "Discovery behavior and current shared-server settings boundary.",
+      "context-builder",
+      "Runtime-managed",
+    );
+    routeRow(
+      "Agent Workflows",
+      "Built-in and custom workflow catalog advertised by the server.",
+      "agent-workflows",
+      `${state.bootstrap?.workflows?.length || 0} advertised`,
+    );
+    routeRow(
+      "Agent Permissions",
+      "Direct agents plus the delegated-agent policy boundary.",
+      "agent-permissions",
+      "Direct settings active",
+    );
+    content.append(routes);
+
+    const providerCard = desktopCard(
+      "CLI Provider Status",
+      "The desktop overview summarizes every CLI provider in one place.",
+    );
+    const providerList = element("div", "provider-status-list");
+    mainCLIProviders.forEach((provider) => {
+      const status = providerStatus(provider);
+      providerList.append(
+        desktopRow(
+          desktopProviderPresentation(provider).title,
+          provider.cli?.version
+            ? `CLI ${provider.cli.version}`
+            : provider.cli?.installed === false
+              ? "CLI not installed"
+              : "CLI status available in provider details",
+          element(
+            "span",
+            `connection-badge ${status.tone}`.trim(),
+            status.label,
+          ),
+        ),
+      );
+    });
+    providerCard.append(providerList);
+    content.append(providerCard);
 
     const defaults = desktopCard(
-      "Session Defaults",
-      "Shared behavior for new server agent sessions.",
+      "Portal Session Default",
+      "Runtime-backed fallback used when a direct provider permission does not choose a stricter execution mode.",
     );
     defaults.append(
       selectSetting(
-        "providerConversationCleanupAction",
-        "Conversation Cleanup",
-        "Choose what happens to provider-side conversations after cleanup.",
-        [
-          ["archive", "Archive"],
-          ["delete", "Delete"],
-        ],
-        "archive",
-      ),
-      textSetting(
-        "agentSessionHandoffInstructions",
-        "Handoff Instructions",
-        "Instructions included when an agent hands work to another agent.",
-        "Optional handoff guidance",
-      ),
-      selectSetting(
         "serverDefaultExecutionMode",
         "Execution Mode",
-        "Fallback execution mode for new sessions.",
+        "Fallback execution mode for new portal sessions.",
         [
           ["readOnly", "Read Only"],
           ["workspaceWrite", "Workspace Write"],
@@ -2674,32 +3378,29 @@
     );
     content.append(defaults);
 
-    const card = element("section", "settings-card");
-    card.append(
-      element("h2", "", "Providers"),
-      element(
-        "p",
-        "card-subtitle",
-        "Open a provider settings page to manage its models and connection.",
+    content.append(
+      informationalCard(
+        "Desktop-Only Overview Behaviors",
+        "These controls depend on desktop window/provider-conversation features that the portal session API does not implement.",
+        [
+          [
+            "Show chats created by MCP tools",
+            "Desktop Compose only",
+            "Controls visibility of local app chats before an agent runs.",
+          ],
+          [
+            "Provider Conversation Cleanup",
+            "Archive / Delete",
+            "Runs when desktop Agent Mode sessions are removed; portal deletion has no equivalent provider-conversation contract.",
+          ],
+          [
+            "Handoff Instructions",
+            "Multiline Save / Clear",
+            "App-wide text appended by the desktop titlebar Handoff action; the portal has no Handoff action.",
+          ],
+        ],
       ),
     );
-    const list = element("div", "glance-list");
-    providers.forEach((provider) => {
-      const link = element("a", "glance-item");
-      link.href = `#settings/${providerDestination(provider)}`;
-      link.dataset.routeLink = "";
-      const status = providerStatus(provider);
-      link.append(
-        element("strong", "", provider.displayName),
-        element("small", "", provider.summary),
-      );
-      const badge = element("span", `glance-status ${status.tone}`.trim());
-      badge.append(element("i"), document.createTextNode(status.label));
-      link.append(badge);
-      list.append(link);
-    });
-    card.append(list);
-    content.append(card);
     installIcons(content);
   }
 
@@ -3422,7 +4123,7 @@
     }
   }
 
-  function credentialForm(provider, methods) {
+  function credentialForm(provider, methods, options = {}) {
     const wrapper = element("div", "settings-card credential-card");
     const codexAPIKey =
       provider.providerID === "codex" && methods.includes("apiKey");
@@ -3433,18 +4134,20 @@
       element(
         "h2",
         "",
-        codexAPIKey
-          ? "OpenAI API Key"
-          : hasDirectConnection
-            ? "Change connection"
-            : "Add connection",
+        options.title ||
+          (codexAPIKey
+            ? "OpenAI API Key"
+            : hasDirectConnection
+              ? "Change connection"
+              : "Add connection"),
       ),
       element(
         "p",
         "card-subtitle",
-        codexAPIKey
-          ? "API keys for direct model access. OpenAI API usage is API-billed."
-          : "Credential fields are write-only and are disposed after every request outcome.",
+        options.subtitle ||
+          (codexAPIKey
+            ? "API keys for direct model access. OpenAI API usage is API-billed."
+            : "Credential fields are write-only and are disposed after every request outcome."),
       ),
     );
     const form = element("form", "secret-form");
@@ -3480,7 +4183,8 @@
     submit.type = "submit";
     submit.dataset.action = "connect-provider";
     actions.append(note, submit);
-    form.append(methodLabel, method, fields, message, actions);
+    if (methods.length > 1) form.append(methodLabel, method);
+    form.append(fields, message, actions);
 
     function addInput(name, labelText, options = {}) {
       const label = element("label", "", labelText);

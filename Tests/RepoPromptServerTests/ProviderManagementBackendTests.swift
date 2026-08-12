@@ -300,6 +300,148 @@ final class ProviderManagementBackendTests: XCTestCase {
         XCTAssertEqual(stored.record.testState, .notTested)
     }
 
+    func testMountedCLIAccountsAdvertiseSingleExternalConnectMethodsWithoutVault() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+
+        let configurations: [ProviderCLIConfiguration] = try [
+            (ProviderKind.claudeCompatible, "claude"),
+            (.openCodeACP, "opencode"),
+            (.cursorACP, "cursor")
+        ].map { kind, name in
+            let credentialDirectory = directory.appendingPathComponent(name, isDirectory: true)
+            try FileManager.default.createDirectory(at: credentialDirectory, withIntermediateDirectories: true)
+            return ProviderCLIConfiguration(
+                kind: kind,
+                executable: "/usr/bin/swift",
+                credentialSourceDirectory: credentialDirectory.path
+            )
+        }
+        let enabled = Set(configurations.map(\.kind))
+        let adapter = ProviderCLIAdapter(
+            configurations: configurations,
+            enabledProviders: enabled,
+            runner: StaticVersionRunner()
+        )
+        let service = ProviderSettingsService(
+            store: store,
+            adapter: adapter,
+            configurations: configurations,
+            initiallyEnabled: enabled,
+            runner: StaticVersionRunner()
+        )
+        try await service.bootstrap()
+
+        let catalog = try await service.catalog()
+        XCTAssertEqual(
+            catalog.providers.first { $0.providerID == .claudeCompatible }?.capabilities.authenticationMethods,
+            [.providerSpecific]
+        )
+        XCTAssertEqual(
+            catalog.providers.first { $0.providerID == .openCodeACP }?.capabilities.authenticationMethods,
+            [.providerSpecific]
+        )
+        XCTAssertEqual(
+            catalog.providers.first { $0.providerID == .cursorACP }?.capabilities.authenticationMethods,
+            [.browserLogin]
+        )
+        XCTAssertTrue(
+            catalog.providers.first { $0.providerID == .claudeGLM }?.capabilities.authenticationMethods.isEmpty == true
+        )
+
+        let attribution = ProviderMutationAttribution(actorID: "admin-1", actorLabel: "alice", channel: "test")
+        for (providerID, method) in [
+            (ProviderSettingsID.claudeCompatible, ProviderAuthenticationMethod.providerSpecific),
+            (.openCodeACP, .providerSpecific),
+            (.cursorACP, .browserLogin)
+        ] {
+            do {
+                _ = try await service.connect(
+                    providerID: providerID,
+                    request: .init(authenticationMethod: method, credential: "must-not-proxy"),
+                    attribution: attribution
+                )
+                XCTFail("\(providerID.rawValue) accepted raw browser credential material")
+            } catch let error as ServiceAPIError {
+                XCTAssertEqual(error.code, .invalidRequest)
+            }
+        }
+        let rejectedConnections = try await store.providerConnections()
+        XCTAssertTrue(rejectedConnections.isEmpty)
+
+        for (providerID, method) in [
+            (ProviderSettingsID.claudeCompatible, ProviderAuthenticationMethod.providerSpecific),
+            (.openCodeACP, .providerSpecific),
+            (.cursorACP, .browserLogin)
+        ] {
+            var snapshot = try await service.connect(
+                providerID: providerID,
+                request: .init(authenticationMethod: method),
+                attribution: attribution
+            )
+            XCTAssertEqual(snapshot.connection?.testState, .valid)
+            XCTAssertEqual(snapshot.connection?.state, .connected)
+            if providerID == .claudeCompatible {
+                XCTAssertEqual(snapshot.connection?.detail, "Claude Code account authorization verified")
+                XCTAssertNil(snapshot.connection?.accountLabel)
+                let encoded = try String(decoding: JSONEncoder.serviceEncoder.encode(snapshot), as: UTF8.self)
+                XCTAssertFalse(encoded.contains("must-not-project"))
+            }
+            snapshot = try await service.testConnection(providerID: providerID, attribution: attribution)
+            XCTAssertEqual(snapshot.connection?.testState, .valid)
+            XCTAssertEqual(snapshot.connection?.authenticationMethod, method)
+        }
+
+        let stored = try await store.providerConnections()
+        XCTAssertEqual(stored.count, 3)
+        XCTAssertTrue(stored.allSatisfy { $0.credentialReference == nil })
+    }
+
+    func testClaudeExternalConnectRejectsMountedButUnauthenticatedAccount() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let configuration = ProviderCLIConfiguration(
+            kind: .claudeCompatible,
+            executable: "/usr/bin/swift",
+            credentialSourceDirectory: directory.path
+        )
+        let service = ProviderSettingsService(
+            store: store,
+            adapter: ProviderCLIAdapter(
+                configurations: [configuration],
+                enabledProviders: [.claudeCompatible],
+                runner: StaticVersionRunner()
+            ),
+            configurations: [configuration],
+            initiallyEnabled: [.claudeCompatible],
+            runner: UnauthenticatedClaudeRunner()
+        )
+        try await service.bootstrap()
+
+        do {
+            _ = try await service.connect(
+                providerID: .claudeCompatible,
+                request: .init(authenticationMethod: .providerSpecific),
+                attribution: .init(actorID: "admin-1", actorLabel: "alice", channel: "test")
+            )
+            XCTFail("an unauthenticated mounted Claude account was marked connected")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .dependencyUnavailable)
+            XCTAssertEqual(
+                error.message,
+                "Claude Code is not authenticated; run 'claude login' in the dedicated server account"
+            )
+        }
+        let stored = try await store.providerConnections()
+        XCTAssertTrue(stored.isEmpty)
+    }
+
     func testConnectionRejectsUnsupportedControlsAndOpenCodeRawCredentialProxying() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
@@ -462,8 +604,40 @@ private struct FailingCredentialHTTPTransport: ProviderCredentialHTTPTransport {
 }
 
 private actor StaticVersionRunner: WorkspaceCommandRunning {
-    func run(executable _: String, arguments _: [String], workingDirectory _: String, maximumBytes _: Int) async throws -> String {
-        "Swift version 6.2"
+    func run(executable _: String, arguments: [String], workingDirectory _: String, maximumBytes _: Int) async throws -> String {
+        response(for: arguments)
+    }
+
+    func run(executable _: String, arguments: [String], workingDirectory _: String, maximumBytes _: Int, environment: [String: String]) async throws -> String {
+        if arguments == ["auth", "status", "--json"] {
+            XCTAssertNotNil(environment["CLAUDE_CONFIG_DIR"])
+            XCTAssertEqual(environment["ANTHROPIC_API_KEY"], "")
+            XCTAssertEqual(environment["ANTHROPIC_AUTH_TOKEN"], "")
+            XCTAssertEqual(environment["CLAUDE_CODE_OAUTH_TOKEN"], "")
+        }
+        return response(for: arguments)
+    }
+
+    private nonisolated func response(for arguments: [String]) -> String {
+        arguments == ["auth", "status", "--json"]
+            ? #"{"loggedIn":true,"email":"must-not-project@example.test","tokenSource":"must-not-project"}"#
+            : "Swift version 6.2"
+    }
+}
+
+private actor UnauthenticatedClaudeRunner: WorkspaceCommandRunning {
+    func run(executable _: String, arguments: [String], workingDirectory _: String, maximumBytes _: Int) async throws -> String {
+        response(for: arguments)
+    }
+
+    func run(executable _: String, arguments: [String], workingDirectory _: String, maximumBytes _: Int, environment _: [String: String]) async throws -> String {
+        response(for: arguments)
+    }
+
+    private nonisolated func response(for arguments: [String]) -> String {
+        arguments == ["auth", "status", "--json"]
+            ? #"{"loggedIn":false}"#
+            : "Swift version 6.2"
     }
 }
 

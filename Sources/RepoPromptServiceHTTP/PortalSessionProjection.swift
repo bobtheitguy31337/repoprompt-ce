@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptServiceProtocol
 
 enum RepoPromptPortalSessionProjection {
@@ -6,6 +7,17 @@ enum RepoPromptPortalSessionProjection {
     static let maximumModelBytes = 256
     static let maximumEntryBytes = 128 * 1024
     static let maximumPageBytes = 1 * 1024 * 1024
+
+    static func tools() -> [PortalToolSummary] {
+        MCPDomainToolCatalog.entries.map {
+            PortalToolSummary(
+                name: $0.name,
+                scope: $0.scope.rawValue,
+                capability: $0.capability.externalName,
+                admissionClass: $0.admissionClass.rawValue
+            )
+        }
+    }
 
     static func project(_ project: ProjectSnapshot) -> PortalProjectSummary {
         PortalProjectSummary(
