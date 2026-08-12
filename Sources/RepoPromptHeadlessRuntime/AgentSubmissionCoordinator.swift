@@ -212,6 +212,9 @@ public actor AgentSubmissionCoordinator {
             let nextDefaults = SessionNextTurnDefaultsRecord(sessionID: session.sessionID, revision: (previousDefaults?.revision ?? 0) + 1, configuration: effective, updatedAt: now)
             let runPresentation = RunPresentationSnapshot(sessionID: session.sessionID, runID: identity.runID, generation: identity.generation, turnEpoch: identity.turnEpoch, phase: .preparing, phaseRevision: 1, runningStatusCode: "accepted", runStartedAt: now)
             let selected = AgentTurnConfigurationWire(catalogRevision: effective.catalogRevision, providerID: effective.providerID, modelID: effective.modelID, effortID: effective.effortID, workflowID: effective.workflowID, permissionID: effective.permissionID, toolValues: effective.toolValues.mapValues(Self.wireValue))
+            let receiptSessionSnapshot = (acceptedNewSession?.snapshot ?? receiptSession).map {
+                Self.acceptedReceiptSessionSnapshot($0, effective: effective, nextDefaults: nextDefaults, runPresentation: runPresentation)
+            }
             let receipt = SubmissionReceipt(
                 submissionID: submissionID,
                 acceptedAt: now,
@@ -227,7 +230,7 @@ public actor AgentSubmissionCoordinator {
                 consumedAttachmentIDs: manifest.attachments.map(\.attachmentID),
                 consumedTaggedFiles: submission.content.taggedFiles,
                 selectedConfiguration: selected,
-                session: acceptedNewSession?.snapshot ?? receiptSession
+                session: receiptSessionSnapshot
             )
             let durableReceipt = try JSONDecoder.serviceDecoder.decode(SubmissionReceipt.self, from: JSONEncoder.serviceEncoder.encode(receipt))
             let durableNewSession = acceptedNewSession.map { prepared in
@@ -321,6 +324,34 @@ public actor AgentSubmissionCoordinator {
             transcript: session.transcript + [human],
             interactions: session.interactions,
             cursor: session.cursor
+        )
+    }
+
+    private static func acceptedReceiptSessionSnapshot(
+        _ session: SessionSnapshot,
+        effective: EffectiveTurnConfigurationRecord,
+        nextDefaults: SessionNextTurnDefaultsRecord,
+        runPresentation: RunPresentationSnapshot
+    ) -> SessionSnapshot {
+        SessionSnapshot(
+            sessionID: session.sessionID,
+            projectID: session.projectID,
+            parentSessionID: session.parentSessionID,
+            rootSessionID: session.rootSessionID,
+            creator: session.creator,
+            provider: session.provider,
+            model: session.model,
+            visibility: session.visibility,
+            state: session.state,
+            runGeneration: session.runGeneration,
+            turnEpoch: session.turnEpoch,
+            revision: session.revision,
+            transcript: session.transcript,
+            interactions: session.interactions,
+            cursor: session.cursor,
+            effectiveTurnConfiguration: EffectiveTurnConfigurationWireSnapshot(effective),
+            nextTurnDefaults: SessionNextTurnDefaultsWireSnapshot(nextDefaults),
+            runPresentation: runPresentation.wireSnapshot
         )
     }
 

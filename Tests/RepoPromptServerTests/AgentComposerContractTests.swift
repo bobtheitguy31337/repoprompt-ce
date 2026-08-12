@@ -507,6 +507,9 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
         }
         let accepted = receipts.0
         XCTAssertEqual(accepted, receipts.1)
+        XCTAssertEqual(accepted.session?.effectiveTurnConfiguration?.configuration.modelID, fixture.modelID)
+        XCTAssertEqual(accepted.session?.nextTurnDefaults?.configuration.configuration.modelID, fixture.modelID)
+        XCTAssertEqual(accepted.session?.runPresentation?.runID, accepted.runID)
         XCTAssertEqual(receipts.2.effectiveTurnConfiguration?.configuration.modelID, fixture.modelID)
         XCTAssertEqual(receipts.2.nextTurnDefaults?.revision, 1)
         XCTAssertEqual(receipts.2.runPresentation?.runID, accepted.runID)
