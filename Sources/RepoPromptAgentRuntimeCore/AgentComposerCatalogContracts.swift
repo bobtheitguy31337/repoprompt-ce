@@ -136,6 +136,42 @@ public enum AgentComposerProviderMatrix {
             discoveryPolicy: .init(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: true, discoveryReplacesStaticChoices: false)
         ),
         .init(
+            providerID: .openAIAPI,
+            displayName: "OpenAI API",
+            runtimeKind: .headlessAdapter,
+            modelSource: "bounded-authenticated-discovery,persisted-dynamic-cache",
+            failurePolicy: "omit-without-fresh-authoritative-catalog;preserve-selected-unavailable",
+            discoveryPolicy: .init(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: false, discoveryReplacesStaticChoices: true),
+            nativeImageSupportRequiresAdapter: false
+        ),
+        .init(
+            providerID: .anthropicAPI,
+            displayName: "Anthropic API",
+            runtimeKind: .headlessAdapter,
+            modelSource: "bounded-authenticated-discovery,persisted-dynamic-cache",
+            failurePolicy: "omit-without-fresh-authoritative-catalog;preserve-selected-unavailable",
+            discoveryPolicy: .init(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: false, discoveryReplacesStaticChoices: true),
+            nativeImageSupportRequiresAdapter: false
+        ),
+        .init(
+            providerID: .openRouter,
+            displayName: "OpenRouter",
+            runtimeKind: .headlessAdapter,
+            modelSource: "bounded-authenticated-discovery,persisted-dynamic-cache",
+            failurePolicy: "omit-without-fresh-authoritative-catalog;preserve-selected-unavailable",
+            discoveryPolicy: .init(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: false, discoveryReplacesStaticChoices: true),
+            nativeImageSupportRequiresAdapter: false
+        ),
+        .init(
+            providerID: .customOpenAICompatible,
+            displayName: "Custom OpenAI-Compatible",
+            runtimeKind: .headlessAdapter,
+            modelSource: "bounded-authenticated-discovery,persisted-dynamic-cache",
+            failurePolicy: "omit-without-fresh-authoritative-catalog;preserve-selected-unavailable",
+            discoveryPolicy: .init(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: false, discoveryReplacesStaticChoices: true),
+            nativeImageSupportRequiresAdapter: false
+        ),
+        .init(
             providerID: .xAI,
             displayName: "xAI",
             runtimeKind: nil,

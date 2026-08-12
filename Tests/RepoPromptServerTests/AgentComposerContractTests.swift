@@ -35,7 +35,7 @@ private func tinyPNG() -> Data {
 
 final class AgentComposerCatalogTests: XCTestCase {
     func testProviderMatrixAndNormalizationFixtureAreExact() throws {
-        XCTAssertEqual(AgentComposerProviderMatrix.entries.map(\.providerID), [.codex, .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom, .openCodeACP, .cursorACP, .xAI])
+        XCTAssertEqual(AgentComposerProviderMatrix.entries.map(\.providerID), [.codex, .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom, .openCodeACP, .cursorACP, .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI])
         XCTAssertEqual(AgentComposerProviderMatrix.liveFreshnessSeconds, 900)
         XCTAssertEqual(AgentComposerProviderMatrix.persistedFallbackMaximumAgeSeconds, 86_400)
         XCTAssertNil(AgentModelIdentityNormalizer.normalize(providerID: .codex, rawModelID: "Default"))
@@ -56,6 +56,50 @@ final class AgentComposerCatalogTests: XCTestCase {
         XCTAssertEqual(compiled.providerRawModelValue, "gpt-5.6-sol-high")
         XCTAssertEqual(compiled.normalizedToolValues["codex.mcpServers"], .choices(["repoprompt"]))
         XCTAssertThrowsError(try adapter.compile(.init(providerID: .codex, model: model, toolValues: ["codex.unknown": .boolean(true)])))
+    }
+
+    func testDirectAPIAdaptersFollowAuthoritativeCatalogsAndExactRuntimeIdentity() throws {
+        let cases: [(ProviderSettingsID, String, [String])] = [
+            (.openAIAPI, "gpt-direct", ["low", "medium", "high", "xhigh", "max"]),
+            (.anthropicAPI, "claude-direct", []),
+            (.openRouter, "router/direct", ["low", "medium", "high", "xhigh", "max"]),
+            (.customOpenAICompatible, "custom-direct", ["low", "medium", "high", "xhigh", "max"])
+        ]
+        let adapters = ProviderTurnConfigurationAdapters.builtIn()
+
+        for (providerID, rawModelID, catalogEfforts) in cases {
+            let matrix = try XCTUnwrap(AgentComposerProviderMatrix.entry(for: providerID))
+            XCTAssertEqual(matrix.runtimeKind, .headlessAdapter)
+            XCTAssertTrue(matrix.discoveryPolicy.allowsPersistedFallback)
+            XCTAssertFalse(matrix.discoveryPolicy.allowsStaticFallbackAfterSuccessfulPreflight)
+            XCTAssertTrue(matrix.discoveryPolicy.discoveryReplacesStaticChoices)
+            XCTAssertNil(ProviderComposerStableControls.permissionDescriptor(providerID: providerID, selectedID: nil, mutable: true, lockReasonCode: nil))
+
+            let adapter = try XCTUnwrap(adapters[providerID])
+            let selectedEffort = catalogEfforts.first
+            let model = ProviderModelDescriptor(
+                providerID: providerID,
+                modelID: rawModelID,
+                providerRawValue: rawModelID,
+                displayName: rawModelID,
+                supportedEffortIDs: catalogEfforts,
+                defaultEffortID: selectedEffort
+            )
+            let compiled = try adapter.compile(.init(providerID: providerID, model: model, effortID: selectedEffort))
+            XCTAssertEqual(compiled.runtimeKind, .headlessAdapter)
+            XCTAssertEqual(compiled.providerRawModelValue, rawModelID)
+            XCTAssertEqual(compiled.executionPolicy.mode, .workspaceWrite)
+            XCTAssertEqual(compiled.executionPolicy.providerSettings["provider.settingsID"], providerID.rawValue)
+            XCTAssertEqual(compiled.executionPolicy.providerSettings["provider.reasoningEffort"], selectedEffort)
+            XCTAssertFalse(compiled.supportsNativeImages)
+            XCTAssertTrue(compiled.normalizedToolValues.isEmpty)
+
+            XCTAssertThrowsError(try adapter.compile(.init(providerID: providerID, model: model, effortID: "not-in-catalog")))
+            XCTAssertThrowsError(try adapter.compile(.init(providerID: providerID, model: model, permissionID: "filesystem.fullAccess")))
+            XCTAssertThrowsError(try adapter.compile(.init(providerID: providerID, model: model, toolValues: ["direct.unknown": .boolean(true)])))
+            let mismatched = ProviderModelDescriptor(providerID: .codex, modelID: rawModelID, providerRawValue: rawModelID, displayName: rawModelID)
+            XCTAssertThrowsError(try adapter.compile(.init(providerID: providerID, model: mismatched)))
+        }
     }
 }
 

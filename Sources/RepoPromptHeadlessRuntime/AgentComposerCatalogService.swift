@@ -247,7 +247,18 @@ public actor AgentComposerCatalogService {
     }
 
     private static func defaultPermissionID(_ provider: ProviderSettingsID) -> String? {
-        switch provider { case .codex: "codex.workspaceWrite"; case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom: "claude.requireApproval"; case .openCodeACP: "opencode.managed"; case .cursorACP: "cursor.managed"; case .xAI: nil }
+        switch provider {
+        case .codex:
+            "codex.workspaceWrite"
+        case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom:
+            "claude.requireApproval"
+        case .openCodeACP:
+            "opencode.managed"
+        case .cursorACP:
+            "cursor.managed"
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
+            nil
+        }
     }
 
     private static func defaultToolValues(_ provider: ProviderSettingsID) -> [String: ComposerControlValueWire] {

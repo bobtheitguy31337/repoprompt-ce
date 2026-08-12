@@ -53,7 +53,7 @@ public enum ProviderComposerStableControls {
     public static func descriptors(providerID: ProviderSettingsID, values: [String: AgentControlValue], mutable: Bool, lockReasonCode: String?) -> [ProviderComposerControlDescriptor] {
         switch providerID {
         case .codex:
-            return [
+            [
                 toggle("codex.bash", "Bash", defaultValue: true, values: values, mutable: mutable, lockReasonCode: lockReasonCode),
                 toggle("codex.search", "Search", defaultValue: true, values: values, mutable: mutable, lockReasonCode: lockReasonCode),
                 toggle("codex.goals", "Goals", defaultValue: true, values: values, mutable: mutable, lockReasonCode: lockReasonCode),
@@ -72,7 +72,7 @@ public enum ProviderComposerStableControls {
                 )
             ]
         case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom:
-            return [
+            [
                 toggle("claude.bash", "Bash", defaultValue: true, values: values, mutable: mutable, lockReasonCode: lockReasonCode),
                 toggle("claude.repoPromptOnlyMCP", "RepoPrompt-only MCP", defaultValue: true, values: values, mutable: mutable, lockReasonCode: lockReasonCode, required: true),
                 toggle("claude.lazyToolLoading", "Lazy tool loading", defaultValue: true, values: values, mutable: mutable, lockReasonCode: lockReasonCode),
@@ -92,8 +92,10 @@ public enum ProviderComposerStableControls {
                     lockReasonCode: lockReasonCode
                 )
             ]
-        default:
-            return []
+        case .openCodeACP, .cursorACP,
+             .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .xAI:
+            []
         }
     }
 
@@ -125,7 +127,7 @@ public enum ProviderComposerStableControls {
                 .init(id: "cursor.managed", displayName: "Managed"),
                 .init(id: "cursor.fullAccess", displayName: "Full Access", warning: true)
             ], mutable: mutable, lockReasonCode: lockReasonCode)
-        case .xAI:
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
             return nil
         }
     }
@@ -305,9 +307,45 @@ public struct TextOnlyACPTurnConfigurationAdapter: ProviderTurnConfigurationAdap
     }
 }
 
+public struct DirectAPITurnConfigurationAdapter: ProviderTurnConfigurationAdapter {
+    public let providerID: ProviderSettingsID
+    public let supportedControlIDs: Set<String> = []
+    public let supportedPermissionIDs: Set<String> = []
+
+    public init(providerID: ProviderSettingsID) {
+        precondition(providerID.isDirectAPI)
+        self.providerID = providerID
+    }
+
+    public func compile(_ input: ProviderTurnConfigurationInput) throws -> CompiledProviderTurnConfiguration {
+        guard input.providerID == providerID, input.model.providerID == providerID else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Direct API model/provider binding is invalid")
+        }
+        guard input.toolValues.isEmpty else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Direct API providers do not expose composer tool controls")
+        }
+        guard input.permissionID == nil else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Direct API permissions are managed by the server")
+        }
+        let effort = input.effortID ?? input.model.defaultEffortID
+        if let effort, !input.model.supportedEffortIDs.contains(effort) {
+            throw ServiceAPIError(code: .invalidRequest, message: "Direct API effort is not supported by the selected model")
+        }
+        var settings = ["provider.settingsID": providerID.rawValue]
+        if let effort { settings["provider.reasoningEffort"] = effort }
+        return .init(
+            runtimeKind: .headlessAdapter,
+            providerRawModelValue: input.model.providerRawValue,
+            executionPolicy: .init(mode: .workspaceWrite, providerSettings: settings),
+            supportsNativeImages: false,
+            normalizedToolValues: [:]
+        )
+    }
+}
+
 public enum ProviderTurnConfigurationAdapters {
     /// Bump whenever a stable control/permission mapping changes interpretation.
-    public static let interpretationRevision = "provider-turn-configuration-v1"
+    public static let interpretationRevision = "provider-turn-configuration-v2"
 
     public static func builtIn() -> [ProviderSettingsID: any ProviderTurnConfigurationAdapter] {
         [
@@ -317,7 +355,11 @@ public enum ProviderTurnConfigurationAdapters {
             .claudeKimi: ClaudeCompatibleTurnConfigurationAdapter(providerID: .claudeKimi),
             .claudeCustom: ClaudeCompatibleTurnConfigurationAdapter(providerID: .claudeCustom),
             .openCodeACP: TextOnlyACPTurnConfigurationAdapter(providerID: .openCodeACP),
-            .cursorACP: TextOnlyACPTurnConfigurationAdapter(providerID: .cursorACP)
+            .cursorACP: TextOnlyACPTurnConfigurationAdapter(providerID: .cursorACP),
+            .openAIAPI: DirectAPITurnConfigurationAdapter(providerID: .openAIAPI),
+            .anthropicAPI: DirectAPITurnConfigurationAdapter(providerID: .anthropicAPI),
+            .openRouter: DirectAPITurnConfigurationAdapter(providerID: .openRouter),
+            .customOpenAICompatible: DirectAPITurnConfigurationAdapter(providerID: .customOpenAICompatible)
         ]
     }
 }
