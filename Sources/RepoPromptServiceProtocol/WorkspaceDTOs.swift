@@ -760,7 +760,6 @@ public struct ContextBuilderInput: Codable, Sendable {
     public let questionTimeoutSeconds: Int?
     public let followUpAnalysis: ContextBuilderFollowUpAnalysis?
     public let followUpBudget: Int?
-    public let selectedPromptIDs: [UUID]?
 
     public init(
         expectedSelectionRevision: Int64,
@@ -771,8 +770,7 @@ public struct ContextBuilderInput: Codable, Sendable {
         enhancementMode: ContextBuilderEnhancementMode? = nil,
         questionTimeoutSeconds: Int? = nil,
         followUpAnalysis: ContextBuilderFollowUpAnalysis? = nil,
-        followUpBudget: Int? = nil,
-        selectedPromptIDs: [UUID]? = nil
+        followUpBudget: Int? = nil
     ) {
         self.expectedSelectionRevision = expectedSelectionRevision
         self.instructions = instructions
@@ -783,7 +781,6 @@ public struct ContextBuilderInput: Codable, Sendable {
         self.questionTimeoutSeconds = questionTimeoutSeconds
         self.followUpAnalysis = followUpAnalysis
         self.followUpBudget = followUpBudget
-        self.selectedPromptIDs = selectedPromptIDs
     }
 
     public var invocationOverrides: ContextBuilderInvocationOverrides {
@@ -793,14 +790,13 @@ public struct ContextBuilderInput: Codable, Sendable {
             allowClarifyingQuestions: allowClarifyingQuestions,
             questionTimeoutSeconds: questionTimeoutSeconds,
             followUpAnalysis: followUpAnalysis,
-            followUpBudget: followUpBudget,
-            selectedPromptIDs: selectedPromptIDs
+            followUpBudget: followUpBudget
         )
     }
 
     private enum CodingKeys: String, CodingKey {
         case expectedSelectionRevision, instructions, budget, responseType, allowClarifyingQuestions
-        case enhancementMode, questionTimeoutSeconds, followUpAnalysis, followUpBudget, selectedPromptIDs
+        case enhancementMode, questionTimeoutSeconds, followUpAnalysis, followUpBudget
     }
 }
 

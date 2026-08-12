@@ -670,8 +670,7 @@ private actor AuthorityToolBackend {
                 enhancementMode: arguments["enhancement_mode"]?.stringValue.flatMap(ContextBuilderEnhancementMode.init(rawValue:)),
                 questionTimeoutSeconds: arguments["question_timeout_seconds"]?.intValue,
                 followUpAnalysis: arguments["follow_up_analysis"]?.stringValue.flatMap(ContextBuilderFollowUpAnalysis.init(rawValue:)),
-                followUpBudget: arguments["follow_up_budget"]?.intValue,
-                selectedPromptIDs: arguments["selected_prompt_ids"]?.arrayValue?.compactMap { $0.stringValue.flatMap(UUID.init(uuidString:)) }
+                followUpBudget: arguments["follow_up_budget"]?.intValue
             ),
             actor: binding.actor,
             origin: .mcp

@@ -19,22 +19,6 @@ public enum ContextBuilderInvocationOrigin: String, Codable, Sendable {
     case `internal`
 }
 
-public struct ContextBuilderSavedPrompt: Codable, Hashable, Sendable {
-    public let promptID: UUID
-    public let name: String
-    public let instructions: String
-    public let enabled: Bool
-    public let order: Int
-
-    public init(promptID: UUID, name: String, instructions: String, enabled: Bool = true, order: Int) {
-        self.promptID = promptID
-        self.name = name
-        self.instructions = instructions
-        self.enabled = enabled
-        self.order = order
-    }
-}
-
 public struct ContextBuilderSettingsProfile: Codable, Hashable, Sendable {
     public let budget: Int
     public let enhancementMode: ContextBuilderEnhancementMode
@@ -43,7 +27,6 @@ public struct ContextBuilderSettingsProfile: Codable, Hashable, Sendable {
     public let mcpClarifyingQuestions: Bool
     public let followUpAnalysis: ContextBuilderFollowUpAnalysis
     public let followUpBudget: Int
-    public let prompts: [ContextBuilderSavedPrompt]
 
     public init(
         budget: Int = 160_000,
@@ -52,8 +35,7 @@ public struct ContextBuilderSettingsProfile: Codable, Hashable, Sendable {
         portalClarifyingQuestions: Bool = true,
         mcpClarifyingQuestions: Bool = false,
         followUpAnalysis: ContextBuilderFollowUpAnalysis = .disabled,
-        followUpBudget: Int = 40_000,
-        prompts: [ContextBuilderSavedPrompt] = []
+        followUpBudget: Int = 40_000
     ) {
         self.budget = budget
         self.enhancementMode = enhancementMode
@@ -62,7 +44,6 @@ public struct ContextBuilderSettingsProfile: Codable, Hashable, Sendable {
         self.mcpClarifyingQuestions = mcpClarifyingQuestions
         self.followUpAnalysis = followUpAnalysis
         self.followUpBudget = followUpBudget
-        self.prompts = prompts
     }
 
     public static let `default` = ContextBuilderSettingsProfile()
@@ -153,7 +134,6 @@ public struct ContextBuilderInvocationOverrides: Codable, Hashable, Sendable {
     public let questionTimeoutSeconds: Int?
     public let followUpAnalysis: ContextBuilderFollowUpAnalysis?
     public let followUpBudget: Int?
-    public let selectedPromptIDs: [UUID]?
 
     public init(
         budget: Int? = nil,
@@ -161,8 +141,7 @@ public struct ContextBuilderInvocationOverrides: Codable, Hashable, Sendable {
         allowClarifyingQuestions: Bool? = nil,
         questionTimeoutSeconds: Int? = nil,
         followUpAnalysis: ContextBuilderFollowUpAnalysis? = nil,
-        followUpBudget: Int? = nil,
-        selectedPromptIDs: [UUID]? = nil
+        followUpBudget: Int? = nil
     ) {
         self.budget = budget
         self.enhancementMode = enhancementMode
@@ -170,7 +149,6 @@ public struct ContextBuilderInvocationOverrides: Codable, Hashable, Sendable {
         self.questionTimeoutSeconds = questionTimeoutSeconds
         self.followUpAnalysis = followUpAnalysis
         self.followUpBudget = followUpBudget
-        self.selectedPromptIDs = selectedPromptIDs
     }
 }
 
@@ -181,7 +159,6 @@ public struct EffectiveContextBuilderSettings: Codable, Hashable, Sendable {
     public let questionTimeoutSeconds: Int
     public let followUpAnalysis: ContextBuilderFollowUpAnalysis
     public let followUpBudget: Int
-    public let prompts: [ContextBuilderSavedPrompt]
 
     public init(
         budget: Int,
@@ -189,8 +166,7 @@ public struct EffectiveContextBuilderSettings: Codable, Hashable, Sendable {
         allowClarifyingQuestions: Bool,
         questionTimeoutSeconds: Int,
         followUpAnalysis: ContextBuilderFollowUpAnalysis,
-        followUpBudget: Int,
-        prompts: [ContextBuilderSavedPrompt]
+        followUpBudget: Int
     ) {
         self.budget = budget
         self.enhancementMode = enhancementMode
@@ -198,6 +174,5 @@ public struct EffectiveContextBuilderSettings: Codable, Hashable, Sendable {
         self.questionTimeoutSeconds = questionTimeoutSeconds
         self.followUpAnalysis = followUpAnalysis
         self.followUpBudget = followUpBudget
-        self.prompts = prompts
     }
 }

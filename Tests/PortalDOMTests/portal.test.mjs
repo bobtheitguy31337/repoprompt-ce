@@ -476,7 +476,6 @@ function typedSettingsFixtures(providers, bootstrap) {
     mcpClarifyingQuestions: false,
     followUpAnalysis: "disabled",
     followUpBudget: 40000,
-    prompts: [],
   };
   return {
     agentModels: {
@@ -1580,7 +1579,7 @@ test("settings save failures remain actionable and accessible after rerender", a
   assert.match(feedback.textContent, /^Save failed:/);
 });
 
-test("Context Builder exposes one MCP clarification setting and no manual portal run", async (t) => {
+test("Context Builder preserves typed controls without saved prompt collection or manual portal run", async (t) => {
   const harness = await createHarness({
     hash: "#settings/context-builder",
     bootstrap: bootstrapFixture({ sessions: [sessionFixture()] }),
@@ -1595,7 +1594,6 @@ test("Context Builder exposes one MCP clarification setting and no manual portal
     "Question Timeout",
     "Allow Clarifying Questions",
     "Follow-up Analysis",
-    "Saved Prompt Collection",
   ]) {
     assert.match(content.textContent, new RegExp(expected));
   }
@@ -1605,12 +1603,50 @@ test("Context Builder exposes one MCP clarification setting and no manual portal
   );
   assert.doesNotMatch(
     content.textContent,
-    /Portal Clarifying Questions|MCP Clarifying Questions|Manual Portal Run|Run Context Builder|Invocation Overrides/,
+    /Portal Clarifying Questions|MCP Clarifying Questions|Manual Portal Run|Run Context Builder|Invocation Overrides|Saved Prompt Collection|Add Saved Prompt/,
+  );
+  assert.equal(
+    document.querySelectorAll(".saved-prompt-list, .saved-prompt-row").length,
+    0,
   );
   assert.equal(
     document.querySelectorAll('input[aria-label="Allow Clarifying Questions"]')
       .length,
     1,
+  );
+  const scope = document.querySelector(
+    'select[aria-label="Context Builder scope"]',
+  );
+  assert.deepEqual(
+    [...scope.options].map((option) => option.value),
+    ["inheritGlobal", "projectOverride"],
+  );
+  assert.equal(scope.value, "inheritGlobal");
+  assert.ok(
+    [...document.querySelectorAll("button")].some(
+      (button) => button.textContent === "Copy Global to Project",
+    ),
+  );
+  const enhancement = document.querySelector(
+    'select[aria-label="Prompt Enhancement"]',
+  );
+  assert.deepEqual(
+    [...enhancement.options].map((option) => option.value),
+    ["rewrite", "augment", "preserve"],
+  );
+  const timeout = document.querySelector(
+    'select[aria-label="Question Timeout"]',
+  );
+  assert.deepEqual(
+    [...timeout.options].map((option) => option.value),
+    ["30", "60", "120", "300"],
+  );
+  const followUp = document.querySelector(
+    'select[aria-label="Follow-up Analysis"]',
+  );
+  assert.deepEqual(
+    [...followUp.options].map((option) => option.value),
+    ["disabled", "plan", "review", "question"],
   );
   const clarifyingQuestions = document.querySelector(
     'input[aria-label="Allow Clarifying Questions"]',
@@ -1630,23 +1666,6 @@ test("Context Builder exposes one MCP clarification setting and no manual portal
     [followUpBudget.min, followUpBudget.max, followUpBudget.step],
     ["40000", "200000", "5000"],
   );
-  click(
-    window,
-    [...document.querySelectorAll("button")].find(
-      (button) => button.textContent === "Add Saved Prompt",
-    ),
-  );
-  const promptName = document.querySelector(
-    'input[aria-label="Saved Context Builder prompt name"]',
-  );
-  const promptInstructions = document.querySelector(
-    'textarea[aria-label="Instructions for saved prompt"]',
-  );
-  assert.equal(promptName.maxLength, 128);
-  assert.equal(promptInstructions.maxLength, 16384);
-  promptName.value = "Focused";
-  promptInstructions.value =
-    "Prioritize the files that implement the requested behavior.";
   submit(
     window,
     [...document.querySelectorAll("form")].find((form) =>
@@ -1678,7 +1697,6 @@ test("Context Builder exposes one MCP clarification setting and no manual portal
     "followUpBudget",
     "mcpClarifyingQuestions",
     "portalClarifyingQuestions",
-    "prompts",
     "questionTimeoutSeconds",
   ]);
   assert.equal(settingsPayload.profile.mcpClarifyingQuestions, true);
@@ -1687,14 +1705,7 @@ test("Context Builder exposes one MCP clarification setting and no manual portal
     true,
     "the hidden portal compatibility field must be preserved",
   );
-  assert.deepEqual(Object.keys(settingsPayload.profile.prompts[0]).sort(), [
-    "enabled",
-    "instructions",
-    "name",
-    "order",
-    "promptID",
-  ]);
-  assert.equal(settingsPayload.profile.prompts[0].name, "Focused");
+  assert.equal("prompts" in settingsPayload.profile, false);
   assert.equal(
     calls.some(
       (call) =>

@@ -2360,8 +2360,7 @@ public actor RepoPromptHeadlessAuthority {
                 allowClarifyingQuestions: input.allowClarifyingQuestions ?? false,
                 questionTimeoutSeconds: input.questionTimeoutSeconds ?? 60,
                 followUpAnalysis: input.followUpAnalysis ?? .disabled,
-                followUpBudget: input.followUpBudget ?? 40_000,
-                prompts: []
+                followUpBudget: input.followUpBudget ?? 40_000
             )
             renderedInstructions = input.instructions
         }

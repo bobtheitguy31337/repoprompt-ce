@@ -302,21 +302,6 @@ public actor ServerSettingsService {
             case .internal: false
             }
         }()
-        let selected: [ContextBuilderSavedPrompt]
-        if let selectedIDs = overrides.selectedPromptIDs {
-            guard selectedIDs.count <= 100, Set(selectedIDs).count == selectedIDs.count else {
-                throw ServiceAPIError(code: .invalidRequest, message: "Context Builder prompt selection is invalid")
-            }
-            let byID = Dictionary(uniqueKeysWithValues: profile.prompts.map { ($0.promptID, $0) })
-            selected = try selectedIDs.map { id -> ContextBuilderSavedPrompt in
-                guard let prompt = byID[id], prompt.enabled else {
-                    throw ServiceAPIError(code: .invalidRequest, message: "Context Builder prompt is unavailable")
-                }
-                return prompt
-            }
-        } else {
-            selected = profile.prompts.filter(\.enabled).sorted { $0.order < $1.order }
-        }
         let effective = ContextBuilderSettingsProfile(
             budget: overrides.budget ?? profile.budget,
             enhancementMode: overrides.enhancementMode ?? profile.enhancementMode,
@@ -324,8 +309,7 @@ public actor ServerSettingsService {
             portalClarifyingQuestions: allowQuestions,
             mcpClarifyingQuestions: allowQuestions,
             followUpAnalysis: overrides.followUpAnalysis ?? profile.followUpAnalysis,
-            followUpBudget: overrides.followUpBudget ?? profile.followUpBudget,
-            prompts: selected
+            followUpBudget: overrides.followUpBudget ?? profile.followUpBudget
         )
         let validated = try normalize(effective)
         return .init(
@@ -334,8 +318,7 @@ public actor ServerSettingsService {
             allowClarifyingQuestions: allowQuestions,
             questionTimeoutSeconds: validated.questionTimeoutSeconds,
             followUpAnalysis: validated.followUpAnalysis,
-            followUpBudget: validated.followUpBudget,
-            prompts: validated.prompts
+            followUpBudget: validated.followUpBudget
         )
     }
 
@@ -350,16 +333,12 @@ public actor ServerSettingsService {
         case .preserve:
             return instructions
         case .augment:
-            return [renderSavedPrompts(effective.prompts), instructions]
-                .filter { !$0.isEmpty }
-                .joined(separator: "\n\n")
+            return instructions
         case .rewrite:
-            let prompts = renderSavedPrompts(effective.prompts)
             return """
             <context-builder-enhancement mode="rewrite">
-            Produce a replacement handoff prompt grounded in repository discovery. Preserve every material constraint from the caller and integrate the enabled saved instructions below.
+            Produce a replacement handoff prompt grounded in repository discovery. Preserve every material constraint from the caller.
             </context-builder-enhancement>
-            \(prompts)
 
             <caller-instructions>
             \(instructions)
@@ -698,17 +677,6 @@ private extension ServerSettingsService {
         )
     }
 
-    func renderSavedPrompts(_ prompts: [ContextBuilderSavedPrompt]) -> String {
-        guard !prompts.isEmpty else { return "" }
-        return prompts.map { prompt in
-            """
-            --- BEGIN SAVED CONTEXT BUILDER PROMPT \(prompt.promptID.uuidString) [\(prompt.name)] ---
-            \(prompt.instructions)
-            --- END SAVED CONTEXT BUILDER PROMPT \(prompt.promptID.uuidString) ---
-            """
-        }.joined(separator: "\n")
-    }
-
     func normalizeProjectContextBuilder(
         mode: ContextBuilderSettingsScopeMode,
         profile: ContextBuilderSettingsProfile?
@@ -733,24 +701,6 @@ private extension ServerSettingsService {
         guard (40_000 ... 200_000).contains(profile.followUpBudget), profile.followUpBudget.isMultiple(of: 5_000) else {
             throw ServiceAPIError(code: .invalidRequest, message: "Context Builder follow-up budget is outside its supported range or increment")
         }
-        guard profile.prompts.count <= 100, Set(profile.prompts.map(\.promptID)).count == profile.prompts.count else {
-            throw ServiceAPIError(code: .invalidRequest, message: "Context Builder prompt collection is invalid")
-        }
-        var names = Set<String>()
-        var totalInstructions = 0
-        let prompts = try profile.prompts.sorted { ($0.order, $0.promptID.uuidString) < ($1.order, $1.promptID.uuidString) }.enumerated().map { index, prompt in
-            guard let name = try normalizedText(prompt.name, maximumBytes: 128), !name.isEmpty,
-                  let instructions = try normalizedText(prompt.instructions, maximumBytes: 16 * 1024), !instructions.isEmpty,
-                  names.insert(name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))).inserted
-            else {
-                throw ServiceAPIError(code: .invalidRequest, message: "Context Builder prompt name or instructions are invalid")
-            }
-            totalInstructions += instructions.utf8.count
-            return ContextBuilderSavedPrompt(promptID: prompt.promptID, name: name, instructions: instructions, enabled: prompt.enabled, order: index)
-        }
-        guard totalInstructions <= 256 * 1024 else {
-            throw ServiceAPIError(code: .invalidRequest, message: "Context Builder prompt collection exceeds its total instruction bound")
-        }
         return .init(
             budget: profile.budget,
             enhancementMode: profile.enhancementMode,
@@ -758,8 +708,7 @@ private extension ServerSettingsService {
             portalClarifyingQuestions: profile.portalClarifyingQuestions,
             mcpClarifyingQuestions: profile.mcpClarifyingQuestions,
             followUpAnalysis: profile.followUpAnalysis,
-            followUpBudget: profile.followUpBudget,
-            prompts: prompts
+            followUpBudget: profile.followUpBudget
         )
     }
 

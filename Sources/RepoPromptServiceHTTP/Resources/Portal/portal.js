@@ -3514,72 +3514,13 @@
       ),
       desktopRow("Analysis Budget", "40k–200k in 5k steps.", followUpBudget),
     );
-    const prompts = element("div", "saved-prompt-list");
-    const promptRows = [];
-    function appendPromptRow(prompt) {
-      const row = element("fieldset", "saved-prompt-row");
-      const name = document.createElement("input");
-      name.type = "text";
-      name.maxLength = 128;
-      name.value = prompt.name;
-      name.setAttribute("aria-label", "Saved Context Builder prompt name");
-      const instructions = document.createElement("textarea");
-      instructions.rows = 4;
-      instructions.maxLength = 16384;
-      instructions.value = prompt.instructions;
-      instructions.setAttribute(
-        "aria-label",
-        `Instructions for ${prompt.name || "saved prompt"}`,
-      );
-      const enabled = typedToggle(
-        `Enable ${prompt.name || "saved prompt"}`,
-        prompt.enabled,
-      );
-      const remove = element("button", "danger-button", "Remove");
-      remove.type = "button";
-      remove.addEventListener("click", () => {
-        row.remove();
-        promptRows.splice(promptRows.indexOf(record), 1);
-      });
-      const record = {
-        promptID: prompt.promptID,
-        name,
-        instructions,
-        enabled: enabled.input,
-      };
-      promptRows.push(record);
-      row.append(name, instructions, enabled.toggle, remove);
-      prompts.append(row);
-    }
-    (profile.prompts || []).forEach(appendPromptRow);
-    const addPrompt = element("button", "secondary-button", "Add Saved Prompt");
-    addPrompt.type = "button";
-    addPrompt.addEventListener("click", () => {
-      if (promptRows.length >= 100) {
-        toast("Context Builder supports at most 100 saved prompts.", true);
-        return;
-      }
-      appendPromptRow({
-        promptID:
-          window.crypto?.randomUUID?.() ||
-          `00000000-0000-4000-8000-${String(Date.now()).slice(-12).padStart(12, "0")}`,
-        name: "",
-        instructions: "",
-        enabled: true,
-      });
-    });
     const save = element(
       "button",
       "primary-button",
       "Save Context Builder Settings",
     );
     save.type = "submit";
-    form.append(
-      element("h3", "settings-subheading", "Saved Prompt Collection"),
-      prompts,
-      addPrompt,
-      save,
-    );
+    form.append(save);
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       const nextProfile = {
@@ -3590,13 +3531,6 @@
         mcpClarifyingQuestions: clarifyingQuestions.input.checked,
         followUpAnalysis: followUp.value,
         followUpBudget: Number(followUpBudget.value),
-        prompts: promptRows.map((row, order) => ({
-          promptID: row.promptID,
-          name: row.name.value.trim(),
-          instructions: row.instructions.value.trim(),
-          enabled: row.enabled.checked,
-          order,
-        })),
       };
       mutateDomain(
         "contextBuilder",
@@ -3631,7 +3565,7 @@
 
     settingsPage(
       "Context Builder",
-      "Configure typed global/project defaults and saved prompts for connected RepoPrompt MCP agents.",
+      "Configure typed global/project defaults for connected RepoPrompt MCP agents.",
       "context",
       [scope, settings],
     );
@@ -4970,7 +4904,7 @@
     );
     routeRow(
       "Context Builder",
-      "Typed defaults and saved prompts for connected RepoPrompt MCP agents.",
+      "Typed defaults for connected RepoPrompt MCP agents.",
       "context-builder",
       "Editable",
     );

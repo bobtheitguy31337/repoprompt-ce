@@ -2685,7 +2685,6 @@ input:disabled {
 
 .typed-settings-form,
 .workflow-definition-form,
-.saved-prompt-list,
 .selection-preset-list {
   display: grid;
   gap: var(--space-10);
@@ -2705,7 +2704,6 @@ input:disabled {
 }
 
 .compact-toggle-label,
-.settings-subheading,
 .preset-availability legend {
   color: var(--text-secondary);
   font-size: 10px;
@@ -2715,7 +2713,6 @@ input:disabled {
 .subagent-custom-grid,
 .workflow-editor-row,
 .model-preset-row,
-.saved-prompt-row,
 .selection-preset-row {
   padding: var(--space-10);
   border: 0.5px solid var(--separator);
@@ -2741,7 +2738,6 @@ input:disabled {
 
 .workflow-definition-form,
 .model-preset-row,
-.saved-prompt-row,
 .selection-preset-row {
   margin-top: var(--space-10);
 }
@@ -2750,8 +2746,6 @@ input:disabled {
 .workflow-definition-form textarea,
 .model-preset-row input,
 .model-preset-row textarea,
-.saved-prompt-row input,
-.saved-prompt-row textarea,
 .direct-provider-form textarea,
 .selection-preset-row input,
 .compact-form input {

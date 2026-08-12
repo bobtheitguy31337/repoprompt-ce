@@ -18,8 +18,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             portalClarifyingQuestions: false,
             mcpClarifyingQuestions: true,
             followUpAnalysis: .plan,
-            followUpBudget: 80_000,
-            prompts: [.init(promptID: UUID(), name: "Planning", instructions: "Produce a bounded plan.", order: 0)]
+            followUpBudget: 80_000
         ))
         try assertRoundTrip(MCPModelPreset(
             presetID: UUID(),
@@ -37,6 +36,97 @@ final class ServerSettingsFoundationTests: XCTestCase {
             order: 0,
             rowRevision: 1
         ))
+    }
+
+    func testLegacyContextBuilderPromptsDecodeSafelyAndAreIgnored() async throws {
+        let legacy = Data("""
+        {
+          "mode": "projectOverride",
+          "profile": {
+            "budget": 100000,
+            "enhancementMode": "augment",
+            "questionTimeoutSeconds": 120,
+            "portalClarifyingQuestions": false,
+            "mcpClarifyingQuestions": true,
+            "followUpAnalysis": "review",
+            "followUpBudget": 80000,
+            "prompts": [{
+              "promptID": "00000000-0000-4000-8000-000000000001",
+              "name": "Legacy",
+              "instructions": "LEGACY_SAVED_PROMPT_MUST_NOT_RUN",
+              "enabled": true,
+              "order": 0
+            }]
+          }
+        }
+        """.utf8)
+        let scope = try JSONDecoder.serviceDecoder.decode(ContextBuilderScopeDocument.self, from: legacy)
+        XCTAssertEqual(scope.mode, .projectOverride)
+        let profile = try XCTUnwrap(scope.profile)
+        XCTAssertEqual(profile.budget, 100_000)
+        XCTAssertEqual(profile.enhancementMode, .augment)
+        XCTAssertEqual(profile.questionTimeoutSeconds, 120)
+        XCTAssertFalse(profile.portalClarifyingQuestions)
+        XCTAssertTrue(profile.mcpClarifyingQuestions)
+        XCTAssertEqual(profile.followUpAnalysis, .review)
+        XCTAssertEqual(profile.followUpBudget, 80_000)
+
+        let encoded = try JSONEncoder.serviceEncoder.encode(scope)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let encodedProfile = try XCTUnwrap(object["profile"] as? [String: Any])
+        XCTAssertNil(encodedProfile["prompts"], "removed saved prompts must not survive a decode/encode cycle")
+
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
+            projectCatalog: StaticProjectCatalog(roots: [:])
+        )
+        let effective = EffectiveContextBuilderSettings(
+            budget: profile.budget,
+            enhancementMode: profile.enhancementMode,
+            allowClarifyingQuestions: profile.mcpClarifyingQuestions,
+            questionTimeoutSeconds: profile.questionTimeoutSeconds,
+            followUpAnalysis: profile.followUpAnalysis,
+            followUpBudget: profile.followUpBudget
+        )
+        let rendered = try await service.renderContextBuilderInstructions("Caller", effective: effective)
+        XCTAssertEqual(rendered, "Caller")
+        XCTAssertFalse(rendered.contains("LEGACY_SAVED_PROMPT_MUST_NOT_RUN"))
+    }
+
+    func testContextBuilderInvocationPayloadRetainsProtectedFields() throws {
+        let input = ContextBuilderInput(
+            expectedSelectionRevision: 7,
+            instructions: "Inspect",
+            budget: 125_000,
+            responseType: "question",
+            allowClarifyingQuestions: true,
+            enhancementMode: .preserve,
+            questionTimeoutSeconds: 300,
+            followUpAnalysis: .question,
+            followUpBudget: 85_000
+        )
+        let encoded = try JSONEncoder.serviceEncoder.encode(input)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertEqual(Set(object.keys), Set([
+            "expectedSelectionRevision", "instructions", "budget", "responseType",
+            "allowClarifyingQuestions", "enhancementMode", "questionTimeoutSeconds",
+            "followUpAnalysis", "followUpBudget"
+        ]))
+        XCTAssertNil(object["selectedPromptIDs"])
+
+        let decoded = try JSONDecoder.serviceDecoder.decode(ContextBuilderInput.self, from: encoded)
+        XCTAssertEqual(decoded.expectedSelectionRevision, 7)
+        XCTAssertEqual(decoded.instructions, "Inspect")
+        XCTAssertEqual(decoded.budget, 125_000)
+        XCTAssertEqual(decoded.responseType, "question")
+        XCTAssertEqual(decoded.allowClarifyingQuestions, true)
+        XCTAssertEqual(decoded.enhancementMode, .preserve)
+        XCTAssertEqual(decoded.questionTimeoutSeconds, 300)
+        XCTAssertEqual(decoded.followUpAnalysis, .question)
+        XCTAssertEqual(decoded.followUpBudget, 85_000)
     }
 
     func testSettingsPersistAcrossRestartAndProjectInheritanceIsDeterministic() async throws {
@@ -101,9 +191,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         }
 
         _ = try await service.replaceGlobalContextBuilder(
-            .init(expectedRevision: 0, profile: .init(budget: 100_000, prompts: [
-                .init(promptID: UUID(), name: "Architecture", instructions: "Inspect the architecture.", order: 4)
-            ])),
+            .init(expectedRevision: 0, profile: .init(budget: 100_000)),
             attribution: attribution
         )
         let context = try await service.copyGlobalContextBuilderToProject(
@@ -112,7 +200,8 @@ final class ServerSettingsFoundationTests: XCTestCase {
             attribution: attribution
         )
         XCTAssertEqual(context.effectiveProfile.budget, 100_000)
-        XCTAssertEqual(context.effectiveProfile.prompts.first?.order, 0)
+        XCTAssertEqual(context.projectMode, .projectOverride)
+        XCTAssertEqual(context.projectProfile, context.globalProfile)
 
         _ = try await service.replaceSubagentPermissions(
             .init(expectedRevision: 0, settings: .init(policy: .custom, codex: .readOnly)),
@@ -212,7 +301,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertFalse(auditJSON.contains("codeMapsEnabled"))
     }
 
-    func testValidationRejectsSecretsBoundsUnknownModelsAndUnauthorizedRoots() async throws {
+    func testValidationRejectsBoundsUnknownModelsAndUnauthorizedRoots() async throws {
         let projectID = UUID()
         let rootID = UUID()
         let store = try await SQLiteServiceStore.open(storage: .memory)
@@ -230,17 +319,6 @@ final class ServerSettingsFoundationTests: XCTestCase {
                 attribution: Self.attribution
             )
             XCTFail("budget increment must be enforced")
-        } catch let error as ServiceAPIError {
-            XCTAssertEqual(error.code, .invalidRequest)
-        }
-        do {
-            _ = try await service.replaceGlobalContextBuilder(
-                .init(expectedRevision: 0, profile: .init(prompts: [
-                    .init(promptID: UUID(), name: "Unsafe", instructions: "Use sk-proj-abcdefghijklmnopqrstuvwxyz0123456789", order: 0)
-                ])),
-                attribution: Self.attribution
-            )
-            XCTFail("secret-shaped prompt text must be rejected")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .invalidRequest)
         }
@@ -348,7 +426,6 @@ final class ServerSettingsFoundationTests: XCTestCase {
             XCTAssertFalse(route.usedRecommendationFallback)
         }
 
-        let savedPromptID = UUID()
         _ = try await service.replaceGlobalContextBuilder(
             .init(expectedRevision: 0, profile: .init(
                 budget: 120_000,
@@ -357,8 +434,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
                 portalClarifyingQuestions: false,
                 mcpClarifyingQuestions: true,
                 followUpAnalysis: .review,
-                followUpBudget: 60_000,
-                prompts: [.init(promptID: savedPromptID, name: "Safety", instructions: "Preserve compatibility.", order: 0)]
+                followUpBudget: 60_000
             )),
             attribution: Self.attribution
         )
@@ -366,17 +442,19 @@ final class ServerSettingsFoundationTests: XCTestCase {
         let mcp = try await service.resolveContextBuilder(
             projectID: projectID,
             origin: .mcp,
-            overrides: .init(budget: 80_000, allowClarifyingQuestions: false, selectedPromptIDs: [savedPromptID])
+            overrides: .init(budget: 80_000, allowClarifyingQuestions: false)
         )
         XCTAssertFalse(portal.allowClarifyingQuestions)
         let defaultMCP = try await service.resolveContextBuilder(projectID: projectID, origin: .mcp)
         XCTAssertTrue(defaultMCP.allowClarifyingQuestions, "MCP Context Builder must consume mcpClarifyingQuestions")
         XCTAssertFalse(mcp.allowClarifyingQuestions, "an explicit invocation override retains precedence")
         XCTAssertEqual(mcp.budget, 80_000)
+        XCTAssertEqual(mcp.enhancementMode, .augment)
         XCTAssertEqual(mcp.questionTimeoutSeconds, 120)
         XCTAssertEqual(mcp.followUpAnalysis, .review)
+        XCTAssertEqual(mcp.followUpBudget, 60_000)
         let rendered = try await service.renderContextBuilderInstructions("Caller", effective: mcp)
-        XCTAssertTrue(rendered.contains("Preserve compatibility."))
+        XCTAssertEqual(rendered, "Caller")
 
         let presetID = UUID()
         _ = try await service.replaceModelPresets(
@@ -529,7 +607,6 @@ final class ServerSettingsFoundationTests: XCTestCase {
             )),
             attribution: Self.attribution
         )
-        let promptID = UUID()
         _ = try await service.replaceGlobalContextBuilder(
             .init(expectedRevision: 0, profile: .init(
                 budget: 100_000,
@@ -538,8 +615,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
                 portalClarifyingQuestions: true,
                 mcpClarifyingQuestions: false,
                 followUpAnalysis: .plan,
-                followUpBudget: 50_000,
-                prompts: [.init(promptID: promptID, name: "Stored", instructions: "Stored instruction", order: 0)]
+                followUpBudget: 50_000
             )),
             attribution: Self.attribution
         )
@@ -557,7 +633,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
 
         let result = try await authority.runContextBuilder(
             sessionID: session.sessionID,
-            input: .init(expectedSelectionRevision: 1, instructions: "Caller"),
+            input: .init(expectedSelectionRevision: 1, instructions: "Caller", responseType: "question"),
             actor: actor,
             origin: .mcp
         )
@@ -566,7 +642,8 @@ final class ServerSettingsFoundationTests: XCTestCase {
         let contextRequest = try XCTUnwrap(recordedContextRequest)
         XCTAssertEqual(contextRequest.tokenBudget, 100_000)
         XCTAssertFalse(contextRequest.allowClarifyingQuestions)
-        XCTAssertTrue(contextRequest.instructions.contains("Stored instruction"))
+        XCTAssertEqual(contextRequest.instructions, "Caller")
+        XCTAssertEqual(contextRequest.responseType, "question")
         XCTAssertEqual(contextRequest.providerSettingsID, .claudeGLM)
         XCTAssertEqual(contextRequest.providerSettings["claude.backendID"], ProviderSettingsID.claudeGLM.rawValue)
         let followUpRequests = await oracleRuntime.requests()
