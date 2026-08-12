@@ -92,7 +92,7 @@ struct SystemProviderHostResolver: ProviderHostResolving {
             hints.ai_flags = AI_ADDRCONFIG
             hints.ai_family = AF_UNSPEC
             hints.ai_socktype = SOCK_STREAM_VALUE
-            hints.ai_protocol = IPPROTO_TCP
+            hints.ai_protocol = Int32(IPPROTO_TCP)
             var result: UnsafeMutablePointer<addrinfo>?
             let status = host.withCString { hostPointer in
                 String(port).withCString { servicePointer in
