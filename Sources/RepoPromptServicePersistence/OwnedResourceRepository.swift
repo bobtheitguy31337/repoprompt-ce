@@ -282,12 +282,14 @@ extension SQLiteServiceStore: OwnedResourceRepository {
             ($0.kind.rawValue, $0.state.rawValue) < ($1.kind.rawValue, $1.state.rawValue)
         }
         let leases = try await worktreeMergeLeases(nonterminalOnly: true)
+        let providerLocalKinds: Set<OwnedResourceKind> = [.providerHome, .providerCredentialCopy, .providerOutput]
+        let coreResources = resources.filter { !providerLocalKinds.contains($0.kind) }
         return OwnedResourceHealthSnapshot(
             aggregates: aggregates,
-            cleanupFailures: resources.count { $0.cleanupError != nil && $0.lifecycleState != .deleted },
-            missingCommittedArtifacts: resources.count { $0.kind == .artifact && $0.lifecycleState == .missing },
-            unhealthyCommittedResources: resources.count { [.missing, .corrupt].contains($0.lifecycleState) },
-            abandonedReservations: resources.count {
+            cleanupFailures: coreResources.count { $0.cleanupError != nil && $0.lifecycleState != .deleted },
+            missingCommittedArtifacts: coreResources.count { $0.kind == .artifact && $0.lifecycleState == .missing },
+            unhealthyCommittedResources: coreResources.count { [.missing, .corrupt].contains($0.lifecycleState) },
+            abandonedReservations: coreResources.count {
                 [.preparing, .prepared, .cleanupPending, .quarantined].contains($0.lifecycleState)
                     && ($0.retentionDeadline.map { $0 <= now } ?? false)
             },

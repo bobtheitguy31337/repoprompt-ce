@@ -246,6 +246,12 @@ final class AuthenticationAndHTTPTests: XCTestCase {
 
     func testServerRemainsReadyWhenAllProviderChecksFail() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
+        try await store.reserveOwnedResource(OwnedResourceRecord(
+            kind: .providerHome,
+            externalID: UUID(),
+            internalPathIdentity: "/var/lib/repoprompt/state/provider-homes/unavailable",
+            lifecycleState: .missing
+        ))
         let runtimes = ProviderKind.allCases.map { CountingUnavailableProviderRuntime(kind: $0) }
         let adapter = ProviderCLIAdapter(runtimes: runtimes, preflightCacheDuration: .milliseconds(50))
         let configurations = ProviderKind.allCases.map {
