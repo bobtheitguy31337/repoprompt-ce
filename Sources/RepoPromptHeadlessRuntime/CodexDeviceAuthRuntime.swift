@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentRuntimeCore
 import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 
@@ -36,11 +37,18 @@ public protocol ProviderManagedAuthenticationDriving: Sendable {
     func authFlowDescriptor(providerID: ProviderSettingsID, forceRefresh: Bool) async -> ProviderAuthFlowDescriptor?
     func authenticationState(providerID: ProviderSettingsID) async -> ProviderManagedAuthenticationState
     func accountSummary(providerID: ProviderSettingsID) async -> ProviderManagedAccountSummary?
+    func discoverModelCatalog(providerID: ProviderSettingsID, forceRefresh: Bool) async throws -> [ProviderModelCatalogEntry]?
     func logout(providerID: ProviderSettingsID) async throws
 }
 
 public extension ProviderManagedAuthenticationDriving {
-    func accountSummary(providerID _: ProviderSettingsID) async -> ProviderManagedAccountSummary? { nil }
+    func accountSummary(providerID _: ProviderSettingsID) async -> ProviderManagedAccountSummary? {
+        nil
+    }
+
+    func discoverModelCatalog(providerID _: ProviderSettingsID, forceRefresh _: Bool) async throws -> [ProviderModelCatalogEntry]? {
+        nil
+    }
 }
 
 public struct UnavailableProviderManagedAuthenticationDriver: ProviderManagedAuthenticationDriving {
@@ -212,6 +220,12 @@ private actor CodexManagedAuthRPCProcess {
         try await send(object)
     }
 
+    func modelList(cursor: String?, limit: Int, timeout: Duration) async throws -> Reply {
+        var params: [String: Any] = ["limit": limit]
+        if let cursor { params["cursor"] = cursor }
+        return try await request(method: "model/list", params: params, timeout: timeout)
+    }
+
     func stop() async {
         guard !stopped else { return }
         stopped = true
@@ -281,6 +295,7 @@ public actor CodexDeviceAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuth
     private var flows: [UUID: Flow] = [:]
     private var expiryTasks: [UUID: Task<Void, Never>] = [:]
     private var cachedAvailability: (Date, Bool)?
+    private var cachedModelCatalog: (Date, [ProviderModelCatalogEntry])?
     private var managedAccountSummary: ProviderManagedAccountSummary?
 
     public init(
@@ -339,6 +354,37 @@ public actor CodexDeviceAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuth
 
     public func accountSummary(providerID: ProviderSettingsID) async -> ProviderManagedAccountSummary? {
         providerID == .codex ? managedAccountSummary : nil
+    }
+
+    /// Uses the same managed Codex account and paginated app-server `model/list`
+    /// contract as RepoPrompt Desktop. No built-in model names are supplied here.
+    public func discoverModelCatalog(providerID: ProviderSettingsID, forceRefresh: Bool = false) async throws -> [ProviderModelCatalogEntry]? {
+        guard providerID == .codex else { return nil }
+        if !forceRefresh,
+           let cachedModelCatalog,
+           now().timeIntervalSince(cachedModelCatalog.0) < 60
+        {
+            return cachedModelCatalog.1
+        }
+
+        var launchedProcess: CodexManagedAuthRPCProcess?
+        do {
+            let process = try await launchRPC()
+            launchedProcess = process
+            let catalog = try await fetchModelCatalog(process: process)
+            await process.stop()
+            guard !catalog.isEmpty else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "Codex returned an empty model catalog")
+            }
+            cachedModelCatalog = (now(), catalog)
+            return catalog
+        } catch let error as ServiceAPIError {
+            await launchedProcess?.stop()
+            throw error
+        } catch {
+            await launchedProcess?.stop()
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Codex model discovery is temporarily unavailable", retryable: true)
+        }
     }
 
     public func start(providerID: ProviderSettingsID, kind: ProviderAuthFlowKind) async throws -> ProviderAuthTransactionStatus {
@@ -472,6 +518,111 @@ public actor CodexDeviceAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuth
             outputDirectory: outputDirectory,
             timeout: requestTimeout
         )
+    }
+
+    private func fetchModelCatalog(process: CodexManagedAuthRPCProcess) async throws -> [ProviderModelCatalogEntry] {
+        var cursor: String?
+        var seenCursors = Set<String>()
+        var seenModelIDs = Set<String>()
+        var catalog: [ProviderModelCatalogEntry] = []
+
+        while catalog.count < 500 {
+            let reply = try await process.modelList(cursor: cursor, limit: 100, timeout: requestTimeout)
+            guard let data = reply.result["data"] as? [[String: Any]] else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "Codex returned an invalid model catalog")
+            }
+
+            for item in data {
+                guard let rawID = Self.string(item, keys: ["id"]),
+                      let id = Self.safeModelText(rawID, maximumBytes: 256),
+                      seenModelIDs.insert(id.lowercased()).inserted
+                else { continue }
+                let providerRawValue = Self.safeModelText(Self.string(item, keys: ["model"]) ?? id, maximumBytes: 256) ?? id
+                let displayName = Self.safeModelText(Self.string(item, keys: ["displayName", "display_name"]) ?? providerRawValue, maximumBytes: 256) ?? providerRawValue
+                let description = Self.safeModelText(Self.string(item, keys: ["description"]) ?? "", maximumBytes: 1024)
+                let effortPayload = item["supportedReasoningEfforts"] as? [[String: Any]]
+                    ?? item["supported_reasoning_efforts"] as? [[String: Any]]
+                    ?? []
+                let efforts = Self.normalizedEfforts(
+                    effortPayload.compactMap { Self.string($0, keys: ["reasoningEffort", "reasoning_effort"]) },
+                    advertisedDefault: Self.string(item, keys: ["defaultReasoningEffort", "default_reasoning_effort"])
+                )
+                let defaultEffort = Self.defaultEffort(
+                    advertised: Self.string(item, keys: ["defaultReasoningEffort", "default_reasoning_effort"]),
+                    supported: efforts
+                )
+                let isDefault = item["isDefault"] as? Bool ?? item["is_default"] as? Bool ?? false
+                let base = ProviderModelCatalogEntry(
+                    id: id,
+                    providerRawValue: providerRawValue,
+                    displayName: displayName,
+                    description: description,
+                    isProviderDefault: isDefault,
+                    reasoningEfforts: efforts,
+                    defaultReasoningEffort: defaultEffort,
+                    supportsNativeImages: true,
+                    supportsSteering: true
+                )
+                catalog.append(base)
+                if CodexServiceTierAvailability.isFastEligible(baseModelID: id), catalog.count < 500 {
+                    catalog.append(
+                        ProviderModelCatalogEntry(
+                            id: "\(id)-fast",
+                            providerRawValue: providerRawValue,
+                            displayName: "\(displayName) Fast",
+                            description: Self.fastDescription(description),
+                            reasoningEfforts: efforts,
+                            defaultReasoningEffort: defaultEffort,
+                            serviceTier: CodexServiceTierAvailability.fastServiceTier,
+                            supportsNativeImages: true,
+                            supportsSteering: true
+                        )
+                    )
+                }
+            }
+
+            guard let next = Self.string(reply.result, keys: ["nextCursor", "next_cursor"]),
+                  seenCursors.insert(next).inserted
+            else { break }
+            cursor = next
+        }
+
+        guard catalog.count <= 500 else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Codex returned an oversized model catalog")
+        }
+        return catalog
+    }
+
+    private nonisolated static let effortOrder = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+
+    private nonisolated static func normalizedEfforts(_ rawValues: [String], advertisedDefault: String?) -> [String] {
+        var values = Set(rawValues.compactMap { safeModelText($0.lowercased(), maximumBytes: 128) })
+        if let advertisedDefault = advertisedDefault.flatMap({ safeModelText($0.lowercased(), maximumBytes: 128) }) {
+            values.insert(advertisedDefault)
+        }
+        return effortOrder.filter { values.remove($0) != nil } + values.sorted()
+    }
+
+    private nonisolated static func defaultEffort(advertised: String?, supported: [String]) -> String? {
+        let advertised = advertised.flatMap { safeModelText($0.lowercased(), maximumBytes: 128) }
+        if let advertised, supported.contains(advertised) { return advertised }
+        return supported.first
+    }
+
+    private nonisolated static func safeModelText(_ value: String, maximumBytes: Int) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.utf8.count <= maximumBytes,
+              !trimmed.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              !ProviderSecretRedaction.containsLikelySecret(trimmed)
+        else { return nil }
+        return trimmed
+    }
+
+    private nonisolated static func fastDescription(_ description: String?) -> String {
+        let warning = CodexServiceTierAvailability.fastCostWarningText
+        guard let description, !description.isEmpty else { return warning }
+        return "\(description) \(warning)"
     }
 
     private func startable(forceRefresh: Bool) async -> Bool {

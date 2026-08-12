@@ -204,6 +204,7 @@ public struct ProviderModelDescriptor: Codable, Hashable, Sendable {
     public let description: String?
     public let supportedEffortIDs: [String]
     public let defaultEffortID: String?
+    public let serviceTier: String?
     public let capabilities: ProviderModelCapabilities
 
     public init(
@@ -214,6 +215,7 @@ public struct ProviderModelDescriptor: Codable, Hashable, Sendable {
         description: String? = nil,
         supportedEffortIDs: [String] = [],
         defaultEffortID: String? = nil,
+        serviceTier: String? = nil,
         capabilities: ProviderModelCapabilities = .init()
     ) {
         self.providerID = providerID
@@ -223,6 +225,7 @@ public struct ProviderModelDescriptor: Codable, Hashable, Sendable {
         self.description = description
         self.supportedEffortIDs = supportedEffortIDs
         self.defaultEffortID = defaultEffortID
+        self.serviceTier = serviceTier
         self.capabilities = capabilities
     }
 }

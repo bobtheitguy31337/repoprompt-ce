@@ -70,6 +70,29 @@ final class CodexDeviceAuthRuntimeTests: XCTestCase {
         let descriptor = await driver.authFlowDescriptor(providerID: .codex, forceRefresh: true)
         XCTAssertNil(descriptor)
     }
+
+    func testModelCatalogUsesPaginatedDesktopAppServerDiscoveryAndExplicitFastTierMetadata() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let driver = try fixture.makeDriver()
+
+        let discovered = try await driver.discoverModelCatalog(providerID: .codex, forceRefresh: true)
+        let catalog = try XCTUnwrap(discovered)
+        XCTAssertEqual(catalog.map(\.id), ["gpt-5.6-luna", "gpt-5.6-luna-fast", "gpt-5.2", "gpt-5.4-mini", "gpt-5.4-mini-fast"])
+        XCTAssertEqual(catalog.first?.reasoningEfforts, ["low", "medium", "high"])
+        XCTAssertEqual(catalog.first?.defaultReasoningEffort, "medium")
+        XCTAssertEqual(catalog.first?.isProviderDefault, true)
+
+        let fast = try XCTUnwrap(catalog.first { $0.id == "gpt-5.6-luna-fast" })
+        XCTAssertEqual(fast.providerRawValue, "gpt-5.6-luna")
+        XCTAssertEqual(fast.serviceTier, "fast")
+        XCTAssertTrue(fast.displayName.hasSuffix(" Fast"))
+        XCTAssertFalse(catalog.contains { $0.id == "gpt-5.2-fast" })
+
+        let listCalls = try fixture.calls().filter { $0.method == "model/list" }
+        XCTAssertEqual(listCalls.map(\.cursor), [nil, "page-2"])
+        XCTAssertEqual(listCalls.map(\.limit), [100, 100])
+    }
 }
 
 private struct FixtureCall: Decodable {
@@ -77,6 +100,8 @@ private struct FixtureCall: Decodable {
     let type: String?
     let refreshToken: Bool?
     let loginID: String?
+    let cursor: String?
+    let limit: Int?
     let codexHome: String
     let sqliteHome: String
     let apiKeyPresent: Bool
@@ -153,6 +178,8 @@ private final class Fixture: @unchecked Sendable {
                     "type": params.get("type"),
                     "refreshToken": params.get("refreshToken"),
                     "loginID": params.get("loginId"),
+                    "cursor": params.get("cursor"),
+                    "limit": params.get("limit"),
                     "codexHome": os.environ.get("CODEX_HOME", ""),
                     "sqliteHome": os.environ.get("CODEX_SQLITE_HOME", ""),
                     "apiKeyPresent": "OPENAI_API_KEY" in os.environ
@@ -168,6 +195,16 @@ private final class Fixture: @unchecked Sendable {
                     auth_file.write_text('{"tokens":{"access_token":"server-only-test-token"}}')
                     os.chmod(auth_file, 0o600)
                 result = {"requiresOpenaiAuth": True, "account": ({"type":"chatgpt", "email":"owner@example.com", "planType":"pro"} if auth_file.exists() else None)}
+            elif method == "model/list":
+                if params.get("cursor") == "page-2":
+                    result = {"data":[
+                        {"id":"gpt-5.4-mini", "model":"gpt-5.4-mini", "displayName":"GPT-5.4 Mini", "description":"Compact model", "isDefault":False, "supportedReasoningEfforts":[{"reasoningEffort":"low"}], "defaultReasoningEffort":"low"}
+                    ]}
+                else:
+                    result = {"data":[
+                        {"id":"gpt-5.6-luna", "model":"gpt-5.6-luna", "displayName":"GPT-5.6 Luna", "description":"Default model", "isDefault":True, "supportedReasoningEfforts":[{"reasoningEffort":"high"}, {"reasoningEffort":"low"}], "defaultReasoningEffort":"medium"},
+                        {"id":"gpt-5.2", "model":"gpt-5.2", "displayName":"GPT-5.2", "description":"Earlier model", "isDefault":False, "supportedReasoningEfforts":[], "defaultReasoningEffort":None}
+                    ], "nextCursor":"page-2"}
             elif method == "account/login/cancel":
                 pass
             elif method == "account/logout":

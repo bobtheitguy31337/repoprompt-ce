@@ -202,6 +202,27 @@ public actor ProviderSettingsService {
         return ProviderSettingsCatalogResponse(providers: snapshots)
     }
 
+    /// Composer reads require a current runtime/authentication projection and the
+    /// account-backed model catalog. Refreshes are coalesced and TTL bounded by
+    /// the same provider status path used by the settings portal.
+    public func composerCatalog() async throws -> ProviderSettingsCatalogResponse {
+        for providerID in ProviderSettingsID.allCases where providerID.ownsRuntimeAdmission && !providerID.isDirectAPI {
+            guard preferences[providerID]?.enabled == true else { continue }
+            await refreshProviderStatus(providerID: providerID)
+            if providerID == .codex,
+               try snapshot(for: providerID).preflight.ready
+            {
+                guard let models = try await managedAuthentication.discoverModelCatalog(providerID: providerID, forceRefresh: false),
+                      !models.isEmpty
+                else {
+                    throw ServiceAPIError(code: .dependencyUnavailable, message: "Codex account model discovery is temporarily unavailable", retryable: true)
+                }
+                try await persistDiscoveredCatalog(models, providerID: providerID)
+            }
+        }
+        return try ProviderSettingsCatalogResponse(providers: ProviderSettingsID.allCases.map { try snapshot(for: $0) })
+    }
+
     public func update(
         providerID: ProviderSettingsID,
         request: UpdateProviderSettingsRequest,
@@ -718,12 +739,13 @@ public actor ProviderSettingsService {
     }
 
     private func persistDiscoveredCatalog(_ models: [ProviderModelCatalogEntry], providerID: ProviderSettingsID) async throws {
-        guard providerID.isDirectAPI,
+        guard providerID.isDirectAPI || providerID == .codex,
               !models.isEmpty,
               models.count <= 500,
               Set(models.map(\.id)).count == models.count,
               models.allSatisfy({ validCatalogEntry($0, providerID: providerID) })
         else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider validation returned an unsafe model catalog") }
+        guard modelCatalogs[providerID] != models else { return }
         let currentRevision = try await store.providerModelCatalog(providerID: providerID)?.revision ?? 0
         let persisted = try await store.replaceProviderModelCatalog(
             providerID: providerID,
@@ -906,6 +928,12 @@ public actor ProviderSettingsService {
             try? await reconcileManagedAuthentication(attribution: Self.lifecycleAttribution)
         }
         await refreshRuntimePreflight(providerID: providerID, kind: kind)
+        if providerID == .codex,
+           (try? snapshot(for: providerID).preflight.ready) == true,
+           let models = try? await managedAuthentication.discoverModelCatalog(providerID: providerID, forceRefresh: false)
+        {
+            try? await persistDiscoveredCatalog(models, providerID: providerID)
+        }
     }
 
     private func refreshCLIHealth(providerID: ProviderSettingsID, kind: ProviderKind, configuration: ProviderCLIConfiguration) async {
@@ -1082,13 +1110,15 @@ public actor ProviderSettingsService {
 
     private func validCatalogEntry(_ entry: ProviderModelCatalogEntry, providerID: ProviderSettingsID) -> Bool {
         let definition = Self.definition(providerID)
-        let safeFields = [entry.id, entry.displayName, entry.description].compactMap(\.self)
+        let safeFields = [entry.id, entry.providerRawValue, entry.displayName, entry.description, entry.serviceTier].compactMap(\.self)
         let optionGroups = [entry.reasoningEfforts, entry.speedModes, entry.serviceTiers]
         guard !entry.id.isEmpty,
               entry.id.utf8.count <= 256,
+              entry.providerRawValue?.utf8.count ?? 0 <= 256,
               !entry.displayName.isEmpty,
               entry.displayName.utf8.count <= 256,
               entry.description?.utf8.count ?? 0 <= 1024,
+              entry.serviceTier?.utf8.count ?? 0 <= 128,
               safeFields.allSatisfy({ safeCatalogText($0) }),
               optionGroups.allSatisfy({ options in
                   options.count <= 64

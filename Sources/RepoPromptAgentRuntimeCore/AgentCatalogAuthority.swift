@@ -17,6 +17,7 @@ public struct AgentCatalogModelCandidate: Codable, Hashable, Sendable {
     public let variantEffortID: String?
     public let supportedEffortIDs: [String]
     public let defaultEffortID: String?
+    public let serviceTier: String?
     public let isProviderDefault: Bool
     public let capabilities: ProviderModelCapabilities
 
@@ -28,6 +29,7 @@ public struct AgentCatalogModelCandidate: Codable, Hashable, Sendable {
         variantEffortID: String? = nil,
         supportedEffortIDs: [String] = [],
         defaultEffortID: String? = nil,
+        serviceTier: String? = nil,
         isProviderDefault: Bool = false,
         capabilities: ProviderModelCapabilities = .init()
     ) {
@@ -38,6 +40,7 @@ public struct AgentCatalogModelCandidate: Codable, Hashable, Sendable {
         self.variantEffortID = variantEffortID
         self.supportedEffortIDs = supportedEffortIDs
         self.defaultEffortID = defaultEffortID
+        self.serviceTier = serviceTier
         self.isProviderDefault = isProviderDefault
         self.capabilities = capabilities
     }
@@ -176,6 +179,7 @@ public struct AgentCatalogResolvedModel: Hashable, Sendable {
             description: descriptor.description,
             supportedEffortIDs: descriptor.supportedEffortIDs,
             defaultEffortID: descriptor.defaultEffortID,
+            serviceTier: descriptor.serviceTier,
             capabilities: descriptor.capabilities
         )
     }
@@ -357,6 +361,7 @@ public enum AgentCatalogAuthority {
                     description: variants.compactMap(\.description).first,
                     supportedEffortIDs: effortIDs,
                     defaultEffortID: defaultEffort,
+                    serviceTier: representative.serviceTier,
                     capabilities: capabilities
                 ),
                 variants: variants,

@@ -195,10 +195,11 @@ final class AgentComposerCatalogTests: XCTestCase {
     }
 
     func testCodexAdapterRejectsUnknownControlsAndKeepsRequiredRepoPromptMCP() throws {
-        let model = ProviderModelDescriptor(providerID: .codex, modelID: "gpt-5.6-sol", providerRawValue: "gpt-5.6-sol-high", displayName: "GPT-5.6 Sol", supportedEffortIDs: ["high"], defaultEffortID: "high", capabilities: .init(nativeImages: true, steering: true))
+        let model = ProviderModelDescriptor(providerID: .codex, modelID: "gpt-5.6-sol-fast", providerRawValue: "gpt-5.6-sol", displayName: "GPT-5.6 Sol Fast", supportedEffortIDs: ["high"], defaultEffortID: "high", serviceTier: "fast", capabilities: .init(nativeImages: true, steering: true))
         let adapter = CodexTurnConfigurationAdapter()
         let compiled = try adapter.compile(.init(providerID: .codex, model: model, effortID: "high", permissionID: "codex.defaultPermission", toolValues: ["codex.mcpServers": .choices([])]))
-        XCTAssertEqual(compiled.providerRawModelValue, "gpt-5.6-sol-high")
+        XCTAssertEqual(compiled.providerRawModelValue, "gpt-5.6-sol")
+        XCTAssertEqual(compiled.executionPolicy.providerSettings["provider.serviceTier"], "fast")
         XCTAssertEqual(compiled.normalizedToolValues["codex.mcpServers"], .choices(["repoprompt"]))
         XCTAssertThrowsError(try adapter.compile(.init(providerID: .codex, model: model, toolValues: ["codex.unknown": .boolean(true)])))
     }

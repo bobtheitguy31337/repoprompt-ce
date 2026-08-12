@@ -186,6 +186,7 @@ public struct CodexTurnConfigurationAdapter: ProviderTurnConfigurationAdapter {
             "provider.permissionId": permission
         ]
         if let effort { native["provider.reasoningEffort"] = effort }
+        if let serviceTier = input.model.serviceTier { native["provider.serviceTier"] = serviceTier }
         return .init(runtimeKind: .codex, providerRawModelValue: input.model.providerRawValue, executionPolicy: .init(mode: mode, providerSettings: native), supportsNativeImages: input.model.capabilities.nativeImages, normalizedToolValues: settings)
     }
 

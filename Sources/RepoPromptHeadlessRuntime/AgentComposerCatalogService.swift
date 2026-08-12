@@ -209,7 +209,7 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
                 context: .init(now: instant, activeRun: context.activeRun, externallyControlled: context.mcpControlled)
             )
         }
-        let catalog = try await providerSettings.catalog(refreshCLI: false, refreshRuntime: false)
+        let catalog = try await providerSettings.composerCatalog()
         let instant = now()
         var states: [AgentCatalogProviderState] = []
         for matrix in AgentComposerProviderMatrix.entries {
@@ -261,11 +261,12 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
     private static func candidate(_ entry: ProviderModelCatalogEntry) -> AgentCatalogModelCandidate {
         .init(
             modelID: entry.id,
-            rawValue: entry.id,
+            rawValue: entry.providerRawValue ?? entry.id,
             displayName: entry.displayName,
             description: entry.description,
             supportedEffortIDs: entry.reasoningEfforts,
             defaultEffortID: entry.defaultReasoningEffort,
+            serviceTier: entry.serviceTier,
             isProviderDefault: entry.isProviderDefault,
             capabilities: .init(nativeImages: entry.supportsNativeImages, steering: entry.supportsSteering)
         )

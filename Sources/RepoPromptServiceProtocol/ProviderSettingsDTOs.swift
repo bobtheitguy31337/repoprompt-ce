@@ -217,11 +217,13 @@ public struct ProviderCLIHealth: Codable, Hashable, Sendable {
 
 public struct ProviderModelCatalogEntry: Codable, Hashable, Sendable {
     public let id: String
+    public let providerRawValue: String?
     public let displayName: String
     public let description: String?
     public let isProviderDefault: Bool
     public let reasoningEfforts: [String]
     public let defaultReasoningEffort: String?
+    public let serviceTier: String?
     public let speedModes: [String]
     public let serviceTiers: [String]
     public let supportsNativeImages: Bool
@@ -229,22 +231,26 @@ public struct ProviderModelCatalogEntry: Codable, Hashable, Sendable {
 
     public init(
         id: String,
+        providerRawValue: String? = nil,
         displayName: String,
         description: String? = nil,
         isProviderDefault: Bool = false,
         reasoningEfforts: [String] = [],
         defaultReasoningEffort: String? = nil,
+        serviceTier: String? = nil,
         speedModes: [String] = [],
         serviceTiers: [String] = [],
         supportsNativeImages: Bool = false,
         supportsSteering: Bool = false
     ) {
         self.id = id
+        self.providerRawValue = providerRawValue
         self.displayName = displayName
         self.description = description
         self.isProviderDefault = isProviderDefault
         self.reasoningEfforts = reasoningEfforts
         self.defaultReasoningEffort = defaultReasoningEffort
+        self.serviceTier = serviceTier
         self.speedModes = speedModes
         self.serviceTiers = serviceTiers
         self.supportsNativeImages = supportsNativeImages
@@ -252,18 +258,20 @@ public struct ProviderModelCatalogEntry: Codable, Hashable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, displayName, description, isProviderDefault, reasoningEfforts, defaultReasoningEffort
+        case id, providerRawValue, displayName, description, isProviderDefault, reasoningEfforts, defaultReasoningEffort, serviceTier
         case speedModes, serviceTiers, supportsNativeImages, supportsSteering
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
+        providerRawValue = try container.decodeIfPresent(String.self, forKey: .providerRawValue)
         displayName = try container.decode(String.self, forKey: .displayName)
         description = try container.decodeIfPresent(String.self, forKey: .description)
         isProviderDefault = try container.decodeIfPresent(Bool.self, forKey: .isProviderDefault) ?? false
         reasoningEfforts = try container.decodeIfPresent([String].self, forKey: .reasoningEfforts) ?? []
         defaultReasoningEffort = try container.decodeIfPresent(String.self, forKey: .defaultReasoningEffort)
+        serviceTier = try container.decodeIfPresent(String.self, forKey: .serviceTier)
         speedModes = try container.decodeIfPresent([String].self, forKey: .speedModes) ?? []
         serviceTiers = try container.decodeIfPresent([String].self, forKey: .serviceTiers) ?? []
         supportsNativeImages = try container.decodeIfPresent(Bool.self, forKey: .supportsNativeImages) ?? false
