@@ -21,7 +21,7 @@ private func testConfiguration(at date: Date = Date(timeIntervalSince1970: 1_700
         modelID: "gpt-5.6-sol",
         providerRawModelValue: "gpt-5.6-sol-high",
         effortID: "high",
-        permissionID: "codex.workspaceWrite",
+        permissionID: "codex.defaultPermission",
         toolValues: ["codex.bash": .boolean(true), "codex.mcpServers": .choices(["repoprompt"])],
         capabilityDigest: "capability-v1",
         actorID: "actor-1",
@@ -34,25 +34,170 @@ private func tinyPNG() -> Data {
 }
 
 final class AgentComposerCatalogTests: XCTestCase {
-    func testProviderMatrixAndNormalizationFixtureAreExact() throws {
+    func testProviderMatrixAndDiscoveryPoliciesAreExact() throws {
         XCTAssertEqual(AgentComposerProviderMatrix.entries.map(\.providerID), [.codex, .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom, .openCodeACP, .cursorACP, .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI])
         XCTAssertEqual(AgentComposerProviderMatrix.liveFreshnessSeconds, 900)
         XCTAssertEqual(AgentComposerProviderMatrix.persistedFallbackMaximumAgeSeconds, 86_400)
-        XCTAssertNil(AgentModelIdentityNormalizer.normalize(providerID: .codex, rawModelID: "Default"))
-        let normalized = try XCTUnwrap(AgentModelIdentityNormalizer.normalize(providerID: .codex, rawModelID: "gpt-5.6-sol-high"))
-        XCTAssertEqual(normalized.modelID, "gpt-5.6-sol")
-        XCTAssertEqual(normalized.effortID, "high")
-        XCTAssertEqual(normalized.displayName, "5.6 Sol")
 
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         let object = try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("Fixtures/AgentParity/v1/provider-matrix.json"))) as? [String: Any]
         XCTAssertEqual((object?["providers"] as? [[String: Any]])?.compactMap { $0["id"] as? String }, AgentComposerProviderMatrix.entries.map { $0.providerID.rawValue })
     }
 
+    func testSharedAuthorityAndHeadlessProjectionHaveByteSemanticParityAcrossProviderStates() async throws {
+        let instant = Date(timeIntervalSince1970: 1_786_400_000)
+        let liveOnly = ProviderDiscoveryPolicy(allowsPersistedFallback: false, allowsStaticFallbackAfterSuccessfulPreflight: false, discoveryReplacesStaticChoices: true)
+        let cached = ProviderDiscoveryPolicy(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: false, discoveryReplacesStaticChoices: true)
+        let discoveredWithFallback = ProviderDiscoveryPolicy(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: true, discoveryReplacesStaticChoices: false)
+        let codexTools = ProviderComposerStableControls.descriptors(providerID: .codex, values: ["codex.goals": .boolean(false)], mutable: true, lockReasonCode: nil)
+        let codexPermission = ProviderComposerStableControls.permissionDescriptor(providerID: .codex, selectedID: "codex.defaultPermission", mutable: true, lockReasonCode: nil)
+        let claudeTools = ProviderComposerStableControls.descriptors(providerID: .claudeCompatible, values: ["claude.bash": .boolean(false)], mutable: true, lockReasonCode: nil)
+        let claudePermission = ProviderComposerStableControls.permissionDescriptor(providerID: .claudeCompatible, selectedID: "claude.requireApproval", mutable: true, lockReasonCode: nil)
+        let states: [AgentCatalogProviderState] = [
+            .init(
+                providerID: .codex,
+                displayName: "Codex discovered",
+                enabled: true,
+                configured: true,
+                preflightReady: true,
+                discoveryPolicy: liveOnly,
+                modelSources: [.init(kind: .live, observedAt: instant, models: [
+                    .init(modelID: "codex-dynamic", rawValue: "provider/codex-low", displayName: "Codex Dynamic", variantEffortID: "low", supportedEffortIDs: ["low"], capabilities: .init(nativeImages: true, steering: true)),
+                    .init(modelID: "codex-dynamic", rawValue: "provider/codex-xhigh", displayName: "Codex Dynamic", variantEffortID: "xhigh", supportedEffortIDs: ["xhigh"], defaultEffortID: "xhigh", isProviderDefault: true, capabilities: .init(nativeImages: true, steering: true))
+                ])],
+                preferredModelID: "codex-dynamic",
+                preferredEffortID: "xhigh",
+                toolControls: codexTools,
+                permissionControl: codexPermission
+            ),
+            .init(
+                providerID: .claudeCompatible,
+                displayName: "Claude runtime catalog",
+                enabled: true,
+                configured: true,
+                preflightReady: true,
+                discoveryPolicy: liveOnly,
+                modelSources: [.init(kind: .live, observedAt: instant, models: [
+                    .init(modelID: "claude-runtime", rawValue: "claude-runtime", displayName: "Claude Runtime", capabilities: .init(nativeImages: true))
+                ])],
+                toolControls: claudeTools,
+                permissionControl: claudePermission
+            ),
+            .init(
+                providerID: .openAIAPI,
+                displayName: "Direct API",
+                enabled: true,
+                configured: true,
+                preflightReady: true,
+                discoveryPolicy: liveOnly,
+                modelSources: [.init(kind: .live, observedAt: instant, models: [
+                    .init(modelID: "direct-model", rawValue: "direct-model", displayName: "Direct Model", supportedEffortIDs: ["low", "high"], defaultEffortID: "low")
+                ])]
+            ),
+            .init(
+                providerID: .openRouter,
+                displayName: "Fresh cached API",
+                enabled: true,
+                configured: true,
+                preflightReady: true,
+                discoveryPolicy: cached,
+                modelSources: [.init(kind: .persisted, observedAt: instant.addingTimeInterval(-300), models: [
+                    .init(modelID: "cached-model", rawValue: "cached-model", displayName: "Cached Model")
+                ])]
+            ),
+            .init(
+                providerID: .openCodeACP,
+                displayName: "ACP discovered plus provider fallback",
+                enabled: true,
+                configured: true,
+                preflightReady: true,
+                discoveryPolicy: discoveredWithFallback,
+                modelSources: [
+                    .init(kind: .live, observedAt: instant, models: [.init(modelID: "acp-discovered", rawValue: "acp/discovered", displayName: "ACP Discovered")]),
+                    .init(kind: .providerFallback, models: [.init(modelID: "acp-provider-fallback", rawValue: "acp/fallback", displayName: "ACP Provider Fallback")])
+                ]
+            ),
+            .init(providerID: .cursorACP, displayName: "Disabled", enabled: false, configured: true, preflightReady: true, discoveryPolicy: liveOnly, modelSources: [.init(kind: .live, observedAt: instant, models: [.init(modelID: "must-not-appear", rawValue: "disabled", displayName: "Disabled")])]),
+            .init(providerID: .anthropicAPI, displayName: "Unhealthy", enabled: true, configured: true, preflightReady: false, discoveryPolicy: liveOnly, modelSources: [.init(kind: .live, observedAt: instant, models: [.init(modelID: "must-not-appear", rawValue: "unhealthy", displayName: "Unhealthy")])]),
+            .init(providerID: .customOpenAICompatible, displayName: "Empty", enabled: true, configured: true, preflightReady: true, discoveryPolicy: cached, modelSources: []),
+            .init(providerID: .xAI, displayName: "Stale cached API", enabled: true, configured: true, preflightReady: true, discoveryPolicy: cached, modelSources: [.init(kind: .persisted, observedAt: instant.addingTimeInterval(-86_401), models: [.init(modelID: "must-not-appear", rawValue: "stale", displayName: "Stale")])])
+        ]
+        let expected = AgentCatalogAuthority.resolve(providers: states, storedSelection: nil, context: .init(now: instant, activeRun: true))
+        XCTAssertEqual(expected.providers.map(\.providerID), [.codex, .claudeCompatible, .openAIAPI, .openRouter, .openCodeACP])
+        XCTAssertEqual(expected.providers[0].models[0].descriptor.supportedEffortIDs, ["low", "xhigh"])
+        XCTAssertEqual(expected.providers[0].models[0].descriptor.defaultEffortID, "xhigh")
+        XCTAssertEqual(expected.providers[0].models[0].descriptor.providerRawValue, "provider/codex-xhigh")
+        XCTAssertEqual(expected.providers[0].models[0].descriptor(selectingEffortID: "low").providerRawValue, "provider/codex-low")
+        XCTAssertTrue(expected.providers.flatMap(\.toolControls).allSatisfy(Self.isActiveRunLocked))
+        XCTAssertTrue(expected.providers.compactMap(\.permissionControl).allSatisfy { !$0.mutable && $0.lockReasonCode == "active_run" })
+
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let runner = StructuredStartProviderRunner()
+        let settings = ProviderSettingsService(store: store, adapter: ProviderCLIAdapter(configurations: [], enabledProviders: [], runner: runner), configurations: [], initiallyEnabled: [], runner: runner)
+        let service = AgentComposerCatalogService(providerSettings: settings, store: store, providerStateLoader: { _ in states }, now: { instant })
+        let actual = try await service.snapshot(context: .init(kind: .project, projectID: UUID(), actorID: "parity", activeRun: true))
+        let expectedGroups = expected.providers.map(Self.wireGroup)
+        XCTAssertEqual(try JSONEncoder.serviceEncoder.encode(actual.providerGroups), try JSONEncoder.serviceEncoder.encode(expectedGroups))
+        XCTAssertEqual(actual.selected?.providerID, expected.selection?.providerID)
+        XCTAssertEqual(actual.selected?.modelID, expected.selection?.modelID)
+        XCTAssertEqual(actual.selected?.effortID, expected.selection?.effortID)
+        XCTAssertEqual(actual.selected?.permissionID, expected.selection?.permissionID)
+        XCTAssertEqual(actual.selected?.toolValues, expected.selection?.toolValues.mapValues(Self.wireValue))
+
+        let unavailable = AgentCatalogAuthority.resolve(
+            providers: states,
+            storedSelection: .init(providerID: .xAI, modelID: "stale-selection", effortID: "high", permissionID: "preserved", toolValues: ["preserved": .boolean(true)]),
+            context: .init(now: instant, externallyControlled: true)
+        )
+        XCTAssertEqual(unavailable.selection?.unavailable, true)
+        XCTAssertEqual(unavailable.selection?.modelID, "stale-selection")
+        XCTAssertEqual(unavailable.selection?.effortID, "high")
+        XCTAssertEqual(unavailable.selection?.permissionID, "preserved")
+        XCTAssertEqual(unavailable.selection?.toolValues, ["preserved": .boolean(true)])
+    }
+
+    private static func isActiveRunLocked(_ control: ProviderComposerControlDescriptor) -> Bool {
+        switch control {
+        case let .toggle(_, _, _, _, _, mutable, _, reason),
+             let .singleChoice(_, _, _, _, _, _, mutable, _, reason),
+             let .multiChoice(_, _, _, _, _, _, mutable, _, reason):
+            return !mutable && reason == "active_run"
+        }
+    }
+
+    private static func wireGroup(_ provider: AgentCatalogResolvedProvider) -> ComposerProviderGroupWire {
+        .init(
+            providerID: provider.providerID,
+            displayName: provider.displayName,
+            models: provider.models.map {
+                .init(id: $0.descriptor.modelID, displayName: $0.descriptor.displayName, description: $0.descriptor.description, supportedEffortIDs: $0.descriptor.supportedEffortIDs, defaultEffortID: $0.descriptor.defaultEffortID, capabilities: .init(nativeImages: $0.descriptor.capabilities.nativeImages, steering: $0.descriptor.capabilities.steering))
+            },
+            toolControls: provider.toolControls.map { control in
+                switch control {
+                case let .toggle(id, name, detail, value, required, mutable, warning, reason): .toggle(common: .init(id: id, displayName: name, detailText: detail, required: required, mutable: mutable, warning: warning, lockReasonCode: reason), value: value)
+                case let .singleChoice(id, name, detail, selected, choices, required, mutable, warning, reason): .singleChoice(common: .init(id: id, displayName: name, detailText: detail, required: required, mutable: mutable, warning: warning, lockReasonCode: reason), selectedID: selected, choices: choices.map { .init(id: $0.id, displayName: $0.displayName, detailText: $0.detailText, enabled: $0.enabled, warning: $0.warning) })
+                case let .multiChoice(id, name, detail, selected, choices, required, mutable, warning, reason): .multiChoice(common: .init(id: id, displayName: name, detailText: detail, required: required, mutable: mutable, warning: warning, lockReasonCode: reason), selectedIDs: selected, choices: choices.map { .init(id: $0.id, displayName: $0.displayName, detailText: $0.detailText, enabled: $0.enabled, warning: $0.warning) })
+                }
+            },
+            permissionControl: provider.permissionControl.map { permission in
+                .init(id: permission.id, displayName: permission.displayName, selectedID: permission.selectedID, choices: permission.choices.map { .init(id: $0.id, displayName: $0.displayName, detailText: $0.detailText, enabled: $0.enabled, warning: $0.warning) }, externallyManaged: permission.externallyManaged, mutable: permission.mutable, lockReasonCode: permission.lockReasonCode)
+            }
+        )
+    }
+
+    private static func wireValue(_ value: AgentControlValue) -> ComposerControlValueWire {
+        switch value {
+        case let .boolean(value): .boolean(value)
+        case let .choice(value): .choice(value)
+        case let .choices(value): .choices(value)
+        }
+    }
+
     func testCodexAdapterRejectsUnknownControlsAndKeepsRequiredRepoPromptMCP() throws {
         let model = ProviderModelDescriptor(providerID: .codex, modelID: "gpt-5.6-sol", providerRawValue: "gpt-5.6-sol-high", displayName: "GPT-5.6 Sol", supportedEffortIDs: ["high"], defaultEffortID: "high", capabilities: .init(nativeImages: true, steering: true))
         let adapter = CodexTurnConfigurationAdapter()
-        let compiled = try adapter.compile(.init(providerID: .codex, model: model, effortID: "high", permissionID: "codex.workspaceWrite", toolValues: ["codex.mcpServers": .choices([])]))
+        let compiled = try adapter.compile(.init(providerID: .codex, model: model, effortID: "high", permissionID: "codex.defaultPermission", toolValues: ["codex.mcpServers": .choices([])]))
         XCTAssertEqual(compiled.providerRawModelValue, "gpt-5.6-sol-high")
         XCTAssertEqual(compiled.normalizedToolValues["codex.mcpServers"], .choices(["repoprompt"]))
         XCTAssertThrowsError(try adapter.compile(.init(providerID: .codex, model: model, toolValues: ["codex.unknown": .boolean(true)])))
@@ -458,6 +603,60 @@ final class NativeProviderRuntimeLifecycleTests: XCTestCase {
 }
 
 final class RepoPromptHTTPComposerContractTests: XCTestCase {
+    func testAuthenticatedComposerCatalogUsesRunnerCompositionAndKeepsFailureCategoriesDistinct() async throws {
+        let fixture = try await StructuredStartFixture.make()
+        defer { Task { try? await fixture.store.close(); try? FileManager.default.removeItem(at: fixture.root) } }
+        let instant = Date(timeIntervalSince1970: 1_786_400_000)
+        let key = InternalSigningKey(keyID: "composer-http", role: .goblinApp, direction: "test", secret: Data("composer-http-contract-secret-32bytes".utf8))
+        let path = "/internal/v1/catalog/composer?projectId=\(fixture.sessionInput.projectID.uuidString.lowercased())"
+        let composedCatalog = RepoPromptServerRunner.composeAgentCatalog(
+            providerSettings: fixture.providerSettings,
+            store: fixture.store,
+            workflows: [],
+            suggestions: [],
+            emptyState: .init(featuredWorkflowIDs: [], tips: [])
+        )
+        let authenticator = InternalRequestAuthenticator(keys: [key], store: fixture.store, now: { instant })
+        let composedService = RepoPromptHTTPService(authority: fixture.authority, store: fixture.store, authenticator: authenticator, eventSigningKey: key, composerCatalog: composedCatalog)
+        let composedApp = Application(router: composedService.internalRouter())
+        try await composedApp.test(.router) { client in
+            let headers = try composerCatalogHeaders(actor: fixture.actor, projectID: fixture.sessionInput.projectID, path: path, nonce: "composercatalog001", instant: instant, key: key)
+            try await client.execute(uri: path, method: .get, headers: headers) { response in
+                XCTAssertEqual(response.status, .ok)
+                let snapshot = try JSONDecoder.serviceDecoder.decode(ComposerCatalogWireSnapshot.self, from: Data(response.body.readableBytesView))
+                let group = try XCTUnwrap(snapshot.providerGroups.first { $0.providerID == .claudeCompatible })
+                XCTAssertEqual(group.models.map(\.id), [fixture.modelID])
+                XCTAssertEqual(group.models.first?.supportedEffortIDs, ["high"])
+                XCTAssertEqual(group.models.first?.defaultEffortID, "high")
+            }
+        }
+
+        let missingService = RepoPromptHTTPService(authority: fixture.authority, store: fixture.store, authenticator: authenticator, eventSigningKey: key)
+        let missingApp = Application(router: missingService.internalRouter())
+        try await missingApp.test(.router) { client in
+            let headers = try composerCatalogHeaders(actor: fixture.actor, projectID: fixture.sessionInput.projectID, path: path, nonce: "composercatalog002", instant: instant, key: key)
+            try await client.execute(uri: path, method: .get, headers: headers) { response in
+                XCTAssertEqual(response.status, .serviceUnavailable)
+                let error = try JSONDecoder.serviceDecoder.decode(ServiceAPIError.self, from: Data(response.body.readableBytesView))
+                XCTAssertEqual(error.code, .dependencyUnavailable)
+                XCTAssertEqual(error.message, "Agent composer catalog is unavailable")
+            }
+        }
+
+        let failingService = RepoPromptHTTPService(authority: fixture.authority, store: fixture.store, authenticator: authenticator, eventSigningKey: key, composerCatalog: FailingComposerCatalog())
+        let failingApp = Application(router: failingService.internalRouter())
+        try await failingApp.test(.router) { client in
+            let headers = try composerCatalogHeaders(actor: fixture.actor, projectID: fixture.sessionInput.projectID, path: path, nonce: "composercatalog003", instant: instant, key: key)
+            try await client.execute(uri: path, method: .get, headers: headers) { response in
+                XCTAssertEqual(response.status, .internalServerError)
+                let error = try JSONDecoder.serviceDecoder.decode(ServiceAPIError.self, from: Data(response.body.readableBytesView))
+                XCTAssertEqual(error.code, .internalFailure)
+                XCTAssertEqual(error.message, "Internal service failure")
+                XCTAssertFalse(error.retryable)
+            }
+        }
+    }
+
     func testActorScopedResponsesArePrivateAndVaryOnCredentials() throws {
         let json = try HTTPResponses.privateJSON(["ok": true])
         XCTAssertEqual(json.headers[.cacheControl], "private, no-store")
@@ -517,7 +716,7 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
         ])
         let submission = AgentTurnSubmissionWire(
             content: .init(text: "Investigate the regression"),
-            configuration: .init(catalogRevision: fixture.catalogRevision, providerID: .claudeCompatible, modelID: fixture.modelID, effortID: fixture.effortID, permissionID: "claude.requireApproval", toolValues: ["claude.repoPromptOnlyMCP": .boolean(true)])
+            configuration: .init(catalogRevision: fixture.catalogRevision, providerID: .claudeCompatible, modelID: fixture.modelID, effortID: fixture.effortID, permissionID: "claude.requireApproval", toolValues: ["claude.mcpStrictMode": .boolean(true)])
         )
         let body = try JSONEncoder.serviceEncoder.encode(AgentStartSessionWire(projectID: fixture.sessionInput.projectID, visibility: fixture.sessionInput.visibility, turn: submission, selectedMessageContext: selectedContext))
         let instant = Date(timeIntervalSince1970: 1_786_400_000)
@@ -551,7 +750,7 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
         let key = UUID().uuidString.lowercased()
         let submission = AgentTurnSubmissionWire(
             content: .init(text: "accepted exactly once"),
-            configuration: .init(catalogRevision: fixture.catalogRevision, providerID: .claudeCompatible, modelID: fixture.modelID, effortID: fixture.effortID, permissionID: "claude.requireApproval", toolValues: ["claude.repoPromptOnlyMCP": .boolean(true)])
+            configuration: .init(catalogRevision: fixture.catalogRevision, providerID: .claudeCompatible, modelID: fixture.modelID, effortID: fixture.effortID, permissionID: "claude.requireApproval", toolValues: ["claude.mcpStrictMode": .boolean(true)])
         )
 
         let body = try JSONEncoder.serviceEncoder.encode(AgentStartSessionWire(projectID: fixture.sessionInput.projectID, visibility: fixture.sessionInput.visibility, turn: submission))
@@ -600,6 +799,51 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
         let storedReceipts = try await fixture.store.connection.query("SELECT COUNT(*) AS count FROM agent_submissions WHERE state='accepted' AND receipt_json IS NOT NULL")
         XCTAssertEqual(storedReceipts.first?.column("count")?.integer, 1)
     }
+}
+
+private struct FailingComposerCatalog: AgentComposerCatalogProviding {
+    private struct Failure: Error {}
+
+    func snapshot(context _: ComposerCatalogContext) async throws -> ComposerCatalogWireSnapshot { throw Failure() }
+    func suggestions(context _: ComposerCatalogContext, query _: String, kinds _: Set<ComposerSuggestionWire.Kind>, limit _: Int) async throws -> ComposerSuggestionPageWire { throw Failure() }
+    func validate(_: AgentTurnConfigurationWire, context _: ComposerCatalogContext, acceptedAt _: Date) async throws -> (EffectiveTurnConfigurationRecord, CompiledProviderTurnConfiguration, ProviderModelDescriptor, String?) { throw Failure() }
+    func compatibilityModels() async throws -> [ModelCatalogItem] { throw Failure() }
+}
+
+private func composerCatalogHeaders(actor: ExternalActor, projectID: UUID, path: String, nonce: String, instant: Date, key: InternalSigningKey) throws -> HTTPFields {
+    let bodyDigest = CanonicalSigning.bodyDigest(Data())
+    let unsigned = GoblinAuthorizationDecision(
+        decisionID: UUID(),
+        actor: actor,
+        projectID: projectID,
+        operation: "getComposerCatalog",
+        requestDigest: bodyDigest,
+        policyRevision: 1,
+        controllerRevision: 1,
+        membershipRevision: 1,
+        issuedAt: instant,
+        expiresAt: instant.addingTimeInterval(30),
+        requestID: UUID(),
+        correlationID: UUID(),
+        keyID: key.keyID,
+        signature: ""
+    )
+    let unsignedData = try JSONEncoder.serviceEncoder.encode(unsigned)
+    let decisionSignature = CanonicalSigning.hmacSHA256(message: try CanonicalSigning.canonicalJSONObject(unsignedData, removingTopLevelKeys: ["signature"]), key: key.secret)
+    let decision = GoblinAuthorizationDecision(decisionID: unsigned.decisionID, actor: actor, projectID: projectID, operation: unsigned.operation, requestDigest: bodyDigest, policyRevision: 1, controllerRevision: 1, membershipRevision: 1, issuedAt: instant, expiresAt: unsigned.expiresAt, requestID: unsigned.requestID, correlationID: unsigned.correlationID, keyID: key.keyID, signature: decisionSignature)
+    let decisionData = try JSONEncoder.serviceEncoder.encode(decision)
+    let decisionDigest = CanonicalSigning.bodyDigest(decisionData)
+    let timestamp = CanonicalSigning.iso8601String(instant)
+    let canonical = CanonicalSigning.requestString(method: "GET", pathAndQuery: path, timestamp: timestamp, nonce: nonce, bodyDigest: bodyDigest, authorizationDecisionDigest: decisionDigest, keyID: key.keyID)
+    var headers = HTTPFields()
+    headers[.init("x-internal-key-id")!] = key.keyID
+    headers[.init("x-internal-timestamp")!] = timestamp
+    headers[.init("x-internal-nonce")!] = nonce
+    headers[.init("x-internal-body-digest")!] = bodyDigest
+    headers[.init("x-internal-authorization-digest")!] = decisionDigest
+    headers[.init("x-internal-signature")!] = CanonicalSigning.hmacSHA256(message: canonical, key: key.secret)
+    headers[.init("x-goblin-authorization-decision")!] = CanonicalSigning.base64URLEncode(decisionData)
+    return headers
 }
 
 private func structuredStartHeaders(body: Data, actor: ExternalActor, projectID: UUID, idempotencyKey: String, nonce: String, instant: Date, key: InternalSigningKey) throws -> HTTPFields {
@@ -682,6 +926,7 @@ private struct StructuredStartFixture {
     let store: SQLiteServiceStore
     let authority: RepoPromptHeadlessAuthority
     let coordinator: AgentSubmissionCoordinator
+    let providerSettings: ProviderSettingsService
     let actor: ExternalActor
     let sessionInput: CreateSessionInput
     let catalogRevision: String
@@ -701,23 +946,24 @@ private struct StructuredStartFixture {
         _ = try await store.upsertProviderConnection(.init(record: connection, credentialReference: nil), expectedRevision: 0)
         let runner = StructuredStartProviderRunner()
         let providerAdapter = ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.claudeCompatible], runner: runner)
-        let settings = ProviderSettingsService(store: store, adapter: providerAdapter, configurations: [configuration], initiallyEnabled: [.claudeCompatible], runner: runner)
+        let modelID = "claude-runtime-test"
+        let modelCatalogPath = root.appendingPathComponent("claude-models.json")
+        try JSONEncoder.serviceEncoder.encode([
+            ProviderModelCatalogEntry(id: modelID, displayName: "Claude Runtime Test", isProviderDefault: true, reasoningEfforts: ["high"], defaultReasoningEffort: "high", supportsNativeImages: true)
+        ]).write(to: modelCatalogPath)
+        let settings = ProviderSettingsService(store: store, adapter: providerAdapter, configurations: [configuration], initiallyEnabled: [.claudeCompatible], modelCatalogFiles: [.claudeCompatible: modelCatalogPath.path], runner: runner)
         try await settings.bootstrap()
         let initialSettings = try await settings.catalog()
         let claude = try XCTUnwrap(initialSettings.providers.first { $0.providerID == .claudeCompatible })
-        _ = try await settings.update(providerID: .claudeCompatible, request: .init(expectedRevision: claude.preference.revision, enabled: true, defaultModel: "claude-fable-5", reasoningEffort: nil, speedMode: nil, serviceTier: nil))
-        await settings.startConnectedProviderRecovery()
-        var refreshed = try await settings.catalog()
-        for _ in 0 ..< 100 where refreshed.providers.first(where: { $0.providerID == .claudeCompatible })?.runtimePreflightVerified != true {
-            try await Task.sleep(for: .milliseconds(10))
-            refreshed = try await settings.catalog()
-        }
+        _ = try await settings.update(providerID: .claudeCompatible, request: .init(expectedRevision: claude.preference.revision, enabled: true, defaultModel: modelID, reasoningEffort: nil, speedMode: nil, serviceTier: nil))
+        let refreshed = try await settings.catalog(refreshCLI: true, refreshRuntime: true)
+        XCTAssertTrue(refreshed.providers.first(where: { $0.providerID == .claudeCompatible })?.preflight.ready == true)
         let catalog = AgentComposerCatalogService(providerSettings: settings, store: store)
         let snapshot = try await catalog.snapshot(context: .init(kind: .project, projectID: project.projectID, actorID: actor.goblinUserID))
         let model = try XCTUnwrap(snapshot.providerGroups.first { $0.providerID == .claudeCompatible }?.models.first)
         let attachments = try AgentComposerAttachmentStore(store: store, configuration: .init(stagingRoot: root.appendingPathComponent("staged").path, acceptedRoot: root.appendingPathComponent("accepted").path, minimumFreeBytes: 0))
         let coordinator = AgentSubmissionCoordinator(store: store, catalog: catalog, compiler: AgentTurnIntentCompiler(), attachments: attachments)
-        return .init(root: root, store: store, authority: authority, coordinator: coordinator, actor: actor, sessionInput: .init(projectID: project.projectID, provider: .claudeCompatible, model: model.id, visibility: .privateSession, startImmediately: false), catalogRevision: snapshot.revision, modelID: model.id, effortID: model.defaultEffortID)
+        return .init(root: root, store: store, authority: authority, coordinator: coordinator, providerSettings: settings, actor: actor, sessionInput: .init(projectID: project.projectID, provider: .claudeCompatible, model: model.id, visibility: .privateSession, startImmediately: false), catalogRevision: snapshot.revision, modelID: model.id, effortID: model.defaultEffortID)
     }
 }
 

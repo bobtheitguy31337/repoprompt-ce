@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAgentRuntimeCore
+import RepoPromptServiceProtocol
 
 @MainActor
 final class AgentProviderPreferenceSnapshotStore {
@@ -72,6 +74,53 @@ final class AgentProviderPreferenceSnapshotStore {
                     selectedModelRaw: selectedModelRaw
                 )
                 : nil
+        )
+    }
+
+    /// Projects Desktop's existing preference/profile resolution into the shared
+    /// cross-platform catalog domain. UI remains an adapter over the same descriptors
+    /// consumed by the headless composer.
+    func composerCatalogProfile(
+        selectedAgent: AgentProviderKind,
+        selectedModelRaw: String? = nil,
+        permissionProfile: AgentProviderPermissionProfile = .userConfigured,
+        externallyManagedReason: String? = nil
+    ) -> AgentCatalogProviderProfile {
+        let binding = controlsBinding(
+            selectedAgent: selectedAgent,
+            selectedModelRaw: selectedModelRaw,
+            permissionProfile: permissionProfile,
+            isSubagent: permissionProfile != .userConfigured,
+            externallyManagedReason: externallyManagedReason
+        )
+        guard let providerID = Self.providerSettingsID(for: selectedAgent) else { return .init() }
+        var values: [String: AgentControlValue] = [:]
+        if let tools = binding.codexTools {
+            values["codex.bash"] = .boolean(tools.bashToolEnabled)
+            values["codex.search"] = .boolean(tools.searchToolEnabled)
+            values["codex.goals"] = .boolean(tools.goalSupportEnabled)
+            values["codex.reasoningSummaries"] = .boolean(tools.reasoningSummariesEnabled)
+            values["codex.memories"] = .boolean(tools.memoriesEnabled)
+            let enabledServers = tools.mcpServerEntries.compactMap { entry in
+                tools.mcpServerStatesByNormalizedName[entry.normalizedName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] == true
+                    ? entry.normalizedName
+                    : nil
+            }
+            values["codex.mcpServers"] = .choices(enabledServers)
+        }
+        if let tools = binding.claudeTools {
+            values["claude.bash"] = .boolean(tools.bashToolEnabled)
+            values["claude.mcpStrictMode"] = .boolean(tools.mcpStrictModeEnabled)
+            values["claude.toolSearch"] = .boolean(tools.toolSearchEnabled)
+            values["claude.promptDelivery"] = .choice(tools.agentModePromptDelivery.rawValue)
+        }
+        let selectedPermission = binding.permission.options.first(where: \.isSelected).map { option in
+            Self.permissionID(option.id, providerID: providerID)
+        }
+        let mutable = externallyManagedReason == nil
+        return .init(
+            toolControls: ProviderComposerStableControls.descriptors(providerID: providerID, values: values, mutable: mutable, lockReasonCode: externallyManagedReason),
+            permissionControl: ProviderComposerStableControls.permissionDescriptor(providerID: providerID, selectedID: selectedPermission, mutable: mutable, lockReasonCode: externallyManagedReason)
         )
     }
 
@@ -516,6 +565,29 @@ final class AgentProviderPreferenceSnapshotStore {
             level
         case .providerOverride:
             .managedDefault
+        }
+    }
+
+    private static func providerSettingsID(for agent: AgentProviderKind) -> ProviderSettingsID? {
+        switch agent {
+        case .codexExec: .codex
+        case .claudeCode: .claudeCompatible
+        case .claudeCodeGLM: .claudeGLM
+        case .kimiCode: .claudeKimi
+        case .customClaudeCompatible: .claudeCustom
+        case .openCode: .openCodeACP
+        case .cursor: .cursorACP
+        }
+    }
+
+    private static func permissionID(_ id: AgentProviderPermissionLevelID, providerID: ProviderSettingsID) -> String {
+        let raw = id.subagentRawValue
+        return switch providerID {
+        case .codex: "codex.\(raw)"
+        case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom: "claude.\(raw)"
+        case .openCodeACP: "opencode.\(raw)"
+        case .cursorACP: "cursor.\(raw)"
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI: raw
         }
     }
 

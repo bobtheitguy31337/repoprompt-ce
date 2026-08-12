@@ -159,7 +159,9 @@ final class AgentCodexModelRegistry {
                 displayName: model.displayName,
                 description: model.description,
                 isPlaceholderDefault: false,
-                isProviderDefault: model.isDefault
+                isProviderDefault: model.isDefault,
+                supportedReasoningEfforts: [model.reasoningEffort].compactMap(\.self),
+                defaultReasoningEffort: model.isDefault ? model.reasoningEffort : nil
             )
         }
         options.append(contentsOf: mapped)

@@ -172,7 +172,7 @@ public actor ProviderSettingsService {
                 let initial = ProviderSettingsPreference(
                     providerID: providerID,
                     enabled: false,
-                    defaultModel: defaultCatalog(for: providerID).first(where: \.isProviderDefault)?.id,
+                    defaultModel: modelCatalogs[providerID]?.first(where: \.isProviderDefault)?.id,
                     revision: 1
                 )
                 preferences[providerID] = try await store.upsertProviderSettings(initial, expectedRevision: 0)
@@ -951,7 +951,7 @@ public actor ProviderSettingsService {
             ? directProviderAllowlist.contains(providerID)
             : (providerID.runtimeKind.map(initiallyEnabled.contains) ?? false)
         let preflightVerified = runtimePreflight[runtimeSettingsID] ?? false
-        let models = modelCatalogs[providerID] ?? defaultCatalog(for: providerID)
+        let models = modelCatalogs[providerID] ?? []
         let connection = connections[providerID]?.record
         let preflight = preflightStatus(
             providerID: providerID,
@@ -1045,7 +1045,7 @@ public actor ProviderSettingsService {
     }
 
     private func validateSelection(_ request: UpdateProviderSettingsRequest, providerID: ProviderSettingsID, definition: Definition) throws {
-        let models = modelCatalogs[providerID] ?? defaultCatalog(for: providerID)
+        let models = modelCatalogs[providerID] ?? []
         let selectedModel: ProviderModelCatalogEntry?
         if let modelID = try normalized(request.defaultModel) {
             guard definition.capabilities.supportsModelSelection,
@@ -1096,6 +1096,7 @@ public actor ProviderSettingsService {
                       && options.allSatisfy { !$0.isEmpty && $0.utf8.count <= 128 && safeCatalogText($0) }
               }),
               definition.capabilities.supportsReasoningEffort || entry.reasoningEfforts.isEmpty,
+              entry.defaultReasoningEffort.map(entry.reasoningEfforts.contains) ?? true,
               definition.capabilities.supportsSpeedMode || entry.speedModes.isEmpty,
               definition.capabilities.supportsServiceTier || entry.serviceTiers.isEmpty
         else { return false }
@@ -1105,46 +1106,6 @@ public actor ProviderSettingsService {
     private func safeCatalogText(_ value: String) -> Bool {
         !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
             && !ProviderSecretRedaction.containsLikelySecret(value)
-    }
-
-    private func defaultCatalog(for providerID: ProviderSettingsID) -> [ProviderModelCatalogEntry] {
-        switch providerID {
-        case .codex:
-            [
-                .init(id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", description: "Frontier coding model", isProviderDefault: true, reasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"], serviceTiers: ["fast"]),
-                .init(id: "gpt-5.6-terra", displayName: "GPT-5.6 Terra", description: "Balanced agentic coding model", reasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"], serviceTiers: ["fast"]),
-                .init(id: "gpt-5.6-luna", displayName: "GPT-5.6 Luna", description: "Efficient coding model", reasoningEfforts: ["low", "medium", "high", "xhigh", "max"], serviceTiers: ["fast"])
-            ]
-        case .claudeCompatible:
-            [
-                .init(id: "claude-fable-5", displayName: "Fable 5", isProviderDefault: true, reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]),
-                .init(id: "claude-opus-5", displayName: "Opus 5", reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]),
-                .init(id: "claude-sonnet-5", displayName: "Sonnet 5", reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]),
-                .init(id: "claude-haiku-4-5-20251001", displayName: "Haiku 4.5")
-            ]
-        case .claudeGLM:
-            [
-                .init(id: "glm-4.5-air", displayName: "GLM 4.5 Air", reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]),
-                .init(id: "glm-4.7", displayName: "GLM 4.7", reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]),
-                .init(id: "glm-5.2[1m]", displayName: "GLM 5.2 · 1M", isProviderDefault: true, reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]),
-                .init(id: "glm-5-turbo", displayName: "GLM 5 Turbo", reasoningEfforts: ["low", "medium", "high", "xhigh", "max"]),
-                .init(id: "glm-5.1", displayName: "GLM 5.1", reasoningEfforts: ["low", "medium", "high", "xhigh", "max"])
-            ]
-        case .claudeKimi:
-            [.init(id: "kimi-code", displayName: "Kimi Code", description: "Backend-managed model selection", isProviderDefault: true)]
-        case .claudeCustom:
-            [.init(id: "custom-claude-compatible", displayName: "Custom Claude-Compatible", description: "Backend-managed model selection", isProviderDefault: true)]
-        case .cursorACP:
-            [.init(id: "auto", displayName: "Auto", description: "Let Cursor choose the best advertised model", isProviderDefault: true)]
-        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible:
-            // Direct catalogs are accepted only after bounded authenticated
-            // discovery and are durably recovered from Schema V6.
-            []
-        case .openCodeACP, .xAI:
-            // These catalogs are provider/account specific. A sanitized
-            // server-side catalog file must opt in exact capabilities.
-            []
-        }
     }
 
     private func projectedCapabilities(

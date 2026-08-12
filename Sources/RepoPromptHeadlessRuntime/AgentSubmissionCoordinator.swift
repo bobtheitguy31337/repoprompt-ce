@@ -34,11 +34,11 @@ public actor AgentSubmissionCoordinator {
     }
 
     private let store: SQLiteServiceStore
-    private let catalog: AgentComposerCatalogService
+    private let catalog: any AgentComposerCatalogProviding
     private let compiler: AgentTurnIntentCompiler
     private let attachments: AgentComposerAttachmentStore
 
-    public init(store: SQLiteServiceStore, catalog: AgentComposerCatalogService, compiler: AgentTurnIntentCompiler, attachments: AgentComposerAttachmentStore) {
+    public init(store: SQLiteServiceStore, catalog: any AgentComposerCatalogProviding, compiler: AgentTurnIntentCompiler, attachments: AgentComposerAttachmentStore) {
         self.store = store
         self.catalog = catalog
         self.compiler = compiler

@@ -243,6 +243,24 @@ private struct RestoreActivationRequest: Decodable {
 }
 
 public enum RepoPromptServerRunner {
+    /// Shared by the executable composition root and authenticated HTTP contract tests.
+    /// Keeping this seam here prevents tests from silently assembling a different catalog authority.
+    public static func composeAgentCatalog(
+        providerSettings: ProviderSettingsService,
+        store: SQLiteServiceStore,
+        workflows: [AgentComposerWorkflowDescriptor],
+        suggestions: [ComposerSuggestionDescriptor],
+        emptyState: AgentEmptyStateDescriptor
+    ) -> any AgentComposerCatalogProviding {
+        AgentComposerCatalogService(
+            providerSettings: providerSettings,
+            store: store,
+            workflows: workflows,
+            suggestions: suggestions,
+            emptyState: emptyState
+        )
+    }
+
     public static func run(configuration: RepoPromptServerConfiguration) async throws {
         let stateDirectory = URL(fileURLWithPath: configuration.stateDatabasePath).deletingLastPathComponent().path
         for directory in [
@@ -450,7 +468,7 @@ public enum RepoPromptServerRunner {
         let composerSuggestions: [ComposerSuggestionDescriptor] = [
             .init(kind: .nativeCommand, id: "compact", insertionText: "/compact", displayName: "Compact context", detailText: "Ask Codex to compact the current context.", providerIDs: [.codex], expansion: "/compact")
         ]
-        let composerCatalog = AgentComposerCatalogService(
+        let composerCatalog = composeAgentCatalog(
             providerSettings: providerSettings,
             store: store,
             workflows: composerWorkflows,

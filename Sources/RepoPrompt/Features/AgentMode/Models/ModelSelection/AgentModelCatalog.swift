@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAgentRuntimeCore
+import RepoPromptServiceProtocol
 
 enum AgentModelCatalog {
     struct AvailabilityContext: Equatable {
@@ -314,43 +316,145 @@ enum AgentModelCatalog {
         includeClaudeEffortVariants: Bool = true
     ) -> [AgentModelOption] {
         guard isAgentAvailable(agentKind, availability: availability) else { return [] }
+        let discovered: [AgentModelOption]
         if agentKind == .cursor {
             let fallbacks = [
                 staticOption(.cursorAuto, for: .cursor),
                 staticOption(.cursorComposer2, for: .cursor)
             ]
-            if let discoveredOptions = resolvedACPDiscoveredModels(for: agentKind)?.options,
-               !discoveredOptions.isEmpty
+            if let options = resolvedACPDiscoveredModels(for: agentKind)?.options,
+               !options.isEmpty
             {
-                let discoveredWithoutFallbacks = discoveredOptions.filter {
-                    !isCursorAutoOption($0) && !isCursorComposer2Option($0)
-                }
-                return fallbacks + discoveredWithoutFallbacks
+                discovered = fallbacks + options.filter { !isCursorAutoOption($0) && !isCursorComposer2Option($0) }
+            } else {
+                discovered = fallbacks
             }
-            return fallbacks
-        }
-        if let discoveredOptions = resolvedACPDiscoveredModels(for: agentKind)?.options,
-           !discoveredOptions.isEmpty
+        } else if let options = resolvedACPDiscoveredModels(for: agentKind)?.options,
+                  !options.isEmpty
         {
-            return discoveredOptions
+            discovered = options
+        } else {
+            discovered = switch agentKind {
+            case .codexExec:
+                AgentCodexModelRegistry.shared.resolvedOptions(
+                    staticOptions: AgentModel.modelsForAgent(agentKind).map { staticOption($0, for: agentKind) },
+                    preferredLiveModels: codexDynamicModels
+                )
+            case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+                ClaudeCompatibleModelCatalogAdapter.options(
+                    for: agentKind,
+                    availability: availability,
+                    includeClaudeEffortVariants: includeClaudeEffortVariants
+                ) ?? []
+            case .openCode, .cursor:
+                AgentModel.modelsForAgent(agentKind)
+                    .filter { isAvailable($0, for: agentKind, availability: availability) }
+                    .map { staticOption($0, for: agentKind) }
+            }
         }
-        switch agentKind {
-        case .codexExec:
-            let staticOptions = AgentModel.modelsForAgent(agentKind).map { staticOption($0, for: agentKind) }
-            return AgentCodexModelRegistry.shared.resolvedOptions(
-                staticOptions: staticOptions,
-                preferredLiveModels: codexDynamicModels
+        return sharedAuthorityOptions(discovered, for: agentKind)
+    }
+
+    /// Desktop discovery is runtime-specific, but every selectable option crosses the
+    /// same cross-platform authority used by the headless composer before reaching UI.
+    private static func sharedAuthorityOptions(_ options: [AgentModelOption], for agentKind: AgentProviderKind) -> [AgentModelOption] {
+        let placeholder = options.first(where: \.isPlaceholderDefault)
+        guard let providerID = providerSettingsID(for: agentKind),
+              let matrix = AgentComposerProviderMatrix.entry(for: providerID)
+        else { return options }
+        let candidates = options.filter { !$0.isPlaceholderDefault }.compactMap {
+            authorityCandidate($0, agentKind: agentKind, capabilities: .init())
+        }
+        let resolved = AgentCatalogAuthority.resolvedModels(
+            providerID: providerID,
+            policy: matrix.discoveryPolicy,
+            sources: [.init(kind: .live, models: candidates)]
+        )
+        return [placeholder].compactMap(\.self) + resolved.flatMap(\.variants).compactMap { candidate in
+            options.first { $0.rawValue.caseInsensitiveCompare(candidate.rawValue) == .orderedSame }
+        }
+    }
+
+    static func sharedAuthorityResolution(
+        availability: AvailabilityContext = .current,
+        codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil,
+        storedSelection: AgentCatalogStoredSelection? = nil,
+        profiles: [ProviderSettingsID: AgentCatalogProviderProfile] = [:],
+        context: AgentCatalogAuthorityContext = .init()
+    ) -> AgentCatalogResolution {
+        let states = selectableAgents(availability: availability).compactMap { agent -> AgentCatalogProviderState? in
+            guard let providerID = providerSettingsID(for: agent),
+                  let matrix = AgentComposerProviderMatrix.entry(for: providerID)
+            else { return nil }
+            let discovered = options(for: agent, availability: availability, codexDynamicModels: codexDynamicModels)
+            let profile = profiles[providerID] ?? .init()
+            let candidates = discovered.filter { !$0.isPlaceholderDefault }.compactMap {
+                authorityCandidate($0, agentKind: agent, capabilities: profile.modelCapabilities)
+            }
+            return .init(
+                providerID: providerID,
+                displayName: agent.displayName,
+                enabled: true,
+                configured: true,
+                preflightReady: true,
+                discoveryPolicy: matrix.discoveryPolicy,
+                modelSources: [.init(kind: .live, models: candidates)],
+                preferredModelID: defaultModelRaw(for: agent, availability: availability, codexDynamicModels: codexDynamicModels),
+                toolControls: profile.toolControls,
+                permissionControl: profile.permissionControl
             )
-        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
-            return ClaudeCompatibleModelCatalogAdapter.options(
-                for: agentKind,
-                availability: availability,
-                includeClaudeEffortVariants: includeClaudeEffortVariants
-            ) ?? []
-        case .openCode, .cursor:
-            return AgentModel.modelsForAgent(agentKind)
-                .filter { isAvailable($0, for: agentKind, availability: availability) }
-                .map { staticOption($0, for: agentKind) }
+        }
+        return AgentCatalogAuthority.resolve(providers: states, storedSelection: storedSelection, context: context)
+    }
+
+    private static func authorityCandidate(
+        _ option: AgentModelOption,
+        agentKind: AgentProviderKind,
+        capabilities: ProviderModelCapabilities
+    ) -> AgentCatalogModelCandidate? {
+        let raw = option.rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return nil }
+        let modelID: String
+        let effortID: String?
+        let displayName: String
+        if agentKind == .codexExec {
+            let specifier = CodexModelSpecifier(raw: raw)
+            modelID = CodexServiceTierVariantCatalog.serviceTierAwareBaseID(for: raw)
+            effortID = specifier.reasoningEffort?.rawValue
+            displayName = AIModel.stripCodexReasoningSuffix(from: option.displayName)
+        } else if agentKind.usesClaudeTooling {
+            let specifier = ClaudeModelSpecifier(raw: raw)
+            guard let base = specifier.baseModel else { return nil }
+            modelID = base
+            effortID = specifier.effortLevel?.rawValue
+            displayName = strippedClaudeEffortSuffix(from: option.displayName)
+        } else {
+            modelID = raw
+            effortID = nil
+            displayName = option.displayName
+        }
+        return .init(
+            modelID: modelID,
+            rawValue: raw,
+            displayName: displayName,
+            description: option.description,
+            variantEffortID: effortID,
+            supportedEffortIDs: option.supportedReasoningEfforts.map(\.rawValue),
+            defaultEffortID: option.defaultReasoningEffort?.rawValue,
+            isProviderDefault: option.isProviderDefault,
+            capabilities: capabilities
+        )
+    }
+
+    private static func providerSettingsID(for agent: AgentProviderKind) -> ProviderSettingsID? {
+        switch agent {
+        case .codexExec: .codex
+        case .claudeCode: .claudeCompatible
+        case .claudeCodeGLM: .claudeGLM
+        case .kimiCode: .claudeKimi
+        case .customClaudeCompatible: .claudeCustom
+        case .openCode: .openCodeACP
+        case .cursor: .cursorACP
         }
     }
 

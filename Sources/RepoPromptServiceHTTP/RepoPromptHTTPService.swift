@@ -23,7 +23,7 @@ public struct RepoPromptHTTPService: Sendable {
     private let durabilityOperations: DurabilityOperationsService?
     private let providerSettings: ProviderSettingsService?
     private let serverSettings: ServerSettingsService?
-    private let composerCatalog: AgentComposerCatalogService?
+    private let composerCatalog: (any AgentComposerCatalogProviding)?
     private let composerAttachments: AgentComposerAttachmentStore?
     private let submissionCoordinator: AgentSubmissionCoordinator?
     private let transcriptPresentation: AgentTranscriptPresentationService?
@@ -40,7 +40,7 @@ public struct RepoPromptHTTPService: Sendable {
         durabilityOperations: DurabilityOperationsService? = nil,
         providerSettings: ProviderSettingsService? = nil,
         serverSettings: ServerSettingsService? = nil,
-        composerCatalog: AgentComposerCatalogService? = nil,
+        composerCatalog: (any AgentComposerCatalogProviding)? = nil,
         composerAttachments: AgentComposerAttachmentStore? = nil,
         submissionCoordinator: AgentSubmissionCoordinator? = nil,
         transcriptPresentation: AgentTranscriptPresentationService? = nil,
@@ -627,14 +627,14 @@ public struct RepoPromptHTTPService: Sendable {
                 let auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getComposerSuggestions", projectID: projectID)
                 _ = try await authority.projectSnapshot(projectID: projectID)
                 let actor = try requireActor(auth)
-                return try await HTTPResponses.privateJSON(requireComposerCatalog().suggestions(context: .init(kind: .project, projectID: projectID, actorID: actor.goblinUserID), query: query, kinds: kinds))
+                return try await HTTPResponses.privateJSON(requireComposerCatalog().suggestions(context: .init(kind: .project, projectID: projectID, actorID: actor.goblinUserID), query: query, kinds: kinds, limit: 50))
             }
             let resolvedSessionID = sessionID!
             let auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getComposerSuggestions", sessionID: resolvedSessionID)
             let actor = try requireActor(auth)
             let snapshot = try await authority.authoritySessionSnapshot(sessionID: resolvedSessionID)
             let active = snapshot.activeRun.map { $0.endedAt == nil && $0.state == "running" } ?? false
-            return try await HTTPResponses.privateJSON(requireComposerCatalog().suggestions(context: .init(kind: .session, projectID: snapshot.session.projectID, sessionID: resolvedSessionID, actorID: actor.goblinUserID, activeRun: active), query: query, kinds: kinds))
+            return try await HTTPResponses.privateJSON(requireComposerCatalog().suggestions(context: .init(kind: .session, projectID: snapshot.session.projectID, sessionID: resolvedSessionID, actorID: actor.goblinUserID, activeRun: active), query: query, kinds: kinds, limit: 50))
         } }
         router.get("/internal/v1/diagnostics") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.operatorRole], operation: "diagnostics")
             let meta = try await store.metadata()
@@ -1250,7 +1250,7 @@ public struct RepoPromptHTTPService: Sendable {
         return serverSettings
     }
 
-    private func requireComposerCatalog() throws -> AgentComposerCatalogService {
+    private func requireComposerCatalog() throws -> any AgentComposerCatalogProviding {
         guard let composerCatalog else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Agent composer catalog is unavailable", retryable: true) }
         return composerCatalog
     }

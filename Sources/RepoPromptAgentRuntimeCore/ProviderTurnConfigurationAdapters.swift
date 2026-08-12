@@ -47,7 +47,7 @@ public enum ProviderComposerStableControls {
         "codex.bash", "codex.search", "codex.goals", "codex.reasoningSummaries", "codex.memories", "codex.mcpServers"
     ]
     public static let claude: Set<String> = [
-        "claude.bash", "claude.repoPromptOnlyMCP", "claude.lazyToolLoading", "claude.promptDelivery"
+        "claude.bash", "claude.mcpStrictMode", "claude.toolSearch", "claude.promptDelivery"
     ]
 
     public static func descriptors(providerID: ProviderSettingsID, values: [String: AgentControlValue], mutable: Bool, lockReasonCode: String?) -> [ProviderComposerControlDescriptor] {
@@ -57,8 +57,8 @@ public enum ProviderComposerStableControls {
                 toggle("codex.bash", "Bash", defaultValue: true, values: values, mutable: mutable, lockReasonCode: lockReasonCode),
                 toggle("codex.search", "Search", defaultValue: true, values: values, mutable: mutable, lockReasonCode: lockReasonCode),
                 toggle("codex.goals", "Goals", defaultValue: true, values: values, mutable: mutable, lockReasonCode: lockReasonCode),
-                toggle("codex.reasoningSummaries", "Reasoning summaries", defaultValue: true, values: values, mutable: mutable, lockReasonCode: lockReasonCode),
-                toggle("codex.memories", "Memories", defaultValue: true, values: values, mutable: mutable, lockReasonCode: lockReasonCode),
+                toggle("codex.reasoningSummaries", "Reasoning summaries", defaultValue: false, values: values, mutable: mutable, lockReasonCode: lockReasonCode),
+                toggle("codex.memories", "Memories", defaultValue: false, values: values, mutable: mutable, lockReasonCode: lockReasonCode),
                 .multiChoice(
                     id: "codex.mcpServers",
                     displayName: "MCP servers",
@@ -74,17 +74,17 @@ public enum ProviderComposerStableControls {
         case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom:
             [
                 toggle("claude.bash", "Bash", defaultValue: true, values: values, mutable: mutable, lockReasonCode: lockReasonCode),
-                toggle("claude.repoPromptOnlyMCP", "RepoPrompt-only MCP", defaultValue: true, values: values, mutable: mutable, lockReasonCode: lockReasonCode, required: true),
-                toggle("claude.lazyToolLoading", "Lazy tool loading", defaultValue: true, values: values, mutable: mutable, lockReasonCode: lockReasonCode),
+                toggle("claude.mcpStrictMode", "RepoPrompt-only MCP", defaultValue: true, values: values, mutable: mutable, lockReasonCode: lockReasonCode),
+                toggle("claude.toolSearch", "Tool search", defaultValue: false, values: values, mutable: mutable, lockReasonCode: lockReasonCode),
                 .singleChoice(
                     id: "claude.promptDelivery",
                     displayName: "Prompt delivery",
                     detailText: nil,
-                    selectedID: string(values["claude.promptDelivery"], fallback: "structured"),
+                    selectedID: string(values["claude.promptDelivery"], fallback: "nativeSystemPrompt"),
                     choices: [
-                        .init(id: "structured", displayName: "Structured"),
-                        .init(id: "argument", displayName: "Argument"),
-                        .init(id: "stdin", displayName: "Standard input")
+                        .init(id: "nativeSystemPrompt", displayName: "Replace System Prompt", detailText: "RepoPrompt instructions replace Claude Code's native system prompt."),
+                        .init(id: "userMessageXMLWithEmptySystemPrompt", displayName: "User Message (No Native)", detailText: "RepoPrompt instructions are added to the user message, and Claude Code's native system prompt is removed."),
+                        .init(id: "userMessageXML", displayName: "User Message (Keep Native)", detailText: "RepoPrompt instructions are added to the user message, and Claude Code keeps its native prompt.")
                     ],
                     required: true,
                     mutable: mutable,
@@ -104,27 +104,27 @@ public enum ProviderComposerStableControls {
         case .codex:
             let choices = [
                 ProviderComposerChoiceDescriptor(id: "codex.readOnly", displayName: "Read Only"),
-                .init(id: "codex.workspaceWrite", displayName: "Workspace Write"),
+                .init(id: "codex.defaultPermission", displayName: "Default"),
                 .init(id: "codex.autoReview", displayName: "Auto Review"),
                 .init(id: "codex.fullAccess", displayName: "Full Access", warning: true)
             ]
-            return .init(id: "codex.permission", selectedID: selectedID ?? "codex.workspaceWrite", choices: choices, mutable: mutable, lockReasonCode: lockReasonCode)
+            return .init(id: "codex.permission", selectedID: selectedID ?? "codex.defaultPermission", choices: choices, mutable: mutable, lockReasonCode: lockReasonCode)
         case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom:
             let choices = [
                 ProviderComposerChoiceDescriptor(id: "claude.requireApproval", displayName: "Require Approval"),
                 .init(id: "claude.autoApproveEdits", displayName: "Auto-approve Edits"),
-                .init(id: "claude.auto", displayName: "Auto"),
+                .init(id: "claude.auto", displayName: "Auto (Preview)"),
                 .init(id: "claude.fullAccess", displayName: "Full Access", warning: true)
             ]
             return .init(id: "claude.permission", selectedID: selectedID ?? "claude.requireApproval", choices: choices, mutable: mutable, lockReasonCode: lockReasonCode)
         case .openCodeACP:
-            return .init(id: "opencode.permission", selectedID: selectedID ?? "opencode.managed", choices: [
-                .init(id: "opencode.managed", displayName: "Managed"),
+            return .init(id: "opencode.permission", selectedID: selectedID ?? "opencode.managedDefault", choices: [
+                .init(id: "opencode.managedDefault", displayName: "Default", detailText: "OpenCode asks before running tools that need approval."),
                 .init(id: "opencode.fullAccess", displayName: "Full Access", warning: true)
             ], mutable: mutable, lockReasonCode: lockReasonCode)
         case .cursorACP:
-            return .init(id: "cursor.permission", selectedID: selectedID ?? "cursor.managed", choices: [
-                .init(id: "cursor.managed", displayName: "Managed"),
+            return .init(id: "cursor.permission", selectedID: selectedID ?? "cursor.managedDefault", choices: [
+                .init(id: "cursor.managedDefault", displayName: "Default", detailText: "Cursor asks before running tools that need approval. RepoPrompt MCP is injected through the ACP session."),
                 .init(id: "cursor.fullAccess", displayName: "Full Access", warning: true)
             ], mutable: mutable, lockReasonCode: lockReasonCode)
         case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
@@ -155,7 +155,7 @@ public enum ProviderComposerStableControls {
 public struct CodexTurnConfigurationAdapter: ProviderTurnConfigurationAdapter {
     public let providerID = ProviderSettingsID.codex
     public let supportedControlIDs = ProviderComposerStableControls.codex
-    public let supportedPermissionIDs: Set<String> = ["codex.readOnly", "codex.workspaceWrite", "codex.autoReview", "codex.fullAccess"]
+    public let supportedPermissionIDs: Set<String> = ["codex.readOnly", "codex.defaultPermission", "codex.autoReview", "codex.fullAccess"]
 
     public init() {}
 
@@ -165,10 +165,10 @@ public struct CodexTurnConfigurationAdapter: ProviderTurnConfigurationAdapter {
         if let effort, !input.model.supportedEffortIDs.contains(effort) {
             throw ServiceAPIError(code: .invalidRequest, message: "Codex effort is not supported by the selected model")
         }
-        let permission = input.permissionID ?? "codex.workspaceWrite"
+        let permission = input.permissionID ?? "codex.defaultPermission"
         let mode: ProviderExecutionMode = switch permission {
         case "codex.readOnly": .readOnly
-        case "codex.workspaceWrite", "codex.autoReview": .workspaceWrite
+        case "codex.defaultPermission", "codex.autoReview": .workspaceWrite
         case "codex.fullAccess": .fullAccess
         default: throw ServiceAPIError(code: .invalidRequest, message: "Codex permission is invalid")
         }
@@ -180,8 +180,8 @@ public struct CodexTurnConfigurationAdapter: ProviderTurnConfigurationAdapter {
             "codex.bashEnabled": String(ProviderComposerStableControls.boolean(settings["codex.bash"], fallback: true)),
             "codex.searchEnabled": String(ProviderComposerStableControls.boolean(settings["codex.search"], fallback: true)),
             "codex.goalsEnabled": String(ProviderComposerStableControls.boolean(settings["codex.goals"], fallback: true)),
-            "codex.reasoningSummariesEnabled": String(ProviderComposerStableControls.boolean(settings["codex.reasoningSummaries"], fallback: true)),
-            "codex.memoriesEnabled": String(ProviderComposerStableControls.boolean(settings["codex.memories"], fallback: true)),
+            "codex.reasoningSummariesEnabled": String(ProviderComposerStableControls.boolean(settings["codex.reasoningSummaries"], fallback: false)),
+            "codex.memoriesEnabled": String(ProviderComposerStableControls.boolean(settings["codex.memories"], fallback: false)),
             "codex.enabledMCPServers": encodedMCPServers,
             "provider.permissionId": permission
         ]
@@ -207,7 +207,7 @@ public struct CodexTurnConfigurationAdapter: ProviderTurnConfigurationAdapter {
                 throw ServiceAPIError(code: .invalidRequest, message: "Codex tool control has the wrong value type")
             }
         }
-        var normalized: [String: AgentControlValue] = ["codex.bash": .boolean(true), "codex.search": .boolean(true), "codex.goals": .boolean(true), "codex.reasoningSummaries": .boolean(true), "codex.memories": .boolean(true), "codex.mcpServers": .choices(["repoprompt"])]
+        var normalized: [String: AgentControlValue] = ["codex.bash": .boolean(true), "codex.search": .boolean(true), "codex.goals": .boolean(true), "codex.reasoningSummaries": .boolean(false), "codex.memories": .boolean(false), "codex.mcpServers": .choices(["repoprompt"])]
         normalized.merge(values) { _, supplied in supplied }
         return normalized
     }
@@ -255,13 +255,11 @@ public struct ClaudeCompatibleTurnConfigurationAdapter: ProviderTurnConfiguratio
                 throw ServiceAPIError(code: .invalidRequest, message: "Claude-compatible tool control has the wrong value type")
             }
         }
-        var settings: [String: AgentControlValue] = ["claude.bash": .boolean(true), "claude.repoPromptOnlyMCP": .boolean(true), "claude.lazyToolLoading": .boolean(true), "claude.promptDelivery": .choice("structured")]
+        var settings: [String: AgentControlValue] = ["claude.bash": .boolean(true), "claude.mcpStrictMode": .boolean(true), "claude.toolSearch": .boolean(false), "claude.promptDelivery": .choice("nativeSystemPrompt")]
         settings.merge(input.toolValues) { _, supplied in supplied }
-        let strict = ProviderComposerStableControls.boolean(settings["claude.repoPromptOnlyMCP"], fallback: true)
-        guard strict else { throw ServiceAPIError(code: .invalidRequest, message: "RepoPrompt-only MCP is required") }
-        settings["claude.repoPromptOnlyMCP"] = .boolean(true)
-        let delivery = ProviderComposerStableControls.string(settings["claude.promptDelivery"], fallback: "structured")
-        guard ["structured", "argument", "stdin"].contains(delivery) else {
+        let strict = ProviderComposerStableControls.boolean(settings["claude.mcpStrictMode"], fallback: true)
+        let delivery = ProviderComposerStableControls.string(settings["claude.promptDelivery"], fallback: "nativeSystemPrompt")
+        guard ["nativeSystemPrompt", "userMessageXMLWithEmptySystemPrompt", "userMessageXML"].contains(delivery) else {
             throw ServiceAPIError(code: .invalidRequest, message: "Claude-compatible prompt delivery is invalid")
         }
         let permissionMode: String = switch permission {
@@ -273,8 +271,8 @@ public struct ClaudeCompatibleTurnConfigurationAdapter: ProviderTurnConfiguratio
         }
         var native: [String: String] = [
             "claude.bashEnabled": String(ProviderComposerStableControls.boolean(settings["claude.bash"], fallback: true)),
-            "claude.strictMCPEnabled": "true",
-            "claude.toolSearchEnabled": String(ProviderComposerStableControls.boolean(settings["claude.lazyToolLoading"], fallback: true)),
+            "claude.strictMCPEnabled": String(strict),
+            "claude.toolSearchEnabled": String(ProviderComposerStableControls.boolean(settings["claude.toolSearch"], fallback: false)),
             "claude.promptDelivery": delivery,
             "claude.permissionMode": permissionMode,
             "provider.settingsId": providerID.rawValue,
@@ -293,14 +291,14 @@ public struct TextOnlyACPTurnConfigurationAdapter: ProviderTurnConfigurationAdap
     public init(providerID: ProviderSettingsID) {
         precondition([.openCodeACP, .cursorACP].contains(providerID))
         self.providerID = providerID
-        supportedPermissionIDs = providerID == .openCodeACP ? ["opencode.managed", "opencode.fullAccess"] : ["cursor.managed", "cursor.fullAccess"]
+        supportedPermissionIDs = providerID == .openCodeACP ? ["opencode.managedDefault", "opencode.fullAccess"] : ["cursor.managedDefault", "cursor.fullAccess"]
     }
 
     public func compile(_ input: ProviderTurnConfigurationInput) throws -> CompiledProviderTurnConfiguration {
         guard input.providerID == providerID, input.model.providerID == providerID, input.toolValues.isEmpty else {
             throw ServiceAPIError(code: .invalidRequest, message: "ACP turn configuration is invalid")
         }
-        let permission = input.permissionID ?? (providerID == .openCodeACP ? "opencode.managed" : "cursor.managed")
+        let permission = input.permissionID ?? (providerID == .openCodeACP ? "opencode.managedDefault" : "cursor.managedDefault")
         guard supportedPermissionIDs.contains(permission) else { throw ServiceAPIError(code: .invalidRequest, message: "ACP permission is invalid") }
         let runtimeKind: ProviderKind = providerID == .openCodeACP ? .openCodeACP : .cursorACP
         return .init(runtimeKind: runtimeKind, providerRawModelValue: input.model.providerRawValue, executionPolicy: .init(mode: permission.hasSuffix("fullAccess") ? .fullAccess : .workspaceWrite, providerSettings: ["provider.permissionId": permission]), supportsNativeImages: false, normalizedToolValues: [:])
@@ -337,7 +335,7 @@ public struct DirectAPITurnConfigurationAdapter: ProviderTurnConfigurationAdapte
             runtimeKind: .headlessAdapter,
             providerRawModelValue: input.model.providerRawValue,
             executionPolicy: .init(mode: .workspaceWrite, providerSettings: settings),
-            supportsNativeImages: false,
+            supportsNativeImages: input.model.capabilities.nativeImages,
             normalizedToolValues: [:]
         )
     }
@@ -345,7 +343,7 @@ public struct DirectAPITurnConfigurationAdapter: ProviderTurnConfigurationAdapte
 
 public enum ProviderTurnConfigurationAdapters {
     /// Bump whenever a stable control/permission mapping changes interpretation.
-    public static let interpretationRevision = "provider-turn-configuration-v2"
+    public static let interpretationRevision = "provider-turn-configuration-v3-desktop-profile"
 
     public static func builtIn() -> [ProviderSettingsID: any ProviderTurnConfigurationAdapter] {
         [

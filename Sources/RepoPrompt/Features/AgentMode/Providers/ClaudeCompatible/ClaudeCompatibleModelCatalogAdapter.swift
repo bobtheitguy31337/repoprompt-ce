@@ -249,7 +249,8 @@ enum ClaudeCompatibleModelCatalogAdapter {
             displayName: option.displayName,
             description: option.description,
             isPlaceholderDefault: option.isPlaceholderDefault,
-            isProviderDefault: option.isProviderDefault
+            isProviderDefault: option.isProviderDefault,
+            supportedReasoningEfforts: option.supportedEffortLevels.compactMap(CodexReasoningEffort.parse)
         )
     }
 

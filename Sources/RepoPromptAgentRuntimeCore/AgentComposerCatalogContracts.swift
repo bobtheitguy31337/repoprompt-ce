@@ -186,59 +186,6 @@ public enum AgentComposerProviderMatrix {
     }
 }
 
-public struct NormalizedProviderModelIdentity: Codable, Hashable, Sendable {
-    public let modelID: String
-    public let effortID: String?
-    public let displayName: String
-
-    public init(modelID: String, effortID: String?, displayName: String) {
-        self.modelID = modelID
-        self.effortID = effortID
-        self.displayName = displayName
-    }
-}
-
-public enum AgentModelIdentityNormalizer {
-    public static let effortOrder = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
-
-    public static func normalize(providerID: ProviderSettingsID, rawModelID: String) -> NormalizedProviderModelIdentity? {
-        let raw = rawModelID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty, raw.lowercased() != "default" else { return nil }
-        if providerID == .codex {
-            for effort in effortOrder.reversed() where raw.hasSuffix("-\(effort)") {
-                let base = String(raw.dropLast(effort.count + 1))
-                return .init(modelID: base, effortID: effort, displayName: displayName(providerID: providerID, modelID: base))
-            }
-        }
-        return .init(modelID: raw, effortID: nil, displayName: displayName(providerID: providerID, modelID: raw))
-    }
-
-    public static func displayName(providerID: ProviderSettingsID, modelID: String) -> String {
-        switch modelID {
-        case "gpt-5.6-sol": "5.6 Sol"
-        case "gpt-5.6-terra": "5.6 Terra"
-        case "gpt-5.6-luna": "5.6 Luna"
-        case "claude-fable-4-8": "Fable 4.8"
-        case "claude-fable-5": "Fable 5"
-        case "claude-opus-4-8": "Opus 4.8"
-        case "claude-opus-5": "Opus 5"
-        case "claude-sonnet-5": "Sonnet 5"
-        case "claude-sonnet-4-6": "Sonnet 4.6"
-        case "claude-haiku-4-5": "Haiku 4.5"
-        case "auto" where providerID == .cursorACP: "Auto"
-        case "composer-2" where providerID == .cursorACP: "Composer 2"
-        default:
-            modelID
-                .split(separator: "-")
-                .map { token in
-                    let value = String(token)
-                    return value.allSatisfy(\.isNumber) ? value : value.prefix(1).uppercased() + value.dropFirst()
-                }
-                .joined(separator: " ")
-        }
-    }
-}
-
 public struct ProviderModelCapabilities: Codable, Hashable, Sendable {
     public let nativeImages: Bool
     public let steering: Bool
