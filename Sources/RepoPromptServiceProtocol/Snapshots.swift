@@ -212,6 +212,7 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
     public let rootSessionID: UUID
     public let creator: ExternalActor
     public let provider: ProviderKind
+    public let providerSettingsID: ProviderSettingsID?
     public let model: String?
     public let visibility: Visibility
     public let state: SessionLifecycleState
@@ -222,7 +223,7 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
     public let interactions: [InteractionSnapshot]
     public let cursor: ServiceCursor
 
-    public init(sessionID: UUID, projectID: UUID, parentSessionID: UUID?, rootSessionID: UUID, creator: ExternalActor, provider: ProviderKind, model: String?, visibility: Visibility, state: SessionLifecycleState, runGeneration: Int64, turnEpoch: Int64, revision: Int64, transcript: [TranscriptEntry], interactions: [InteractionSnapshot], cursor: ServiceCursor) {
+    public init(sessionID: UUID, projectID: UUID, parentSessionID: UUID?, rootSessionID: UUID, creator: ExternalActor, provider: ProviderKind, providerSettingsID: ProviderSettingsID? = nil, model: String?, visibility: Visibility, state: SessionLifecycleState, runGeneration: Int64, turnEpoch: Int64, revision: Int64, transcript: [TranscriptEntry], interactions: [InteractionSnapshot], cursor: ServiceCursor) {
         schemaVersion = 1
         self.sessionID = sessionID
         self.projectID = projectID
@@ -230,6 +231,7 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
         self.rootSessionID = rootSessionID
         self.creator = creator
         self.provider = provider
+        self.providerSettingsID = providerSettingsID
         self.model = model
         self.visibility = visibility
         self.state = state
@@ -249,6 +251,7 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
         case rootSessionID = "rootSessionId"
         case creator
         case provider
+        case providerSettingsID = "providerSettingsId"
         case model
         case visibility
         case state

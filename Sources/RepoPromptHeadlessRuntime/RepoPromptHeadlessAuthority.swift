@@ -34,7 +34,10 @@ public actor RepoPromptHeadlessAuthority {
     private let contextBuilderRuntime: (any ContextBuilderRuntimeService)?
     private let oracleRuntime: (any OracleRuntimeService)?
     private let projectSourceService: ProjectSourceProvisioningService?
-    private let workflowCatalog = BuiltinWorkflowCatalog()
+    private let serverSettings: ServerSettingsService?
+    private let directProviderDefaults: (any DirectProviderRuntimeDefaultsProviding)?
+    private let subagentPermissions: SubagentPermissionResolver
+    private let workflowRepository: WorkflowRepository
     private let projects = ProjectRuntimeSupervisor()
     private let eventHub = ServiceEventHub()
     private var sessions: [UUID: SessionAuthority] = [:]
@@ -61,7 +64,9 @@ public actor RepoPromptHeadlessAuthority {
         interactionDelivery: (any InteractionDeliveryPort)? = nil,
         contextBuilderRuntime: (any ContextBuilderRuntimeService)? = nil,
         oracleRuntime: (any OracleRuntimeService)? = nil,
-        projectSourceService: ProjectSourceProvisioningService? = nil
+        projectSourceService: ProjectSourceProvisioningService? = nil,
+        serverSettings: ServerSettingsService? = nil,
+        directProviderDefaults: (any DirectProviderRuntimeDefaultsProviding)? = nil
     ) {
         self.store = store
         self.clock = clock
@@ -75,6 +80,13 @@ public actor RepoPromptHeadlessAuthority {
         self.contextBuilderRuntime = contextBuilderRuntime ?? providerAdapter.map { ProviderContextBuilderRuntimeService(providers: $0) }
         self.oracleRuntime = oracleRuntime ?? providerAdapter.map { ProviderOracleRuntimeService(providers: $0) }
         self.projectSourceService = projectSourceService
+        self.serverSettings = serverSettings
+        self.directProviderDefaults = directProviderDefaults
+        workflowRepository = WorkflowRepository(store: store)
+        subagentPermissions = SubagentPermissionResolver(
+            settings: serverSettings,
+            directDefaults: directProviderDefaults
+        )
     }
 
     public func recover() async throws {
@@ -114,7 +126,7 @@ public actor RepoPromptHeadlessAuthority {
             await eventHub.publish(event)
         }
         try await recoverExecutionWorkspaces()
-        try await store.installWorkflows(workflowCatalog.workflows())
+        try await workflowRepository.recover()
     }
 
     private func recoverExecutionWorkspaces() async throws {
@@ -704,6 +716,7 @@ public actor RepoPromptHeadlessAuthority {
                 rootSessionID: seed.rootSessionID,
                 creator: seed.creator,
                 provider: seed.provider,
+                providerSettingsID: ProviderSettingsID.defaultSettingsID(for: seed.provider),
                 model: seed.model,
                 visibility: seed.visibility,
                 state: .idle,
@@ -723,10 +736,18 @@ public actor RepoPromptHeadlessAuthority {
                 state: .idle,
                 revision: 1
             )
+            let importedProviderSettingsID = ProviderSettingsID.defaultSettingsID(for: seed.provider)
+            let importedChildPermission: ResolvedSubagentPermission? = if seed.parentSessionID != nil, let importedProviderSettingsID {
+                await subagentPermissions.resolve(providerID: importedProviderSettingsID)
+            } else {
+                nil
+            }
+            var importedProviderSettings = importedChildPermission?.providerSettings ?? seed.providerSettings
+            if let importedProviderSettingsID { importedProviderSettings["provider.settingsID"] = importedProviderSettingsID.rawValue }
             let permissions = ExecutionPermissionSnapshot(
                 sessionID: seed.sessionID,
-                mode: seed.permissionMode,
-                providerSettings: seed.providerSettings,
+                mode: importedChildPermission?.mode ?? seed.permissionMode,
+                providerSettings: importedProviderSettings,
                 revision: 1,
                 updatedActor: seed.creator
             )
@@ -934,6 +955,21 @@ public actor RepoPromptHeadlessAuthority {
             guard parent?.projectID == input.projectID else { throw ServiceAPIError(code: .rootUnauthorized, message: "Child session cannot cross project runtime") }
             guard let rootSessionID = parent?.rootSessionID, !cancellationBarriers.contains(rootSessionID) else { throw ServiceAPIError(code: .quiescing, message: "Root session is canceling; new children are fenced") }
         }
+        let providerSettingsID = input.providerSettingsID ?? ProviderSettingsID.defaultSettingsID(for: input.provider)
+        if let providerSettingsID, providerSettingsID.runtimeKind != input.provider {
+            throw ServiceAPIError(code: .invalidRequest, message: "Exact provider identity does not match the session runtime")
+        }
+        let childPermission: ResolvedSubagentPermission? = if input.parentSessionID != nil, let providerSettingsID {
+            await subagentPermissions.resolve(providerID: providerSettingsID)
+        } else {
+            nil
+        }
+        var initialProviderSettings = childPermission?.providerSettings ?? input.initialProviderSettings ?? [:]
+        if let reasoningEffort = input.initialProviderSettings?["provider.reasoningEffort"] {
+            initialProviderSettings["provider.reasoningEffort"] = reasoningEffort
+        }
+        if let providerSettingsID { initialProviderSettings["provider.settingsID"] = providerSettingsID.rawValue }
+        let initialPermissionMode = childPermission?.mode ?? input.initialPermissionMode ?? "workspaceWrite"
         let sessionID = ids.next()
         let rootSessionID = parent?.rootSessionID ?? sessionID
         let seededSelection: SelectionSnapshot
@@ -947,12 +983,12 @@ public actor RepoPromptHeadlessAuthority {
         let cursor = try await store.nextCursor()
         var transcript: [TranscriptEntry] = []
         if let prompt = input.initialPrompt, !prompt.isEmpty { transcript.append(TranscriptEntry(entryID: ids.next(), sessionSequence: 1, kind: .human, content: prompt, actor: externalActor, timestamp: clock.now())) }
-        let snapshot = SessionSnapshot(sessionID: sessionID, projectID: input.projectID, parentSessionID: input.parentSessionID, rootSessionID: rootSessionID, creator: externalActor, provider: input.provider, model: input.model, visibility: input.visibility, state: .idle, runGeneration: 0, turnEpoch: 0, revision: 1, transcript: transcript, interactions: [], cursor: cursor)
+        let snapshot = SessionSnapshot(sessionID: sessionID, projectID: input.projectID, parentSessionID: input.parentSessionID, rootSessionID: rootSessionID, creator: externalActor, provider: input.provider, providerSettingsID: providerSettingsID, model: input.model, visibility: input.visibility, state: .idle, runGeneration: 0, turnEpoch: 0, revision: 1, transcript: transcript, interactions: [], cursor: cursor)
         let agent = AgentSnapshot(agentID: sessionID, sessionID: sessionID, rootSessionID: rootSessionID, parentAgentID: input.parentSessionID, role: input.parentSessionID == nil ? "root" : "child", state: snapshot.state, revision: 1)
         let permissions = ExecutionPermissionSnapshot(
             sessionID: sessionID,
-            mode: input.initialPermissionMode ?? "workspaceWrite",
-            providerSettings: input.initialProviderSettings ?? [:],
+            mode: initialPermissionMode,
+            providerSettings: initialProviderSettings,
             revision: 1,
             updatedActor: externalActor
         )
@@ -1051,11 +1087,44 @@ public actor RepoPromptHeadlessAuthority {
         return snapshot
     }
 
-    public func spawnChildSession(parentSessionID: UUID, provider: ProviderKind? = nil, model: String? = nil, initialPrompt: String, role: String = "child", label: String? = nil) async throws -> SessionSnapshot {
+    public func spawnChildSession(
+        parentSessionID: UUID,
+        provider: ProviderKind? = nil,
+        providerSettingsID: ProviderSettingsID? = nil,
+        model: String? = nil,
+        initialPrompt: String,
+        role: String = "child",
+        label: String? = nil
+    ) async throws -> SessionSnapshot {
         guard let parentAuthority = sessions[parentSessionID] else { throw ServiceAPIError(code: .notFound, message: "Parent session not found") }
         let parent = await parentAuthority.snapshot()
         guard !cancellationBarriers.contains(parent.rootSessionID) else { throw ServiceAPIError(code: .quiescing, message: "Root session is canceling; new children are fenced") }
-        let child = try await createAuthoritySession(input: CreateSessionInput(projectID: parent.projectID, parentSessionID: parentSessionID, provider: provider ?? parent.provider, model: model ?? parent.model, visibility: parent.visibility, initialPrompt: initialPrompt), externalActor: parent.creator, idempotencyKey: "agent-manage:\(ids.next().uuidString)", requestDigest: CanonicalSigning.bodyDigest(Data(initialPrompt.utf8)))
+        let explicitProviderID = providerSettingsID ?? provider.flatMap { ProviderSettingsID.defaultSettingsID(for: $0) }
+        let routed: ResolvedAgentModelRoute? = if provider == nil, providerSettingsID == nil, model == nil, let target = AgentRoutingTarget(rawValue: role) {
+            try await serverSettings?.resolveAgentTarget(projectID: parent.projectID, target: target)
+        } else {
+            nil
+        }
+        let resolvedProvider = provider ?? explicitProviderID?.runtimeKind ?? routed?.provider ?? parent.provider
+        let resolvedProviderID = explicitProviderID ?? routed?.providerID ?? parent.providerSettingsID ?? ProviderSettingsID.defaultSettingsID(for: resolvedProvider)
+        let resolvedModel = model ?? routed?.modelID ?? parent.model
+        var routeSettings: [String: String] = [:]
+        if let effort = routed?.reasoningEffort { routeSettings["provider.reasoningEffort"] = effort }
+        let child = try await createAuthoritySession(
+            input: CreateSessionInput(
+                projectID: parent.projectID,
+                parentSessionID: parentSessionID,
+                provider: resolvedProvider,
+                providerSettingsID: resolvedProviderID,
+                model: resolvedModel,
+                visibility: parent.visibility,
+                initialPrompt: initialPrompt,
+                initialProviderSettings: routeSettings
+            ),
+            externalActor: parent.creator,
+            idempotencyKey: "agent-manage:\(ids.next().uuidString)",
+            requestDigest: CanonicalSigning.bodyDigest(Data(initialPrompt.utf8))
+        )
         if var agent = agents[child.sessionID] {
             agent = AgentSnapshot(agentID: agent.agentID, sessionID: agent.sessionID, rootSessionID: agent.rootSessionID, parentAgentID: agent.parentAgentID, providerNativeIdentity: agent.providerNativeIdentity, role: role, label: label, state: agent.state, revision: agent.revision + 1)
             let agentEvent = try await store.persistAgent(agent, projectID: child.projectID, actor: nil, correlationID: ids.next(), eventType: .agentUpdated)
@@ -1236,12 +1305,14 @@ public actor RepoPromptHeadlessAuthority {
 
     public func projectTree(projectID: UUID, request: ProjectTreeRequest) async throws -> [ProjectTreeEntry] {
         guard let tool = tools[projectID] else { throw ServiceAPIError(code: .notFound, message: "Project not found") }
-        return try await tool.tree(request)
+        let advanced = try await advancedSettings()
+        return try await tool.tree(request, settings: advanced.settings)
     }
 
     public func projectSearch(projectID: UUID, request: ProjectSearchRequest) async throws -> [ProjectSearchHit] {
         guard let tool = tools[projectID] else { throw ServiceAPIError(code: .notFound, message: "Project not found") }
-        return try await tool.search(request)
+        let advanced = try await advancedSettings()
+        return try await tool.search(request, settings: advanced.settings)
     }
 
     public func projectFile(projectID: UUID, request: ProjectFileRequest) async throws -> ProjectFileSnapshot {
@@ -1251,7 +1322,31 @@ public actor RepoPromptHeadlessAuthority {
 
     public func projectCodeMap(projectID: UUID, request: ProjectCodeMapRequest) async throws -> ProjectCodeMapSnapshot {
         guard let tool = tools[projectID] else { throw ServiceAPIError(code: .notFound, message: "Project not found") }
-        return try await tool.codeMap(request)
+        let advanced = try await advancedSettings()
+        return try await tool.codeMap(request, settings: advanced.settings)
+    }
+
+    public func modelDiscovery(sessionID: UUID) async throws -> MCPModelDiscoverySnapshot {
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        guard let serverSettings else {
+            return MCPModelDiscoverySnapshot(
+                providers: [],
+                presets: [],
+                roleModelRestrictionApplied: false,
+                settingsRevision: 0
+            )
+        }
+        return try await serverSettings.modelDiscovery(projectID: session.projectID)
+    }
+
+    public func advancedSettings() async throws -> AdvancedServerSettingsSnapshot {
+        if let serverSettings { return try await serverSettings.advanced() }
+        return AdvancedServerSettingsSnapshot(settings: .default, revision: 0, updatedAt: Date(timeIntervalSince1970: 0))
+    }
+
+    public func historyIdleThresholdMinutes(explicit: Int?) async throws -> Int {
+        if let explicit { return max(0, min(explicit, 60)) }
+        return try await advancedSettings().settings.historyIdleThresholdMinutes
     }
 
     public func projectDiff(projectID: UUID, request: ProjectDiffRequest) async throws -> ProjectDiffSnapshot {
@@ -1308,15 +1403,56 @@ public actor RepoPromptHeadlessAuthority {
         return snapshot
     }
 
+    public func workflowRepositorySnapshot() async throws -> ServerWorkflowRepositorySnapshot {
+        try await workflowRepository.snapshot()
+    }
+
     public func workflowSnapshots() async throws -> [WorkflowSnapshot] {
-        try await store.workflows()
+        try await workflowRepository.discoveryWorkflows()
     }
 
     public func workflowSnapshot(workflowID: String) async throws -> WorkflowSnapshot {
-        guard let workflow = try await workflowSnapshots().first(where: { $0.workflowID == workflowID }) else {
-            throw ServiceAPIError(code: .notFound, message: "Workflow not found")
-        }
-        return workflow
+        try await workflowRepository.workflow(workflowID: workflowID)
+    }
+
+    public func createWorkflow(_ request: CreateServerWorkflowRequest, attribution: SettingsMutationAttribution) async throws -> ServerWorkflowRepositorySnapshot {
+        try ensureWritable()
+        return try await workflowRepository.create(request, attribution: attribution)
+    }
+
+    public func updateWorkflow(workflowID: String, request: UpdateServerWorkflowRequest, attribution: SettingsMutationAttribution) async throws -> ServerWorkflowRepositorySnapshot {
+        try ensureWritable()
+        return try await workflowRepository.update(workflowID: workflowID, request: request, attribution: attribution)
+    }
+
+    public func cloneWorkflow(workflowID: String, request: CloneServerWorkflowRequest, attribution: SettingsMutationAttribution) async throws -> ServerWorkflowRepositorySnapshot {
+        try ensureWritable()
+        return try await workflowRepository.clone(workflowID: workflowID, request: request, attribution: attribution)
+    }
+
+    public func deleteWorkflow(workflowID: String, request: DeleteServerWorkflowRequest, attribution: SettingsMutationAttribution) async throws -> ServerWorkflowRepositorySnapshot {
+        try ensureWritable()
+        return try await workflowRepository.delete(workflowID: workflowID, request: request, attribution: attribution)
+    }
+
+    public func setWorkflowVisibility(workflowID: String, request: SetServerWorkflowVisibilityRequest, attribution: SettingsMutationAttribution) async throws -> ServerWorkflowRepositorySnapshot {
+        try ensureWritable()
+        return try await workflowRepository.setVisibility(workflowID: workflowID, request: request, attribution: attribution)
+    }
+
+    public func reorderWorkflows(_ request: ReorderServerWorkflowsRequest, attribution: SettingsMutationAttribution) async throws -> ServerWorkflowRepositorySnapshot {
+        try ensureWritable()
+        return try await workflowRepository.reorder(request, attribution: attribution)
+    }
+
+    public func updateWorkflowPreferences(_ request: UpdateServerWorkflowPreferencesRequest, attribution: SettingsMutationAttribution) async throws -> ServerWorkflowRepositorySnapshot {
+        try ensureWritable()
+        return try await workflowRepository.updatePreferences(request, attribution: attribution)
+    }
+
+    public func reloadWorkflows(_ request: ReloadServerWorkflowsRequest, attribution: SettingsMutationAttribution) async throws -> ServerWorkflowRepositorySnapshot {
+        try ensureWritable()
+        return try await workflowRepository.reload(request, attribution: attribution)
     }
 
     public func providerCapabilities(preflight: Bool = false) async -> [ProviderCapability] {
@@ -1434,6 +1570,200 @@ public actor RepoPromptHeadlessAuthority {
         return next
     }
 
+    public func projectSelectionPresets(projectID: UUID) async throws -> ProjectSelectionPresetsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Selection preset authority is unavailable", retryable: true)
+        }
+        _ = try await projects.authority(projectID: projectID)
+        return try await serverSettings.selectionPresets(projectID: projectID)
+    }
+
+    public func createProjectSelectionPreset(
+        projectID: UUID,
+        request: CreateProjectSelectionPresetRequest,
+        attribution: SettingsMutationAttribution
+    ) async throws -> ProjectSelectionPresetsSnapshot {
+        try ensureWritable()
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Selection preset authority is unavailable", retryable: true)
+        }
+        let current = try await projectSelectionPresets(projectID: projectID)
+        guard current.revision == request.expectedCollectionRevision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Selection preset collection revision is stale", currentRevision: current.revision)
+        }
+        let preset = ProjectSelectionPreset(
+            presetID: ids.next(),
+            projectID: projectID,
+            name: request.name,
+            entries: request.entries,
+            order: current.presets.count,
+            rowRevision: 1
+        )
+        return try await serverSettings.replaceSelectionPresets(
+            projectID: projectID,
+            request: .init(expectedRevision: current.revision, presets: current.presets + [preset]),
+            attribution: attribution
+        )
+    }
+
+    public func updateProjectSelectionPreset(
+        projectID: UUID,
+        presetID: UUID,
+        request: UpdateProjectSelectionPresetRequest,
+        attribution: SettingsMutationAttribution
+    ) async throws -> ProjectSelectionPresetsSnapshot {
+        try ensureWritable()
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Selection preset authority is unavailable", retryable: true)
+        }
+        let current = try await projectSelectionPresets(projectID: projectID)
+        guard current.revision == request.expectedCollectionRevision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Selection preset collection revision is stale", currentRevision: current.revision)
+        }
+        guard let existing = current.presets.first(where: { $0.presetID == presetID }) else {
+            throw ServiceAPIError(code: .notFound, message: "Selection preset not found")
+        }
+        guard existing.rowRevision == request.expectedRowRevision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Selection preset row revision is stale", currentRevision: existing.rowRevision)
+        }
+        let updated = ProjectSelectionPreset(
+            presetID: existing.presetID,
+            projectID: existing.projectID,
+            name: request.name,
+            entries: request.entries,
+            order: existing.order,
+            rowRevision: existing.rowRevision + 1
+        )
+        return try await serverSettings.replaceSelectionPresets(
+            projectID: projectID,
+            request: .init(expectedRevision: current.revision, presets: current.presets.map { $0.presetID == presetID ? updated : $0 }),
+            attribution: attribution
+        )
+    }
+
+    public func deleteProjectSelectionPreset(
+        projectID: UUID,
+        presetID: UUID,
+        request: DeleteProjectSelectionPresetRequest,
+        attribution: SettingsMutationAttribution
+    ) async throws -> ProjectSelectionPresetsSnapshot {
+        try ensureWritable()
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Selection preset authority is unavailable", retryable: true)
+        }
+        let current = try await projectSelectionPresets(projectID: projectID)
+        guard current.revision == request.expectedCollectionRevision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Selection preset collection revision is stale", currentRevision: current.revision)
+        }
+        guard let existing = current.presets.first(where: { $0.presetID == presetID }) else {
+            throw ServiceAPIError(code: .notFound, message: "Selection preset not found")
+        }
+        guard existing.rowRevision == request.expectedRowRevision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Selection preset row revision is stale", currentRevision: existing.rowRevision)
+        }
+        let remaining = current.presets.filter { $0.presetID != presetID }.enumerated().map { index, preset in
+            ProjectSelectionPreset(
+                presetID: preset.presetID,
+                projectID: preset.projectID,
+                name: preset.name,
+                entries: preset.entries,
+                order: index,
+                rowRevision: preset.order == index ? preset.rowRevision : preset.rowRevision + 1
+            )
+        }
+        return try await serverSettings.replaceSelectionPresets(
+            projectID: projectID,
+            request: .init(expectedRevision: current.revision, presets: remaining),
+            attribution: attribution
+        )
+    }
+
+    public func reorderProjectSelectionPresets(
+        projectID: UUID,
+        request: ReorderProjectSelectionPresetsRequest,
+        attribution: SettingsMutationAttribution
+    ) async throws -> ProjectSelectionPresetsSnapshot {
+        try ensureWritable()
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Selection preset authority is unavailable", retryable: true)
+        }
+        let current = try await projectSelectionPresets(projectID: projectID)
+        guard current.revision == request.expectedCollectionRevision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Selection preset collection revision is stale", currentRevision: current.revision)
+        }
+        guard Set(request.orderedPresetIDs).count == request.orderedPresetIDs.count,
+              Set(request.orderedPresetIDs) == Set(current.presets.map(\.presetID))
+        else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Selection preset order must contain every preset exactly once")
+        }
+        let byID = Dictionary(uniqueKeysWithValues: current.presets.map { ($0.presetID, $0) })
+        let reordered = request.orderedPresetIDs.enumerated().compactMap { index, presetID -> ProjectSelectionPreset? in
+            guard let preset = byID[presetID] else { return nil }
+            return ProjectSelectionPreset(
+                presetID: preset.presetID,
+                projectID: preset.projectID,
+                name: preset.name,
+                entries: preset.entries,
+                order: index,
+                rowRevision: preset.order == index ? preset.rowRevision : preset.rowRevision + 1
+            )
+        }
+        return try await serverSettings.replaceSelectionPresets(
+            projectID: projectID,
+            request: .init(expectedRevision: current.revision, presets: reordered),
+            attribution: attribution
+        )
+    }
+
+    public func captureProjectSelectionPreset(
+        projectID: UUID,
+        request: CaptureProjectSelectionPresetRequest,
+        attribution: SettingsMutationAttribution
+    ) async throws -> ProjectSelectionPresetsSnapshot {
+        let session = try await sessionSnapshot(sessionID: request.sessionID)
+        guard session.projectID == projectID else {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Session does not belong to the requested project")
+        }
+        let selection = try await selectionSnapshot(sessionID: request.sessionID)
+        guard selection.revision == request.expectedSelectionRevision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Selection revision is stale", currentRevision: selection.revision)
+        }
+        return try await createProjectSelectionPreset(
+            projectID: projectID,
+            request: .init(expectedCollectionRevision: request.expectedCollectionRevision, name: request.name, entries: selection.entries),
+            attribution: attribution
+        )
+    }
+
+    public func applyProjectSelectionPreset(
+        projectID: UUID,
+        request: ApplyProjectSelectionPresetRequest,
+        actor: ExternalActor
+    ) async throws -> SelectionSnapshot {
+        try ensureWritable()
+        let session = try await sessionSnapshot(sessionID: request.sessionID)
+        guard session.projectID == projectID else {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Session does not belong to the requested project")
+        }
+        let collection = try await projectSelectionPresets(projectID: projectID)
+        guard collection.revision == request.expectedCollectionRevision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Selection preset collection revision is stale", currentRevision: collection.revision)
+        }
+        guard let preset = collection.presets.first(where: { $0.presetID == request.presetID }) else {
+            throw ServiceAPIError(code: .notFound, message: "Selection preset not found")
+        }
+        let selection = try await selectionSnapshot(sessionID: request.sessionID)
+        guard selection.revision == request.expectedSelectionRevision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Selection revision is stale", currentRevision: selection.revision)
+        }
+        return try await replaceSelection(
+            sessionID: request.sessionID,
+            entries: preset.entries,
+            expectedRevision: request.expectedSelectionRevision,
+            actor: actor
+        )
+    }
+
     public func replaceSelection(sessionID: UUID, entries: [LogicalSelectionEntry], expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> SelectionSnapshot {
         let idempotency = try mutationIdempotency(actor: actor, operation: "replaceSelection", key: idempotencyKey, digest: requestDigest)
         if let idempotency, let prior: SelectionSnapshot = try await priorResult(idempotency) { return prior }
@@ -1542,6 +1872,7 @@ public actor RepoPromptHeadlessAuthority {
             rootSessionID: currentSession.rootSessionID,
             creator: currentSession.creator,
             provider: currentSession.provider,
+            providerSettingsID: currentSession.providerSettingsID,
             model: currentSession.model,
             visibility: input.visibility,
             state: currentSession.state,
@@ -1566,6 +1897,9 @@ public actor RepoPromptHeadlessAuthority {
         let idempotency = try mutationIdempotency(actor: actor, operation: "updateExecutionPermissions", key: idempotencyKey, digest: requestDigest)
         if let idempotency, let prior: ExecutionPermissionSnapshot = try await priorResult(idempotency) { return prior }
         let session = try await sessionSnapshot(sessionID: sessionID)
+        guard session.parentSessionID == nil else {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Child execution permissions are frozen by sub-agent policy at creation")
+        }
         let current = try await store.permissions(sessionID: sessionID)
         let revision = current?.revision ?? 0
         guard revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Permission revision is stale", currentRevision: revision) }
@@ -1868,10 +2202,40 @@ public actor RepoPromptHeadlessAuthority {
         return try await createArtifact(projectID: session.projectID, sessionID: sessionID, kind: "context", logicalName: "context-r\(selection.revision).md", content: Data(content.utf8), actor: actor)
     }
 
-    public func runContextBuilder(sessionID: UUID, input: ContextBuilderInput, actor: ExternalActor) async throws -> ContextBuilderSnapshot {
+    public func runContextBuilder(
+        sessionID: UUID,
+        input: ContextBuilderInput,
+        actor: ExternalActor,
+        origin: ContextBuilderInvocationOrigin = .internal
+    ) async throws -> ContextBuilderSnapshot {
         guard let contextBuilderRuntime else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Context Builder runtime is not configured") }
         guard artifactService != nil else { throw ServiceAPIError(code: .capabilityMissing, message: "Context Builder requires durable artifact storage") }
         let session = try await sessionSnapshot(sessionID: sessionID)
+        let effectiveSettings: EffectiveContextBuilderSettings
+        let renderedInstructions: String
+        if let serverSettings {
+            effectiveSettings = try await serverSettings.resolveContextBuilder(
+                projectID: session.projectID,
+                origin: origin,
+                overrides: input.invocationOverrides
+            )
+            renderedInstructions = try await serverSettings.renderContextBuilderInstructions(input.instructions, effective: effectiveSettings)
+        } else {
+            effectiveSettings = .init(
+                budget: input.budget ?? 160_000,
+                enhancementMode: input.enhancementMode ?? .preserve,
+                allowClarifyingQuestions: input.allowClarifyingQuestions ?? false,
+                questionTimeoutSeconds: input.questionTimeoutSeconds ?? 60,
+                followUpAnalysis: input.followUpAnalysis ?? .disabled,
+                followUpBudget: input.followUpBudget ?? 40_000,
+                prompts: []
+            )
+            renderedInstructions = input.instructions
+        }
+        let contextBuilderRoute = try await serverSettings?.resolveAgentTarget(projectID: session.projectID, target: .contextBuilder)
+        let contextBuilderProviderID = contextBuilderRoute?.providerID ?? session.providerSettingsID
+        let contextBuilderProviderSettings = await runtimeProviderSettings(providerID: contextBuilderProviderID)
+        let advanced = try await advancedSettings()
         let current = try await selectionSnapshot(sessionID: sessionID)
         guard current.revision == input.expectedSelectionRevision else { throw ServiceAPIError(code: .staleRevision, message: "Selection revision is stale", currentRevision: current.revision) }
         let project = try await projectSnapshot(projectID: session.projectID)
@@ -1881,7 +2245,7 @@ public actor RepoPromptHeadlessAuthority {
         let workingDirectory = try await executionLocation(session: session).workingDirectory
         var candidates: [ContextBuilderFileCandidate] = []
         for root in project.roots {
-            let entries = try await tool.tree(.init(rootID: root.rootID, maximumDepth: 32, maximumEntries: 20000))
+            let entries = try await tool.tree(.init(rootID: root.rootID, maximumDepth: 32, maximumEntries: 20000), settings: advanced.settings)
             candidates.append(contentsOf: entries.filter { !$0.isDirectory }.map {
                 ContextBuilderFileCandidate(rootID: root.rootID, logicalPath: $0.logicalPath, byteCount: $0.size ?? 0)
             })
@@ -1898,26 +2262,37 @@ public actor RepoPromptHeadlessAuthority {
                 tools: ContextBuilderWorkspaceTools { call in
                     switch call {
                     case let .tree(rootID, logicalPath, maximumDepth, maximumEntries):
-                        try await .tree(tool.tree(.init(rootID: rootID, logicalPath: logicalPath, maximumDepth: maximumDepth, maximumEntries: maximumEntries)))
+                        return .tree(try await tool.tree(.init(rootID: rootID, logicalPath: logicalPath, maximumDepth: maximumDepth, maximumEntries: maximumEntries), settings: advanced.settings))
                     case let .search(rootID, logicalPath, query, useRegex, maximumResults):
-                        try await .search(tool.search(.init(rootID: rootID, query: query, logicalPath: logicalPath, useRegex: useRegex, maximumResults: maximumResults)))
+                        return .search(try await tool.search(.init(rootID: rootID, query: query, logicalPath: logicalPath, useRegex: useRegex, maximumResults: maximumResults), settings: advanced.settings))
                     case let .read(rootID, logicalPath, startLine, lineCount):
-                        try await .file(tool.readFile(.init(rootID: rootID, logicalPath: logicalPath, startLine: startLine, lineCount: lineCount)))
+                        return .file(try await tool.readFile(.init(rootID: rootID, logicalPath: logicalPath, startLine: startLine, lineCount: lineCount)))
                     case let .codeMap(rootID, logicalPath):
-                        try await .codeMap(tool.codeMap(.init(rootID: rootID, logicalPath: logicalPath)))
+                        return .codeMap(try await tool.codeMap(.init(rootID: rootID, logicalPath: logicalPath), settings: advanced.settings))
                     case let .diff(rootID, comparison, logicalPaths):
-                        try await .diff(tool.diff(.init(rootID: rootID, comparison: comparison, logicalPaths: logicalPaths)))
+                        return .diff(try await tool.diff(.init(rootID: rootID, comparison: comparison, logicalPaths: logicalPaths)))
                     case let .askUser(prompt, choices):
-                        try await .answer(self.askContextBuilderQuestion(sessionID: sessionID, prompt: prompt, choices: choices))
+                        guard effectiveSettings.allowClarifyingQuestions else {
+                            throw ServiceAPIError(code: .capabilityMissing, message: "Clarifying questions are disabled for this Context Builder origin")
+                        }
+                        return .answer(try await self.askContextBuilderQuestion(
+                            sessionID: sessionID,
+                            prompt: prompt,
+                            choices: choices,
+                            timeoutSeconds: effectiveSettings.questionTimeoutSeconds
+                        ))
                     }
                 }
             ),
-            instructions: input.instructions,
-            tokenBudget: input.budget,
+            instructions: renderedInstructions,
+            tokenBudget: effectiveSettings.budget,
             responseType: input.responseType,
-            allowClarifyingQuestions: input.allowClarifyingQuestions,
-            provider: session.provider,
-            model: session.model,
+            allowClarifyingQuestions: effectiveSettings.allowClarifyingQuestions,
+            provider: contextBuilderRoute?.provider ?? session.provider,
+            providerSettingsID: contextBuilderProviderID,
+            providerSettings: contextBuilderProviderSettings,
+            model: contextBuilderRoute?.modelID ?? session.model,
+            reasoningEffort: contextBuilderRoute?.reasoningEffort,
             runID: runID
         ))
         let proposalData = try JSONEncoder.serviceEncoder.encode(proposal)
@@ -1929,6 +2304,49 @@ public actor RepoPromptHeadlessAuthority {
             content: proposalData,
             actor: actor
         )
+        var followUpResponse: String?
+        var followUpArtifactID: UUID?
+        if effectiveSettings.followUpAnalysis != .disabled {
+            guard let oracleRuntime else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "Context Builder follow-up analysis requires the Oracle runtime")
+            }
+            let oracleRoute = try await serverSettings?.resolveAgentTarget(projectID: session.projectID, target: .oracle)
+            let oracleProviderID = oracleRoute?.providerID ?? session.providerSettingsID
+            let oracleProviderSettings = await runtimeProviderSettings(providerID: oracleProviderID)
+            let proposedSelection = SelectionSnapshot(
+                sessionID: sessionID,
+                entries: proposal.selection,
+                revision: current.revision,
+                bindingRevision: current.bindingRevision
+            )
+            let proposedContext = try await materializedContext(projectID: session.projectID, selection: proposedSelection, include: ["files"])
+            let followUp = try await oracleRuntime.ask(.init(
+                sessionID: sessionID,
+                prompt: proposal.response ?? renderedInstructions,
+                mode: effectiveSettings.followUpAnalysis.rawValue,
+                selectedContext: proposedContext,
+                priorTurns: [],
+                providerSessionID: nil,
+                provider: oracleRoute?.provider ?? session.provider,
+                providerSettingsID: oracleProviderID,
+                providerSettings: oracleProviderSettings,
+                model: oracleRoute?.modelID ?? session.model,
+                reasoningEffort: oracleRoute?.reasoningEffort,
+                tokenBudget: effectiveSettings.followUpBudget,
+                workingDirectory: workingDirectory,
+                runID: ids.next()
+            ))
+            followUpResponse = followUp.response
+            let followUpArtifact = try await createArtifact(
+                projectID: project.projectID,
+                sessionID: sessionID,
+                kind: "context-builder-follow-up",
+                logicalName: "context-builder-follow-up-\(runID.uuidString).md",
+                content: Data(followUp.response.utf8),
+                actor: actor
+            )
+            followUpArtifactID = followUpArtifact.artifactID
+        }
         let latestProject = try await projectSnapshot(projectID: session.projectID)
         let latestSelection = try await selectionSnapshot(sessionID: sessionID)
         let latestContext = try await sessionContext(sessionID: sessionID)
@@ -1958,7 +2376,12 @@ public actor RepoPromptHeadlessAuthority {
                 chatID: chatID,
                 sessionID: sessionID,
                 providerSessionID: proposal.providerSessionID,
-                turns: [.init(prompt: input.instructions, response: response, timestamp: clock.now())],
+                providerSettingsID: contextBuilderRoute?.providerID ?? session.providerSettingsID,
+                providerSettings: contextBuilderProviderSettings,
+                provider: contextBuilderRoute?.provider ?? session.provider,
+                model: contextBuilderRoute?.modelID ?? session.model,
+                reasoningEffort: contextBuilderRoute?.reasoningEffort,
+                turns: [.init(prompt: renderedInstructions, response: response, timestamp: clock.now())],
                 revision: 1
             ))
             continuationChatID = chatID
@@ -1967,7 +2390,14 @@ public actor RepoPromptHeadlessAuthority {
             let event = try await store.persistSession(replacingCursor(authority.snapshot(), cursor: cursor), eventType: .transcriptMessage, actor: nil, correlationID: runID, idempotency: nil)
             await eventHub.publish(event)
         }
-        return ContextBuilderSnapshot(selection: selection, proposalArtifactID: proposalArtifact.artifactID, response: proposal.response, chatID: continuationChatID)
+        return ContextBuilderSnapshot(
+            selection: selection,
+            proposalArtifactID: proposalArtifact.artifactID,
+            response: proposal.response,
+            chatID: continuationChatID,
+            followUpResponse: followUpResponse,
+            followUpArtifactID: followUpArtifactID
+        )
     }
 
     public func askOracle(sessionID: UUID, input: OracleInput, actor: ExternalActor) async throws -> OracleSnapshot {
@@ -1979,17 +2409,57 @@ public actor RepoPromptHeadlessAuthority {
         let context = try await materializedContext(projectID: project.projectID, selection: selection, include: ["files"])
         let chatID = input.chatID ?? ids.next()
         let priorChat: OracleChatState
+        let oracleRoute: ResolvedAgentModelRoute?
         if let inputChatID = input.chatID {
             guard let stored = try await store.oracleChat(chatID: inputChatID), stored.sessionID == sessionID else { throw ServiceAPIError(code: .notFound, message: "Oracle chat not found for this session") }
+            if let presetID = input.modelPresetID, let serverSettings {
+                let availability: MCPModelPresetAvailability
+                switch input.contextMode {
+                case "plan": availability = .plan
+                case "review": availability = .review
+                default: availability = .chat
+                }
+                let resolved = try await serverSettings.resolveModelPreset(presetID: presetID, availability: availability)
+                guard resolved.providerID == stored.providerSettingsID,
+                      resolved.provider == stored.provider,
+                      resolved.modelID == stored.model,
+                      resolved.reasoningEffort == stored.reasoningEffort
+                else {
+                    throw ServiceAPIError(code: .invalidRequest, message: "Oracle continuation preset does not match the frozen chat route")
+                }
+            }
             priorChat = stored
+            oracleRoute = nil
         } else {
+            if let presetID = input.modelPresetID, let serverSettings {
+                let availability: MCPModelPresetAvailability
+                switch input.contextMode {
+                case "plan": availability = .plan
+                case "review": availability = .review
+                default: availability = .chat
+                }
+                oracleRoute = try await serverSettings.resolveModelPreset(presetID: presetID, availability: availability)
+            } else {
+                oracleRoute = try await serverSettings?.resolveAgentTarget(projectID: session.projectID, target: .oracle)
+            }
             priorChat = OracleChatState(
                 chatID: chatID,
                 sessionID: sessionID,
                 providerSessionID: nil,
+                providerSettingsID: oracleRoute?.providerID ?? session.providerSettingsID,
+                providerSettings: await runtimeProviderSettings(providerID: oracleRoute?.providerID ?? session.providerSettingsID),
+                provider: oracleRoute?.provider ?? session.provider,
+                model: oracleRoute?.modelID ?? session.model,
+                reasoningEffort: oracleRoute?.reasoningEffort,
                 turns: [],
                 revision: 0
             )
+        }
+        let oracleProviderSettings: [String: String]
+        if let frozenProviderSettings = priorChat.providerSettings {
+            oracleProviderSettings = frozenProviderSettings
+        } else {
+            oracleProviderSettings = await runtimeProviderSettings(providerID: priorChat.providerSettingsID ?? session.providerSettingsID)
         }
         let execution = try await oracleRuntime.ask(.init(
             sessionID: sessionID,
@@ -1998,8 +2468,11 @@ public actor RepoPromptHeadlessAuthority {
             selectedContext: context,
             priorTurns: priorChat.turns,
             providerSessionID: priorChat.providerSessionID,
-            provider: session.provider,
-            model: session.model,
+            provider: priorChat.provider ?? session.provider,
+            providerSettingsID: priorChat.providerSettingsID ?? session.providerSettingsID,
+            providerSettings: oracleProviderSettings,
+            model: priorChat.model ?? session.model,
+            reasoningEffort: priorChat.reasoningEffort,
             workingDirectory: workingDirectory,
             runID: ids.next()
         ))
@@ -2008,6 +2481,11 @@ public actor RepoPromptHeadlessAuthority {
             chatID: chatID,
             sessionID: sessionID,
             providerSessionID: execution.providerSessionID,
+            providerSettingsID: priorChat.providerSettingsID,
+            providerSettings: oracleProviderSettings,
+            provider: priorChat.provider,
+            model: priorChat.model,
+            reasoningEffort: priorChat.reasoningEffort,
             turns: priorChat.turns + [
                 OracleChatTurn(prompt: input.prompt, response: response, timestamp: clock.now())
             ],
@@ -2147,6 +2625,13 @@ public actor RepoPromptHeadlessAuthority {
         !quiescing
     }
 
+    private func runtimeProviderSettings(providerID: ProviderSettingsID?) async -> [String: String] {
+        guard let providerID, let directProviderDefaults,
+              let defaults = try? await directProviderDefaults.directProviderRuntimeDefaults(for: providerID)
+        else { return [:] }
+        return defaults.providerSettings
+    }
+
     private func ensureWritable() throws {
         if quiescing { throw ServiceAPIError(code: .quiescing, message: "Service is quiescing", retryable: true) }
     }
@@ -2251,12 +2736,12 @@ public actor RepoPromptHeadlessAuthority {
         return try JSONDecoder.serviceDecoder.decode(T.self, from: existing.response)
     }
 
-    private func askContextBuilderQuestion(sessionID: UUID, prompt: String, choices: [String]) async throws -> String? {
-        let expiresAt = clock.now().addingTimeInterval(120)
+    private func askContextBuilderQuestion(sessionID: UUID, prompt: String, choices: [String], timeoutSeconds: Int) async throws -> String? {
+        let expiresAt = clock.now().addingTimeInterval(TimeInterval(timeoutSeconds))
         let payload = try JSONEncoder.serviceEncoder.encode(ContextBuilderQuestionPayload(prompt: prompt, choices: choices))
         let interaction = try await requestInteraction(sessionID: sessionID, kind: .question, payload: payload, expiresAt: expiresAt)
         do {
-            for _ in 0 ..< 1200 {
+            for _ in 0 ..< max(1, timeoutSeconds * 10) {
                 try Task.checkCancellation()
                 guard let current = try await store.interactions(sessionID: sessionID).first(where: { $0.interactionID == interaction.interactionID }) else {
                     throw ServiceAPIError(code: .notFound, message: "Context Builder interaction disappeared")
@@ -2317,9 +2802,10 @@ public actor RepoPromptHeadlessAuthority {
         let session = try await sessionSnapshot(sessionID: selection.sessionID)
         guard session.projectID == projectID else { throw ServiceAPIError(code: .rootUnauthorized, message: "Selection does not belong to the project") }
         let tool = try await sessionToolAuthority(session: session)
+        let advanced = try await advancedSettings()
         for entry in selection.entries {
             if entry.mode == .codeMap {
-                let codeMap = try await tool.codeMap(.init(rootID: entry.rootID, logicalPath: entry.logicalPath))
+                let codeMap = try await tool.codeMap(.init(rootID: entry.rootID, logicalPath: entry.logicalPath), settings: advanced.settings)
                 sections.append("## \(entry.logicalPath) [codemap:\(codeMap.status)]\n```\n\(codeMap.content)\n```")
                 continue
             }
@@ -2794,11 +3280,11 @@ public actor RepoPromptHeadlessAuthority {
     }
 
     private func replacingCursor(_ value: SessionSnapshot, cursor: ServiceCursor) -> SessionSnapshot {
-        SessionSnapshot(sessionID: value.sessionID, projectID: value.projectID, parentSessionID: value.parentSessionID, rootSessionID: value.rootSessionID, creator: value.creator, provider: value.provider, model: value.model, visibility: value.visibility, state: value.state, runGeneration: value.runGeneration, turnEpoch: value.turnEpoch, revision: value.revision, transcript: value.transcript, interactions: value.interactions, cursor: cursor)
+        SessionSnapshot(sessionID: value.sessionID, projectID: value.projectID, parentSessionID: value.parentSessionID, rootSessionID: value.rootSessionID, creator: value.creator, provider: value.provider, providerSettingsID: value.providerSettingsID, model: value.model, visibility: value.visibility, state: value.state, runGeneration: value.runGeneration, turnEpoch: value.turnEpoch, revision: value.revision, transcript: value.transcript, interactions: value.interactions, cursor: cursor)
     }
 
     private func replacingLifecycle(_ value: SessionSnapshot, state: SessionLifecycleState, cursor: ServiceCursor) -> SessionSnapshot {
-        SessionSnapshot(sessionID: value.sessionID, projectID: value.projectID, parentSessionID: value.parentSessionID, rootSessionID: value.rootSessionID, creator: value.creator, provider: value.provider, model: value.model, visibility: value.visibility, state: state, runGeneration: value.runGeneration, turnEpoch: value.turnEpoch, revision: value.revision + 1, transcript: value.transcript, interactions: value.interactions, cursor: cursor)
+        SessionSnapshot(sessionID: value.sessionID, projectID: value.projectID, parentSessionID: value.parentSessionID, rootSessionID: value.rootSessionID, creator: value.creator, provider: value.provider, providerSettingsID: value.providerSettingsID, model: value.model, visibility: value.visibility, state: state, runGeneration: value.runGeneration, turnEpoch: value.turnEpoch, revision: value.revision + 1, transcript: value.transcript, interactions: value.interactions, cursor: cursor)
     }
 
     private static func bindingSnapshot(_ binding: RunBindingIdentity) -> RunBindingSnapshot {

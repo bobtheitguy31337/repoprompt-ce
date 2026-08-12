@@ -364,6 +364,7 @@ public struct CreateSessionInput: Codable, Sendable {
     public let projectID: UUID
     public let parentSessionID: UUID?
     public let provider: ProviderKind
+    public let providerSettingsID: ProviderSettingsID?
     public let model: String?
     public let visibility: Visibility
     public let initialPrompt: String?
@@ -372,10 +373,11 @@ public struct CreateSessionInput: Codable, Sendable {
     public let initialPermissionMode: String?
     public let initialProviderSettings: [String: String]?
 
-    public init(projectID: UUID, parentSessionID: UUID? = nil, provider: ProviderKind, model: String? = nil, visibility: Visibility, initialPrompt: String? = nil, selectedMessageContext: SelectedMessageContext? = nil, startImmediately: Bool = false, initialPermissionMode: String? = nil, initialProviderSettings: [String: String]? = nil) {
+    public init(projectID: UUID, parentSessionID: UUID? = nil, provider: ProviderKind, providerSettingsID: ProviderSettingsID? = nil, model: String? = nil, visibility: Visibility, initialPrompt: String? = nil, selectedMessageContext: SelectedMessageContext? = nil, startImmediately: Bool = false, initialPermissionMode: String? = nil, initialProviderSettings: [String: String]? = nil) {
         self.projectID = projectID
         self.parentSessionID = parentSessionID
         self.provider = provider
+        self.providerSettingsID = providerSettingsID
         self.model = model
         self.visibility = visibility
         self.initialPrompt = initialPrompt
@@ -396,6 +398,7 @@ public struct CreateSessionInput: Codable, Sendable {
             projectID: projectID,
             parentSessionID: parentSessionID,
             provider: provider,
+            providerSettingsID: providerSettingsID,
             model: model,
             visibility: visibility,
             initialPrompt: context?.frozenPrompt(userPrompt: initialPrompt) ?? initialPrompt,
@@ -410,6 +413,7 @@ public struct CreateSessionInput: Codable, Sendable {
         case projectID = "projectId"
         case parentSessionID = "parentSessionId"
         case provider
+        case providerSettingsID = "providerSettingsId"
         case model
         case visibility
         case initialPrompt

@@ -3,7 +3,7 @@ import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 import RepoPromptHeadlessRuntime
 
-public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProviding {
+public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProviding, DirectProviderRuntimeDefaultsProviding {
     public struct RuntimeDefaults: Sendable, Equatable {
         public let mode: String
         public let providerSettings: [String: String]
@@ -40,6 +40,10 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
             guard let key = PortalDesktopSettingKey(rawValue: rawKey) else {
                 throw ServiceAPIError(code: .invalidRequest, message: "Unknown server setting")
             }
+            guard key.isMutable else {
+                let code: ServiceErrorCode = key.mutability == .supersededByTypedSettings ? .capabilityMissing : .invalidRequest
+                throw ServiceAPIError(code: code, message: "Legacy setting is read-only; use its typed server authority")
+            }
             values[rawKey] = try key.validated(value)
         }
         let updated = PortalDesktopSettingsSnapshot(
@@ -48,6 +52,11 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
             updatedAt: Date()
         )
         return try await store.upsertPortalDesktopSettings(updated, expectedRevision: current.revision)
+    }
+
+    public func directProviderRuntimeDefaults(for providerID: ProviderSettingsID) async throws -> DirectProviderRuntimeDefaults {
+        let defaults = try await runtimeDefaults(for: providerID)
+        return .init(mode: defaults.mode, providerSettings: defaults.providerSettings)
     }
 
     public func runtimeDefaults(for providerID: ProviderSettingsID) async throws -> RuntimeDefaults {
@@ -97,7 +106,7 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
         case .cursorACP:
             let permission = values[PortalDesktopSettingKey.cursorPermissionLevel.rawValue] ?? "managedDefault"
             return .init(mode: permission == "fullAccess" ? "fullAccess" : fallbackMode, providerSettings: [:])
-        case .xAI:
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
             return .init(mode: fallbackMode, providerSettings: [:])
         }
     }

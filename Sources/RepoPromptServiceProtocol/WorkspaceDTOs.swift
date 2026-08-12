@@ -753,29 +753,54 @@ public struct ContextBuildInput: Codable, Sendable {
 public struct ContextBuilderInput: Codable, Sendable {
     public let expectedSelectionRevision: Int64
     public let instructions: String
-    public let budget: Int
+    public let budget: Int?
     public let responseType: String?
-    public let allowClarifyingQuestions: Bool
+    public let allowClarifyingQuestions: Bool?
+    public let enhancementMode: ContextBuilderEnhancementMode?
+    public let questionTimeoutSeconds: Int?
+    public let followUpAnalysis: ContextBuilderFollowUpAnalysis?
+    public let followUpBudget: Int?
+    public let selectedPromptIDs: [UUID]?
 
-    public init(expectedSelectionRevision: Int64, instructions: String, budget: Int, responseType: String? = nil, allowClarifyingQuestions: Bool = false) {
+    public init(
+        expectedSelectionRevision: Int64,
+        instructions: String,
+        budget: Int? = nil,
+        responseType: String? = nil,
+        allowClarifyingQuestions: Bool? = nil,
+        enhancementMode: ContextBuilderEnhancementMode? = nil,
+        questionTimeoutSeconds: Int? = nil,
+        followUpAnalysis: ContextBuilderFollowUpAnalysis? = nil,
+        followUpBudget: Int? = nil,
+        selectedPromptIDs: [UUID]? = nil
+    ) {
         self.expectedSelectionRevision = expectedSelectionRevision
         self.instructions = instructions
         self.budget = budget
         self.responseType = responseType
         self.allowClarifyingQuestions = allowClarifyingQuestions
+        self.enhancementMode = enhancementMode
+        self.questionTimeoutSeconds = questionTimeoutSeconds
+        self.followUpAnalysis = followUpAnalysis
+        self.followUpBudget = followUpBudget
+        self.selectedPromptIDs = selectedPromptIDs
+    }
+
+    public var invocationOverrides: ContextBuilderInvocationOverrides {
+        .init(
+            budget: budget,
+            enhancementMode: enhancementMode,
+            allowClarifyingQuestions: allowClarifyingQuestions,
+            questionTimeoutSeconds: questionTimeoutSeconds,
+            followUpAnalysis: followUpAnalysis,
+            followUpBudget: followUpBudget,
+            selectedPromptIDs: selectedPromptIDs
+        )
     }
 
     private enum CodingKeys: String, CodingKey {
         case expectedSelectionRevision, instructions, budget, responseType, allowClarifyingQuestions
-    }
-
-    public init(from decoder: any Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        expectedSelectionRevision = try values.decode(Int64.self, forKey: .expectedSelectionRevision)
-        instructions = try values.decode(String.self, forKey: .instructions)
-        budget = try values.decode(Int.self, forKey: .budget)
-        responseType = try values.decodeIfPresent(String.self, forKey: .responseType)
-        allowClarifyingQuestions = try values.decodeIfPresent(Bool.self, forKey: .allowClarifyingQuestions) ?? false
+        case enhancementMode, questionTimeoutSeconds, followUpAnalysis, followUpBudget, selectedPromptIDs
     }
 }
 
@@ -789,8 +814,17 @@ public struct ContextBuilderSnapshot: Codable, Hashable, Sendable {
     public let proposalArtifactID: UUID
     public let response: String?
     public let chatID: UUID?
+    public let followUpResponse: String?
+    public let followUpArtifactID: UUID?
 
-    public init(selection: SelectionSnapshot, proposalArtifactID: UUID, response: String?, chatID: UUID?) {
+    public init(
+        selection: SelectionSnapshot,
+        proposalArtifactID: UUID,
+        response: String?,
+        chatID: UUID?,
+        followUpResponse: String? = nil,
+        followUpArtifactID: UUID? = nil
+    ) {
         sessionID = selection.sessionID
         entries = selection.entries
         revision = selection.revision
@@ -798,6 +832,8 @@ public struct ContextBuilderSnapshot: Codable, Hashable, Sendable {
         self.proposalArtifactID = proposalArtifactID
         self.response = response
         self.chatID = chatID
+        self.followUpResponse = followUpResponse
+        self.followUpArtifactID = followUpArtifactID
     }
 
     public var selection: SelectionSnapshot {
@@ -812,6 +848,8 @@ public struct ContextBuilderSnapshot: Codable, Hashable, Sendable {
         case proposalArtifactID = "proposalArtifactId"
         case response
         case chatID = "chatId"
+        case followUpResponse
+        case followUpArtifactID = "followUpArtifactId"
     }
 }
 
@@ -819,17 +857,20 @@ public struct OracleInput: Codable, Sendable {
     public let chatID: UUID?
     public let prompt: String
     public let contextMode: String
+    public let modelPresetID: UUID?
 
-    public init(chatID: UUID?, prompt: String, contextMode: String) {
+    public init(chatID: UUID?, prompt: String, contextMode: String, modelPresetID: UUID? = nil) {
         self.chatID = chatID
         self.prompt = prompt
         self.contextMode = contextMode
+        self.modelPresetID = modelPresetID
     }
 
     private enum CodingKeys: String, CodingKey {
         case chatID = "chatId"
         case prompt
         case contextMode
+        case modelPresetID = "modelPresetId"
     }
 }
 
@@ -876,6 +917,11 @@ public struct OracleChatState: Codable, Hashable, Sendable {
     public let chatID: UUID
     public let sessionID: UUID
     public let providerSessionID: String?
+    public let providerSettingsID: ProviderSettingsID?
+    public let providerSettings: [String: String]?
+    public let provider: ProviderKind?
+    public let model: String?
+    public let reasoningEffort: String?
     public let turns: [OracleChatTurn]
     public let revision: Int64
 
@@ -883,12 +929,22 @@ public struct OracleChatState: Codable, Hashable, Sendable {
         chatID: UUID,
         sessionID: UUID,
         providerSessionID: String? = nil,
+        providerSettingsID: ProviderSettingsID? = nil,
+        providerSettings: [String: String]? = nil,
+        provider: ProviderKind? = nil,
+        model: String? = nil,
+        reasoningEffort: String? = nil,
         turns: [OracleChatTurn],
         revision: Int64
     ) {
         self.chatID = chatID
         self.sessionID = sessionID
         self.providerSessionID = providerSessionID
+        self.providerSettingsID = providerSettingsID
+        self.providerSettings = providerSettings
+        self.provider = provider
+        self.model = model
+        self.reasoningEffort = reasoningEffort
         self.turns = turns
         self.revision = revision
     }
@@ -897,7 +953,7 @@ public struct OracleChatState: Codable, Hashable, Sendable {
         case chatID = "chatId"
         case sessionID = "sessionId"
         case providerSessionID = "providerSessionId"
-        case turns
-        case revision
+        case providerSettingsID = "providerSettingsId"
+        case providerSettings, provider, model, reasoningEffort, turns, revision
     }
 }

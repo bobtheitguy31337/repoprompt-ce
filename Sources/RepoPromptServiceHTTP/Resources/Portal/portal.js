@@ -9,6 +9,10 @@
     "claudeCustom",
     "openCodeACP",
     "cursorACP",
+    "openAIAPI",
+    "anthropicAPI",
+    "openRouter",
+    "customOpenAICompatible",
     "xAI",
   ];
   const supportedRoutes = new Set([
@@ -18,6 +22,8 @@
     "agent-permissions",
     "agent-workflows",
     "context-builder",
+    "portal-appearance",
+    "advanced",
     "mcp-server",
     "mcp-tools",
     "workspace-approvals",
@@ -55,6 +61,19 @@
     bootstrap: null,
     desktopSettings: null,
     settingsMutation: null,
+    domainMutations: {},
+    typedSettings: {
+      agentModels: null,
+      subagentPermissions: null,
+      contextBuilder: null,
+      modelPresets: null,
+      advanced: null,
+      selectionPresets: null,
+      workflows: null,
+      selections: {},
+      directConfigurations: {},
+      contextBuilderResult: null,
+    },
     generatedAt: null,
     route: "home",
     loading: false,
@@ -83,6 +102,45 @@
       retryOperation: null,
     },
   };
+
+  const appearanceCookieName = "rpce_portal_appearance";
+  const appearanceThemes = new Set(["system", "light", "dark"]);
+  const appearanceDensities = new Set(["normal", "large", "extraLarge"]);
+
+  function portalAppearance() {
+    const encoded = document.cookie
+      .split(";")
+      .map((entry) => entry.trim())
+      .find((entry) => entry.startsWith(`${appearanceCookieName}=`))
+      ?.slice(appearanceCookieName.length + 1);
+    const [version, theme, density] = decodeURIComponent(encoded || "").split(
+      ".",
+    );
+    return {
+      theme: version === "v1" && appearanceThemes.has(theme) ? theme : "system",
+      density:
+        version === "v1" && appearanceDensities.has(density)
+          ? density
+          : "normal",
+    };
+  }
+
+  function applyPortalAppearance(preference = portalAppearance()) {
+    document.documentElement.dataset.portalTheme = preference.theme;
+    document.documentElement.dataset.textDensity = preference.density;
+  }
+
+  function savePortalAppearance(preference) {
+    const theme = appearanceThemes.has(preference.theme)
+      ? preference.theme
+      : "system";
+    const density = appearanceDensities.has(preference.density)
+      ? preference.density
+      : "normal";
+    document.cookie = `${appearanceCookieName}=${encodeURIComponent(`v1.${theme}.${density}`)}; Path=/portal; SameSite=Strict; Secure`;
+    applyPortalAppearance({ theme, density });
+    announce("Portal appearance updated");
+  }
 
   // Hand-authored web-safe semantic line glyphs substitute for non-portable
   // SF Symbols without copying Apple artwork.
@@ -428,6 +486,117 @@
     );
   }
 
+  async function loadSettingsDomain(domain) {
+    const projectID = state.agent.selectedProjectID;
+    const sessionID = state.agent.selectedSessionID;
+    switch (domain) {
+      case "agentModels":
+        state.typedSettings.agentModels = await api(
+          projectID
+            ? `api/v1/projects/${encodeURIComponent(projectID)}/settings/agent-models`
+            : "api/v1/settings/agent-models",
+        );
+        break;
+      case "subagentPermissions":
+        state.typedSettings.subagentPermissions = await api(
+          "api/v1/settings/subagent-permissions",
+        );
+        break;
+      case "contextBuilder":
+        state.typedSettings.contextBuilder = await api(
+          projectID
+            ? `api/v1/projects/${encodeURIComponent(projectID)}/settings/context-builder`
+            : "api/v1/settings/context-builder",
+        );
+        break;
+      case "modelPresets":
+        state.typedSettings.modelPresets = await api(
+          "api/v1/settings/model-presets",
+        );
+        break;
+      case "advanced":
+        state.typedSettings.advanced = await api("api/v1/settings/advanced");
+        break;
+      case "selectionPresets":
+        state.typedSettings.selectionPresets = projectID
+          ? await api(
+              `api/v1/projects/${encodeURIComponent(projectID)}/selection-presets`,
+            )
+          : null;
+        break;
+      case "workflows":
+        state.typedSettings.workflows = await api("api/v1/workflows");
+        break;
+      case "selection":
+        if (sessionID) {
+          state.typedSettings.selections[sessionID] = await api(
+            `api/v1/sessions/${encodeURIComponent(sessionID)}/selection`,
+          );
+        }
+        break;
+      case "directConfigurations": {
+        const configurations = {};
+        await Promise.all(
+          orderedProviders()
+            .filter(
+              (provider) =>
+                provider.category === "apiProvider" &&
+                provider.deploymentAllowed &&
+                provider.providerID !== "xAI",
+            )
+            .map(async (provider) => {
+              configurations[provider.providerID] = await api(
+                `api/v1/provider-settings/${encodeURIComponent(provider.providerID)}/direct-configuration`,
+              );
+            }),
+        );
+        state.typedSettings.directConfigurations = configurations;
+        break;
+      }
+      default:
+        throw new PortalError(`Unknown settings domain: ${domain}`);
+    }
+  }
+
+  async function loadTypedSettings() {
+    await Promise.all([
+      loadSettingsDomain("agentModels"),
+      loadSettingsDomain("subagentPermissions"),
+      loadSettingsDomain("contextBuilder"),
+      loadSettingsDomain("modelPresets"),
+      loadSettingsDomain("advanced"),
+      loadSettingsDomain("selectionPresets"),
+      loadSettingsDomain("workflows"),
+      loadSettingsDomain("selection"),
+      loadSettingsDomain("directConfigurations"),
+    ]);
+  }
+
+  async function mutateDomain(domain, control, operation, applyResult) {
+    if (state.domainMutations[domain]) return state.domainMutations[domain];
+    if (control) setDisabledReason(control, true, "Saving…");
+    state.domainMutations[domain] = (async () => {
+      try {
+        const result = await operation();
+        applyResult(result);
+        document.getElementById("settings-freshness").textContent = "Saved";
+        announce("Setting saved");
+        renderRoute();
+        return result;
+      } catch (error) {
+        toast(error.message, true);
+        if (error.code === "staleRevision") {
+          await loadSettingsDomain(domain);
+        }
+        renderRoute();
+        return null;
+      } finally {
+        state.domainMutations[domain] = null;
+      }
+    })();
+    return state.domainMutations[domain];
+  }
+
   async function loadAll(refresh = false) {
     if (state.loadPromise) return state.loadPromise;
     setLoading(true);
@@ -453,6 +622,8 @@
         state.bootstrap.workflows ||= [];
         state.providers = providerCatalog.providers;
         state.desktopSettings = desktopSettings;
+        reconcileAgentSelection();
+        await loadTypedSettings();
         state.generatedAt =
           providerCatalog.generatedAt || new Date().toISOString();
         document.getElementById("service-caption").textContent =
@@ -715,6 +886,14 @@
     reconcileAgentSelection();
     renderHomeProviders();
     updateShell();
+    Promise.all([
+      loadSettingsDomain("agentModels"),
+      loadSettingsDomain("contextBuilder"),
+      loadSettingsDomain("selectionPresets"),
+      loadSettingsDomain("selection"),
+    ])
+      .then(renderRoute)
+      .catch((error) => toast(error.message, true));
     if (state.agent.selectedSessionID) loadTranscript();
   }
 
@@ -731,6 +910,9 @@
     state.agent.transcriptPage = null;
     state.agent.selectionGeneration += 1;
     renderHomeProviders();
+    loadSettingsDomain("selection").catch((error) =>
+      toast(error.message, true),
+    );
     loadTranscript();
   }
 
@@ -1165,6 +1347,8 @@
         "agent-permissions": "Agent Permissions",
         "agent-workflows": "Agent Workflows",
         "context-builder": "Context Builder",
+        "portal-appearance": "Portal Appearance",
+        advanced: "Advanced",
         "mcp-server": "MCP Server",
         "mcp-tools": "Tools",
         "workspace-approvals": "Workspace Approvals",
@@ -1181,20 +1365,22 @@
       const renderers = {
         overview: renderOverview,
         "cli-providers": renderCLIProviders,
-        "agent-models": renderDesktopAgentModels,
+        "agent-models": renderTypedAgentModels,
         "agent-permissions": renderAgentPermissions,
-        "agent-workflows": renderAgentWorkflows,
-        "context-builder": renderContextBuilder,
+        "agent-workflows": renderTypedAgentWorkflows,
+        "context-builder": renderTypedContextBuilder,
+        "portal-appearance": renderPortalAppearance,
+        advanced: renderAdvanced,
         "mcp-server": renderMCPServer,
         "mcp-tools": renderMCPTools,
         "workspace-approvals": renderWorkspaceApprovals,
-        "model-presets": renderModelPresets,
-        "api-providers": renderAPIProviders,
-        openrouter: renderOpenRouter,
-        "custom-api": renderCustomAPI,
+        "model-presets": renderTypedModelPresets,
+        "api-providers": renderTypedAPIProviders,
+        openrouter: renderTypedOpenRouter,
+        "custom-api": renderTypedCustomAPI,
         "model-config": renderModelConfig,
         "manage-workspaces": renderManageWorkspaces,
-        "manage-presets": renderManagePresets,
+        "manage-presets": renderTypedManagePresets,
       };
       if ((!state.providers.length || !state.desktopSettings) && state.loading)
         renderInitialSettingsLoading();
@@ -1694,7 +1880,7 @@
     if (provider.cli?.installed === false)
       return "The provider command is not installed on this server.";
     if (provider.providerID === "claudeCustom")
-      return "Custom endpoint credentials require an operator-managed connection until a safe endpoint validator is configured.";
+      return "Custom endpoint credentials remain an operator-managed boundary because this Claude-compatible backend does not advertise a safe endpoint validator.";
     if (
       ["claudeCompatible", "openCodeACP", "cursorACP"].includes(
         provider.providerID,
@@ -1999,7 +2185,7 @@
     const card = desktopCard(
       custom ? "Custom Backend" : "Backend Behavior",
       custom
-        ? "Define an Anthropic-compatible endpoint. Credential entry remains unavailable until the server can validate the configured host safely."
+        ? "Define an Anthropic-compatible endpoint. Credential entry is unavailable because this backend does not advertise a safe configured-host validator."
         : "These runtime settings mirror the desktop backend behavior. Provider credentials are managed in the key section above.",
     );
     card.append(
@@ -2133,7 +2319,7 @@
     save.type = "submit";
     save.dataset.action = "save-compatible-backend-settings";
     actions.append(
-      element("span", "form-note", "Applies to future sessions."),
+      element("span", "form-note", "Applies to new sessions."),
       save,
     );
     form.append(message, actions);
@@ -2189,304 +2375,361 @@
     return toggle;
   }
 
-  function renderDesktopAgentModels() {
-    const connected = orderedProviders().filter(
-      (provider) =>
-        provider.category === "cliProvider" && isConnectedProvider(provider),
+  function typedSelect(label, options, currentValue) {
+    const select = document.createElement("select");
+    select.setAttribute("aria-label", label);
+    options.forEach(([value, title]) => {
+      const option = element("option", "", title);
+      option.value = value;
+      option.selected = value === currentValue;
+      select.append(option);
+    });
+    return select;
+  }
+
+  function typedToggle(label, checked) {
+    const toggle = element("label", "toggle desktop-toggle");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = checked;
+    input.setAttribute("aria-label", label);
+    toggle.append(input, element("span"));
+    return { toggle, input };
+  }
+
+  function agentTargetValue(target) {
+    if (!target) return "";
+    return [
+      target.providerID,
+      target.modelID || "",
+      target.reasoningEffort || "",
+    ]
+      .map(encodeURIComponent)
+      .join("|");
+  }
+
+  function agentTargetFromValue(value, pinned = false) {
+    if (!value) return null;
+    const [providerID, modelID, reasoningEffort] = value
+      .split("|")
+      .map(decodeURIComponent);
+    return {
+      providerID,
+      modelID: modelID || null,
+      reasoningEffort: reasoningEffort || null,
+      pinned,
+    };
+  }
+
+  function agentTargetChoices() {
+    const choices = [["", "Unassigned"]];
+    orderedProviders()
+      .filter((provider) => provider.deploymentAllowed)
+      .forEach((provider) => {
+        if (!(provider.models || []).length) {
+          const target = { providerID: provider.providerID };
+          choices.push([
+            agentTargetValue(target),
+            `${provider.displayName} · Provider default`,
+          ]);
+        }
+        (provider.models || []).forEach((modelEntry) => {
+          const efforts = modelEntry.reasoningEfforts?.length
+            ? modelEntry.reasoningEfforts
+            : [null];
+          efforts.forEach((effort) => {
+            const target = {
+              providerID: provider.providerID,
+              modelID: modelEntry.id,
+              reasoningEffort: effort,
+            };
+            choices.push([
+              agentTargetValue(target),
+              `${provider.displayName} · ${modelEntry.displayName}${effort ? ` · ${humanize(effort)}` : ""}`,
+            ]);
+          });
+        });
+      });
+    return choices;
+  }
+
+  function renderTypedAgentModels() {
+    const snapshot = state.typedSettings.agentModels;
+    if (!snapshot) {
+      settingsPage(
+        "Agent Models",
+        "Loading typed routing settings…",
+        "model",
+        [],
+      );
+      return;
+    }
+    const projectID = state.agent.selectedProjectID;
+    const projectOverride =
+      Boolean(projectID) && snapshot.projectMode === "projectOverride";
+    const scope = desktopCard(
+      "Scope",
+      "Global routing is shared by every project. An active project may inherit it or own a complete revisioned override.",
     );
-    const recommendations = agentModelRecommendations(connected);
-    const recommendationCard = desktopCard(
-      "Recommended Setup",
-      recommendations.length
-        ? "A live assessment of the CLI providers connected to this server using the desktop 2026-08 recommendation candidate chains."
-        : connected.length
-          ? "The connected providers do not produce a desktop recommendation target. Codex, Claude Code, or Cursor must be connected before the desktop recommender assigns models."
-          : "Connect at least one CLI provider to calculate desktop-style recommendations.",
-    );
-    if (recommendations.length) {
-      recommendations.forEach(([label, value, detail]) =>
-        recommendationCard.append(
-          desktopRow(
-            label,
-            detail,
-            element("span", "recommended-value", value),
-          ),
+    if (projectID) {
+      const mode = typedSelect(
+        "Agent Models scope",
+        [
+          ["inheritGlobal", "Use global settings"],
+          ["projectOverride", "Use project override"],
+        ],
+        snapshot.projectMode,
+      );
+      mode.addEventListener("change", () =>
+        mutateDomain(
+          "agentModels",
+          mode,
+          () =>
+            api(
+              `api/v1/projects/${encodeURIComponent(projectID)}/settings/agent-models`,
+              {
+                method: "PATCH",
+                body: JSON.stringify({
+                  expectedRevision: snapshot.projectRevision,
+                  mode: mode.value,
+                  profile:
+                    mode.value === "projectOverride"
+                      ? snapshot.globalProfile
+                      : null,
+                }),
+              },
+            ),
+          (value) => {
+            state.typedSettings.agentModels = value;
+          },
         ),
       );
-      recommendationCard.append(
-        element(
-          "p",
-          "scope-footnote",
-          "Desktop RepoPrompt can apply Oracle, Context Builder, and role mappings globally or per workspace. The shared server does not yet expose that routing authority, so the portal reports recommendations instead of saving inert role values.",
+      scope.append(
+        desktopRow(
+          "Project routing",
+          "Project overrides are complete snapshots; inherited projects track global edits immediately.",
+          mode,
         ),
       );
-    } else {
-      const action = element(
+      const copy = element(
         "button",
         "secondary-button",
-        "Open CLI Providers",
+        "Copy Global to Project",
       );
-      action.type = "button";
-      action.dataset.action = "open-cli-providers";
-      action.addEventListener("click", () =>
-        navigateToSettings("cli-providers"),
+      copy.type = "button";
+      copy.dataset.action = "copy-global-agent-models";
+      copy.addEventListener("click", () =>
+        mutateDomain(
+          "agentModels",
+          copy,
+          () =>
+            api(
+              `api/v1/projects/${encodeURIComponent(projectID)}/settings/agent-models/copy-global`,
+              {
+                method: "POST",
+                body: JSON.stringify({
+                  expectedGlobalRevision: snapshot.globalRevision,
+                  expectedProjectRevision: snapshot.projectRevision,
+                }),
+              },
+            ),
+          (value) => {
+            state.typedSettings.agentModels = value;
+          },
+        ),
       );
-      recommendationCard.append(
+      scope.append(copy);
+    } else {
+      scope.append(
         element(
           "p",
           "empty-inline",
-          connected.length
-            ? "No desktop recommendation target is available for the connected provider set. OpenCode is not assigned to desktop recommendation roles, and compatible backends participate in role fallbacks only when Codex, Claude Code, or Cursor is ready."
-            : "No connected CLI providers.",
+          "No active project is available; editing the global profile.",
         ),
-        action,
       );
     }
 
-    const providerDefaults = element("div", "provider-stack");
-    const providersWithModels = orderedProviders().filter(
-      (provider) =>
-        provider.deploymentAllowed &&
-        provider.category === "cliProvider" &&
-        (provider.models || []).length,
+    const recommendations = desktopCard(
+      "Recommended Setup",
+      `Server profile ${snapshot.recommendationProfileVersion} is the canonical recommendation authority. OpenCode remains a connection signal but is never invented as a routing target.`,
     );
-    providersWithModels.forEach((provider, index) =>
-      providerDefaults.append(providerCard(provider, index === 0, true)),
-    );
-    if (!providersWithModels.length)
-      providerDefaults.append(
-        informationalCard(
-          "No Model Catalogs",
-          "The server has not advertised a selectable model catalog.",
+    (snapshot.recommendations || []).forEach((row) => {
+      const provider = orderedProviders().find(
+        (candidate) =>
+          candidate.providerID === row.recommendedTarget?.providerID,
+      );
+      const target = row.recommendedTarget;
+      const value = target
+        ? `${provider?.displayName || target.providerID}${target.modelID ? ` · ${target.modelID}` : ""}${target.reasoningEffort ? ` · ${humanize(target.reasoningEffort)}` : ""}`
+        : humanize(row.availability);
+      recommendations.append(
+        desktopRow(
+          humanize(row.target),
+          row.detail,
+          element(
+            "span",
+            row.availability === "exact"
+              ? "recommended-value"
+              : "read-only-value",
+            value,
+          ),
         ),
       );
-
-    const runtime = desktopCard(
-      "Provider Defaults",
-      "These controls are runtime-backed. They set each provider's default model and advertised options for new portal sessions when the session does not choose an explicit model.",
+    });
+    const apply = element(
+      "button",
+      "primary-button",
+      "Apply Recommended Setup",
     );
-    runtime.append(providerDefaults);
+    apply.type = "button";
+    apply.dataset.action = "apply-recommended-agent-models";
+    apply.addEventListener("click", () => {
+      const projectEndpoint = projectOverride
+        ? `api/v1/projects/${encodeURIComponent(projectID)}/settings/agent-models/apply-recommendations`
+        : "api/v1/settings/agent-models/apply-recommendations";
+      mutateDomain(
+        "agentModels",
+        apply,
+        () =>
+          api(projectEndpoint, {
+            method: "POST",
+            body: JSON.stringify({
+              expectedRevision: projectOverride
+                ? snapshot.projectRevision
+                : snapshot.globalRevision,
+            }),
+          }),
+        (value) => {
+          state.typedSettings.agentModels = value;
+        },
+      );
+    });
+    recommendations.append(apply);
+
+    const profile = projectOverride
+      ? snapshot.projectProfile || snapshot.effectiveProfile
+      : snapshot.globalProfile;
+    const routes = desktopCard(
+      projectOverride ? "Project Agent Routes" : "Global Agent Routes",
+      "These six assignments are resolved before runtime launch. Pinned unavailable targets fail explicitly; unpinned targets may use an exact server recommendation fallback.",
+    );
+    const form = element("form", "typed-settings-form");
+    const targetControls = {};
+    const choices = agentTargetChoices();
+    [
+      "oracle",
+      "contextBuilder",
+      "explore",
+      "engineer",
+      "pair",
+      "design",
+    ].forEach((targetName) => {
+      const row = element("div", "typed-route-row");
+      const select = typedSelect(
+        `${humanize(targetName)} route`,
+        choices,
+        agentTargetValue(profile[targetName]),
+      );
+      const pinned = typedToggle(
+        `Pin ${humanize(targetName)} route`,
+        profile[targetName]?.pinned === true,
+      );
+      row.append(
+        element("strong", "", humanize(targetName)),
+        select,
+        element("span", "compact-toggle-label", "Pinned"),
+        pinned.toggle,
+      );
+      form.append(row);
+      targetControls[targetName] = { select, pinned: pinned.input };
+    });
+    const restrict = typedToggle(
+      "Hide non-role models from MCP agents",
+      profile.restrictDiscoveryToRoleModels === true,
+    );
+    form.append(
+      desktopRow(
+        "Hide non-role models from MCP agents",
+        "Filters list_models discovery to configured role targets while preserving enabled model presets.",
+        restrict.toggle,
+      ),
+    );
+    const save = element("button", "primary-button", "Save Agent Routes");
+    save.type = "submit";
+    form.append(save);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const nextProfile = {
+        restrictDiscoveryToRoleModels: restrict.input.checked,
+      };
+      Object.entries(targetControls).forEach(([name, controls]) => {
+        nextProfile[name] = agentTargetFromValue(
+          controls.select.value,
+          controls.pinned.checked,
+        );
+      });
+      mutateDomain(
+        "agentModels",
+        save,
+        () =>
+          api(
+            projectOverride
+              ? `api/v1/projects/${encodeURIComponent(projectID)}/settings/agent-models`
+              : "api/v1/settings/agent-models",
+            {
+              method: "PATCH",
+              body: JSON.stringify(
+                projectOverride
+                  ? {
+                      expectedRevision: snapshot.projectRevision,
+                      mode: "projectOverride",
+                      profile: nextProfile,
+                    }
+                  : {
+                      expectedRevision: snapshot.globalRevision,
+                      profile: nextProfile,
+                    },
+              ),
+            },
+          ),
+        (value) => {
+          state.typedSettings.agentModels = value;
+        },
+      );
+    });
+    routes.append(form);
+
+    const providerDefaults = desktopCard(
+      "Provider Defaults",
+      "Provider settings remain the exact runtime-backed defaults for explicit portal sessions and unassigned model fields.",
+    );
+    const stack = element("div", "provider-stack");
+    orderedProviders()
+      .filter(
+        (provider) =>
+          provider.deploymentAllowed &&
+          provider.category === "cliProvider" &&
+          (provider.models || []).length,
+      )
+      .forEach((provider, index) =>
+        stack.append(providerCard(provider, index === 0, true)),
+      );
+    providerDefaults.append(stack);
     settingsPage(
       "Agent Models",
-      "Check desktop-style recommendations and configure the provider defaults the shared server can actually enforce.",
+      "Configure typed global/project routing for Oracle, Context Builder, and all four sub-agent roles.",
       "model",
-      [recommendationCard, runtime],
+      [scope, recommendations, routes, providerDefaults],
       recommendation(
         "model",
-        recommendations.length
+        snapshot.recommendations.some((row) => row.availability === "exact")
           ? "Recommendation check complete"
-          : connected.length
-            ? "No desktop recommendation target available"
-            : "Recommendations need a connected CLI provider",
-        recommendations.length
-          ? `${connected.length} connected CLI provider${connected.length === 1 ? "" : "s"} evaluated against the desktop 2026-08 profile.`
-          : connected.length
-            ? "The connected provider set is not a desktop recommendation driver; connect Codex, Claude Code, or Cursor."
-            : "Connect Claude Code, Codex, OpenCode, or Cursor, then return here.",
+          : "No desktop recommendation target available",
+        snapshot.recommendations.some((row) => row.availability === "exact")
+          ? `Connected providers were evaluated against desktop profile ${snapshot.recommendationProfileVersion} (2026-08).`
+          : "The connected provider set has no exact profile target. OpenCode is not assigned to Oracle, Context Builder, or role defaults.",
       ),
     );
-  }
-
-  function agentModelRecommendations(connectedProviders) {
-    const compatibleBackendIDs = new Set([
-      "claudeGLM",
-      "claudeKimi",
-      "claudeCustom",
-    ]);
-    const byID = Object.fromEntries(
-      connectedProviders
-        .filter(
-          (provider) =>
-            !compatibleBackendIDs.has(provider.providerID) ||
-            provider.preference?.enabled,
-        )
-        .map((provider) => [provider.providerID, provider]),
-    );
-    const hasRecommendationDriver = [
-      "codex",
-      "claudeCompatible",
-      "cursorACP",
-    ].some((providerID) => byID[providerID]);
-    if (!hasRecommendationDriver) return [];
-
-    const slotKeys = {
-      claudeGLM: {
-        haiku: "claudeGLMHaikuModel",
-        sonnet: "claudeGLMSonnetModel",
-        opus: "claudeGLMOpusModel",
-      },
-      claudeCustom: {
-        haiku: "claudeCustomHaikuModel",
-        sonnet: "claudeCustomSonnetModel",
-        opus: "claudeCustomOpusModel",
-      },
-    };
-
-    function target(candidate) {
-      const provider = byID[candidate.providerID];
-      if (!provider) return null;
-      const title = desktopProviderPresentation(provider).title;
-      if (candidate.backendManaged)
-        return {
-          value: `${title} · Backend-managed model`,
-          exactTargetAdvertised: true,
-          targetLabel: "Backend-managed model",
-        };
-      if (candidate.slot) {
-        if (
-          candidate.providerID === "claudeCustom" &&
-          settingValue("claudeCustomModelBehavior", "noModel") !==
-            "claudeSlotMapping"
-        )
-          return {
-            value: `${title} · Backend-managed model`,
-            exactTargetAdvertised: true,
-            targetLabel: "Backend-managed model",
-          };
-        const mapped = settingValue(
-          slotKeys[candidate.providerID]?.[candidate.slot],
-        );
-        const slot = `${humanize(candidate.slot)} slot`;
-        return {
-          value: `${title} · ${slot}${mapped ? ` → ${mapped}` : ""}`,
-          exactTargetAdvertised: Boolean(mapped),
-          targetLabel: slot,
-        };
-      }
-
-      const models = provider.models || [];
-      const advertised =
-        models.find((model) => candidate.ids?.includes(model.id)) ||
-        models.find((model) => {
-          const haystack = `${model.id} ${model.displayName}`.toLowerCase();
-          return candidate.contains?.every((token) =>
-            haystack.includes(token.toLowerCase()),
-          );
-        });
-      const effortAdvertised =
-        !candidate.effort ||
-        advertised?.reasoningEfforts?.includes(candidate.effort);
-      const pieces = [title, advertised?.displayName || candidate.label];
-      if (candidate.effort) pieces.push(humanize(candidate.effort));
-      return {
-        value: pieces.join(" · "),
-        exactTargetAdvertised: Boolean(advertised && effortAdvertised),
-        targetLabel: `${candidate.label}${candidate.effort ? ` ${humanize(candidate.effort)}` : ""}`,
-      };
-    }
-
-    function choose(candidates) {
-      let informationalFallback = null;
-      for (const candidate of candidates) {
-        const resolved = target(candidate);
-        if (!resolved) continue;
-        if (resolved.exactTargetAdvertised) return resolved;
-        informationalFallback ||= resolved;
-      }
-      return informationalFallback;
-    }
-
-    function row(label, resolved, detail) {
-      if (!resolved) return null;
-      const catalogDetail = resolved.exactTargetAdvertised
-        ? ""
-        : ` The desktop target is ${resolved.targetLabel}; this server has not advertised that exact model/effort, so the assessment is informational.`;
-      return [label, resolved.value, `${detail}${catalogDetail}`];
-    }
-
-    const codex = (effort) => ({
-      providerID: "codex",
-      ids: ["gpt-5.6-sol", `gpt-5.6-sol-${effort}`],
-      contains: ["gpt-5.6", "sol"],
-      label: "GPT-5.6 Sol",
-      effort,
-    });
-    const claude = (family, effort = null) => ({
-      providerID: "claudeCompatible",
-      ids: [`claude-${family}-5`, `claude-${family}`],
-      contains: [family],
-      label: humanize(family),
-      effort,
-    });
-    const glm = (slot) => ({ providerID: "claudeGLM", slot });
-    const kimi = { providerID: "claudeKimi", backendManaged: true };
-    const custom = (slot) => ({ providerID: "claudeCustom", slot });
-    const legacyCodex = (id, label) => ({
-      providerID: "codex",
-      ids: [id],
-      contains: [id],
-      label,
-    });
-    const cursor = (composer = false) => ({
-      providerID: "cursorACP",
-      ids: composer ? ["composer-2", "composer2"] : ["auto"],
-      contains: composer ? ["composer", "2"] : ["auto"],
-      label: composer ? "Composer 2" : "Auto",
-    });
-
-    return [
-      row(
-        "Oracle Model",
-        choose([codex("high"), claude("opus")]),
-        "Desktop priority: Codex GPT-5.6 Sol High, OpenAI API when configured, then Claude Opus.",
-      ),
-      row(
-        "Context Builder Agent",
-        choose([codex("low"), claude("sonnet"), cursor(true)]),
-        "Desktop priority: Codex GPT-5.6 Sol Low, Claude Sonnet, then Cursor Composer 2.",
-      ),
-      row(
-        "Explore",
-        choose([
-          codex("low"),
-          claude("sonnet", "high"),
-          claude("haiku"),
-          glm("haiku"),
-          kimi,
-          custom("haiku"),
-          legacyCodex("gpt-5.4-mini-medium", "GPT-5.4 Mini Medium"),
-          legacyCodex("gpt-5.1-codex-mini", "GPT-5.1 Codex Mini"),
-          cursor(false),
-        ]),
-        "Desktop role chain for fast exploration and codebase mapping.",
-      ),
-      row(
-        "Engineer",
-        choose([
-          codex("medium"),
-          claude("sonnet"),
-          glm("sonnet"),
-          kimi,
-          custom("sonnet"),
-          cursor(true),
-        ]),
-        "Desktop role chain for balanced implementation work.",
-      ),
-      row(
-        "Pair",
-        choose([
-          codex("high"),
-          claude("opus"),
-          glm("opus"),
-          kimi,
-          custom("opus"),
-          cursor(true),
-        ]),
-        "Desktop role chain for highest-quality interactive engineering.",
-      ),
-      row(
-        "Design",
-        choose([
-          claude("opus"),
-          glm("opus"),
-          kimi,
-          custom("opus"),
-          cursor(true),
-          codex("medium"),
-        ]),
-        "Desktop role chain for architecture and extended analysis.",
-      ),
-    ].filter(Boolean);
   }
 
   function renderAgentPermissions() {
@@ -2518,187 +2761,1117 @@
     ]
       .filter(([provider]) => provider)
       .map(([provider, title]) => providerRuntimeControls(provider, title));
-    const subagents = informationalCard(
+    const subagentSnapshot = state.typedSettings.subagentPermissions;
+    const subagents = desktopCard(
       "Sub-Agents",
-      "Desktop RepoPrompt exposes Safe Managed, Inherit Provider Settings, and Custom policies for Codex, Claude Code, OpenCode, and Cursor. The shared server does not yet expose a mutation authority for that policy, so the portal does not save decorative values.",
-      [
-        [
-          "Current authority",
-          "Server runtime policy",
-          "Delegated-agent permissions are resolved by the Agent Mode runtime that launches the sub-agent.",
-        ],
-        [
-          "Desktop recommendation",
-          "Safe Managed",
-          "Use bounded permissions unless an explicit workflow requires broader access.",
-        ],
-      ],
+      "This revisioned policy is frozen into every child session before ProviderExecutionPolicy is created. Missing or corrupt settings fail closed to Safe Managed.",
     );
+    if (subagentSnapshot) {
+      const form = element("form", "typed-settings-form");
+      const settings = subagentSnapshot.settings;
+      const policy = typedSelect(
+        "Sub-agent permission policy",
+        [
+          ["safeManaged", "Safe Managed (recommended)"],
+          ["inheritProviderSettings", "Inherit Provider Settings"],
+          ["custom", "Custom"],
+        ],
+        settings.policy,
+      );
+      form.append(
+        desktopRow(
+          "Policy",
+          "Safe Managed resolves Codex to Auto Review, Claude to Require Approval, and ACP providers to Managed Default.",
+          policy,
+        ),
+      );
+      const custom = element("div", "subagent-custom-grid");
+      const controls = {
+        codex: typedSelect(
+          "Custom Codex sub-agent mode",
+          [
+            ["readOnly", "Read Only"],
+            ["defaultPermission", "Default Permission"],
+            ["autoReview", "Auto Review"],
+            ["fullAccess", "Full Access"],
+          ],
+          settings.codex,
+        ),
+        claude: typedSelect(
+          "Custom Claude sub-agent mode",
+          [
+            ["requireApproval", "Require Approval"],
+            ["autoApproveEdits", "Auto-Approve Edits"],
+            ["auto", "Auto"],
+            ["fullAccess", "Full Access"],
+          ],
+          settings.claude,
+        ),
+        openCode: typedSelect(
+          "Custom OpenCode sub-agent mode",
+          [
+            ["managedDefault", "Managed Default"],
+            ["fullAccess", "Full Access"],
+          ],
+          settings.openCode,
+        ),
+        cursor: typedSelect(
+          "Custom Cursor sub-agent mode",
+          [
+            ["managedDefault", "Managed Default"],
+            ["fullAccess", "Full Access"],
+          ],
+          settings.cursor,
+        ),
+      };
+      Object.entries(controls).forEach(([name, control]) =>
+        custom.append(
+          desktopRow(humanize(name), "Custom frozen launch mode.", control),
+        ),
+      );
+      const warning = element(
+        "div",
+        "inline-message warning",
+        "Full Access can allow delegated agents to act without a managed approval boundary.",
+      );
+      function updateCustomVisibility() {
+        custom.hidden = policy.value !== "custom";
+        warning.hidden =
+          policy.value === "safeManaged" ||
+          (policy.value === "custom" &&
+            !Object.values(controls).some(
+              (control) => control.value === "fullAccess",
+            ));
+      }
+      policy.addEventListener("change", updateCustomVisibility);
+      Object.values(controls).forEach((control) =>
+        control.addEventListener("change", updateCustomVisibility),
+      );
+      updateCustomVisibility();
+      const save = element("button", "primary-button", "Save Sub-Agent Policy");
+      save.type = "submit";
+      form.append(custom, warning, save);
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        mutateDomain(
+          "subagentPermissions",
+          save,
+          () =>
+            api("api/v1/settings/subagent-permissions", {
+              method: "PATCH",
+              body: JSON.stringify({
+                expectedRevision: subagentSnapshot.revision,
+                settings: {
+                  policy: policy.value,
+                  codex: controls.codex.value,
+                  claude: controls.claude.value,
+                  openCode: controls.openCode.value,
+                  cursor: controls.cursor.value,
+                },
+              }),
+            }),
+          (value) => {
+            state.typedSettings.subagentPermissions = value;
+          },
+        );
+      });
+      subagents.append(form);
+    }
     settingsPage(
       "Agent Permissions",
-      "Configure runtime-backed direct-agent permissions and review the shared-server sub-agent boundary.",
+      "Configure runtime-backed direct-agent and delegated sub-agent permissions.",
       "shield",
       [fallback, ...providerCards, subagents],
       recommendation(
         "shield",
         "Direct permissions apply to new sessions",
-        "Codex, Claude Code, OpenCode, and Cursor controls now match the desktop provider map.",
+        "Direct and sub-agent policies are consumed by the server runtime and frozen for new sessions.",
       ),
     );
   }
 
-  function renderAgentWorkflows() {
-    const workflows = state.bootstrap?.workflows || [];
-    const catalog = desktopCard(
-      "Server Workflow Catalog",
-      "Workflows actually advertised by the Agent Mode runtime. This is a live, read-only projection rather than a second browser-side workflow registry.",
+  function renderTypedAgentWorkflows() {
+    const snapshot = state.typedSettings.workflows;
+    if (!snapshot) {
+      settingsPage(
+        "Agent Workflows",
+        "Loading workflow repository…",
+        "workflow",
+        [],
+      );
+      return;
+    }
+    const preferences = desktopCard(
+      "Workflow Runtime",
+      "SQLite is the server-native authoring authority. Definitions are path-free, revisioned, validated, and reloaded into runtime discovery.",
     );
+    const cleanup = typedToggle(
+      "Include Session Cleanup Guidance",
+      snapshot.includeSessionCleanupGuidance,
+    );
+    cleanup.input.addEventListener("change", () =>
+      mutateDomain(
+        "workflows",
+        cleanup.input,
+        () =>
+          api("api/v1/workflows/preferences", {
+            method: "PATCH",
+            body: JSON.stringify({
+              expectedRevision: snapshot.revision,
+              includeSessionCleanupGuidance: cleanup.input.checked,
+            }),
+          }),
+        (value) => {
+          state.typedSettings.workflows = value;
+        },
+      ),
+    );
+    preferences.append(
+      desktopRow(
+        "Include Session Cleanup Guidance",
+        "Appends bounded cleanup guidance during workflow prompt assembly.",
+        cleanup.toggle,
+      ),
+      element(
+        "div",
+        "inline-message warning",
+        "Hidden workflows are excluded from new discovery. Sessions do not persist a durable workflow association, so hidden-workflow lookup fails closed; re-enable the workflow before starting a new run.",
+      ),
+    );
+    const reload = element("button", "secondary-button", "Reload & Revalidate");
+    reload.type = "button";
+    reload.addEventListener("click", () =>
+      mutateDomain(
+        "workflows",
+        reload,
+        () =>
+          api("api/v1/workflows/reload", {
+            method: "POST",
+            body: JSON.stringify({ expectedRevision: snapshot.revision }),
+          }),
+        (value) => {
+          state.typedSettings.workflows = value;
+        },
+      ),
+    );
+    preferences.append(reload);
+
+    const catalog = desktopCard(
+      "Workflow Catalog",
+      "Feature, hide, clone, edit, and delete server-native definitions. Built-ins remain immutable; cloning creates a custom definition.",
+    );
+    const featured = snapshot.workflows
+      .filter((workflow) => workflow.featuredOrder !== null)
+      .sort((left, right) => left.featuredOrder - right.featuredOrder);
+    function reorderFeatured(workflowID, delta, control) {
+      const ids = featured.map((workflow) => workflow.workflowID);
+      const index = ids.indexOf(workflowID);
+      const next = index + delta;
+      if (index < 0 || next < 0 || next >= ids.length) return;
+      [ids[index], ids[next]] = [ids[next], ids[index]];
+      mutateDomain(
+        "workflows",
+        control,
+        () =>
+          api("api/v1/workflows/reorder", {
+            method: "POST",
+            body: JSON.stringify({
+              expectedRevision: snapshot.revision,
+              featuredWorkflowIDs: ids,
+            }),
+          }),
+        (value) => {
+          state.typedSettings.workflows = value;
+        },
+      );
+    }
     const list = element("div", "workflow-settings-list");
-    workflows.forEach((workflow) => {
-      const row = element("div", "desktop-setting-row compact");
-      const copy = element("div", "desktop-setting-copy");
+    snapshot.workflows.forEach((workflow) => {
+      const details = element("details", "workflow-editor-row");
+      const summary = element("summary", "workflow-editor-summary");
+      const copy = element("span", "desktop-setting-copy");
       copy.append(
         element("strong", "", workflow.name),
-        element("small", "", workflow.workflowID),
+        element(
+          "small",
+          "",
+          `${humanize(workflow.source)} · revision ${workflow.rowRevision}${workflow.featuredOrder !== null ? ` · featured ${workflow.featuredOrder + 1}` : ""}`,
+        ),
       );
-      row.append(
+      summary.append(
         copy,
         element(
           "span",
-          workflow.enabled ? "connection-badge connected" : "connection-badge",
-          workflow.enabled ? "Enabled" : "Disabled",
+          workflow.visible ? "connection-badge connected" : "connection-badge",
+          workflow.visible ? "Visible" : "Hidden",
         ),
       );
-      list.append(row);
+      details.append(summary);
+      const actions = element("div", "workflow-inline-actions");
+      const visible = element(
+        "button",
+        "secondary-button",
+        workflow.visible ? "Hide" : "Show",
+      );
+      visible.type = "button";
+      visible.addEventListener("click", () =>
+        mutateDomain(
+          "workflows",
+          visible,
+          () =>
+            api(
+              `api/v1/workflows/${encodeURIComponent(workflow.workflowID)}/visibility`,
+              {
+                method: "PATCH",
+                body: JSON.stringify({
+                  expectedRevision: snapshot.revision,
+                  expectedRowRevision: workflow.rowRevision,
+                  visible: !workflow.visible,
+                }),
+              },
+            ),
+          (value) => {
+            state.typedSettings.workflows = value;
+          },
+        ),
+      );
+      const clone = element("button", "secondary-button", "Clone");
+      clone.type = "button";
+      clone.addEventListener("click", () =>
+        mutateDomain(
+          "workflows",
+          clone,
+          () =>
+            api(
+              `api/v1/workflows/${encodeURIComponent(workflow.workflowID)}/clone`,
+              {
+                method: "POST",
+                body: JSON.stringify({
+                  expectedRevision: snapshot.revision,
+                  expectedSourceRowRevision: workflow.rowRevision,
+                  name: `${workflow.name} Copy`,
+                }),
+              },
+            ),
+          (value) => {
+            state.typedSettings.workflows = value;
+          },
+        ),
+      );
+      const feature = element(
+        "button",
+        "secondary-button",
+        workflow.featuredOrder === null ? "Feature" : "Unfeature",
+      );
+      feature.type = "button";
+      feature.addEventListener("click", () => {
+        const ids = featured
+          .map((item) => item.workflowID)
+          .filter((id) => id !== workflow.workflowID);
+        if (workflow.featuredOrder === null) ids.push(workflow.workflowID);
+        mutateDomain(
+          "workflows",
+          feature,
+          () =>
+            api("api/v1/workflows/reorder", {
+              method: "POST",
+              body: JSON.stringify({
+                expectedRevision: snapshot.revision,
+                featuredWorkflowIDs: ids,
+              }),
+            }),
+          (value) => {
+            state.typedSettings.workflows = value;
+          },
+        );
+      });
+      actions.append(visible, clone, feature);
+      if (workflow.featuredOrder !== null) {
+        const earlier = element("button", "secondary-button", "Move Earlier");
+        earlier.type = "button";
+        earlier.disabled = workflow.featuredOrder === 0;
+        earlier.addEventListener("click", () =>
+          reorderFeatured(workflow.workflowID, -1, earlier),
+        );
+        const later = element("button", "secondary-button", "Move Later");
+        later.type = "button";
+        later.disabled = workflow.featuredOrder === featured.length - 1;
+        later.addEventListener("click", () =>
+          reorderFeatured(workflow.workflowID, 1, later),
+        );
+        actions.append(earlier, later);
+      }
+      details.append(actions);
+      if (workflow.source === "custom") {
+        const form = element("form", "workflow-definition-form");
+        const name = document.createElement("input");
+        name.type = "text";
+        name.maxLength = 128;
+        name.value = workflow.name;
+        name.setAttribute("aria-label", `Workflow name for ${workflow.name}`);
+        const definition = document.createElement("textarea");
+        definition.rows = 10;
+        definition.maxLength = 262144;
+        definition.value = workflow.definition;
+        definition.setAttribute(
+          "aria-label",
+          `Markdown definition for ${workflow.name}`,
+        );
+        const enabled = typedToggle(
+          `Enable ${workflow.name}`,
+          workflow.enabled,
+        );
+        const featuredToggle = typedToggle(
+          `Feature ${workflow.name}`,
+          workflow.featuredOrder !== null,
+        );
+        const save = element("button", "primary-button", "Save Workflow");
+        save.type = "submit";
+        const remove = element("button", "danger-button", "Delete");
+        remove.type = "button";
+        remove.addEventListener("click", async () => {
+          if (
+            !(await confirmAction({
+              title: "Delete workflow?",
+              message: `Delete ${workflow.name}?`,
+              label: "Delete",
+              returnFocus: remove,
+            }))
+          )
+            return;
+          mutateDomain(
+            "workflows",
+            remove,
+            () =>
+              api(
+                `api/v1/workflows/${encodeURIComponent(workflow.workflowID)}`,
+                {
+                  method: "DELETE",
+                  body: JSON.stringify({
+                    expectedRevision: snapshot.revision,
+                    expectedRowRevision: workflow.rowRevision,
+                  }),
+                },
+              ),
+            (value) => {
+              state.typedSettings.workflows = value;
+            },
+          );
+        });
+        form.append(
+          desktopRow("Name", "Server-visible workflow name.", name),
+          definition,
+          desktopRow(
+            "Enabled",
+            "Admitted to runtime execution.",
+            enabled.toggle,
+          ),
+          desktopRow(
+            "Featured",
+            "Included in the ordered featured catalog.",
+            featuredToggle.toggle,
+          ),
+          save,
+          remove,
+        );
+        form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          mutateDomain(
+            "workflows",
+            save,
+            () =>
+              api(
+                `api/v1/workflows/${encodeURIComponent(workflow.workflowID)}`,
+                {
+                  method: "PATCH",
+                  body: JSON.stringify({
+                    expectedRevision: snapshot.revision,
+                    expectedRowRevision: workflow.rowRevision,
+                    name: name.value.trim(),
+                    definition: definition.value,
+                    enabled: enabled.input.checked,
+                    visible: workflow.visible,
+                    featured: featuredToggle.input.checked,
+                  }),
+                },
+              ),
+            (value) => {
+              state.typedSettings.workflows = value;
+            },
+          );
+        });
+        details.append(form);
+      } else {
+        details.append(
+          element(
+            "p",
+            "scope-footnote",
+            "Built-in definitions are immutable. Clone this workflow to edit a custom copy.",
+          ),
+        );
+      }
+      list.append(details);
     });
-    if (!workflows.length)
-      list.append(
-        element(
-          "p",
-          "empty-inline",
-          "No workflows are advertised by the server.",
+    catalog.append(list);
+
+    const create = desktopCard(
+      "New Custom Workflow",
+      "Create a path-free markdown definition in the server repository. Open Folder and Reveal remain desktop-only local filesystem actions.",
+    );
+    const createForm = element("form", "workflow-definition-form");
+    const name = document.createElement("input");
+    name.type = "text";
+    name.maxLength = 128;
+    name.placeholder = "Workflow name";
+    name.setAttribute("aria-label", "New workflow name");
+    const definition = document.createElement("textarea");
+    definition.rows = 10;
+    definition.maxLength = 262144;
+    definition.placeholder =
+      "# Workflow\n\n## Purpose\nDescribe the workflow.\n\n## Instructions\n- Add bounded steps.";
+    definition.setAttribute("aria-label", "New workflow markdown definition");
+    const save = element("button", "primary-button", "Create Workflow");
+    save.type = "submit";
+    if (
+      snapshot.workflows.filter((workflow) => workflow.source === "custom")
+        .length >= 200
+    ) {
+      [name, definition, save].forEach((control) =>
+        setDisabledReason(
+          control,
+          true,
+          "The server supports at most 200 custom workflows.",
         ),
       );
-    catalog.append(list);
-    const desktopBoundary = informationalCard(
-      "Desktop Management Boundary",
-      "The desktop page can mutate local markdown workflow files. The web server currently exposes workflow discovery, not safe CRUD for that filesystem.",
-      [
-        [
-          "Cleanup guidance",
-          "Runtime-managed",
-          "Desktop can append session-cleanup instructions to built-in prompts.",
-        ],
-        [
-          "Featured order",
-          "Not portal-editable",
-          "Desktop can add, remove, and reorder featured workflows.",
-        ],
-        [
-          "Built-in workflows",
-          "Catalog only",
-          "Desktop can show, hide, feature, and clone built-ins.",
-        ],
-        [
-          "Custom workflows",
-          "Not portal-editable",
-          "Desktop can create, reload, reveal, clone, and delete markdown files.",
-        ],
-      ],
-    );
+    }
+    createForm.append(name, definition, save);
+    createForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      mutateDomain(
+        "workflows",
+        save,
+        () =>
+          api("api/v1/workflows", {
+            method: "POST",
+            body: JSON.stringify({
+              expectedRevision: snapshot.revision,
+              name: name.value.trim(),
+              definition: definition.value,
+              enabled: true,
+              visible: true,
+              featured: false,
+            }),
+          }),
+        (value) => {
+          state.typedSettings.workflows = value;
+        },
+      );
+    });
+    create.append(createForm);
     settingsPage(
       "Agent Workflows",
-      "Review the workflow catalog the shared server can execute and the desktop-only authoring boundary.",
+      "Manage the server-native workflow repository and its runtime visibility.",
       "workflow",
-      [catalog, desktopBoundary],
+      [preferences, catalog, create],
     );
   }
 
-  function renderContextBuilder() {
-    const about = desktopCard(
-      "About",
-      "Context Builder explores the codebase, curates relevant files, and can rewrite, augment, or preserve the prompt before an agent begins.",
+  function renderTypedContextBuilder() {
+    const snapshot = state.typedSettings.contextBuilder;
+    if (!snapshot) {
+      settingsPage(
+        "Context Builder",
+        "Loading typed Context Builder settings…",
+        "context",
+        [],
+      );
+      return;
+    }
+    const projectID = state.agent.selectedProjectID;
+    const projectOverride =
+      Boolean(projectID) && snapshot.projectMode === "projectOverride";
+    const scope = desktopCard(
+      "Scope",
+      "Stored defaults resolve explicit invocation override → project override → global setting → typed default.",
     );
-    const models = element("button", "secondary-button", "Open Agent Models");
-    models.type = "button";
-    models.dataset.action = "open-agent-models";
-    models.addEventListener("click", () => navigateToSettings("agent-models"));
-    about.append(
-      element(
-        "p",
-        "card-subtitle",
-        "As on desktop, agent and model selection belong in Agent Models rather than being duplicated here.",
+    if (projectID) {
+      const mode = typedSelect(
+        "Context Builder scope",
+        [
+          ["inheritGlobal", "Use global settings"],
+          ["projectOverride", "Use project override"],
+        ],
+        snapshot.projectMode,
+      );
+      mode.addEventListener("change", () =>
+        mutateDomain(
+          "contextBuilder",
+          mode,
+          () =>
+            api(
+              `api/v1/projects/${encodeURIComponent(projectID)}/settings/context-builder`,
+              {
+                method: "PATCH",
+                body: JSON.stringify({
+                  expectedRevision: snapshot.projectRevision,
+                  mode: mode.value,
+                  profile:
+                    mode.value === "projectOverride"
+                      ? snapshot.globalProfile
+                      : null,
+                }),
+              },
+            ),
+          (value) => {
+            state.typedSettings.contextBuilder = value;
+          },
+        ),
+      );
+      const copy = element(
+        "button",
+        "secondary-button",
+        "Copy Global to Project",
+      );
+      copy.type = "button";
+      copy.addEventListener("click", () =>
+        mutateDomain(
+          "contextBuilder",
+          copy,
+          () =>
+            api(
+              `api/v1/projects/${encodeURIComponent(projectID)}/settings/context-builder/copy-global`,
+              {
+                method: "POST",
+                body: JSON.stringify({
+                  expectedGlobalRevision: snapshot.globalRevision,
+                  expectedProjectRevision: snapshot.projectRevision,
+                }),
+              },
+            ),
+          (value) => {
+            state.typedSettings.contextBuilder = value;
+          },
+        ),
+      );
+      scope.append(
+        desktopRow(
+          "Project defaults",
+          "Inherited projects track global settings immediately.",
+          mode,
+        ),
+        copy,
+      );
+    }
+
+    const profile = JSON.parse(
+      JSON.stringify(
+        projectOverride
+          ? snapshot.projectProfile || snapshot.effectiveProfile
+          : snapshot.globalProfile,
       ),
-      models,
     );
-    const shared = informationalCard(
-      "Desktop Shared Settings",
-      "The desktop controls below are documented here for parity. The portal will not persist them until the shared Context Builder runtime exposes a revisioned settings authority.",
+    const settings = desktopCard(
+      projectOverride ? "Project Defaults" : "Global Defaults",
+      "These values are consumed by portal and MCP Context Builder runs, including origin-specific clarifying questions and follow-up Oracle analysis.",
+    );
+    const form = element("form", "typed-settings-form");
+    const budget = document.createElement("input");
+    budget.type = "number";
+    budget.min = "10000";
+    budget.max = "200000";
+    budget.step = "5000";
+    budget.value = String(profile.budget);
+    budget.setAttribute("aria-label", "Context Budget");
+    const enhancement = typedSelect(
+      "Prompt Enhancement",
       [
-        [
-          "Context Budget",
-          "10k–200k · default 160k",
-          "Target selected-context size in 5k steps.",
-        ],
-        [
-          "Prompt Enhancement",
-          "Rewrite / Augment / Preserve",
-          "Controls whether the submitted prompt is replaced, extended, or left intact.",
-        ],
-        [
-          "Question Timeout",
-          "30 sec / 1 min / 2 min / 5 min",
-          "Used by clarifying questions and Agent Mode ask_user interactions.",
-        ],
+        ["rewrite", "Rewrite"],
+        ["augment", "Augment"],
+        ["preserve", "Preserve"],
       ],
+      profile.enhancementMode,
     );
-    const uiRuns = informationalCard(
-      "UI Runs",
-      "Controls used when Context Builder starts from the desktop UI.",
+    const timeout = typedSelect(
+      "Question Timeout",
       [
-        [
-          "Allow Clarifying Questions",
-          "Desktop-managed",
-          "Agent may ask focused questions before continuing.",
-        ],
-        [
-          "Follow-up Analysis",
-          "Desktop-managed",
-          "Optionally runs a separate Oracle plan, review, or question call.",
-        ],
-        [
-          "Analysis Budget",
-          "40k–200k",
-          "Appears only when follow-up analysis is enabled; uses the Oracle model from Agent Models.",
-        ],
-        [
-          "Custom Instructions",
-          "Prompt collection",
-          "Desktop manages selectable prompts, not one undifferentiated text field.",
-        ],
+        ["30", "30 seconds"],
+        ["60", "1 minute"],
+        ["120", "2 minutes"],
+        ["300", "5 minutes"],
       ],
+      String(profile.questionTimeoutSeconds),
     );
-    const mcpRuns = informationalCard(
-      "MCP Runs",
-      "Controls used when another agent invokes the Context Builder MCP tool.",
+    const portalQuestions = typedToggle(
+      "Allow Clarifying Questions for portal runs",
+      profile.portalClarifyingQuestions,
+    );
+    const mcpQuestions = typedToggle(
+      "Allow Clarifying Questions for MCP runs",
+      profile.mcpClarifyingQuestions,
+    );
+    const followUp = typedSelect(
+      "Follow-up Analysis",
       [
-        [
-          "Allow Clarifying Questions",
-          "Runtime-managed",
-          "The caller must be watching RepoPrompt and respond before the shared question timeout.",
-        ],
+        ["disabled", "Disabled"],
+        ["plan", "Plan"],
+        ["review", "Review"],
+        ["question", "Question"],
+      ],
+      profile.followUpAnalysis,
+    );
+    const followUpBudget = document.createElement("input");
+    followUpBudget.type = "number";
+    followUpBudget.min = "40000";
+    followUpBudget.max = "200000";
+    followUpBudget.step = "5000";
+    followUpBudget.value = String(profile.followUpBudget);
+    followUpBudget.setAttribute("aria-label", "Follow-up Analysis Budget");
+    form.append(
+      desktopRow("Context Budget", "10k–200k in 5k steps.", budget),
+      desktopRow(
+        "Prompt Enhancement",
+        "Rewrite, augment, or preserve caller instructions.",
+        enhancement,
+      ),
+      desktopRow(
+        "Question Timeout",
+        "Applied to ask_user settlement.",
+        timeout,
+      ),
+      desktopRow(
+        "Portal Clarifying Questions",
+        "Used only for authenticated portal-origin runs.",
+        portalQuestions.toggle,
+      ),
+      desktopRow(
+        "MCP Clarifying Questions",
+        "Used only for MCP-origin runs.",
+        mcpQuestions.toggle,
+      ),
+      desktopRow(
+        "Follow-up Analysis",
+        "Runs Oracle after proposal and before committing selection.",
+        followUp,
+      ),
+      desktopRow("Analysis Budget", "40k–200k in 5k steps.", followUpBudget),
+    );
+    const prompts = element("div", "saved-prompt-list");
+    const promptRows = [];
+    function appendPromptRow(prompt) {
+      const row = element("fieldset", "saved-prompt-row");
+      const name = document.createElement("input");
+      name.type = "text";
+      name.maxLength = 128;
+      name.value = prompt.name;
+      name.setAttribute("aria-label", "Saved Context Builder prompt name");
+      const instructions = document.createElement("textarea");
+      instructions.rows = 4;
+      instructions.maxLength = 16384;
+      instructions.value = prompt.instructions;
+      instructions.setAttribute(
+        "aria-label",
+        `Instructions for ${prompt.name || "saved prompt"}`,
+      );
+      const enabled = typedToggle(
+        `Enable ${prompt.name || "saved prompt"}`,
+        prompt.enabled,
+      );
+      const remove = element("button", "danger-button", "Remove");
+      remove.type = "button";
+      remove.addEventListener("click", () => {
+        row.remove();
+        promptRows.splice(promptRows.indexOf(record), 1);
+      });
+      const record = {
+        promptID: prompt.promptID,
+        name,
+        instructions,
+        enabled: enabled.input,
+      };
+      promptRows.push(record);
+      row.append(name, instructions, enabled.toggle, remove);
+      prompts.append(row);
+    }
+    (profile.prompts || []).forEach(appendPromptRow);
+    const addPrompt = element("button", "secondary-button", "Add Saved Prompt");
+    addPrompt.type = "button";
+    addPrompt.addEventListener("click", () => {
+      if (promptRows.length >= 100) {
+        toast("Context Builder supports at most 100 saved prompts.", true);
+        return;
+      }
+      appendPromptRow({
+        promptID:
+          window.crypto?.randomUUID?.() ||
+          `00000000-0000-4000-8000-${String(Date.now()).slice(-12).padStart(12, "0")}`,
+        name: "",
+        instructions: "",
+        enabled: true,
+      });
+    });
+    const save = element(
+      "button",
+      "primary-button",
+      "Save Context Builder Settings",
+    );
+    save.type = "submit";
+    form.append(
+      element("h3", "settings-subheading", "Saved Prompt Collection"),
+      prompts,
+      addPrompt,
+      save,
+    );
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const nextProfile = {
+        budget: Number(budget.value),
+        enhancementMode: enhancement.value,
+        questionTimeoutSeconds: Number(timeout.value),
+        portalClarifyingQuestions: portalQuestions.input.checked,
+        mcpClarifyingQuestions: mcpQuestions.input.checked,
+        followUpAnalysis: followUp.value,
+        followUpBudget: Number(followUpBudget.value),
+        prompts: promptRows.map((row, order) => ({
+          promptID: row.promptID,
+          name: row.name.value.trim(),
+          instructions: row.instructions.value.trim(),
+          enabled: row.enabled.checked,
+          order,
+        })),
+      };
+      mutateDomain(
+        "contextBuilder",
+        save,
+        () =>
+          api(
+            projectOverride
+              ? `api/v1/projects/${encodeURIComponent(projectID)}/settings/context-builder`
+              : "api/v1/settings/context-builder",
+            {
+              method: "PATCH",
+              body: JSON.stringify(
+                projectOverride
+                  ? {
+                      expectedRevision: snapshot.projectRevision,
+                      mode: "projectOverride",
+                      profile: nextProfile,
+                    }
+                  : {
+                      expectedRevision: snapshot.globalRevision,
+                      profile: nextProfile,
+                    },
+              ),
+            },
+          ),
+        (value) => {
+          state.typedSettings.contextBuilder = value;
+        },
+      );
+    });
+    settings.append(form);
+
+    const run = desktopCard(
+      "Manual Portal Run",
+      "Run Context Builder against an existing session. Stored portal defaults apply; enabled saved-prompt checkboxes are sent as the bounded selectedPromptIDs invocation field.",
+    );
+    const sessions = (state.bootstrap?.sessions || []).filter(
+      (session) => session.projectId === projectID,
+    );
+    if (sessions.length) {
+      const runForm = element(
+        "form",
+        "typed-settings-form context-builder-run-form",
+      );
+      const session = typedSelect(
+        "Context Builder session",
+        sessions.map((item) => [item.sessionId, item.title]),
+        state.agent.selectedSessionID || sessions[0].sessionId,
+      );
+      const instructions = document.createElement("textarea");
+      instructions.rows = 8;
+      instructions.maxLength = 64000;
+      instructions.placeholder = "Describe the task and the context you need.";
+      instructions.setAttribute("aria-label", "Context Builder instructions");
+      const selectedPrompts = element("fieldset", "manual-prompt-selection");
+      selectedPrompts.append(element("legend", "", "Saved prompts"));
+      (snapshot.effectiveProfile.prompts || [])
+        .filter((prompt) => prompt.enabled)
+        .forEach((prompt) => {
+          const label = element("label", "check-row");
+          const input = document.createElement("input");
+          input.type = "checkbox";
+          input.value = prompt.promptID;
+          input.checked = true;
+          label.append(input, document.createTextNode(prompt.name));
+          selectedPrompts.append(label);
+        });
+      const submit = element("button", "primary-button", "Run Context Builder");
+      submit.type = "submit";
+      runForm.append(
+        desktopRow(
+          "Session",
+          "Selection revision is loaded immediately before the run.",
+          session,
+        ),
+        instructions,
+        selectedPrompts,
+        submit,
+      );
+      runForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const sessionID = session.value;
+        submit.disabled = true;
+        try {
+          const selection = await api(
+            `api/v1/sessions/${encodeURIComponent(sessionID)}/selection`,
+          );
+          state.typedSettings.selections[sessionID] = selection;
+          const result = await api(
+            `api/v1/sessions/${encodeURIComponent(sessionID)}/context-builder`,
+            {
+              method: "POST",
+              body: JSON.stringify({
+                expectedSelectionRevision: selection.revision,
+                instructions: instructions.value.trim(),
+                selectedPromptIDs: [
+                  ...selectedPrompts.querySelectorAll(
+                    'input[type="checkbox"]:checked',
+                  ),
+                ].map((input) => input.value),
+              }),
+            },
+          );
+          state.typedSettings.contextBuilderResult = result;
+          state.typedSettings.selections[sessionID] = {
+            ...selection,
+            entries: result.entries,
+            revision: result.revision,
+            bindingRevision: result.bindingRevision,
+          };
+          announce("Context Builder run completed");
+          renderRoute();
+        } catch (error) {
+          toast(error.message, true);
+        } finally {
+          submit.disabled = false;
+        }
+      });
+      run.append(runForm);
+      if (state.typedSettings.contextBuilderResult) {
+        const result = state.typedSettings.contextBuilderResult;
+        run.append(
+          informationalCard(
+            "Latest Result",
+            "The proposal and optional follow-up are durable server artifacts.",
+            [
+              ["Selection revision", String(result.revision)],
+              ["Proposal", result.response || "Completed"],
+              ["Follow-up", result.followUpResponse || "Disabled"],
+            ],
+          ),
+        );
+      }
+    } else {
+      run.append(
+        element(
+          "p",
+          "empty-inline",
+          "Create a session in the active project before running Context Builder manually.",
+        ),
+      );
+    }
+    settingsPage(
+      "Context Builder",
+      "Configure typed global/project defaults, saved prompts, and authenticated manual portal runs.",
+      "context",
+      [scope, settings, run],
+    );
+  }
+
+  function renderPortalAppearance() {
+    const preference = portalAppearance();
+    const card = desktopCard(
+      "Browser Appearance",
+      "These controls are browser-local and apply immediately. They never enter server settings, audit rows, or session state.",
+    );
+    const theme = typedSelect(
+      "Portal theme",
+      [
+        ["system", "System"],
+        ["light", "Light"],
+        ["dark", "Dark"],
+      ],
+      preference.theme,
+    );
+    const density = typedSelect(
+      "Portal text density",
+      [
+        ["normal", "Normal"],
+        ["large", "Large"],
+        ["extraLarge", "Extra Large"],
+      ],
+      preference.density,
+    );
+    function save() {
+      savePortalAppearance({ theme: theme.value, density: density.value });
+    }
+    theme.addEventListener("change", save);
+    density.addEventListener("change", save);
+    card.append(
+      desktopRow("Theme", "System, light, or dark browser rendering.", theme),
+      desktopRow(
+        "Text Density",
+        "Scales portal typography without changing desktop text-size settings.",
+        density,
+      ),
+    );
+    const boundaries = informationalCard(
+      "Desktop Appearance Boundary",
+      "Desktop transcript, editor, tooltip, spell-check, and @-mention settings control SwiftUI components that do not exist in this portal.",
+      [
+        ["File-change collapsing", "Intentionally omitted"],
+        ["Tooltips / timestamps", "Intentionally omitted"],
+        ["Spell checking", "Browser-owned"],
+        ["@-mention menu and picker", "Desktop-only"],
       ],
     );
     settingsPage(
-      "Context Builder",
-      "Review the canonical desktop settings map and the current shared-server authority boundary.",
-      "context",
-      [about, shared, uiRuns, mcpRuns],
-      recommendation(
-        "info",
-        "No decorative Context Builder controls",
-        "Previous portal fields were stored but never consumed by Context Builder; they are now shown honestly as pending runtime support.",
+      "Portal Appearance",
+      "Choose browser-native theme and text density without copying macOS preference keys.",
+      "appearance",
+      [card, boundaries],
+    );
+  }
+
+  function renderAdvanced() {
+    const snapshot = state.typedSettings.advanced;
+    if (!snapshot) {
+      settingsPage(
+        "Advanced",
+        "Loading canonical server settings…",
+        "sliders",
+        [],
+      );
+      return;
+    }
+    const settings = snapshot.settings;
+    const card = desktopCard(
+      "Server Scanning, Code Maps & History",
+      `Revision ${snapshot.revision} is also scanner policy generation ${snapshot.scannerPolicyGeneration}; updates invalidate subsequent scans by generation.`,
+    );
+    card.append(
+      element(
+        "div",
+        "inline-message warning",
+        "Ignore and symlink changes can widen repository scanning. Review project root confinement before saving.",
       ),
+    );
+    const toggles = {
+      respectRepoIgnore: typedToggle(
+        "Respect .repo_ignore rules",
+        settings.respectRepoIgnore,
+      ),
+      respectCursorIgnore: typedToggle(
+        "Respect .cursorignore rules",
+        settings.respectCursorIgnore,
+      ),
+      respectNestedIgnoreFiles: typedToggle(
+        "Respect nested ignore files",
+        settings.respectNestedIgnoreFiles,
+      ),
+      followSymbolicLinks: typedToggle(
+        "Follow symbolic links",
+        settings.followSymbolicLinks,
+      ),
+      showEmptyFolders: typedToggle(
+        "Show empty folders",
+        settings.showEmptyFolders,
+      ),
+      codeMapsEnabled: typedToggle(
+        "Enable Code Maps",
+        settings.codeMapsEnabled,
+      ),
+    };
+    Object.entries(toggles).forEach(([key, toggle]) =>
+      card.append(
+        desktopRow(
+          toggle.input.getAttribute("aria-label"),
+          key === "codeMapsEnabled"
+            ? "Disabling rejects code-map generation and suppresses tool admission."
+            : "Consumed by the canonical project scanner.",
+          toggle.toggle,
+        ),
+      ),
+    );
+    const history = document.createElement("input");
+    history.type = "number";
+    history.min = "0";
+    history.max = "60";
+    history.step = "1";
+    history.value = String(settings.historyIdleThresholdMinutes);
+    history.setAttribute("aria-label", "Default history idle threshold");
+    card.append(
+      desktopRow(
+        "History Idle Threshold",
+        "0–60 minutes; explicit history query overrides still win.",
+        history,
+      ),
+    );
+    const save = element("button", "primary-button", "Save Advanced Settings");
+    save.type = "button";
+    save.addEventListener("click", () => {
+      const historyIdleThresholdMinutes = Number(history.value);
+      if (
+        !Number.isInteger(historyIdleThresholdMinutes) ||
+        historyIdleThresholdMinutes < 0 ||
+        historyIdleThresholdMinutes > 60
+      ) {
+        toast(
+          "History idle threshold must be an integer from 0 through 60.",
+          true,
+        );
+        return;
+      }
+      mutateDomain(
+        "advanced",
+        save,
+        () =>
+          api("api/v1/settings/advanced", {
+            method: "PATCH",
+            body: JSON.stringify({
+              expectedRevision: snapshot.revision,
+              settings: {
+                ...Object.fromEntries(
+                  Object.entries(toggles).map(([key, toggle]) => [
+                    key,
+                    toggle.input.checked,
+                  ]),
+                ),
+                historyIdleThresholdMinutes,
+              },
+            }),
+          }),
+        (value) => {
+          state.typedSettings.advanced = value;
+        },
+      );
+    });
+    card.append(save);
+    const boundary = informationalCard(
+      "Desktop Utility Boundaries",
+      "These local desktop integrations have no safe or useful server-setting equivalent and remain input-free.",
+      [
+        ["Prompt packaging", "Desktop Copy / built-in Chat only"],
+        ["Keyboard shortcut link", "Intentionally omitted"],
+        ["repoprompt:// URL opener", "macOS-only"],
+        ["Saved prompt import/export/reset", "Desktop store only"],
+      ],
+    );
+    settingsPage(
+      "Advanced",
+      "Configure only canonical settings consumed by shared-server runtime operations.",
+      "sliders",
+      [card, boundary],
     );
   }
 
@@ -2762,8 +3935,8 @@
         ],
         [
           "Oracle model presets",
-          "No server CRUD authority",
-          "The portal does not store inert preset toggles.",
+          "Typed server repository",
+          "Manage named chat/plan/review routes on the Model Presets page.",
         ],
       ],
     );
@@ -2779,7 +3952,7 @@
     const tools = state.bootstrap?.tools || [];
     const card = desktopCard(
       "Advertised MCP Tools",
-      "The canonical tool catalog comes from the same server runtime that registers the tools. Portal toggles are intentionally absent until server admission policy exposes a real mutation API.",
+      "The canonical tool catalog comes from the same server runtime that registers the tools. Admission remains server policy, so no browser toggles are rendered.",
     );
     const toolbar = element("div", "tool-catalog-toolbar");
     const searchLabel = element("label", "tool-search-field");
@@ -2918,185 +4091,497 @@
     );
   }
 
-  function renderModelPresets() {
-    const card = informationalCard(
-      "Desktop Model Presets",
-      "Desktop RepoPrompt owns a revisioned preset store. The shared server does not currently advertise that store or a CRUD contract, so the portal no longer counts an unused JSON setting as if presets existed.",
-      [
-        [
-          "Preset fields",
-          "Name, model, description",
-          "Each preset can also map supported Oracle/chat modes.",
-        ],
-        [
-          "Create",
-          "Add / Create Default",
-          "Desktop validates and persists a new preset.",
-        ],
-        [
-          "Edit",
-          "Rename and reconfigure",
-          "Desktop edits model, description, and mode mappings.",
-        ],
-        [
-          "Delete",
-          "Supported",
-          "Desktop removes the selected preset with confirmation.",
-        ],
-        [
-          "Temporary hidden state",
-          "Desktop banner",
-          "Desktop explains when presets are temporarily unavailable.",
-        ],
-      ],
+  function renderTypedModelPresets() {
+    const snapshot = state.typedSettings.modelPresets;
+    if (!snapshot) {
+      settingsPage("Model Presets", "Loading model presets…", "model", []);
+      return;
+    }
+    const card = desktopCard(
+      "Oracle Model Presets",
+      "This ordered revisioned collection is consumed by list_models, ask_oracle, and oracle_send. Disabled or unavailable targets fail explicitly.",
     );
+    const form = element("form", "typed-settings-form");
+    const rowsContainer = element("div", "model-preset-rows");
+    const rows = [];
+    const emptyState = element(
+      "p",
+      "empty-inline",
+      "No model presets configured. Create one from the advertised provider catalog.",
+    );
+    function syncPresetRows() {
+      rows.forEach((row, index) => {
+        row.earlier.disabled = index === 0;
+        row.later.disabled = index === rows.length - 1;
+        rowsContainer.append(row.details);
+      });
+      if (rows.length === 0) {
+        if (!emptyState.isConnected) rowsContainer.append(emptyState);
+      } else {
+        emptyState.remove();
+      }
+    }
+    function appendPreset(preset) {
+      const details = element("details", "model-preset-row");
+      const summary = element("summary", "workflow-editor-summary");
+      summary.append(
+        element("strong", "", preset.name || "New Preset"),
+        element(
+          "span",
+          preset.enabled ? "connection-badge connected" : "connection-badge",
+          preset.enabled ? "Enabled" : "Disabled",
+        ),
+      );
+      const name = document.createElement("input");
+      name.type = "text";
+      name.maxLength = 128;
+      name.value = preset.name;
+      name.setAttribute("aria-label", "Model preset name");
+      const description = document.createElement("textarea");
+      description.rows = 3;
+      description.maxLength = 1024;
+      description.value = preset.description || "";
+      description.setAttribute(
+        "aria-label",
+        `Description for ${preset.name || "preset"}`,
+      );
+      const target = typedSelect(
+        `Model target for ${preset.name || "preset"}`,
+        agentTargetChoices().filter(([value]) => value),
+        agentTargetValue(preset.target),
+      );
+      const enabled = typedToggle(
+        `Enable ${preset.name || "preset"}`,
+        preset.enabled,
+      );
+      const availability = element("fieldset", "preset-availability");
+      availability.append(element("legend", "", "Available modes"));
+      const modeInputs = {};
+      ["chat", "plan", "review"].forEach((mode) => {
+        const label = element("label", "check-row");
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.checked = preset.availability.includes(mode);
+        modeInputs[mode] = input;
+        label.append(input, document.createTextNode(humanize(mode)));
+        availability.append(label);
+      });
+      const actions = element("div", "workflow-inline-actions");
+      const earlier = element("button", "secondary-button", "Move Earlier");
+      earlier.type = "button";
+      const later = element("button", "secondary-button", "Move Later");
+      later.type = "button";
+      const remove = element("button", "danger-button", "Delete");
+      remove.type = "button";
+      const record = {
+        presetID: preset.presetID,
+        name,
+        description,
+        target,
+        enabled: enabled.input,
+        modeInputs,
+        details,
+        earlier,
+        later,
+      };
+      earlier.addEventListener("click", () => {
+        const index = rows.indexOf(record);
+        if (index <= 0) return;
+        [rows[index - 1], rows[index]] = [rows[index], rows[index - 1]];
+        syncPresetRows();
+      });
+      later.addEventListener("click", () => {
+        const index = rows.indexOf(record);
+        if (index < 0 || index >= rows.length - 1) return;
+        [rows[index], rows[index + 1]] = [rows[index + 1], rows[index]];
+        syncPresetRows();
+      });
+      remove.addEventListener("click", async () => {
+        if (
+          !(await confirmAction({
+            title: "Delete model preset?",
+            message: `Delete ${name.value.trim() || preset.name || "this model preset"}?`,
+            label: "Delete",
+            returnFocus: remove,
+          }))
+        )
+          return;
+        const index = rows.indexOf(record);
+        if (index < 0) return;
+        rows.splice(index, 1);
+        details.remove();
+        syncPresetRows();
+      });
+      actions.append(earlier, later, remove);
+      details.append(
+        summary,
+        desktopRow("Name", "Unique display and persisted name.", name),
+        description,
+        desktopRow("Provider / Model", "Exact advertised target.", target),
+        desktopRow(
+          "Enabled",
+          "Available to MCP model resolution.",
+          enabled.toggle,
+        ),
+        availability,
+        actions,
+      );
+      rows.push(record);
+      syncPresetRows();
+    }
+    rowsContainer.append(emptyState);
+    snapshot.presets.forEach(appendPreset);
+    syncPresetRows();
+    const add = element("button", "secondary-button", "Add Preset");
+    add.type = "button";
+    add.addEventListener("click", () => {
+      if (rows.length >= 100) {
+        toast("Model Presets supports at most 100 entries.", true);
+        return;
+      }
+      const firstTarget =
+        agentTargetChoices().find(([value]) => value)?.[0] || "";
+      if (!firstTarget) {
+        toast("No advertised model target is available.", true);
+        return;
+      }
+      appendPreset({
+        presetID:
+          window.crypto?.randomUUID?.() ||
+          `00000000-0000-4000-8000-${String(Date.now()).slice(-12).padStart(12, "0")}`,
+        name: "New Preset",
+        description: null,
+        target: agentTargetFromValue(firstTarget),
+        availability: ["chat", "plan", "review"],
+        enabled: true,
+      });
+    });
+    const save = element("button", "primary-button", "Save Model Presets");
+    save.type = "submit";
+    const formActions = element(
+      "div",
+      "workflow-inline-actions model-preset-actions",
+    );
+    formActions.append(add, save);
+    form.append(rowsContainer, formActions);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const missingAvailability = rows.find(
+        (row) => !Object.values(row.modeInputs).some((input) => input.checked),
+      );
+      if (missingAvailability) {
+        missingAvailability.details.open = true;
+        toast(
+          "Each model preset must be available in at least one mode.",
+          true,
+        );
+        return;
+      }
+      mutateDomain(
+        "modelPresets",
+        save,
+        () =>
+          api("api/v1/settings/model-presets", {
+            method: "PATCH",
+            body: JSON.stringify({
+              expectedRevision: snapshot.revision,
+              presets: rows.map((row, order) => ({
+                presetID: row.presetID,
+                name: row.name.value.trim(),
+                description: row.description.value.trim() || null,
+                target: agentTargetFromValue(row.target.value),
+                availability: Object.entries(row.modeInputs)
+                  .filter(([, input]) => input.checked)
+                  .map(([mode]) => mode),
+                enabled: row.enabled.checked,
+                order,
+              })),
+            }),
+          }),
+        (value) => {
+          state.typedSettings.modelPresets = value;
+        },
+      );
+    });
+    card.append(form);
     settingsPage(
       "Model Presets",
-      "Review the canonical desktop preset feature and the current shared-server boundary.",
+      "Manage named Oracle model routes and their chat, plan, and review availability.",
       "model",
       [card],
-      recommendation(
-        "info",
-        "Preset management is not available on this server",
-        "A real server-side preset authority is required before editable controls can be exposed.",
-      ),
     );
   }
 
-  function renderAPIProviders() {
-    const providers = orderedProviders().filter(
-      (provider) =>
-        provider.category === "apiProvider" && provider.deploymentAllowed,
+  function directProviderCard(provider) {
+    const configuration =
+      state.typedSettings.directConfigurations[provider.providerID];
+    const card = desktopCard(provider.displayName, provider.summary);
+    card.dataset.providerId = provider.providerID;
+    card.append(
+      desktopRow(
+        "Enabled",
+        "A direct provider becomes launchable only after deployment admission, validated connection, sanitized catalog, and registered runtime all agree.",
+        providerEnabledToggle(provider),
+      ),
     );
-    const cards = providers.map((provider) => {
-      const card = desktopCard(provider.displayName, provider.summary);
-      if (provider.authentication?.authenticated)
-        card.append(connectedProviderSummary(provider));
-      else {
-        const direct = (
-          provider.capabilities.authenticationMethods || []
-        ).filter((method) => directAuthenticationMethods.has(method));
-        if (direct.length) card.append(credentialForm(provider, direct));
-        else
-          card.append(
-            element(
-              "p",
-              "empty-inline",
-              "No browser-manageable authentication method is advertised.",
-            ),
-          );
+    if (configuration) {
+      const form = element("form", "typed-settings-form direct-provider-form");
+      const baseURL = document.createElement("input");
+      baseURL.type = "url";
+      baseURL.value = configuration.baseURL || "";
+      baseURL.placeholder = "https://provider.example/v1";
+      baseURL.setAttribute("aria-label", `${provider.displayName} base URL`);
+      const preferredModel = document.createElement("input");
+      preferredModel.type = "text";
+      preferredModel.maxLength = 256;
+      preferredModel.value = configuration.preferredModel || "";
+      preferredModel.placeholder = "Provider default / auto-detect";
+      preferredModel.setAttribute(
+        "aria-label",
+        `${provider.displayName} preferred model`,
+      );
+      const maximum = document.createElement("input");
+      maximum.type = "number";
+      maximum.min = "1";
+      maximum.max = "65536";
+      maximum.step = "1";
+      maximum.value = String(configuration.maximumOutputTokens);
+      maximum.setAttribute(
+        "aria-label",
+        `${provider.displayName} maximum output tokens`,
+      );
+      const headers = document.createElement("textarea");
+      headers.rows = 4;
+      headers.value = JSON.stringify(
+        configuration.customHeaders || {},
+        null,
+        2,
+      );
+      headers.setAttribute(
+        "aria-label",
+        `${provider.displayName} custom headers`,
+      );
+      if (provider.providerID === "customOpenAICompatible") {
+        form.append(
+          desktopRow(
+            "Public HTTPS Base URL",
+            "HTTPS port 443 only; DNS is re-resolved and pinned for every request. Private, local, metadata, mixed, redirecting, and credential-bearing endpoints fail closed.",
+            baseURL,
+          ),
+        );
       }
-      return card;
-    });
-    if (!cards.length)
-      cards.push(
-        informationalCard(
-          "No Direct API Provider Runtimes",
-          "The portal only renders providers backed by a deployed server runtime. Desktop supports a broader local API-provider catalog that cannot be emulated with inert key fields.",
-          [
-            [
-              "Desktop cloud providers",
-              "Anthropic, OpenAI, DeepSeek, Fireworks, xAI, Groq, Z.AI, Gemini",
-              "Each has provider-specific validation and model discovery.",
-            ],
-            [
-              "Desktop enterprise/local",
-              "Azure and Ollama",
-              "Azure has deployment settings; Ollama uses local model discovery.",
-            ],
-            [
-              "Current server catalog",
-              "None enabled",
-              "The packaged xAI definition remains disabled until its portable runtime exists.",
-            ],
-          ],
+      form.append(
+        desktopRow(
+          "Preferred Model",
+          "Optional exact catalog ID; empty uses provider selection.",
+          preferredModel,
+        ),
+        desktopRow(
+          "Maximum Output Tokens",
+          "Bounded direct-runtime output limit.",
+          maximum,
         ),
       );
+      if (
+        ["openRouter", "customOpenAICompatible"].includes(provider.providerID)
+      ) {
+        form.append(
+          desktopRow(
+            "Custom Headers (JSON)",
+            "Authorization, cookies, host/forwarding headers, controls, oversized values, and likely secrets are rejected.",
+            headers,
+          ),
+        );
+      }
+      form.append(
+        desktopRow(
+          "Content-Type",
+          "Fixed by the runtime; not a credential-bearing override.",
+          element("span", "read-only-value", "application/json"),
+        ),
+      );
+      const save = element(
+        "button",
+        "primary-button",
+        "Save Runtime Configuration",
+      );
+      save.type = "submit";
+      if (provider.connection) {
+        [baseURL, preferredModel, maximum, headers].forEach((control) =>
+          setDisabledReason(
+            control,
+            true,
+            "Disconnect the provider before changing runtime configuration.",
+          ),
+        );
+        setDisabledReason(
+          save,
+          true,
+          "Disconnect the provider before changing runtime configuration.",
+        );
+      }
+      form.append(save);
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        let customHeaders = {};
+        try {
+          customHeaders = JSON.parse(headers.value || "{}");
+          if (
+            !customHeaders ||
+            Array.isArray(customHeaders) ||
+            typeof customHeaders !== "object"
+          )
+            throw new Error("Headers must be a JSON object.");
+          const headerEntries = Object.entries(customHeaders);
+          if (headerEntries.length > 16)
+            throw new Error("At most 16 custom headers are allowed.");
+          if (headerEntries.some(([, value]) => typeof value !== "string"))
+            throw new Error("Every custom header value must be a string.");
+        } catch (error) {
+          toast(error.message, true);
+          return;
+        }
+        const maximumOutputTokens = Number(maximum.value);
+        if (
+          !Number.isInteger(maximumOutputTokens) ||
+          maximumOutputTokens < 1 ||
+          maximumOutputTokens > 65536
+        ) {
+          toast(
+            "Maximum output tokens must be an integer from 1 through 65,536.",
+            true,
+          );
+          return;
+        }
+        mutateDomain(
+          "directConfigurations",
+          save,
+          () =>
+            api(
+              `api/v1/provider-settings/${encodeURIComponent(provider.providerID)}/direct-configuration`,
+              {
+                method: "PATCH",
+                body: JSON.stringify({
+                  expectedRevision: configuration.revision,
+                  baseURL:
+                    provider.providerID === "customOpenAICompatible"
+                      ? baseURL.value.trim() || null
+                      : null,
+                  preferredModel: preferredModel.value.trim() || null,
+                  maximumOutputTokens,
+                  customHeaders: [
+                    "openRouter",
+                    "customOpenAICompatible",
+                  ].includes(provider.providerID)
+                    ? customHeaders
+                    : {},
+                  contentTypePolicy: "applicationJSON",
+                }),
+              },
+            ),
+          (value) => {
+            state.typedSettings.directConfigurations[provider.providerID] =
+              value;
+          },
+        );
+      });
+      card.append(form);
+    }
+    if (provider.authentication?.authenticated) {
+      card.append(connectedProviderSummary(provider));
+    } else {
+      const direct = (provider.capabilities.authenticationMethods || []).filter(
+        (method) => directAuthenticationMethods.has(method),
+      );
+      if (direct.length) card.append(credentialForm(provider, direct));
+      else
+        card.append(
+          element(
+            "p",
+            "empty-inline",
+            "No write-only browser credential method is advertised by the completed backend contract.",
+          ),
+        );
+    }
+    return card;
+  }
+
+  function renderTypedAPIProviders() {
+    const providers = orderedProviders().filter(
+      (provider) =>
+        ["openAIAPI", "anthropicAPI"].includes(provider.providerID) &&
+        provider.category === "apiProvider" &&
+        provider.deploymentAllowed,
+    );
+    const cards = providers.map(directProviderCard);
+    cards.push(
+      informationalCard(
+        "Unsupported Provider Boundaries",
+        "No inert credential or endpoint controls are rendered for protocols and network trust models outside the completed backend truth contract.",
+        [
+          [
+            "DeepSeek / Fireworks / xAI / Groq / Z.AI",
+            "Use hardened custom OpenAI-compatible when standards-compatible",
+          ],
+          ["Gemini", "Intentionally omitted protocol"],
+          ["Azure OpenAI", "Deployment / enterprise identity boundary"],
+          ["Ollama / LM Studio", "Deployment / local-network boundary"],
+        ],
+      ),
+    );
     settingsPage(
       "API Providers",
-      "Configure only direct API providers backed by an advertised shared-server runtime.",
+      "Configure OpenAI and Anthropic only when their complete direct HTTPS runtimes are deployment-admitted.",
       "cloud",
       cards,
     );
   }
 
-  function renderOpenRouter() {
-    const card = informationalCard(
-      "Desktop OpenRouter Setup",
-      "OpenRouter is not advertised by the shared-server provider catalog. The portal therefore does not accept an API key or save catalog controls that no runtime consumes.",
-      [
-        [
-          "API key",
-          "Validate & Fetch / Delete",
-          "Desktop validates the key and fetches the account's model catalog.",
-        ],
-        [
-          "Default models",
-          "Include or exclude",
-          "Desktop can mix curated defaults with fetched models.",
-        ],
-        [
-          "Custom settings",
-          "Optional",
-          "Maximum output tokens and custom request headers can be overridden.",
-        ],
-        [
-          "Registered models",
-          "Add / remove",
-          "Desktop searches fetched models and manages which models appear.",
-        ],
-        [
-          "Refresh",
-          "Supported on desktop",
-          "Re-fetches provider metadata from OpenRouter.",
-        ],
-      ],
+  function renderTypedOpenRouter() {
+    const provider = orderedProviders().find(
+      (candidate) =>
+        candidate.providerID === "openRouter" && candidate.deploymentAllowed,
     );
+    const cards = provider
+      ? [directProviderCard(provider)]
+      : [
+          informationalCard(
+            "OpenRouter Deployment Boundary",
+            "This deployment does not advertise the complete OpenRouter runtime. Credential, token, header, and model controls remain input-free.",
+            [["Status", "Deployment-disabled"]],
+          ),
+        ];
     settingsPage(
       "OpenRouter",
-      "OpenRouter requires a real shared-server provider runtime before browser configuration is safe or effective.",
+      "Configure fixed-host OpenRouter only when validation, catalog, vault, and execution truth are all advertised.",
       "cloud",
-      [card],
+      cards,
     );
   }
 
-  function renderCustomAPI() {
-    const card = informationalCard(
-      "Desktop Custom API Setup",
-      "No generic custom-API runtime is advertised by this server. Endpoint and credential fields stay unavailable rather than implying that a Content-Type toggle alone configures a provider.",
-      [
-        [
-          "Connection",
-          "Base URL + write-only API key",
-          "Desktop validates the endpoint before saving.",
-        ],
-        [
-          "Preferred model",
-          "Selectable",
-          "Desktop stores a preferred model and maximum output-token limit.",
-        ],
-        [
-          "Validation",
-          "Validate & Save / Delete",
-          "The connection lifecycle is explicit.",
-        ],
-        [
-          "Request headers",
-          "Content-Type option",
-          "This is one advanced request behavior, not the entire provider setup.",
-        ],
-        [
-          "Fetched models",
-          "Search + enable",
-          "Desktop discovers models from the validated endpoint.",
-        ],
-      ],
+  function renderTypedCustomAPI() {
+    const provider = orderedProviders().find(
+      (candidate) =>
+        candidate.providerID === "customOpenAICompatible" &&
+        candidate.deploymentAllowed,
     );
+    const cards = provider
+      ? [directProviderCard(provider)]
+      : [
+          informationalCard(
+            "Custom API Deployment Boundary",
+            "This deployment does not advertise the hardened custom OpenAI-compatible runtime. Endpoint and credential controls remain input-free.",
+            [
+              ["Required policy", "Public HTTPS/443 + pinned-address egress"],
+              ["Status", "Deployment-disabled"],
+            ],
+          ),
+        ];
     settingsPage(
       "Custom API",
-      "A safe endpoint validator and portable request runtime are required before web configuration can be enabled.",
+      "Configure a custom provider only through the completed SSRF-safe validation and request runtime.",
       "sliders",
-      [card],
+      cards,
     );
   }
 
@@ -3218,48 +4703,269 @@
     );
   }
 
-  function renderManagePresets() {
-    const card = informationalCard(
-      "Workspace Selection Presets",
-      "The desktop destination manages saved file-selection presets for a workspace. It is unrelated to Agent Workflows; the portal previously displayed the wrong data here.",
-      [
-        [
-          "List and switch",
-          "Desktop workspace state",
-          "Activates a saved file selection in the current workspace.",
-        ],
-        [
-          "Reorder",
-          "Supported on desktop",
-          "Changes preset order and keyboard shortcut assignment.",
-        ],
-        [
-          "Rename",
-          "Supported on desktop",
-          "Updates the selected workspace preset.",
-        ],
-        [
-          "Delete",
-          "Supported on desktop",
-          "Removes a workspace selection preset.",
-        ],
-        [
-          "Shared server",
-          "No preset snapshot or CRUD API",
-          "The portal cannot display or mutate selection presets until the workspace authority exposes them.",
-        ],
-      ],
+  function renderTypedManagePresets() {
+    const snapshot = state.typedSettings.selectionPresets;
+    const project = selectedProject();
+    const session = selectedSession();
+    if (!project || !snapshot) {
+      const boundary = informationalCard(
+        "No Active Server Project",
+        "Selection presets are project-scoped and cannot be edited without an operator-provisioned project.",
+        [["Project lifecycle", "Operator / deployment boundary"]],
+      );
+      settingsPage(
+        "Manage Presets",
+        "Manage named file-selection presets for the active server project.",
+        "listStar",
+        [boundary],
+      );
+      return;
+    }
+    const card = desktopCard(
+      `${project.name} Selection Presets`,
+      "Named presets capture logical root-confined selections. Apply and capture fence both the collection revision and live session selection revision.",
     );
+    const list = element("div", "selection-preset-list");
+    function orderedIDsWithMove(presetID, delta) {
+      const ids = snapshot.presets.map((preset) => preset.presetID);
+      const index = ids.indexOf(presetID);
+      const next = index + delta;
+      if (index < 0 || next < 0 || next >= ids.length) return null;
+      [ids[index], ids[next]] = [ids[next], ids[index]];
+      return ids;
+    }
+    snapshot.presets.forEach((preset, index) => {
+      const row = element("section", "selection-preset-row");
+      const name = document.createElement("input");
+      name.type = "text";
+      name.maxLength = 256;
+      name.value = preset.name;
+      name.setAttribute("aria-label", `Preset name for ${preset.name}`);
+      const actions = element("div", "workflow-inline-actions");
+      const rename = element("button", "secondary-button", "Save Name");
+      rename.type = "button";
+      rename.addEventListener("click", () =>
+        mutateDomain(
+          "selectionPresets",
+          rename,
+          () =>
+            api(
+              `api/v1/projects/${encodeURIComponent(project.projectId)}/selection-presets/${encodeURIComponent(preset.presetID)}`,
+              {
+                method: "PATCH",
+                body: JSON.stringify({
+                  expectedCollectionRevision: snapshot.revision,
+                  expectedRowRevision: preset.rowRevision,
+                  name: name.value.trim(),
+                  entries: preset.entries,
+                }),
+              },
+            ),
+          (value) => {
+            state.typedSettings.selectionPresets = value;
+          },
+        ),
+      );
+      const apply = element("button", "primary-button", "Apply to Session");
+      apply.type = "button";
+      const selection = session
+        ? state.typedSettings.selections[session.sessionId]
+        : null;
+      if (!session || !selection) {
+        setDisabledReason(
+          apply,
+          true,
+          "Select a session with a loaded selection before applying a preset.",
+        );
+      } else {
+        apply.addEventListener("click", () =>
+          mutateDomain(
+            "selectionPresets",
+            apply,
+            () =>
+              api(
+                `api/v1/projects/${encodeURIComponent(project.projectId)}/selection-presets/apply`,
+                {
+                  method: "POST",
+                  body: JSON.stringify({
+                    presetID: preset.presetID,
+                    expectedCollectionRevision: snapshot.revision,
+                    sessionID: session.sessionId,
+                    expectedSelectionRevision: selection.revision,
+                  }),
+                },
+              ),
+            (value) => {
+              state.typedSettings.selections[session.sessionId] = value;
+            },
+          ),
+        );
+      }
+      const earlier = element("button", "secondary-button", "Move Earlier");
+      earlier.type = "button";
+      earlier.disabled = index === 0;
+      earlier.addEventListener("click", () => {
+        const ids = orderedIDsWithMove(preset.presetID, -1);
+        if (!ids) return;
+        mutateDomain(
+          "selectionPresets",
+          earlier,
+          () =>
+            api(
+              `api/v1/projects/${encodeURIComponent(project.projectId)}/selection-presets/reorder`,
+              {
+                method: "POST",
+                body: JSON.stringify({
+                  expectedCollectionRevision: snapshot.revision,
+                  orderedPresetIDs: ids,
+                }),
+              },
+            ),
+          (value) => {
+            state.typedSettings.selectionPresets = value;
+          },
+        );
+      });
+      const later = element("button", "secondary-button", "Move Later");
+      later.type = "button";
+      later.disabled = index === snapshot.presets.length - 1;
+      later.addEventListener("click", () => {
+        const ids = orderedIDsWithMove(preset.presetID, 1);
+        if (!ids) return;
+        mutateDomain(
+          "selectionPresets",
+          later,
+          () =>
+            api(
+              `api/v1/projects/${encodeURIComponent(project.projectId)}/selection-presets/reorder`,
+              {
+                method: "POST",
+                body: JSON.stringify({
+                  expectedCollectionRevision: snapshot.revision,
+                  orderedPresetIDs: ids,
+                }),
+              },
+            ),
+          (value) => {
+            state.typedSettings.selectionPresets = value;
+          },
+        );
+      });
+      const remove = element("button", "danger-button", "Delete");
+      remove.type = "button";
+      remove.addEventListener("click", async () => {
+        if (
+          !(await confirmAction({
+            title: "Delete selection preset?",
+            message: `Delete ${preset.name}? Active selections are not changed.`,
+            label: "Delete",
+            returnFocus: remove,
+          }))
+        )
+          return;
+        mutateDomain(
+          "selectionPresets",
+          remove,
+          () =>
+            api(
+              `api/v1/projects/${encodeURIComponent(project.projectId)}/selection-presets/${encodeURIComponent(preset.presetID)}`,
+              {
+                method: "DELETE",
+                body: JSON.stringify({
+                  expectedCollectionRevision: snapshot.revision,
+                  expectedRowRevision: preset.rowRevision,
+                }),
+              },
+            ),
+          (value) => {
+            state.typedSettings.selectionPresets = value;
+          },
+        );
+      });
+      actions.append(rename, apply, earlier, later, remove);
+      row.append(
+        name,
+        element(
+          "small",
+          "scope-footnote",
+          `${preset.entries.length} selection entr${preset.entries.length === 1 ? "y" : "ies"} · row revision ${preset.rowRevision}`,
+        ),
+        actions,
+      );
+      list.append(row);
+    });
+    if (!snapshot.presets.length) {
+      list.append(
+        element(
+          "p",
+          "empty-inline",
+          "No named selection presets exist for this project.",
+        ),
+      );
+    }
+    card.append(list);
+    const capture = desktopCard(
+      "Capture Current Session",
+      "Save the currently selected session files as a new named project preset.",
+    );
+    if (session && state.typedSettings.selections[session.sessionId]) {
+      const selection = state.typedSettings.selections[session.sessionId];
+      const form = element("form", "typed-settings-form compact-form");
+      const name = document.createElement("input");
+      name.type = "text";
+      name.maxLength = 256;
+      name.placeholder = "Preset name";
+      name.setAttribute("aria-label", "New selection preset name");
+      const save = element("button", "primary-button", "Capture Preset");
+      save.type = "submit";
+      if (snapshot.presets.length >= 100) {
+        [name, save].forEach((control) =>
+          setDisabledReason(
+            control,
+            true,
+            "The server supports at most 100 named selection presets per project.",
+          ),
+        );
+      }
+      form.append(name, save);
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        mutateDomain(
+          "selectionPresets",
+          save,
+          () =>
+            api(
+              `api/v1/projects/${encodeURIComponent(project.projectId)}/selection-presets/capture`,
+              {
+                method: "POST",
+                body: JSON.stringify({
+                  expectedCollectionRevision: snapshot.revision,
+                  sessionID: session.sessionId,
+                  expectedSelectionRevision: selection.revision,
+                  name: name.value.trim(),
+                }),
+              },
+            ),
+          (value) => {
+            state.typedSettings.selectionPresets = value;
+          },
+        );
+      });
+      capture.append(form);
+    } else {
+      capture.append(
+        element(
+          "p",
+          "empty-inline",
+          "Select an existing session before capturing a preset.",
+        ),
+      );
+    }
     settingsPage(
       "Manage Presets",
-      "Review the exact desktop workspace-preset semantics and current server boundary.",
-      "workflow",
-      [card],
-      recommendation(
-        "info",
-        "Workspace presets are not workflow presets",
-        "Workflow catalog data now remains on Agent Workflows, where it belongs.",
-      ),
+      "Manage project-scoped named file selections, not Agent Workflows or prompt presets.",
+      "listStar",
+      [card, capture],
     );
   }
 
@@ -3303,7 +5009,7 @@
     }
     routeRow(
       "Agent Models",
-      "Desktop-style recommendation check plus runtime-backed provider defaults.",
+      "Typed global/project routes plus server profile 202_608 recommendations.",
       "agent-models",
       connected.length ? "Recommendations ready" : "Connect a CLI provider",
     );
@@ -3315,21 +5021,21 @@
     );
     routeRow(
       "Context Builder",
-      "Discovery behavior and current shared-server settings boundary.",
+      "Typed defaults, saved prompts, and authenticated manual portal runs.",
       "context-builder",
-      "Runtime-managed",
+      "Editable",
     );
     routeRow(
       "Agent Workflows",
       "Built-in and custom workflow catalog advertised by the server.",
       "agent-workflows",
-      `${state.bootstrap?.workflows?.length || 0} advertised`,
+      `${state.typedSettings.workflows?.workflows?.length || 0} managed`,
     );
     routeRow(
       "Agent Permissions",
-      "Direct agents plus the delegated-agent policy boundary.",
+      "Direct agents plus Safe Managed, Inherit, and Custom sub-agent policy.",
       "agent-permissions",
-      "Direct settings active",
+      "Editable",
     );
     content.append(routes);
 
@@ -3438,45 +5144,6 @@
     } else {
       providers.forEach((provider, index) =>
         stack.append(providerCard(provider, index === 0, false)),
-      );
-    }
-    content.append(stack);
-    installIcons(content);
-  }
-
-  function renderAgentModels() {
-    const content = document.getElementById("settings-content");
-    disposeSensitiveInputs(content);
-    content.replaceChildren(
-      pageHeader(
-        "Agent Models",
-        "Choose provider defaults and only the reasoning, fast-mode, and service-tier values advertised for the selected model.",
-        "model",
-      ),
-      recommendation(
-        "model",
-        "Server defaults",
-        "Explicit per-session choices take precedence. These defaults apply only when a session omits the corresponding value.",
-      ),
-    );
-    const stack = element("div", "provider-stack");
-    const providers = orderedProviders().filter(
-      (provider) => provider.deploymentAllowed,
-    );
-    if (!providers.length) {
-      const empty = element("div", "empty-state-panel");
-      empty.append(
-        element("h2", "", "No model catalogs"),
-        element(
-          "p",
-          "",
-          "The provider settings service has not advertised models.",
-        ),
-      );
-      stack.append(empty);
-    } else {
-      providers.forEach((provider, index) =>
-        stack.append(providerCard(provider, index === 0, true)),
       );
     }
     content.append(stack);
@@ -3948,7 +5615,7 @@
       "div",
       "inline-message info auth-flow-message",
       provider.providerID === "codex"
-        ? "RepoPrompt CE will keep checking this separate Codex sign-in until it completes or expires."
+        ? "RepoPrompt CE keeps checking this separate Codex sign-in while it is pending."
         : advertisedFlowDetail,
     );
     flowMessage.setAttribute("role", "status");
@@ -4744,6 +6411,7 @@
   function start() {
     if (state.initialized) return;
     state.initialized = true;
+    applyPortalAppearance();
     installIcons();
     renderInitialLoading();
     document.addEventListener("click", handleDocumentClick);
@@ -4817,7 +6485,7 @@
     window.addEventListener("offline", () => {
       setConnectionPresentation(
         "offline",
-        "This browser is offline. Changes cannot be sent until the connection returns.",
+        "This browser is offline. Changes require a restored connection.",
       );
       document.getElementById("service-caption").textContent =
         "Browser offline";
@@ -4854,6 +6522,7 @@
       whenIdle: async () => {
         await state.loadPromise;
         await state.settingsMutation;
+        await Promise.all(Object.values(state.domainMutations).filter(Boolean));
         await state.agent.transcriptPromise;
         await state.agent.mutationPromise;
       },

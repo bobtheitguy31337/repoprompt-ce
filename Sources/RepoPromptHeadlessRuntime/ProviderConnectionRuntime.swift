@@ -214,7 +214,8 @@ public actor ProviderAuthenticationAdapter: ProviderCredentialTesting {
                   let config = try? await backendSettings?.backendSettings(for: providerID)
             else { return [] }
             return [config.authHeader.authenticationMethod]
-        case .claudeCustom, .openCodeACP, .cursorACP, .xAI:
+        case .claudeCustom, .openCodeACP, .cursorACP,
+             .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
             return []
         }
     }
@@ -264,7 +265,8 @@ public actor ProviderAuthenticationAdapter: ProviderCredentialTesting {
                 "messages": [["role": "user", "content": "Reply OK"]]
             ])
             acceptedDetail = providerID == .claudeGLM ? "Z.ai credential validated" : "Kimi credential validated"
-        case .claudeCustom, .openCodeACP, .cursorACP, .xAI:
+        case .claudeCustom, .openCodeACP, .cursorACP,
+             .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
             return .init(state: .unavailable, detail: "Provider credential validation is unavailable")
         }
         if request.httpMethod == nil { request.httpMethod = "GET" }

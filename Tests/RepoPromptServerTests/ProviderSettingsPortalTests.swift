@@ -26,7 +26,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
         let persisted = try await store.providerSettings()
         let metadata = try await store.metadata()
         XCTAssertEqual(persisted, [initial])
-        XCTAssertEqual(metadata.schemaVersion, 5)
+        XCTAssertEqual(metadata.schemaVersion, 6)
 
         do {
             _ = try await store.upsertProviderSettings(initial, expectedRevision: 0)
@@ -76,6 +76,14 @@ final class ProviderSettingsPortalTests: XCTestCase {
             XCTFail("expected stale settings revision")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .staleRevision)
+        }
+        do {
+            _ = try await service.update(.init(expectedRevision: 1, changes: [
+                PortalDesktopSettingKey.contextBuilderBudget.rawValue: "120000"
+            ]))
+            XCTFail("superseded typed settings must be read-only on the legacy authority")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .capabilityMissing)
         }
         do {
             _ = try await service.update(.init(expectedRevision: 1, changes: ["appearanceMode": "dark"]))
@@ -150,7 +158,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
             authenticationStatusFiles: [.codex: statusURL.path]
         )
         try await service.bootstrap()
-        let catalog = try await service.catalog()
+        let catalog = try await service.catalog(refreshCLI: true)
         let codex = try XCTUnwrap(catalog.providers.first { $0.providerID == .codex })
         XCTAssertTrue(codex.cli?.installed == true)
         XCTAssertTrue(codex.cli?.healthy == true)
@@ -207,7 +215,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
         )
         try await service.bootstrap()
 
-        let catalog = try await service.catalog()
+        let catalog = try await service.catalog(refreshCLI: true, refreshRuntime: true)
         let codex = try XCTUnwrap(catalog.providers.first { $0.providerID == .codex })
         XCTAssertEqual(Set(codex.capabilities.authenticationMethods), [.deviceCodeBeta, .apiKey])
         XCTAssertEqual(codex.capabilities.authFlows.map(\.kind), [.deviceCodeBeta])
@@ -426,7 +434,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
             runner: StaticProviderVersionRunner(output: "tool 9.9.9 /run/secrets/raw-token")
         )
         try await service.bootstrap()
-        let catalog = try await service.catalog()
+        let catalog = try await service.catalog(refreshCLI: true)
         let codex = try XCTUnwrap(catalog.providers.first { $0.providerID == .codex })
         XCTAssertTrue(codex.cli?.healthy == true)
         XCTAssertEqual(codex.cli?.version, "9.9.9")

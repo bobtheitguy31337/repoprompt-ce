@@ -27,6 +27,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
     public let parentSessionID: UUID?
     public let title: String
     public let provider: ProviderKind
+    public let providerSettingsID: ProviderSettingsID?
     public let model: String?
     public let state: SessionLifecycleState
     public let revision: Int64
@@ -39,6 +40,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         parentSessionID: UUID?,
         title: String,
         provider: ProviderKind,
+        providerSettingsID: ProviderSettingsID? = nil,
         model: String?,
         state: SessionLifecycleState,
         revision: Int64,
@@ -50,6 +52,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         self.parentSessionID = parentSessionID
         self.title = title
         self.provider = provider
+        self.providerSettingsID = providerSettingsID
         self.model = model
         self.state = state
         self.revision = revision
@@ -61,19 +64,52 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         case sessionID = "sessionId"
         case projectID = "projectId"
         case parentSessionID = "parentSessionId"
-        case title, provider, model, state, revision, runGeneration, lastActivityAt
+        case title, provider
+        case providerSettingsID = "providerSettingsId"
+        case model, state, revision, runGeneration, lastActivityAt
     }
 }
 
 public struct PortalWorkflowSummary: Codable, Hashable, Sendable {
     public let workflowID: String
     public let name: String
+    public let source: ServerWorkflowSource
     public let enabled: Bool
+    public let visible: Bool
+    public let featuredOrder: Int?
+    public let rowRevision: Int64
 
-    public init(workflowID: String, name: String, enabled: Bool) {
+    public init(
+        workflowID: String,
+        name: String,
+        source: ServerWorkflowSource = .builtin,
+        enabled: Bool,
+        visible: Bool = true,
+        featuredOrder: Int? = nil,
+        rowRevision: Int64 = 1
+    ) {
         self.workflowID = workflowID
         self.name = name
+        self.source = source
         self.enabled = enabled
+        self.visible = visible
+        self.featuredOrder = featuredOrder
+        self.rowRevision = rowRevision
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case workflowID, name, source, enabled, visible, featuredOrder, rowRevision
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        workflowID = try container.decode(String.self, forKey: .workflowID)
+        name = try container.decode(String.self, forKey: .name)
+        source = try container.decodeIfPresent(ServerWorkflowSource.self, forKey: .source) ?? .builtin
+        enabled = try container.decode(Bool.self, forKey: .enabled)
+        visible = try container.decodeIfPresent(Bool.self, forKey: .visible) ?? true
+        featuredOrder = try container.decodeIfPresent(Int.self, forKey: .featuredOrder)
+        rowRevision = try container.decodeIfPresent(Int64.self, forKey: .rowRevision) ?? 1
     }
 }
 
@@ -98,21 +134,27 @@ public struct PortalBootstrapResponse: Codable, Sendable {
     public let sessions: [PortalSessionSummary]
     public let workflows: [PortalWorkflowSummary]
     public let tools: [PortalToolSummary]
+    public let workflowRepositoryRevision: Int64
+    public let includeSessionCleanupGuidance: Bool
 
     public init(
         projects: [PortalProjectSummary],
         sessions: [PortalSessionSummary],
         workflows: [PortalWorkflowSummary],
-        tools: [PortalToolSummary] = []
+        tools: [PortalToolSummary] = [],
+        workflowRepositoryRevision: Int64 = 0,
+        includeSessionCleanupGuidance: Bool = true
     ) {
         self.projects = projects
         self.sessions = sessions
         self.workflows = workflows
         self.tools = tools
+        self.workflowRepositoryRevision = workflowRepositoryRevision
+        self.includeSessionCleanupGuidance = includeSessionCleanupGuidance
     }
 
     private enum CodingKeys: String, CodingKey {
-        case projects, sessions, workflows, tools
+        case projects, sessions, workflows, tools, workflowRepositoryRevision, includeSessionCleanupGuidance
     }
 
     public init(from decoder: Decoder) throws {
@@ -121,6 +163,8 @@ public struct PortalBootstrapResponse: Codable, Sendable {
         sessions = try container.decode([PortalSessionSummary].self, forKey: .sessions)
         workflows = try container.decode([PortalWorkflowSummary].self, forKey: .workflows)
         tools = try container.decodeIfPresent([PortalToolSummary].self, forKey: .tools) ?? []
+        workflowRepositoryRevision = try container.decodeIfPresent(Int64.self, forKey: .workflowRepositoryRevision) ?? 0
+        includeSessionCleanupGuidance = try container.decodeIfPresent(Bool.self, forKey: .includeSessionCleanupGuidance) ?? true
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -129,6 +173,8 @@ public struct PortalBootstrapResponse: Codable, Sendable {
         try container.encode(sessions, forKey: .sessions)
         try container.encode(workflows, forKey: .workflows)
         try container.encode(tools, forKey: .tools)
+        try container.encode(workflowRepositoryRevision, forKey: .workflowRepositoryRevision)
+        try container.encode(includeSessionCleanupGuidance, forKey: .includeSessionCleanupGuidance)
     }
 }
 
@@ -185,14 +231,23 @@ public struct PortalTranscriptPage: Codable, Sendable {
 public struct PortalCreateSessionRequest: Codable, Hashable, Sendable {
     public let operationID: UUID
     public let projectID: UUID
-    public let providerID: ProviderSettingsID
+    public let providerID: ProviderSettingsID?
+    public let routingTarget: AgentRoutingTarget?
     public let model: String?
     public let initialPrompt: String
 
-    public init(operationID: UUID, projectID: UUID, providerID: ProviderSettingsID, model: String?, initialPrompt: String) {
+    public init(
+        operationID: UUID,
+        projectID: UUID,
+        providerID: ProviderSettingsID? = nil,
+        routingTarget: AgentRoutingTarget? = nil,
+        model: String?,
+        initialPrompt: String
+    ) {
         self.operationID = operationID
         self.projectID = projectID
         self.providerID = providerID
+        self.routingTarget = routingTarget
         self.model = model
         self.initialPrompt = initialPrompt
     }
@@ -201,7 +256,7 @@ public struct PortalCreateSessionRequest: Codable, Hashable, Sendable {
         case operationID = "operationId"
         case projectID = "projectId"
         case providerID = "providerId"
-        case model, initialPrompt
+        case routingTarget, model, initialPrompt
     }
 }
 

@@ -77,7 +77,7 @@ public actor ProjectToolAuthority {
         self.gitExecutable = gitExecutable
     }
 
-    public func tree(_ request: ProjectTreeRequest) async throws -> [ProjectTreeEntry] {
+    public func tree(_ request: ProjectTreeRequest, settings: AdvancedServerSettings = .default) async throws -> [ProjectTreeEntry] {
         let root = try await project.root(rootID: request.rootID)
         let start = request.logicalPath.isEmpty
             ? root.snapshot.canonicalPath
@@ -85,11 +85,22 @@ public actor ProjectToolAuthority {
         let maximumDepth = max(0, min(request.maximumDepth, 32))
         let maximumEntries = max(1, min(request.maximumEntries, 20000))
         var entries: [ProjectTreeEntry] = []
-        try walkTree(rootID: request.rootID, rootPath: root.snapshot.canonicalPath, currentPath: start, depth: 0, maximumDepth: maximumDepth, maximumEntries: maximumEntries, entries: &entries)
+        var visited = Set<String>()
+        _ = try walkTree(
+            rootID: request.rootID,
+            rootPath: root.snapshot.canonicalPath,
+            currentPath: start,
+            depth: 0,
+            maximumDepth: maximumDepth,
+            maximumEntries: maximumEntries,
+            settings: settings,
+            visited: &visited,
+            entries: &entries
+        )
         return entries
     }
 
-    public func search(_ request: ProjectSearchRequest) async throws -> [ProjectSearchHit] {
+    public func search(_ request: ProjectSearchRequest, settings: AdvancedServerSettings = .default) async throws -> [ProjectSearchHit] {
         guard !request.query.isEmpty else { throw ServiceAPIError(code: .invalidRequest, message: "Search query is required") }
         let root = try await project.root(rootID: request.rootID)
         let start = request.logicalPath.isEmpty
@@ -98,7 +109,20 @@ public actor ProjectToolAuthority {
         let maximumResults = max(1, min(request.maximumResults, 2000))
         let maximumFileBytes = max(1, min(request.maximumFileBytes, 8_388_608))
         let expression = try request.useRegex ? NSRegularExpression(pattern: request.query) : nil
-        return try searchFiles(request: request, start: start, rootPath: root.snapshot.canonicalPath, maximumResults: maximumResults, maximumFileBytes: maximumFileBytes, expression: expression)
+        var hits: [ProjectSearchHit] = []
+        var visited = Set<String>()
+        try scanFiles(
+            request: request,
+            rootPath: root.snapshot.canonicalPath,
+            currentPath: start,
+            maximumResults: maximumResults,
+            maximumFileBytes: maximumFileBytes,
+            expression: expression,
+            settings: settings,
+            visited: &visited,
+            hits: &hits
+        )
+        return hits
     }
 
     private func searchFiles(request: ProjectSearchRequest, start: String, rootPath: String, maximumResults: Int, maximumFileBytes: Int, expression: NSRegularExpression?) throws -> [ProjectSearchHit] {
@@ -149,7 +173,10 @@ public actor ProjectToolAuthority {
         return ProjectFileSnapshot(rootID: request.rootID, logicalPath: request.logicalPath, content: content, contentDigest: CanonicalSigning.bodyDigest(data), truncated: data.count > maximumBytes || end < lines.count)
     }
 
-    public func codeMap(_ request: ProjectCodeMapRequest) async throws -> ProjectCodeMapSnapshot {
+    public func codeMap(_ request: ProjectCodeMapRequest, settings: AdvancedServerSettings = .default) async throws -> ProjectCodeMapSnapshot {
+        guard settings.codeMapsEnabled else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Code maps are disabled by Advanced server settings")
+        }
         let path = try await project.authorize(rootID: request.rootID, logicalPath: request.logicalPath, filesystem: filesystem)
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue else {
@@ -180,19 +207,146 @@ public actor ProjectToolAuthority {
         return ProjectDiffSnapshot(rootID: request.rootID, comparison: request.comparison, patch: patch, truncated: data.count >= maximumBytes, contentDigest: CanonicalSigning.bodyDigest(data))
     }
 
-    private func walkTree(rootID: UUID, rootPath: String, currentPath: String, depth: Int, maximumDepth: Int, maximumEntries: Int, entries: inout [ProjectTreeEntry]) throws {
-        guard entries.count < maximumEntries, depth <= maximumDepth else { return }
-        let urls = try FileManager.default.contentsOfDirectory(at: URL(fileURLWithPath: currentPath), includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey], options: [.skipsHiddenFiles]).sorted { $0.lastPathComponent < $1.lastPathComponent }
+    @discardableResult
+    private func walkTree(
+        rootID: UUID,
+        rootPath: String,
+        currentPath: String,
+        depth: Int,
+        maximumDepth: Int,
+        maximumEntries: Int,
+        settings: AdvancedServerSettings,
+        visited: inout Set<String>,
+        entries: inout [ProjectTreeEntry]
+    ) throws -> Bool {
+        guard entries.count < maximumEntries, depth <= maximumDepth else { return false }
+        let canonical = URL(fileURLWithPath: currentPath).resolvingSymlinksInPath().standardizedFileURL.path
+        guard Self.isInside(canonical, root: rootPath), visited.insert(canonical).inserted else { return false }
+        let urls = try FileManager.default.contentsOfDirectory(
+            at: URL(fileURLWithPath: currentPath),
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ).sorted { $0.lastPathComponent < $1.lastPathComponent }
+        var emitted = false
         for url in urls {
-            guard entries.count < maximumEntries else { return }
-            let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey])
-            guard values.isSymbolicLink != true else { continue }
+            guard entries.count < maximumEntries else { return emitted }
             let relative = Self.relativePath(url.path, root: rootPath)
-            entries.append(ProjectTreeEntry(rootID: rootID, logicalPath: relative, isDirectory: values.isDirectory == true, size: values.isDirectory == true ? nil : Int64(values.fileSize ?? 0)))
-            if values.isDirectory == true, depth < maximumDepth {
-                try walkTree(rootID: rootID, rootPath: rootPath, currentPath: url.path, depth: depth + 1, maximumDepth: maximumDepth, maximumEntries: maximumEntries, entries: &entries)
+            guard !Self.isIgnored(relativePath: relative, rootPath: rootPath, settings: settings) else { continue }
+            let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey])
+            if values.isSymbolicLink == true, !settings.followSymbolicLinks { continue }
+            let resolvedURL = values.isSymbolicLink == true ? url.resolvingSymlinksInPath() : url
+            guard Self.isInside(resolvedURL.path, root: rootPath) else { continue }
+            let resolvedValues = try resolvedURL.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
+            if resolvedValues.isDirectory == true {
+                let insertion = entries.count
+                if settings.showEmptyFolders {
+                    entries.append(ProjectTreeEntry(rootID: rootID, logicalPath: relative, isDirectory: true, size: nil))
+                }
+                let childEmitted = depth < maximumDepth
+                    ? try walkTree(rootID: rootID, rootPath: rootPath, currentPath: resolvedURL.path, depth: depth + 1, maximumDepth: maximumDepth, maximumEntries: maximumEntries, settings: settings, visited: &visited, entries: &entries)
+                    : false
+                if !settings.showEmptyFolders, childEmitted {
+                    entries.insert(ProjectTreeEntry(rootID: rootID, logicalPath: relative, isDirectory: true, size: nil), at: insertion)
+                }
+                emitted = emitted || settings.showEmptyFolders || childEmitted
+            } else {
+                entries.append(ProjectTreeEntry(rootID: rootID, logicalPath: relative, isDirectory: false, size: Int64(resolvedValues.fileSize ?? 0)))
+                emitted = true
             }
         }
+        return emitted
+    }
+
+    private func scanFiles(
+        request: ProjectSearchRequest,
+        rootPath: String,
+        currentPath: String,
+        maximumResults: Int,
+        maximumFileBytes: Int,
+        expression: NSRegularExpression?,
+        settings: AdvancedServerSettings,
+        visited: inout Set<String>,
+        hits: inout [ProjectSearchHit]
+    ) throws {
+        guard hits.count < maximumResults else { return }
+        let canonical = URL(fileURLWithPath: currentPath).resolvingSymlinksInPath().standardizedFileURL.path
+        guard Self.isInside(canonical, root: rootPath), visited.insert(canonical).inserted else { return }
+        let urls = try FileManager.default.contentsOfDirectory(at: URL(fileURLWithPath: currentPath), includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey], options: [.skipsHiddenFiles])
+        for url in urls.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            guard hits.count < maximumResults else { return }
+            let relative = Self.relativePath(url.path, root: rootPath)
+            guard !Self.isIgnored(relativePath: relative, rootPath: rootPath, settings: settings) else { continue }
+            let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            if values.isSymbolicLink == true, !settings.followSymbolicLinks { continue }
+            let resolvedURL = values.isSymbolicLink == true ? url.resolvingSymlinksInPath() : url
+            guard Self.isInside(resolvedURL.path, root: rootPath) else { continue }
+            let resolvedValues = try resolvedURL.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey])
+            if resolvedValues.isDirectory == true {
+                try scanFiles(request: request, rootPath: rootPath, currentPath: resolvedURL.path, maximumResults: maximumResults, maximumFileBytes: maximumFileBytes, expression: expression, settings: settings, visited: &visited, hits: &hits)
+                continue
+            }
+            guard resolvedValues.isRegularFile == true, (resolvedValues.fileSize ?? 0) <= maximumFileBytes else { continue }
+            let data = try Data(contentsOf: resolvedURL, options: [.mappedIfSafe])
+            guard let content = String(data: data, encoding: .utf8) else { continue }
+            for (offset, line) in content.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                let text = String(line)
+                let matched = if let expression {
+                    expression.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+                } else {
+                    text.localizedCaseInsensitiveContains(request.query)
+                }
+                if matched {
+                    hits.append(ProjectSearchHit(rootID: request.rootID, logicalPath: relative, line: offset + 1, preview: String(text.prefix(1000))))
+                    if hits.count >= maximumResults { return }
+                }
+            }
+        }
+    }
+
+    private static func isInside(_ path: String, root: String) -> Bool {
+        let canonicalRoot = URL(fileURLWithPath: root).resolvingSymlinksInPath().standardizedFileURL.path
+        let canonicalPath = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+        return canonicalPath == canonicalRoot || canonicalPath.hasPrefix(canonicalRoot + "/")
+    }
+
+    private static func isIgnored(relativePath: String, rootPath: String, settings: AdvancedServerSettings) -> Bool {
+        let components = relativePath.split(separator: "/").map(String.init)
+        let directoryCount = max(0, components.count - 1)
+        let depths = settings.respectNestedIgnoreFiles ? Array(0 ... directoryCount) : [0]
+        var ignored = false
+        for depth in depths {
+            let base = components.prefix(depth).joined(separator: "/")
+            let directory = base.isEmpty ? rootPath : URL(fileURLWithPath: rootPath).appendingPathComponent(base).path
+            let names = (settings.respectRepoIgnore ? [".gitignore"] : []) + (settings.respectCursorIgnore ? [".cursorignore"] : [])
+            for name in names {
+                guard let text = try? String(contentsOfFile: URL(fileURLWithPath: directory).appendingPathComponent(name).path, encoding: .utf8) else { continue }
+                let candidate = components.dropFirst(depth).joined(separator: "/")
+                for raw in text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init) {
+                    let line = raw.trimmingCharacters(in: .whitespaces)
+                    guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+                    let negated = line.hasPrefix("!")
+                    let pattern = negated ? String(line.dropFirst()) : line
+                    if glob(pattern, matches: candidate) || glob(pattern, matches: components.last ?? candidate) {
+                        ignored = !negated
+                    }
+                }
+            }
+        }
+        return ignored
+    }
+
+    private static func glob(_ pattern: String, matches value: String) -> Bool {
+        var expression = "^"
+        for character in pattern.trimmingCharacters(in: CharacterSet(charactersIn: "/")) {
+            switch character {
+            case "*": expression += "[^/]*"
+            case "?": expression += "[^/]"
+            default: expression += NSRegularExpression.escapedPattern(for: String(character))
+            }
+        }
+        if pattern.hasSuffix("/") { expression += "(?:/.*)?" }
+        expression += "$"
+        return value.range(of: expression, options: .regularExpression) != nil
     }
 
     private static func relativePath(_ path: String, root: String) -> String {

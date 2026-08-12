@@ -609,7 +609,15 @@ private actor AuthorityToolBackend {
 
     private func oracleUtilities(_ arguments: [String: Value]) async throws -> Value {
         let providers = await authority.providerCapabilities(preflight: true)
-        return try value(ProviderCatalogResult(operation: arguments["op"]?.stringValue ?? "models", providers: providers))
+        let discovery = try await authority.modelDiscovery(sessionID: binding.sessionID)
+        return try value(ProviderCatalogResult(
+            operation: arguments["op"]?.stringValue ?? "models",
+            providers: providers,
+            rawModels: discovery.providers,
+            presets: discovery.presets,
+            roleModelRestrictionApplied: discovery.roleModelRestrictionApplied,
+            settingsRevision: discovery.settingsRevision
+        ))
     }
 
     private func askOracle(_ arguments: [String: Value], continuing: Bool) async throws -> Value {
@@ -625,7 +633,8 @@ private actor AuthorityToolBackend {
             input: OracleInput(
                 chatID: chatID,
                 prompt: message,
-                contextMode: arguments["mode"]?.stringValue ?? "chat"
+                contextMode: arguments["mode"]?.stringValue ?? "chat",
+                modelPresetID: arguments["model_preset_id"]?.stringValue.flatMap(UUID.init(uuidString:))
             ),
             actor: binding.actor
         ))
@@ -655,11 +664,17 @@ private actor AuthorityToolBackend {
             input: ContextBuilderInput(
                 expectedSelectionRevision: selection.revision,
                 instructions: instructions,
-                budget: arguments["budget"]?.intValue ?? 4000,
+                budget: arguments["budget"]?.intValue,
                 responseType: arguments["response_type"]?.stringValue,
-                allowClarifyingQuestions: arguments["allow_clarifying_questions"]?.boolValue ?? false
+                allowClarifyingQuestions: arguments["allow_clarifying_questions"]?.boolValue,
+                enhancementMode: arguments["enhancement_mode"]?.stringValue.flatMap(ContextBuilderEnhancementMode.init(rawValue:)),
+                questionTimeoutSeconds: arguments["question_timeout_seconds"]?.intValue,
+                followUpAnalysis: arguments["follow_up_analysis"]?.stringValue.flatMap(ContextBuilderFollowUpAnalysis.init(rawValue:)),
+                followUpBudget: arguments["follow_up_budget"]?.intValue,
+                selectedPromptIDs: arguments["selected_prompt_ids"]?.arrayValue?.compactMap { $0.stringValue.flatMap(UUID.init(uuidString:)) }
             ),
-            actor: binding.actor
+            actor: binding.actor,
+            origin: .mcp
         ))
     }
 
@@ -771,9 +786,11 @@ private actor AuthorityToolBackend {
                 throw ServiceAPIError(code: .invalidRequest, message: "Agent start requires message")
             }
             let provider = arguments["provider"]?.stringValue.flatMap(ProviderKind.init(rawValue:))
+            let providerSettingsID = arguments["provider_settings_id"]?.stringValue.flatMap(ProviderSettingsID.init(rawValue:))
             let child = try await authority.spawnChildSession(
                 parentSessionID: binding.sessionID,
                 provider: provider,
+                providerSettingsID: providerSettingsID,
                 model: arguments["model"]?.stringValue,
                 initialPrompt: message,
                 role: arguments["model_id"]?.stringValue ?? defaultRole,
@@ -826,7 +843,21 @@ private actor AuthorityToolBackend {
                     || $0.transcript.contains { $0.content.lowercased().contains(query) }
             }.prefix(limit)))
         case "time":
-            return .object(["session_count": .int(all.count), "group_by": arguments["group_by"] ?? .string("session")])
+            let threshold = try await authority.historyIdleThresholdMinutes(explicit: arguments["idle_threshold_minutes"]?.intValue)
+            let maximumGap = TimeInterval(threshold * 60)
+            let activeSeconds = all.reduce(0.0) { total, session in
+                let timestamps = session.transcript.map(\.timestamp).sorted()
+                let duration = zip(timestamps, timestamps.dropFirst()).reduce(0.0) { subtotal, pair in
+                    subtotal + min(maximumGap, max(0, pair.1.timeIntervalSince(pair.0)))
+                }
+                return total + duration
+            }
+            return .object([
+                "session_count": .int(all.count),
+                "group_by": arguments["group_by"] ?? .string("session"),
+                "idle_threshold_minutes": .int(threshold),
+                "active_seconds": .double(activeSeconds)
+            ])
         default:
             throw ServiceAPIError(code: .invalidRequest, message: "Unsupported history operation")
         }
@@ -1006,6 +1037,17 @@ private struct CodeStructureResult: Encodable {
 private struct ProviderCatalogResult: Encodable {
     let operation: String
     let providers: [ProviderCapability]
+    let rawModels: [ProviderSettingsSnapshot]
+    let presets: [MCPModelPreset]
+    let roleModelRestrictionApplied: Bool
+    let settingsRevision: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case operation, providers, presets
+        case rawModels = "raw_models"
+        case roleModelRestrictionApplied = "role_model_restriction_applied"
+        case settingsRevision = "settings_revision"
+    }
 }
 
 private struct OracleLogResult: Encodable {

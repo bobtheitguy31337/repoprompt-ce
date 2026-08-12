@@ -362,6 +362,7 @@ public actor SQLiteServiceStore {
                 rootSessionID: base.rootSessionID,
                 creator: base.creator,
                 provider: base.provider,
+                providerSettingsID: base.providerSettingsID,
                 model: base.model,
                 visibility: base.visibility,
                 state: base.state,
@@ -396,6 +397,7 @@ public actor SQLiteServiceStore {
                     rootSessionID: base.rootSessionID,
                     creator: base.creator,
                     provider: base.provider,
+                    providerSettingsID: base.providerSettingsID,
                     model: base.model,
                     visibility: base.visibility,
                     state: base.state,
@@ -1436,7 +1438,7 @@ public actor SQLiteServiceStore {
         }
     }
 
-    private func appendProviderConnectionAuditInTransaction(
+    func appendProviderConnectionAuditInTransaction(
         providerID: ProviderSettingsID,
         connectionID: UUID?,
         mutation: ProviderConnectionAuditMutation
@@ -1481,7 +1483,7 @@ public actor SQLiteServiceStore {
         case .claudeCustom: [.apiKey, .authToken]
         case .cursorACP: [.apiKey, .browserLogin]
         case .openCodeACP: [.providerSpecific]
-        case .xAI: [.apiKey]
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI: [.apiKey]
         }
         let vaultMethods: Set<ProviderAuthenticationMethod> = [.apiKey, .enterpriseAccessToken, .authToken]
         guard allowedMethods.contains(record.authenticationMethod),
@@ -1632,6 +1634,9 @@ public actor SQLiteServiceStore {
         for statement in SchemaV5.statements {
             _ = try await connection.query(statement)
         }
+        for statement in SchemaV6.statements {
+            _ = try await connection.query(statement)
+        }
         let count = try await connection.query("SELECT COUNT(*) AS count FROM service_metadata").first?.column("count")?.integer ?? 0
         if count == 0 {
             _ = try await connection.query("INSERT INTO service_metadata(fixed_id,store_id,schema_version,created_at,last_clean_shutdown,current_boot_epoch,next_global_sequence,replay_floor) VALUES(1,?,1,CURRENT_TIMESTAMP,0,1,1,0)", [.text(UUID().uuidString)])
@@ -1674,6 +1679,15 @@ public actor SQLiteServiceStore {
         } else {
             _ = try await connection.query("UPDATE service_metadata SET schema_version=5 WHERE fixed_id=1")
             _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v5',5,'server-authoritative Desktop settings projection',?,CURRENT_TIMESTAMP)", [.text(SchemaV5.digest)])
+        }
+        let v6 = try await connection.query("SELECT digest FROM schema_migrations WHERE version=6").first
+        if let v6 {
+            guard v6.column("digest")?.string == SchemaV6.digest else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Schema v6 migration digest mismatch", retryable: false)
+            }
+        } else {
+            _ = try await connection.query("UPDATE service_metadata SET schema_version=6 WHERE fixed_id=1")
+            _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v6',6,'typed revisioned server settings and digest-only audit',?,CURRENT_TIMESTAMP)", [.text(SchemaV6.digest)])
         }
     }
 
@@ -1849,7 +1863,7 @@ public actor SQLiteServiceStore {
     }
 
     private func replacingCursor(_ value: SessionSnapshot, cursor: ServiceCursor) -> SessionSnapshot {
-        SessionSnapshot(sessionID: value.sessionID, projectID: value.projectID, parentSessionID: value.parentSessionID, rootSessionID: value.rootSessionID, creator: value.creator, provider: value.provider, model: value.model, visibility: value.visibility, state: value.state, runGeneration: value.runGeneration, turnEpoch: value.turnEpoch, revision: value.revision, transcript: value.transcript, interactions: value.interactions, cursor: cursor)
+        SessionSnapshot(sessionID: value.sessionID, projectID: value.projectID, parentSessionID: value.parentSessionID, rootSessionID: value.rootSessionID, creator: value.creator, provider: value.provider, providerSettingsID: value.providerSettingsID, model: value.model, visibility: value.visibility, state: value.state, runGeneration: value.runGeneration, turnEpoch: value.turnEpoch, revision: value.revision, transcript: value.transcript, interactions: value.interactions, cursor: cursor)
     }
 }
 

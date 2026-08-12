@@ -22,6 +22,7 @@ public struct RepoPromptHTTPService: Sendable {
     private let drainController: MutationDrainController
     private let durabilityOperations: DurabilityOperationsService?
     private let providerSettings: ProviderSettingsService?
+    private let serverSettings: ServerSettingsService?
     private let portalDesktopSettings: PortalDesktopSettingsService
 
     public init(
@@ -34,6 +35,7 @@ public struct RepoPromptHTTPService: Sendable {
         drainController: MutationDrainController = MutationDrainController(),
         durabilityOperations: DurabilityOperationsService? = nil,
         providerSettings: ProviderSettingsService? = nil,
+        serverSettings: ServerSettingsService? = nil,
         portalDesktopSettings: PortalDesktopSettingsService? = nil
     ) {
         self.authority = authority
@@ -44,6 +46,7 @@ public struct RepoPromptHTTPService: Sendable {
         self.drainController = drainController
         self.durabilityOperations = durabilityOperations
         self.providerSettings = providerSettings
+        self.serverSettings = serverSettings
         self.portalDesktopSettings = portalDesktopSettings ?? PortalDesktopSettingsService(store: store)
         self.readiness = readiness ?? RepoPromptReadinessService(
             authority: authority,
@@ -101,13 +104,31 @@ public struct RepoPromptHTTPService: Sendable {
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(PortalCreateSessionRequest.self, from: data)
             let catalog = try await requireProviderSettings().catalog(refreshCLI: false)
-            guard let provider = catalog.providers.first(where: { $0.providerID == input.providerID }) else {
+            let providerID: ProviderSettingsID
+            let resolvedModel: String?
+            let reasoningEffort: String?
+            if let explicitProviderID = input.providerID {
+                providerID = explicitProviderID
+                resolvedModel = input.model
+                reasoningEffort = nil
+            } else {
+                let target = input.routingTarget ?? .engineer
+                guard let resolved = try await requireServerSettings().resolveAgentTarget(projectID: input.projectID, target: target) else {
+                    throw ServiceAPIError(code: .dependencyUnavailable, message: "No Agent Model route is available for the new session", retryable: true)
+                }
+                providerID = resolved.providerID
+                resolvedModel = resolved.modelID
+                reasoningEffort = resolved.reasoningEffort
+            }
+            guard let provider = catalog.providers.first(where: { $0.providerID == providerID }) else {
                 throw ServiceAPIError(code: .notFound, message: "Provider settings not found")
             }
-            let runtimeDefaults = try await requirePortalDesktopSettings().runtimeDefaults(for: input.providerID)
+            let runtimeDefaults = try await requirePortalDesktopSettings().runtimeDefaults(for: providerID)
             let createInput = try RepoPromptPortalSessionProjection.validatedCreateInput(
                 input,
                 provider: provider,
+                resolvedModel: resolvedModel,
+                reasoningEffort: reasoningEffort,
                 runtimeDefaults: runtimeDefaults
             )
             let snapshot = try await authority.createSession(
@@ -144,10 +165,251 @@ public struct RepoPromptHTTPService: Sendable {
             let input = try await JSONDecoder.serviceDecoder.decode(UpdatePortalDesktopSettingsRequest.self, from: bodyData(request))
             return try await portalJSON(requirePortalDesktopSettings().update(input))
         } }
+        router.get("/portal/api/v1/settings/agent-models") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            return try await portalJSON(requireServerSettings().agentModels())
+        } }
+        router.patch("/portal/api/v1/settings/agent-models") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let input = try await JSONDecoder.serviceDecoder.decode(ReplaceGlobalAgentModelsRequest.self, from: bodyData(request))
+            return try await portalJSON(requireServerSettings().replaceGlobalAgentModels(input, attribution: principal.settingsAttribution))
+        } }
+        router.post("/portal/api/v1/settings/agent-models/apply-recommendations") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let input = try await JSONDecoder.serviceDecoder.decode(ApplyAgentModelRecommendationsRequest.self, from: bodyData(request))
+            return try await portalJSON(requireServerSettings().applyGlobalAgentModelRecommendations(input, attribution: principal.settingsAttribution))
+        } }
+        router.get("/portal/api/v1/projects/:id/settings/agent-models") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            return try await portalJSON(requireServerSettings().agentModels(projectID: projectID))
+        } }
+        router.patch("/portal/api/v1/projects/:id/settings/agent-models") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let input = try await JSONDecoder.serviceDecoder.decode(ReplaceProjectAgentModelsRequest.self, from: bodyData(request))
+            return try await portalJSON(requireServerSettings().replaceProjectAgentModels(projectID: projectID, request: input, attribution: principal.settingsAttribution))
+        } }
+        router.post("/portal/api/v1/projects/:id/settings/agent-models/copy-global") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let input = try await JSONDecoder.serviceDecoder.decode(CopyGlobalAgentModelsToProjectRequest.self, from: bodyData(request))
+            return try await portalJSON(requireServerSettings().copyGlobalAgentModelsToProject(projectID: projectID, request: input, attribution: principal.settingsAttribution))
+        } }
+        router.post("/portal/api/v1/projects/:id/settings/agent-models/apply-recommendations") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let input = try await JSONDecoder.serviceDecoder.decode(ApplyAgentModelRecommendationsRequest.self, from: bodyData(request))
+            return try await portalJSON(requireServerSettings().applyProjectAgentModelRecommendations(projectID: projectID, request: input, attribution: principal.settingsAttribution))
+        } }
+        router.get("/portal/api/v1/settings/subagent-permissions") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            return try await portalJSON(requireServerSettings().subagentPermissions())
+        } }
+        router.patch("/portal/api/v1/settings/subagent-permissions") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let input = try await JSONDecoder.serviceDecoder.decode(ReplaceSubagentPermissionSettingsRequest.self, from: bodyData(request))
+            return try await portalJSON(requireServerSettings().replaceSubagentPermissions(input, attribution: principal.settingsAttribution))
+        } }
+        router.get("/portal/api/v1/settings/context-builder") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            return try await portalJSON(requireServerSettings().contextBuilder())
+        } }
+        router.patch("/portal/api/v1/settings/context-builder") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let input = try await JSONDecoder.serviceDecoder.decode(ReplaceGlobalContextBuilderSettingsRequest.self, from: bodyData(request))
+            return try await portalJSON(requireServerSettings().replaceGlobalContextBuilder(input, attribution: principal.settingsAttribution))
+        } }
+        router.get("/portal/api/v1/projects/:id/settings/context-builder") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            return try await portalJSON(requireServerSettings().contextBuilder(projectID: projectID))
+        } }
+        router.patch("/portal/api/v1/projects/:id/settings/context-builder") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let input = try await JSONDecoder.serviceDecoder.decode(ReplaceProjectContextBuilderSettingsRequest.self, from: bodyData(request))
+            return try await portalJSON(requireServerSettings().replaceProjectContextBuilder(projectID: projectID, request: input, attribution: principal.settingsAttribution))
+        } }
+        router.post("/portal/api/v1/projects/:id/settings/context-builder/copy-global") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let input = try await JSONDecoder.serviceDecoder.decode(CopyGlobalContextBuilderToProjectRequest.self, from: bodyData(request))
+            return try await portalJSON(requireServerSettings().copyGlobalContextBuilderToProject(projectID: projectID, request: input, attribution: principal.settingsAttribution))
+        } }
+        router.get("/portal/api/v1/settings/model-presets") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            return try await portalJSON(requireServerSettings().modelPresets())
+        } }
+        router.patch("/portal/api/v1/settings/model-presets") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let input = try await JSONDecoder.serviceDecoder.decode(ReplaceMCPModelPresetsRequest.self, from: bodyData(request))
+            return try await portalJSON(requireServerSettings().replaceModelPresets(input, attribution: principal.settingsAttribution))
+        } }
+        router.get("/portal/api/v1/settings/advanced") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            return try await portalJSON(requireServerSettings().advanced())
+        } }
+        router.patch("/portal/api/v1/settings/advanced") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let input = try await JSONDecoder.serviceDecoder.decode(ReplaceAdvancedServerSettingsRequest.self, from: bodyData(request))
+            return try await portalJSON(requireServerSettings().replaceAdvanced(input, attribution: principal.settingsAttribution))
+        } }
+        router.get("/portal/api/v1/sessions/:id/selection") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            return try await portalJSON(authority.selectionSnapshot(sessionID: sessionID))
+        } }
+        router.post("/portal/api/v1/sessions/:id/context-builder") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let input = try await JSONDecoder.serviceDecoder.decode(ContextBuilderInput.self, from: bodyData(request))
+            return try await portalJSON(authority.runContextBuilder(sessionID: sessionID, input: input, actor: principal.externalActor, origin: .portal), status: .accepted)
+        } }
+        router.get("/portal/api/v1/projects/:id/selection-presets") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            return try await portalJSON(authority.projectSelectionPresets(projectID: projectID))
+        } }
+        router.post("/portal/api/v1/projects/:id/selection-presets") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let input = try await JSONDecoder.serviceDecoder.decode(CreateProjectSelectionPresetRequest.self, from: bodyData(request))
+            return try await portalJSON(authority.createProjectSelectionPreset(projectID: projectID, request: input, attribution: principal.settingsAttribution), status: .created)
+        } }
+        router.patch("/portal/api/v1/projects/:id/selection-presets/:presetID") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let presetID = try context.parameters.require("presetID", as: UUID.self)
+            let input = try await JSONDecoder.serviceDecoder.decode(UpdateProjectSelectionPresetRequest.self, from: bodyData(request))
+            return try await portalJSON(authority.updateProjectSelectionPreset(projectID: projectID, presetID: presetID, request: input, attribution: principal.settingsAttribution))
+        } }
+        router.delete("/portal/api/v1/projects/:id/selection-presets/:presetID") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let presetID = try context.parameters.require("presetID", as: UUID.self)
+            let input = try await JSONDecoder.serviceDecoder.decode(DeleteProjectSelectionPresetRequest.self, from: bodyData(request))
+            return try await portalJSON(authority.deleteProjectSelectionPreset(projectID: projectID, presetID: presetID, request: input, attribution: principal.settingsAttribution))
+        } }
+        router.post("/portal/api/v1/projects/:id/selection-presets/reorder") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let input = try await JSONDecoder.serviceDecoder.decode(ReorderProjectSelectionPresetsRequest.self, from: bodyData(request))
+            return try await portalJSON(authority.reorderProjectSelectionPresets(projectID: projectID, request: input, attribution: principal.settingsAttribution))
+        } }
+        router.post("/portal/api/v1/projects/:id/selection-presets/capture") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let input = try await JSONDecoder.serviceDecoder.decode(CaptureProjectSelectionPresetRequest.self, from: bodyData(request))
+            return try await portalJSON(authority.captureProjectSelectionPreset(projectID: projectID, request: input, attribution: principal.settingsAttribution), status: .created)
+        } }
+        router.post("/portal/api/v1/projects/:id/selection-presets/apply") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let input = try await JSONDecoder.serviceDecoder.decode(ApplyProjectSelectionPresetRequest.self, from: bodyData(request))
+            return try await portalJSON(authority.applyProjectSelectionPreset(projectID: projectID, request: input, actor: principal.externalActor))
+        } }
+        router.get("/portal/api/v1/workflows") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            return try await portalJSON(authority.workflowRepositorySnapshot())
+        } }
+        router.post("/portal/api/v1/workflows") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let data = try await bodyData(request)
+            let input = try Self.decodeStrictWorkflowPayload(CreateServerWorkflowRequest.self, data: data, allowedKeys: ["expectedRevision", "name", "definition", "enabled", "visible", "featured"])
+            return try await portalJSON(authority.createWorkflow(input, attribution: principal.settingsAttribution), status: .created)
+        } }
+        router.patch("/portal/api/v1/workflows/:id") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let workflowID = try context.parameters.require("id")
+            let data = try await bodyData(request)
+            let input = try Self.decodeStrictWorkflowPayload(UpdateServerWorkflowRequest.self, data: data, allowedKeys: ["expectedRevision", "expectedRowRevision", "name", "definition", "enabled", "visible", "featured"])
+            return try await portalJSON(authority.updateWorkflow(workflowID: workflowID, request: input, attribution: principal.settingsAttribution))
+        } }
+        router.delete("/portal/api/v1/workflows/:id") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let workflowID = try context.parameters.require("id")
+            let data = try await bodyData(request)
+            let input = try Self.decodeStrictWorkflowPayload(DeleteServerWorkflowRequest.self, data: data, allowedKeys: ["expectedRevision", "expectedRowRevision"])
+            return try await portalJSON(authority.deleteWorkflow(workflowID: workflowID, request: input, attribution: principal.settingsAttribution))
+        } }
+        router.post("/portal/api/v1/workflows/:id/clone") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let workflowID = try context.parameters.require("id")
+            let data = try await bodyData(request)
+            let input = try Self.decodeStrictWorkflowPayload(CloneServerWorkflowRequest.self, data: data, allowedKeys: ["expectedRevision", "expectedSourceRowRevision", "name"])
+            return try await portalJSON(authority.cloneWorkflow(workflowID: workflowID, request: input, attribution: principal.settingsAttribution), status: .created)
+        } }
+        router.patch("/portal/api/v1/workflows/:id/visibility") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let workflowID = try context.parameters.require("id")
+            let data = try await bodyData(request)
+            let input = try Self.decodeStrictWorkflowPayload(SetServerWorkflowVisibilityRequest.self, data: data, allowedKeys: ["expectedRevision", "expectedRowRevision", "visible"])
+            return try await portalJSON(authority.setWorkflowVisibility(workflowID: workflowID, request: input, attribution: principal.settingsAttribution))
+        } }
+        router.post("/portal/api/v1/workflows/reorder") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let data = try await bodyData(request)
+            let input = try Self.decodeStrictWorkflowPayload(ReorderServerWorkflowsRequest.self, data: data, allowedKeys: ["expectedRevision", "featuredWorkflowIDs"])
+            return try await portalJSON(authority.reorderWorkflows(input, attribution: principal.settingsAttribution))
+        } }
+        router.patch("/portal/api/v1/workflows/preferences") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let data = try await bodyData(request)
+            let input = try Self.decodeStrictWorkflowPayload(UpdateServerWorkflowPreferencesRequest.self, data: data, allowedKeys: ["expectedRevision", "includeSessionCleanupGuidance"])
+            return try await portalJSON(authority.updateWorkflowPreferences(input, attribution: principal.settingsAttribution))
+        } }
+        router.post("/portal/api/v1/workflows/reload") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let data = try await bodyData(request)
+            let input = try Self.decodeStrictWorkflowPayload(ReloadServerWorkflowsRequest.self, data: data, allowedKeys: ["expectedRevision"])
+            return try await portalJSON(authority.reloadWorkflows(input, attribution: principal.settingsAttribution))
+        } }
         router.get("/portal/api/v1/provider-settings") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(context: context)
             let catalog = try await requireProviderSettings().catalog()
             return try portalJSON(catalog)
+        } }
+        router.get("/portal/api/v1/provider-settings/:id/direct-configuration") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            return try await portalJSON(requireProviderSettings().directConfiguration(providerID: providerSettingsID(context)))
+        } }
+        router.patch("/portal/api/v1/provider-settings/:id/direct-configuration") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let input = try await JSONDecoder.serviceDecoder.decode(UpdateDirectProviderConfigurationRequest.self, from: bodyData(request))
+            let configuration = try await requireProviderSettings().updateDirectConfiguration(
+                providerID: providerSettingsID(context),
+                request: input,
+                attribution: principal.providerAttribution
+            )
+            return try portalJSON(configuration)
         } }
         router.patch("/portal/api/v1/provider-settings/:id") { request, context in await portalRespond(request) {
             let principal = try await authenticatePortal(context: context)
@@ -233,6 +495,21 @@ public struct RepoPromptHTTPService: Sendable {
         router.get("/internal/v1/provider-settings") { request, context in await respond(request) {
             _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp, .operatorRole], operation: "providerCatalog")
             return try await HTTPResponses.json(requireProviderSettings().catalog())
+        } }
+        router.get("/internal/v1/provider-settings/:id/direct-configuration") { request, context in await respond(request) {
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp, .operatorRole], operation: "providerDirectConfigurationRead")
+            return try await HTTPResponses.json(requireProviderSettings().directConfiguration(providerID: providerSettingsID(context)))
+        } }
+        router.patch("/internal/v1/provider-settings/:id/direct-configuration") { request, context in await respond(request) {
+            let data = try await bodyData(request)
+            _ = try requireIdempotency(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerDirectConfigurationUpdate")
+            let input = try JSONDecoder.serviceDecoder.decode(UpdateDirectProviderConfigurationRequest.self, from: data)
+            return try await HTTPResponses.json(requireProviderSettings().updateDirectConfiguration(
+                providerID: providerSettingsID(context),
+                request: input,
+                attribution: providerAttribution(auth)
+            ))
         } }
         router.patch("/internal/v1/provider-settings/:id") { request, context in await respond(request) {
             let data = try await bodyData(request)
@@ -680,8 +957,10 @@ public struct RepoPromptHTTPService: Sendable {
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "runContextBuilder", sessionID: id)
             _ = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(ContextBuilderInput.self, from: data)
-            guard (1 ... 1_000_000).contains(input.budget) else { throw ServiceAPIError(code: .invalidRequest, message: "Context Builder budget exceeds the v1 limit") }
-            return try await HTTPResponses.json(authority.runContextBuilder(sessionID: id, input: input, actor: requireActor(auth)))
+            if let budget = input.budget, !(1 ... 1_000_000).contains(budget) {
+                throw ServiceAPIError(code: .invalidRequest, message: "Context Builder budget exceeds the v1 bound")
+            }
+            return try await HTTPResponses.json(authority.runContextBuilder(sessionID: id, input: input, actor: requireActor(auth), origin: .internal))
         } }
         router.post("/internal/v1/sessions/:id/context/oracle") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
@@ -778,6 +1057,7 @@ public struct RepoPromptHTTPService: Sendable {
     private struct PortalAuthenticatedPrincipal {
         let actorID: String
         let providerAttribution: ProviderMutationAttribution
+        let settingsAttribution: SettingsMutationAttribution
         let externalActor: ExternalActor
     }
 
@@ -797,6 +1077,7 @@ public struct RepoPromptHTTPService: Sendable {
         return PortalAuthenticatedPrincipal(
             actorID: actorID,
             providerAttribution: ProviderMutationAttribution(actorID: actorID, actorLabel: actorLabel, channel: "portal-mtls"),
+            settingsAttribution: SettingsMutationAttribution(actorID: actorID, actorLabel: actorLabel, channel: "portal-mtls"),
             externalActor: ExternalActor(goblinUserID: actorID, username: actorLabel, displayName: actorLabel)
         )
     }
@@ -824,11 +1105,30 @@ public struct RepoPromptHTTPService: Sendable {
         return providerSettings
     }
 
+    private func requireServerSettings() throws -> ServerSettingsService {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Server settings are unavailable", retryable: true)
+        }
+        return serverSettings
+    }
+
     private func providerAttribution(_ auth: AuthenticatedInternalRequest) -> ProviderMutationAttribution {
         if let actor = auth.decision?.actor {
             return .init(actorID: actor.goblinUserID, actorLabel: actor.username, channel: "goblin-app")
         }
         return .init(actorID: "signing-key:\(auth.keyID)", actorLabel: auth.role.rawValue, channel: "internal-hmac")
+    }
+
+    static func decodeStrictWorkflowPayload<Value: Decodable>(
+        _ type: Value.Type,
+        data: Data,
+        allowedKeys: Set<String>
+    ) throws -> Value {
+        let value = try JSONSerialization.jsonObject(with: data)
+        guard let object = value as? [String: Any], Set(object.keys).isSubset(of: allowedKeys) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Workflow request contains unsupported fields")
+        }
+        return try JSONDecoder.serviceDecoder.decode(type, from: data)
     }
 
     private func portalJSON(_ value: some Encodable, status: HTTPResponse.Status = .ok) throws -> Response {
@@ -866,14 +1166,25 @@ public struct RepoPromptHTTPService: Sendable {
     private func portalBootstrap() async throws -> PortalBootstrapResponse {
         let projects = await authority.projectSnapshots().map(RepoPromptPortalSessionProjection.project)
         let sessions = try await authority.sessionSnapshots().map(RepoPromptPortalSessionProjection.project)
-        let workflows = try await authority.workflowSnapshots().map {
-            PortalWorkflowSummary(workflowID: $0.workflowID, name: $0.name, enabled: $0.enabled)
+        let workflowRepository = try await authority.workflowRepositorySnapshot()
+        let workflows = workflowRepository.workflows.filter { $0.enabled && $0.visible }.map {
+            PortalWorkflowSummary(
+                workflowID: $0.workflowID,
+                name: $0.name,
+                source: $0.source,
+                enabled: $0.enabled,
+                visible: $0.visible,
+                featuredOrder: $0.featuredOrder,
+                rowRevision: $0.rowRevision
+            )
         }
         return PortalBootstrapResponse(
             projects: projects,
             sessions: sessions,
             workflows: workflows,
-            tools: RepoPromptPortalSessionProjection.tools()
+            tools: RepoPromptPortalSessionProjection.tools(),
+            workflowRepositoryRevision: workflowRepository.revision,
+            includeSessionCleanupGuidance: workflowRepository.includeSessionCleanupGuidance
         )
     }
 

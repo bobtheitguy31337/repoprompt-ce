@@ -229,17 +229,31 @@ actor DirectHeadlessMCPService {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let store = try await SQLiteServiceStore.open(storage: .file(root.appendingPathComponent("repoprompt.sqlite").path))
         let processPort = try PortableProcessSupervisionPort()
+        let configurations = providerConfigurations()
         let providers = ProviderCLIAdapter(
-            configurations: providerConfigurations(),
+            configurations: configurations,
             processPort: processPort,
             processStore: store,
             outputDirectory: providerOutput.path,
             ephemeralHomeRoot: providerHomes.path
         )
+        let providerSettings = ProviderSettingsService(
+            store: store,
+            adapter: providers,
+            configurations: configurations,
+            initiallyEnabled: Set(configurations.map(\.kind))
+        )
+        try await providerSettings.bootstrap()
+        let serverSettings = ServerSettingsService(
+            store: store,
+            providerCatalog: providerSettings,
+            projectCatalog: store
+        )
         let authority = try RepoPromptHeadlessAuthority(
             store: store,
             artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path),
-            providerAdapter: providers
+            providerAdapter: providers,
+            serverSettings: serverSettings
         )
         try await authority.recover()
         let actor = ExternalActor(goblinUserID: "direct-mcp", username: "direct-mcp", displayName: "Direct MCP")

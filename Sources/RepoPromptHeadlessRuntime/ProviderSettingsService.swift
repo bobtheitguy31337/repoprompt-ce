@@ -57,6 +57,8 @@ public actor ProviderSettingsService {
     private let managedAuthentication: any ProviderManagedAuthenticationDriving
     private let vault: ProviderCredentialVault?
     private let credentialTester: any ProviderCredentialTesting
+    private let directProviderRegistry: DirectProviderRegistry?
+    private let directProviderAllowlist: Set<ProviderSettingsID>
     private let runner: any WorkspaceCommandRunning
     private var preferences: [ProviderSettingsID: ProviderSettingsPreference] = [:]
     private var cliHealth: [ProviderSettingsID: ProviderCLIHealth] = [:]
@@ -83,6 +85,8 @@ public actor ProviderSettingsService {
         managedAuthentication: any ProviderManagedAuthenticationDriving = UnavailableProviderManagedAuthenticationDriver(),
         vault: ProviderCredentialVault? = nil,
         credentialTester: any ProviderCredentialTesting = UnavailableProviderCredentialTester(),
+        directProviderRegistry: DirectProviderRegistry? = nil,
+        directProviderAllowlist: Set<ProviderSettingsID> = [],
         runner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner()
     ) {
         self.store = store
@@ -95,11 +99,20 @@ public actor ProviderSettingsService {
         self.managedAuthentication = managedAuthentication
         self.vault = vault
         self.credentialTester = credentialTester
+        self.directProviderRegistry = directProviderRegistry
+        self.directProviderAllowlist = Set(directProviderAllowlist.filter(\.isDirectAPI))
         self.runner = runner
     }
 
     public func bootstrap() async throws {
         modelCatalogs = try loadModelCatalogs()
+        for persistedCatalog in try await store.providerModelCatalogs() {
+            guard persistedCatalog.models.count <= 500,
+                  Set(persistedCatalog.models.map(\.id)).count == persistedCatalog.models.count,
+                  persistedCatalog.models.allSatisfy({ validCatalogEntry($0, providerID: persistedCatalog.providerID) })
+            else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Persisted provider model catalog is invalid", retryable: false) }
+            modelCatalogs[persistedCatalog.providerID] = persistedCatalog.models
+        }
         let persisted = try await store.providerSettings()
         preferences = Dictionary(uniqueKeysWithValues: persisted.map { ($0.providerID, $0) })
         for preference in persisted {
@@ -132,17 +145,26 @@ public actor ProviderSettingsService {
         }
         for providerID in ProviderSettingsID.allCases {
             let validatorMethods = await credentialTester.supportedAuthenticationMethods(for: providerID)
-            if let runtimeKind = providerID.runtimeKind,
-               let configuration = configurations[runtimeKind],
-               initiallyEnabled.contains(runtimeKind),
-               FileManager.default.isExecutableFile(atPath: configuration.executable)
+            let runtimeEligible: Bool
+            if providerID.isDirectAPI {
+                runtimeEligible = directProviderAllowlist.contains(providerID) && directProviderRegistry != nil
+            } else if let runtimeKind = providerID.runtimeKind,
+                      let configuration = configurations[runtimeKind],
+                      initiallyEnabled.contains(runtimeKind),
+                      FileManager.default.isExecutableFile(atPath: configuration.executable)
             {
+                runtimeEligible = true
+            } else {
+                runtimeEligible = false
+            }
+            if runtimeEligible {
                 let vaultMethods: Set<ProviderAuthenticationMethod> = [.apiKey, .enterpriseAccessToken, .authToken]
                 var methods = Set(validatorMethods.filter { vault != nil || !vaultMethods.contains($0) })
                 if let externalMethod = Self.externalAuthenticationMethod(for: providerID), externallyProvisioned(providerID) {
                     methods.insert(externalMethod)
                 }
                 supportedAuthenticationMethods[providerID] = methods
+                if providerID.isDirectAPI { runtimePreflight[providerID] = true }
             } else {
                 supportedAuthenticationMethods[providerID] = []
             }
@@ -159,7 +181,23 @@ public actor ProviderSettingsService {
         }
     }
 
-    public func catalog(refreshCLI _: Bool = false, refreshRuntime _: Bool = false) async throws -> ProviderSettingsCatalogResponse {
+    public func catalog(refreshCLI: Bool = false, refreshRuntime: Bool = false) async throws -> ProviderSettingsCatalogResponse {
+        if refreshCLI || refreshRuntime {
+            for providerID in ProviderSettingsID.allCases where providerID.ownsRuntimeAdmission && !providerID.isDirectAPI {
+                guard let kind = providerID.runtimeKind,
+                      let configuration = configurations[kind]
+                else { continue }
+                if refreshCLI {
+                    await refreshCLIHealth(providerID: providerID, kind: kind, configuration: configuration)
+                    if providerID == .codex {
+                        await refreshManagedAuthenticationCapabilities(providerID: providerID, forceRefresh: true)
+                    }
+                }
+                if refreshRuntime {
+                    await refreshRuntimePreflight(providerID: providerID, kind: kind)
+                }
+            }
+        }
         let snapshots = try ProviderSettingsID.allCases.map { try snapshot(for: $0) }
         return ProviderSettingsCatalogResponse(providers: snapshots)
     }
@@ -178,9 +216,12 @@ public actor ProviderSettingsService {
         }
         let definition = Self.definition(providerID)
         if request.enabled, providerID.runtimeKind == nil {
-            throw ServiceAPIError(code: .capabilityMissing, message: "This provider has no portable server runtime yet")
+            throw ServiceAPIError(code: .capabilityMissing, message: "This provider has no portable server runtime")
         }
-        if request.enabled, let kind = providerID.runtimeKind, !initiallyEnabled.contains(kind) {
+        if request.enabled, providerID.isDirectAPI, !directProviderAllowlist.contains(providerID) {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Deployment configuration does not allow this direct provider")
+        }
+        if request.enabled, !providerID.isDirectAPI, let kind = providerID.runtimeKind, !initiallyEnabled.contains(kind) {
             throw ServiceAPIError(code: .capabilityMissing, message: "Deployment configuration does not allow this provider")
         }
         try validateSelection(request, providerID: providerID, definition: definition)
@@ -204,6 +245,27 @@ public actor ProviderSettingsService {
         preferences[providerID] = try await store.upsertProviderSettings(next, expectedRevision: current.revision, audit: audit)
         try await applyRuntimePreference(providerID)
         return try snapshot(for: providerID)
+    }
+
+    public func directConfiguration(providerID: ProviderSettingsID) async throws -> DirectProviderConfiguration {
+        guard let directProviderRegistry else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Direct provider configuration is unavailable")
+        }
+        return try await directProviderRegistry.configuration(for: providerID)
+    }
+
+    public func updateDirectConfiguration(
+        providerID: ProviderSettingsID,
+        request: UpdateDirectProviderConfigurationRequest,
+        attribution: ProviderMutationAttribution
+    ) async throws -> DirectProviderConfiguration {
+        guard connections[providerID] == nil else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Disconnect the direct provider before changing its runtime configuration")
+        }
+        guard let directProviderRegistry else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Direct provider configuration is unavailable")
+        }
+        return try await directProviderRegistry.update(providerID: providerID, request: request, attribution: attribution)
     }
 
     public func setEnabled(
@@ -323,6 +385,18 @@ public actor ProviderSettingsService {
         } else {
             externalValidation = nil
         }
+        let directValidation: ProviderCredentialTestResult?
+        if providerID.isDirectAPI {
+            let validation = await credentialTester.test(providerID: providerID, method: request.authenticationMethod, secret: secret)
+            guard validation.state == .valid, let models = validation.models else {
+                let code: ServiceErrorCode = validation.state == .invalid ? .invalidRequest : .dependencyUnavailable
+                throw ServiceAPIError(code: code, message: validation.state == .invalid ? "Provider rejected the configured credential" : "Provider validation is temporarily unavailable", retryable: validation.state != .invalid)
+            }
+            try await persistDiscoveredCatalog(models, providerID: providerID)
+            directValidation = validation
+        } else {
+            directValidation = nil
+        }
         let credentialReference = secret.map { _ in UUID() }
         if let secret, let credentialReference {
             try await vault?.store(secret: secret, providerID: providerID, connectionID: credentialReference)
@@ -335,9 +409,12 @@ public actor ProviderSettingsService {
                 throw error
             }
         }
-        let detail = externalValidation?.detail ?? "Credential stored; explicit validation is required"
-        let initialTestState: ProviderCredentialTestState = external ? .valid : .notTested
-        let initialState: ProviderConnectionState = external ? .connected : .attention
+        let detail = directValidation.map { _ in "Provider credential and model catalog validated" }
+            ?? externalValidation?.detail
+            ?? "Credential stored; explicit validation is required"
+        let initiallyValidated = external || directValidation != nil
+        let initialTestState: ProviderCredentialTestState = initiallyValidated ? .valid : .notTested
+        let initialState: ProviderConnectionState = initiallyValidated ? .connected : .attention
         let record = ProviderConnectionRecord(
             connectionID: connectionID,
             providerID: providerID,
@@ -345,7 +422,7 @@ public actor ProviderSettingsService {
             state: initialState,
             accountLabel: accountLabel,
             expiresAt: request.expiresAt,
-            lastTestedAt: external ? Date() : nil,
+            lastTestedAt: initiallyValidated ? Date() : nil,
             testState: initialTestState,
             detail: detail,
             keyHelperConfigured: false,
@@ -359,7 +436,7 @@ public actor ProviderSettingsService {
             operation: old == nil ? "connect" : "rotate",
             attribution: attribution,
             authenticationMethod: request.authenticationMethod,
-            result: external ? "configured" : "stored"
+            result: initiallyValidated ? "validated" : "stored"
         )
         do {
             connections[providerID] = try await store.upsertProviderConnection(stored, expectedRevision: expectedRevision, audit: audit)
@@ -430,6 +507,12 @@ public actor ProviderSettingsService {
             secret = try await vault.load(providerID: providerID, connectionID: reference)
         } else { secret = nil }
         let result = await credentialTester.test(providerID: providerID, method: stored.record.authenticationMethod, secret: secret)
+        if result.state == .valid, providerID.isDirectAPI {
+            guard let models = result.models else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider validation returned no model catalog")
+            }
+            try await persistDiscoveredCatalog(models, providerID: providerID)
+        }
         let knownSecrets = secret.flatMap { String(data: $0, encoding: .utf8) }.map { [$0] } ?? []
         let detail = try safeDetail(ProviderSecretRedaction.redact(result.detail, knownSecrets: knownSecrets))
         let returnedAccountLabel = try safeLabel(result.accountLabel)
@@ -634,6 +717,22 @@ public actor ProviderSettingsService {
         }
     }
 
+    private func persistDiscoveredCatalog(_ models: [ProviderModelCatalogEntry], providerID: ProviderSettingsID) async throws {
+        guard providerID.isDirectAPI,
+              !models.isEmpty,
+              models.count <= 500,
+              Set(models.map(\.id)).count == models.count,
+              models.allSatisfy({ validCatalogEntry($0, providerID: providerID) })
+        else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider validation returned an unsafe model catalog") }
+        let currentRevision = try await store.providerModelCatalog(providerID: providerID)?.revision ?? 0
+        let persisted = try await store.replaceProviderModelCatalog(
+            providerID: providerID,
+            models: models,
+            expectedRevision: currentRevision
+        )
+        modelCatalogs[providerID] = persisted.models
+    }
+
     private func safeLabel(_ value: String?) throws -> String? {
         guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
         guard value.utf8.count <= 256,
@@ -656,7 +755,8 @@ public actor ProviderSettingsService {
         switch providerID {
         case .claudeCompatible, .openCodeACP: .providerSpecific
         case .cursorACP: .browserLogin
-        case .codex, .claudeGLM, .claudeKimi, .claudeCustom, .xAI: nil
+        case .codex, .claudeGLM, .claudeKimi, .claudeCustom,
+             .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI: nil
         }
     }
 
@@ -722,12 +822,23 @@ public actor ProviderSettingsService {
     }
 
     private func applyRuntimePreference(_ providerID: ProviderSettingsID) async throws {
-        guard let kind = providerID.runtimeKind else { return }
         let ownerID = providerID.runtimeSettingsOwner
         guard let preference = preferences[ownerID] else { return }
-        guard configurations[kind] != nil else { return }
+        let defaults = ProviderRuntimeDefaults(
+            enabled: preference.enabled,
+            model: preference.defaultModel,
+            reasoningEffort: preference.reasoningEffort,
+            speedMode: preference.speedMode,
+            serviceTier: preference.serviceTier
+        )
+        if providerID.isDirectAPI {
+            guard directProviderAllowlist.contains(providerID), directProviderRegistry != nil else { return }
+            try await adapter.applyRuntimeDefaults(providerID: providerID, defaults: defaults)
+            return
+        }
+        guard let kind = providerID.runtimeKind, configurations[kind] != nil else { return }
         let effectiveAdmission = initiallyEnabled.contains(kind) && preferences.values.contains {
-            $0.providerID.runtimeKind == kind && $0.enabled
+            !$0.providerID.isDirectAPI && $0.providerID.runtimeKind == kind && $0.enabled
         }
         try await adapter.applyRuntimeDefaults(
             kind: kind,
@@ -836,7 +947,9 @@ public actor ProviderSettingsService {
         }
         let definition = Self.definition(providerID)
         let runtimeSettingsID = providerID.runtimeSettingsOwner
-        let deploymentAllowed = providerID.runtimeKind.map(initiallyEnabled.contains) ?? false
+        let deploymentAllowed = providerID.isDirectAPI
+            ? directProviderAllowlist.contains(providerID)
+            : (providerID.runtimeKind.map(initiallyEnabled.contains) ?? false)
         let preflightVerified = runtimePreflight[runtimeSettingsID] ?? false
         let models = modelCatalogs[providerID] ?? defaultCatalog(for: providerID)
         let connection = connections[providerID]?.record
@@ -857,7 +970,9 @@ public actor ProviderSettingsService {
             runtimePreflightVerified: preflightVerified,
             effectiveEnabled: preference.enabled && preflight.ready,
             preference: preference,
-            cli: providerID.runtimeKind == nil ? nil : cliHealth[runtimeSettingsID] ?? ProviderCLIHealth(installed: false, healthy: false, detail: "CLI health has not been checked"),
+            cli: providerID.isDirectAPI || providerID.runtimeKind == nil
+                ? nil
+                : cliHealth[runtimeSettingsID] ?? ProviderCLIHealth(installed: false, healthy: false, detail: "CLI health has not been checked"),
             authentication: authenticationStatus(providerID),
             connection: connection,
             preflight: preflight,
@@ -905,10 +1020,13 @@ public actor ProviderSettingsService {
     private func preflightStatus(providerID: ProviderSettingsID, preference: ProviderSettingsPreference, deploymentAllowed: Bool, runtimeVerified: Bool, connection: ProviderConnectionRecord?, cli: ProviderCLIHealth?) -> ProviderPreflightStatus {
         guard preference.enabled else { return .init(ready: false, reason: .disabled, detail: "Provider is administratively disabled") }
         guard deploymentAllowed else { return .init(ready: false, reason: .deploymentDisabled, detail: "Deployment configuration does not allow this provider runtime") }
-        if providerID.runtimeKind != nil, cli?.installed != true {
+        if !providerID.isDirectAPI, providerID.runtimeKind != nil, cli?.installed != true {
             return .init(ready: false, reason: .missingExecutable, detail: "Provider executable is missing")
         }
         guard runtimeVerified else { return .init(ready: false, reason: .runtimeUnavailable, detail: cli?.detail ?? "Provider runtime preflight failed") }
+        if providerID.isDirectAPI, modelCatalogs[providerID]?.isEmpty != false {
+            return .init(ready: false, reason: .runtimeUnavailable, detail: "Direct provider model catalog is unavailable")
+        }
         if let connection,
            [.browserLogin, .providerSpecific].contains(connection.authenticationMethod),
            !externallyProvisioned(providerID)
@@ -1018,6 +1136,10 @@ public actor ProviderSettingsService {
             [.init(id: "custom-claude-compatible", displayName: "Custom Claude-Compatible", description: "Backend-managed model selection", isProviderDefault: true)]
         case .cursorACP:
             [.init(id: "auto", displayName: "Auto", description: "Let Cursor choose the best advertised model", isProviderDefault: true)]
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible:
+            // Direct catalogs are accepted only after bounded authenticated
+            // discovery and are durably recovered from Schema V6.
+            []
         case .openCodeACP, .xAI:
             // These catalogs are provider/account specific. A sanitized
             // server-side catalog file must opt in exact capabilities.
@@ -1065,6 +1187,14 @@ public actor ProviderSettingsService {
             return Definition(displayName: "OpenCode", category: .cliProvider, summary: "Provider-specific ACP catalog and authentication", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
         case .cursorACP:
             return Definition(displayName: "Cursor", category: .cliProvider, summary: "Cursor ACP with externally provisioned authentication", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+        case .openAIAPI:
+            return Definition(displayName: "OpenAI API", category: .apiProvider, summary: "Direct fixed-host OpenAI HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: true, authenticationMethods: [], authFlows: []))
+        case .anthropicAPI:
+            return Definition(displayName: "Anthropic API", category: .apiProvider, summary: "Direct fixed-host Anthropic Messages HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+        case .openRouter:
+            return Definition(displayName: "OpenRouter", category: .apiProvider, summary: "Direct fixed-host OpenRouter HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+        case .customOpenAICompatible:
+            return Definition(displayName: "Custom OpenAI-Compatible", category: .apiProvider, summary: "Public HTTPS OpenAI-compatible runtime with pinned-address egress", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
         case .xAI:
             return Definition(displayName: "xAI", category: .apiProvider, summary: "Provider runtime is not available on the server", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: true, authenticationMethods: [], authFlows: []))
         }

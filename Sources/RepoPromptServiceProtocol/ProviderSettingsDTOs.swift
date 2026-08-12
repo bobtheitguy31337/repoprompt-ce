@@ -1,8 +1,8 @@
 import Foundation
 
-/// Stable identifiers for the server-owned provider settings surface. CLI
-/// providers map to `ProviderKind`; API-only providers remain catalog entries
-/// until a portable runtime is available.
+/// Stable identifiers for the server-owned provider settings surface. Exact
+/// identities survive even when several implementations share the portable
+/// `headlessAdapter` runtime kind.
 public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
     case codex
     case claudeCompatible
@@ -11,7 +11,22 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
     case claudeCustom
     case openCodeACP
     case cursorACP
+    case openAIAPI
+    case anthropicAPI
+    case openRouter
+    case customOpenAICompatible
+    /// Decode-only compatibility boundary. It is never deployment-admitted.
     case xAI
+
+    public static func defaultSettingsID(for runtimeKind: ProviderKind) -> ProviderSettingsID? {
+        switch runtimeKind {
+        case .codex: .codex
+        case .claudeCompatible: .claudeCompatible
+        case .openCodeACP: .openCodeACP
+        case .cursorACP: .cursorACP
+        case .headlessAdapter, .mcp: nil
+        }
+    }
 
     public var runtimeKind: ProviderKind? {
         switch self {
@@ -19,6 +34,7 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
         case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom: .claudeCompatible
         case .openCodeACP: .openCodeACP
         case .cursorACP: .cursorACP
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible: .headlessAdapter
         case .xAI: nil
         }
     }
@@ -29,7 +45,8 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
     public var ownsRuntimeAdmission: Bool {
         switch self {
         case .codex, .claudeCompatible, .openCodeACP, .cursorACP: true
-        case .claudeGLM, .claudeKimi, .claudeCustom, .xAI: false
+        case .claudeGLM, .claudeKimi, .claudeCustom,
+             .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI: false
         }
     }
 
@@ -37,6 +54,13 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
         switch self {
         case .claudeGLM, .claudeKimi, .claudeCustom: .claudeCompatible
         default: self
+        }
+    }
+
+    public var isDirectAPI: Bool {
+        switch self {
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible: true
+        default: false
         }
     }
 }

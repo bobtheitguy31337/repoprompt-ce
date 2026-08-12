@@ -203,11 +203,21 @@ public struct ProviderCredentialTestResult: Codable, Hashable, Sendable {
     public let detail: String
     public let accountLabel: String?
     public let expiresAt: Date?
+    /// Sanitized discovery result. Credentials, response headers, and raw
+    /// provider payloads must never enter this projection.
+    public let models: [ProviderModelCatalogEntry]?
 
-    public init(state: ProviderCredentialTestState, detail: String, accountLabel: String? = nil, expiresAt: Date? = nil) {
+    public init(
+        state: ProviderCredentialTestState,
+        detail: String,
+        accountLabel: String? = nil,
+        expiresAt: Date? = nil,
+        models: [ProviderModelCatalogEntry]? = nil
+    ) {
         self.state = state
         self.detail = detail
         self.accountLabel = accountLabel
         self.expiresAt = expiresAt
+        self.models = models
     }
 }

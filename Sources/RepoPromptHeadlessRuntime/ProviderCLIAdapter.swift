@@ -47,30 +47,53 @@ enum ProviderCLIProbeEnvironment {
 /// Provider-neutral runtime router. Provider protocol knowledge lives in the
 /// individual native runtime controllers, never in this dispatcher.
 public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, InteractionDeliveryPort {
+    private struct RunRoute: Sendable {
+        let kind: ProviderKind
+        let exactProviderID: ProviderSettingsID?
+    }
+
     private let runtimes: [ProviderKind: any AgentProviderRuntime]
+    private let exactRuntimes: [ProviderSettingsID: any AgentProviderRuntime]
     private let cataloguedConfigurations: [ProviderKind: ProviderCLIConfiguration]
     private var enabledProviders: Set<ProviderKind>
+    private var enabledExactProviders: Set<ProviderSettingsID>
     private var runtimeDefaults: [ProviderKind: ProviderRuntimeDefaults]
-    private var knownRuns: [UUID: ProviderKind] = [:]
+    private var exactRuntimeDefaults: [ProviderSettingsID: ProviderRuntimeDefaults]
+    private var knownRuns: [UUID: RunRoute] = [:]
     private var preflightCache: [ProviderKind: (capability: ProviderCapability, expiresAt: ContinuousClock.Instant)] = [:]
     private var preflightTasks: [ProviderKind: Task<ProviderCapability, Never>] = [:]
     private let preflightCacheDuration: Duration
 
-    public init(runtimes: [any AgentProviderRuntime], cataloguedConfigurations: [ProviderCLIConfiguration] = [], enabledProviders: Set<ProviderKind>? = nil, preflightCacheDuration: Duration = .seconds(15)) {
+    public init(
+        runtimes: [any AgentProviderRuntime],
+        exactRuntimes: [ProviderSettingsID: any AgentProviderRuntime] = [:],
+        cataloguedConfigurations: [ProviderCLIConfiguration] = [],
+        enabledProviders: Set<ProviderKind>? = nil,
+        enabledExactProviders: Set<ProviderSettingsID>? = nil,
+        preflightCacheDuration: Duration = .seconds(15)
+    ) {
         let initialEnabled = enabledProviders ?? Set(runtimes.map(\.kind))
         self.runtimes = Dictionary(uniqueKeysWithValues: runtimes.map { ($0.kind, $0) })
+        self.exactRuntimes = exactRuntimes
         self.cataloguedConfigurations = Dictionary(uniqueKeysWithValues: cataloguedConfigurations.map { ($0.kind, $0) })
         self.enabledProviders = initialEnabled
+        let initialExactEnabled = enabledExactProviders ?? Set(exactRuntimes.keys)
+        self.enabledExactProviders = initialExactEnabled
         self.preflightCacheDuration = preflightCacheDuration
         runtimeDefaults = Dictionary(uniqueKeysWithValues: runtimes.map {
             ($0.kind, ProviderRuntimeDefaults(enabled: initialEnabled.contains($0.kind)))
+        })
+        exactRuntimeDefaults = Dictionary(uniqueKeysWithValues: exactRuntimes.keys.map {
+            ($0, ProviderRuntimeDefaults(enabled: initialExactEnabled.contains($0)))
         })
     }
 
     public func capabilities() async -> [ProviderCapability] {
         var values: [ProviderCapability] = []
         for kind in ProviderKind.allCases {
-            if enabledProviders.contains(kind), let runtime = runtimes[kind] {
+            if kind == .headlessAdapter, !enabledExactProviders.isEmpty {
+                values.append(.init(kind: .headlessAdapter, enabled: true, executable: nil, supportsResume: false, supportsSteering: false, protocolVersion: "direct-api-v1"))
+            } else if enabledProviders.contains(kind), let runtime = runtimes[kind] {
                 await values.append(runtime.capability())
             } else {
                 values.append(unavailableCapability(for: kind))
@@ -93,6 +116,13 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
     }
 
     private func preflight(kind: ProviderKind) async -> ProviderCapability {
+        if kind == .headlessAdapter, !enabledExactProviders.isEmpty {
+            var anyEnabled = false
+            for providerID in enabledExactProviders {
+                if let runtime = exactRuntimes[providerID], await runtime.preflight().enabled { anyEnabled = true }
+            }
+            return .init(kind: .headlessAdapter, enabled: anyEnabled, executable: nil, supportsResume: false, supportsSteering: false, protocolVersion: "direct-api-v1", reasonUnavailable: anyEnabled ? nil : "direct API preflight failed")
+        }
         guard enabledProviders.contains(kind) else {
             return unavailableCapability(for: kind)
         }
@@ -139,6 +169,15 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
         }
     }
 
+    public func applyRuntimeDefaults(providerID: ProviderSettingsID, defaults: ProviderRuntimeDefaults) throws {
+        guard providerID.isDirectAPI, exactRuntimes[providerID] != nil else {
+            throw ServiceAPIError(code: .providerUnavailable, message: "Exact provider runtime is not configured")
+        }
+        exactRuntimeDefaults[providerID] = defaults
+        if defaults.enabled { enabledExactProviders.insert(providerID) }
+        else { enabledExactProviders.remove(providerID) }
+    }
+
     public func execute(kind: ProviderKind, model: String?, prompt: String, workingDirectory: String, maximumBytes: Int, runID: UUID?, resumeProviderSessionID: String?, onProviderSessionIdentity: @escaping @Sendable (String) async -> Void) async throws -> ProviderExecutionResult {
         let actualRunID = runID ?? UUID()
         return try await executeStreaming(.init(kind: kind, model: model, prompt: prompt, workingDirectory: workingDirectory, maximumBytes: maximumBytes, runID: actualRunID, resumeProviderSessionID: resumeProviderSessionID)) { event in
@@ -147,14 +186,26 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
     }
 
     public func executeStreaming(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
-        guard enabledProviders.contains(request.kind), let runtime = runtimes[request.kind] else {
-            let message = cataloguedConfigurations[request.kind] == nil
-                ? "Requested provider is not configured"
-                : "Requested provider is administratively disabled"
-            throw ServiceAPIError(code: .providerUnavailable, message: message)
+        let exactProviderID = request.policy.providerSettings["provider.settingsID"].flatMap(ProviderSettingsID.init(rawValue:))
+        let runtime: any AgentProviderRuntime
+        let defaults: ProviderRuntimeDefaults
+        if request.kind == .headlessAdapter, let exactProviderID, exactProviderID.isDirectAPI {
+            guard enabledExactProviders.contains(exactProviderID), let exactRuntime = exactRuntimes[exactProviderID] else {
+                throw ServiceAPIError(code: .providerUnavailable, message: "Requested direct provider is not configured or is administratively disabled")
+            }
+            runtime = exactRuntime
+            defaults = exactRuntimeDefaults[exactProviderID] ?? ProviderRuntimeDefaults(enabled: true)
+        } else {
+            guard enabledProviders.contains(request.kind), let kindRuntime = runtimes[request.kind] else {
+                let message = cataloguedConfigurations[request.kind] == nil
+                    ? "Requested provider is not configured"
+                    : "Requested provider is administratively disabled"
+                throw ServiceAPIError(code: .providerUnavailable, message: message)
+            }
+            runtime = kindRuntime
+            defaults = runtimeDefaults[request.kind] ?? ProviderRuntimeDefaults(enabled: true)
         }
-        knownRuns[request.runID] = request.kind
-        let defaults = runtimeDefaults[request.kind] ?? ProviderRuntimeDefaults(enabled: true)
+        knownRuns[request.runID] = RunRoute(kind: request.kind, exactProviderID: exactProviderID)
         return try await runtime.execute(request.applying(defaults: defaults), onEvent: onEvent)
     }
 
@@ -192,7 +243,7 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
     }
 
     public func prepareRun(kind: ProviderKind, runID: UUID) {
-        knownRuns[runID] = kind
+        knownRuns[runID] = RunRoute(kind: kind, exactProviderID: nil)
     }
 
     public func forgetRun(runID: UUID) {
@@ -200,10 +251,12 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
     }
 
     private func runtime(containing runID: UUID) async -> (any AgentProviderRuntime)? {
-        if let kind = knownRuns[runID], let runtime = runtimes[kind] { return runtime }
-        for runtime in runtimes.values where await runtime.hasActiveRun(runID) {
-            return runtime
+        if let route = knownRuns[runID] {
+            if let exactProviderID = route.exactProviderID, let runtime = exactRuntimes[exactProviderID] { return runtime }
+            if let runtime = runtimes[route.kind] { return runtime }
         }
+        for runtime in exactRuntimes.values where await runtime.hasActiveRun(runID) { return runtime }
+        for runtime in runtimes.values where await runtime.hasActiveRun(runID) { return runtime }
         return nil
     }
 
@@ -229,7 +282,19 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
 public actor ProviderCLIAdapter: AgentProviderDispatcher, InteractionDeliveryPort {
     private let dispatcher: PortableAgentProviderDispatcher
 
-    public init(configurations: [ProviderCLIConfiguration], enabledProviders: Set<ProviderKind>? = nil, runner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(), processPort: PortableProcessSupervisionPort? = nil, processStore: SQLiteServiceStore? = nil, outputDirectory: String = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-provider-output").path, ephemeralHomeRoot: String = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-provider-homes").path, credentialEnvironment: any ProviderProcessEnvironmentProviding = EmptyProviderProcessEnvironment(), credentialSource: (any ProviderCredentialSourceProviding)? = nil) {
+    public init(
+        configurations: [ProviderCLIConfiguration],
+        enabledProviders: Set<ProviderKind>? = nil,
+        exactRuntimes: [ProviderSettingsID: any AgentProviderRuntime] = [:],
+        enabledExactProviders: Set<ProviderSettingsID>? = nil,
+        runner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(),
+        processPort: PortableProcessSupervisionPort? = nil,
+        processStore: SQLiteServiceStore? = nil,
+        outputDirectory: String = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-provider-output").path,
+        ephemeralHomeRoot: String = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-provider-homes").path,
+        credentialEnvironment: any ProviderProcessEnvironmentProviding = EmptyProviderProcessEnvironment(),
+        credentialSource: (any ProviderCredentialSourceProviding)? = nil
+    ) {
         let enabledProviders = enabledProviders ?? Set(configurations.map(\.kind))
         let credentialSource = credentialSource ?? StaticProviderCredentialSource(configurations: configurations)
         let runtimes: [any AgentProviderRuntime] = if let processPort {
@@ -241,11 +306,27 @@ public actor ProviderCLIAdapter: AgentProviderDispatcher, InteractionDeliveryPor
             // that do not provide the process authority required by native protocols.
             configurations.map { CommandCompatibilityProviderRuntime(configuration: $0, runner: runner) }
         }
-        dispatcher = PortableAgentProviderDispatcher(runtimes: runtimes, cataloguedConfigurations: configurations, enabledProviders: enabledProviders)
+        dispatcher = PortableAgentProviderDispatcher(
+            runtimes: runtimes,
+            exactRuntimes: exactRuntimes,
+            cataloguedConfigurations: configurations,
+            enabledProviders: enabledProviders,
+            enabledExactProviders: enabledExactProviders
+        )
     }
 
-    public init(runtimes: [any AgentProviderRuntime], preflightCacheDuration: Duration = .seconds(15)) {
-        dispatcher = PortableAgentProviderDispatcher(runtimes: runtimes, preflightCacheDuration: preflightCacheDuration)
+    public init(
+        runtimes: [any AgentProviderRuntime],
+        exactRuntimes: [ProviderSettingsID: any AgentProviderRuntime] = [:],
+        enabledExactProviders: Set<ProviderSettingsID>? = nil,
+        preflightCacheDuration: Duration = .seconds(15)
+    ) {
+        dispatcher = PortableAgentProviderDispatcher(
+            runtimes: runtimes,
+            exactRuntimes: exactRuntimes,
+            enabledExactProviders: enabledExactProviders,
+            preflightCacheDuration: preflightCacheDuration
+        )
     }
 
     public func capabilities() async -> [ProviderCapability] {
@@ -266,6 +347,10 @@ public actor ProviderCLIAdapter: AgentProviderDispatcher, InteractionDeliveryPor
 
     public func applyRuntimeDefaults(kind: ProviderKind, defaults: ProviderRuntimeDefaults) async throws {
         try await dispatcher.applyRuntimeDefaults(kind: kind, defaults: defaults)
+    }
+
+    public func applyRuntimeDefaults(providerID: ProviderSettingsID, defaults: ProviderRuntimeDefaults) async throws {
+        try await dispatcher.applyRuntimeDefaults(providerID: providerID, defaults: defaults)
     }
 
     public func cancel(runID: UUID) async throws {

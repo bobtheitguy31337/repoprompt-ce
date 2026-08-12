@@ -30,6 +30,7 @@
   --shadow-card: 0 1px 1px rgb(0 0 0 / 3%), 0 6px 22px rgb(0 0 0 / 5%);
   --titlebar-height: 48px;
   --settings-sidebar-width: 250px;
+  --portal-font-size: 14px;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -65,10 +66,56 @@ body {
   overflow: hidden;
 }
 
+html[data-portal-theme="light"] {
+  color-scheme: light;
+  --bg-window: #f3f3f5;
+  --bg-detail: #fbfbfc;
+  --bg-sidebar: rgb(234 234 237 / 88%);
+  --bg-control: rgb(255 255 255 / 72%);
+  --bg-control-strong: #fff;
+  --text: #202124;
+  --text-secondary: #69696f;
+  --text-tertiary: #929298;
+  --separator: rgb(60 60 67 / 18%);
+  --border: rgb(60 60 67 / 24%);
+  --accent: #0878f9;
+  --accent-soft: rgb(8 120 249 / 12%);
+  --success: #2c9e34;
+  --warning: #b87900;
+  --danger: #b51d20;
+}
+
+html[data-portal-theme="dark"] {
+  color-scheme: dark;
+  --bg-window: #1d1d1f;
+  --bg-detail: #202022;
+  --bg-sidebar: rgb(38 38 41 / 92%);
+  --bg-control: rgb(55 55 58 / 78%);
+  --bg-control-strong: #313134;
+  --text: #f1f1f2;
+  --text-secondary: #aaaab0;
+  --text-tertiary: #7e7e85;
+  --separator: rgb(255 255 255 / 12%);
+  --border: rgb(255 255 255 / 16%);
+  --accent: #55a4ff;
+  --accent-soft: rgb(85 164 255 / 16%);
+  --success: #65ca69;
+  --warning: #f0bd39;
+  --danger: #ff6265;
+}
+
+html[data-text-density="large"] {
+  --portal-font-size: 16px;
+}
+
+html[data-text-density="extraLarge"] {
+  --portal-font-size: 18px;
+}
+
 body {
   color: var(--text);
   background: var(--bg-window);
-  font: 14px/1.4 var(--font-ui);
+  font: var(--portal-font-size) / 1.4 var(--font-ui);
   letter-spacing: -0.006em;
 }
 
@@ -2610,6 +2657,126 @@ input:disabled {
 
   .new-session-options label {
     width: 100%;
+  }
+}
+
+.typed-settings-form,
+.workflow-definition-form,
+.saved-prompt-list,
+.selection-preset-list {
+  display: grid;
+  gap: var(--space-10);
+}
+
+.typed-route-row {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.45fr) minmax(220px, 1.6fr) auto auto;
+  align-items: center;
+  gap: var(--space-10);
+  padding: var(--space-8) 0;
+  border-top: 0.5px solid var(--separator);
+}
+
+.typed-route-row select {
+  min-width: 0;
+}
+
+.compact-toggle-label,
+.settings-subheading,
+.preset-availability legend,
+.manual-prompt-selection legend {
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.subagent-custom-grid,
+.workflow-editor-row,
+.model-preset-row,
+.saved-prompt-row,
+.selection-preset-row {
+  padding: var(--space-10);
+  border: 0.5px solid var(--separator);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--bg-control) 72%, transparent);
+}
+
+.workflow-editor-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-12);
+}
+
+.workflow-inline-actions,
+.compact-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-8);
+  margin-top: var(--space-10);
+}
+
+.workflow-definition-form,
+.model-preset-row,
+.saved-prompt-row,
+.selection-preset-row {
+  margin-top: var(--space-10);
+}
+
+.workflow-definition-form input,
+.workflow-definition-form textarea,
+.model-preset-row input,
+.model-preset-row textarea,
+.saved-prompt-row input,
+.saved-prompt-row textarea,
+.direct-provider-form textarea,
+.context-builder-run-form textarea,
+.selection-preset-row input,
+.compact-form input {
+  width: 100%;
+}
+
+.preset-availability,
+.manual-prompt-selection {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-10);
+  padding: var(--space-10);
+  border: 0.5px solid var(--separator);
+  border-radius: 8px;
+}
+
+.check-row {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-6);
+}
+
+.inline-message.warning {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 30%, transparent);
+  background: color-mix(in srgb, var(--warning) 9%, transparent);
+}
+
+@media (max-width: 760px) {
+  .typed-route-row {
+    grid-template-columns: 1fr;
+  }
+
+  .desktop-setting-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .desktop-setting-row select,
+  .desktop-setting-row input[type="text"],
+  .desktop-setting-row input[type="number"],
+  .read-only-value,
+  .recommended-value {
+    width: 100%;
+    max-width: none;
+    text-align: left;
   }
 }
 

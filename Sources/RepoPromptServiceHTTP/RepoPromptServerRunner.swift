@@ -25,6 +25,7 @@ public struct RepoPromptServerConfiguration: Sendable {
     public let eventSigningKey: InternalSigningKey
     public let providerExecutables: [ProviderKind: String]
     public let enabledProviders: Set<ProviderKind>
+    public let enabledDirectProviders: Set<ProviderSettingsID>
     public let providerVersions: [ProviderKind: String]
     public let providerProtocols: [ProviderKind: String]
     public let providerCredentialSources: [ProviderKind: String]
@@ -92,6 +93,22 @@ public struct RepoPromptServerConfiguration: Sendable {
             }
             enabledProviders.insert(kind)
         }
+        let allowedDirectProviders = Set([
+            ProviderSettingsID.openAIAPI,
+            .anthropicAPI,
+            .openRouter,
+            .customOpenAICompatible
+        ])
+        let enabledDirectProviderNames = environment["REPOPROMPT_ENABLED_DIRECT_PROVIDERS"]?
+            .split(separator: ",")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) } ?? []
+        var enabledDirectProviders = Set<ProviderSettingsID>()
+        for name in enabledDirectProviderNames where !name.isEmpty {
+            guard let providerID = ProviderSettingsID(rawValue: name), allowedDirectProviders.contains(providerID) else {
+                throw ConfigurationError.invalid("REPOPROMPT_ENABLED_DIRECT_PROVIDERS contains an unknown or prohibited provider: \(name)")
+            }
+            enabledDirectProviders.insert(providerID)
+        }
         let versions: [ProviderKind: String] = [.codex: CodexCLIContract.pinnedVersion, .claudeCompatible: "2.1.226", .openCodeACP: "1.15.11", .cursorACP: "2026.08.04-aaa8809"]
         let protocols: [ProviderKind: String] = [.codex: "app-server-v2", .claudeCompatible: "stream-json-v1", .openCodeACP: "acp-v1", .cursorACP: "acp-v1-beta"]
         if environment["REPOPROMPT_CODEX_CREDENTIAL_HOME"].map({ !$0.isEmpty }) == true
@@ -150,6 +167,9 @@ public struct RepoPromptServerConfiguration: Sendable {
         } else {
             previousVaultKeys = []
         }
+        if !enabledDirectProviders.isEmpty, vaultKey == nil {
+            throw ConfigurationError.invalid("Deployment-admitted direct providers require a provider vault master key")
+        }
         let vaultFilePath = environment["REPOPROMPT_PROVIDER_VAULT_FILE"] ?? URL(fileURLWithPath: stateDatabase).deletingLastPathComponent().appendingPathComponent("provider-credentials.vault").path
         guard vaultFilePath.hasPrefix("/") else {
             throw ConfigurationError.invalid("Provider vault path must be absolute")
@@ -178,6 +198,7 @@ public struct RepoPromptServerConfiguration: Sendable {
             signingKeys: signingKeys, eventSigningKey: event,
             providerExecutables: providers,
             enabledProviders: enabledProviders,
+            enabledDirectProviders: enabledDirectProviders,
             providerVersions: versions,
             providerProtocols: protocols,
             providerCredentialSources: credentialSources,
@@ -347,6 +368,27 @@ public enum RepoPromptServerRunner {
             outputDirectory: processOutput
         )
         let portalDesktopSettings = PortalDesktopSettingsService(store: store)
+        let directTransport = try ValidatedProviderEgressTransport()
+        let directProviderRegistry = DirectProviderRegistry(
+            store: store,
+            transport: directTransport,
+            deploymentAllowlist: configuration.enabledDirectProviders
+        )
+        try await directProviderRegistry.bootstrap()
+        let directCredentialAccessor = VaultDirectProviderCredentialAccessor(store: store, vault: providerVault)
+        let directRuntimes: [ProviderSettingsID: any AgentProviderRuntime] = Dictionary(uniqueKeysWithValues:
+            configuration.enabledDirectProviders.map { providerID in
+                (
+                    providerID,
+                    DirectAPIProviderRuntime(
+                        providerID: providerID,
+                        registry: directProviderRegistry,
+                        credentials: directCredentialAccessor,
+                        transport: directTransport
+                    ) as any AgentProviderRuntime
+                )
+            }
+        )
         let credentialEnvironment = VaultProviderProcessEnvironment(
             store: store,
             vault: providerVault,
@@ -358,12 +400,18 @@ public enum RepoPromptServerRunner {
         let providers = ProviderCLIAdapter(
             configurations: providerConfigurations,
             enabledProviders: configuration.enabledProviders,
+            exactRuntimes: directRuntimes,
+            enabledExactProviders: configuration.enabledDirectProviders,
             processPort: processPort,
             processStore: store,
             outputDirectory: processOutput,
             ephemeralHomeRoot: configuration.providerHomeDirectory,
             credentialEnvironment: credentialEnvironment,
             credentialSource: credentialEnvironment
+        )
+        let credentialTester = CompositeProviderCredentialTester(
+            cli: ProviderAuthenticationAdapter(configurations: providerConfigurations, backendSettings: portalDesktopSettings),
+            direct: DirectProviderCredentialTester(registry: directProviderRegistry, transport: directTransport)
         )
         let providerSettings = ProviderSettingsService(
             store: store,
@@ -375,16 +423,25 @@ public enum RepoPromptServerRunner {
             authFlows: TransientProviderAuthFlowCoordinator(driver: codexAuthentication),
             managedAuthentication: codexAuthentication,
             vault: providerVault,
-            credentialTester: ProviderAuthenticationAdapter(configurations: providerConfigurations, backendSettings: portalDesktopSettings)
+            credentialTester: credentialTester,
+            directProviderRegistry: directProviderRegistry,
+            directProviderAllowlist: configuration.enabledDirectProviders
         )
         try await providers.recoverProcessFamilies()
         try await providerSettings.bootstrap()
+        let serverSettings = ServerSettingsService(
+            store: store,
+            providerCatalog: providerSettings,
+            projectCatalog: store
+        )
         let authority = RepoPromptHeadlessAuthority(
             store: store,
             worktreeService: worktrees,
             artifactService: artifacts,
             providerAdapter: providers,
-            projectSourceService: projectSources
+            projectSourceService: projectSources,
+            serverSettings: serverSettings,
+            directProviderDefaults: portalDesktopSettings
         )
         try await authority.recover()
 
@@ -419,6 +476,7 @@ public enum RepoPromptServerRunner {
             drainController: drainController,
             durabilityOperations: durabilityOperations,
             providerSettings: providerSettings,
+            serverSettings: serverSettings,
             portalDesktopSettings: portalDesktopSettings
         )
         let internalApplication = try Application(

@@ -427,6 +427,161 @@ function desktopSettingsFixture(overrides = {}) {
   };
 }
 
+function typedSettingsFixtures(providers, bootstrap) {
+  const codex = providers.find((provider) => provider.providerID === "codex");
+  const sol = codex?.models?.find((entry) =>
+    `${entry.id} ${entry.displayName}`.toLowerCase().includes("gpt-5.6 sol"),
+  );
+  const recommendationTarget = (effort) =>
+    sol && sol.reasoningEfforts.includes(effort)
+      ? {
+          providerID: "codex",
+          modelID: sol.id,
+          reasoningEffort: effort,
+          pinned: false,
+        }
+      : null;
+  const recommendations = [
+    ["oracle", "high"],
+    ["contextBuilder", "low"],
+    ["explore", "low"],
+    ["engineer", "medium"],
+    ["pair", "high"],
+    ["design", "medium"],
+  ].map(([target, effort]) => {
+    const recommendedTarget = recommendationTarget(effort);
+    return {
+      target,
+      recommendedTarget,
+      availability: recommendedTarget ? "exact" : "unavailable",
+      detail: recommendedTarget
+        ? "Exact profile 202_608 target is advertised"
+        : "No recommendation provider is advertised",
+    };
+  });
+  const emptyProfile = {
+    oracle: null,
+    contextBuilder: null,
+    explore: null,
+    engineer: null,
+    pair: null,
+    design: null,
+    restrictDiscoveryToRoleModels: false,
+  };
+  const contextProfile = {
+    budget: 160000,
+    enhancementMode: "rewrite",
+    questionTimeoutSeconds: 60,
+    portalClarifyingQuestions: true,
+    mcpClarifyingQuestions: false,
+    followUpAnalysis: "disabled",
+    followUpBudget: 40000,
+    prompts: [],
+  };
+  return {
+    agentModels: {
+      globalProfile: emptyProfile,
+      globalRevision: 0,
+      projectID: projectOneID,
+      projectMode: "inheritGlobal",
+      projectProfile: null,
+      projectRevision: 0,
+      effectiveProfile: emptyProfile,
+      recommendationProfileVersion: "202_608",
+      recommendations,
+      updatedAt: "1970-01-01T00:00:00Z",
+    },
+    subagentPermissions: {
+      settings: {
+        policy: "safeManaged",
+        codex: "autoReview",
+        claude: "requireApproval",
+        openCode: "managedDefault",
+        cursor: "managedDefault",
+      },
+      revision: 0,
+      updatedAt: "1970-01-01T00:00:00Z",
+    },
+    contextBuilder: {
+      globalProfile: contextProfile,
+      globalRevision: 0,
+      projectID: projectOneID,
+      projectMode: "inheritGlobal",
+      projectProfile: null,
+      projectRevision: 0,
+      effectiveProfile: contextProfile,
+      updatedAt: "1970-01-01T00:00:00Z",
+    },
+    modelPresets: {
+      presets: [],
+      revision: 0,
+      updatedAt: "1970-01-01T00:00:00Z",
+    },
+    advanced: {
+      settings: {
+        respectRepoIgnore: true,
+        respectCursorIgnore: true,
+        respectNestedIgnoreFiles: true,
+        followSymbolicLinks: false,
+        showEmptyFolders: true,
+        codeMapsEnabled: true,
+        historyIdleThresholdMinutes: 5,
+      },
+      revision: 0,
+      scannerPolicyGeneration: 0,
+      updatedAt: "1970-01-01T00:00:00Z",
+    },
+    selectionPresets: {
+      projectID: projectOneID,
+      presets: [],
+      revision: 0,
+      updatedAt: "1970-01-01T00:00:00Z",
+    },
+    workflows: {
+      workflows: (bootstrap.workflows || []).map((workflow) => ({
+        workflowID: workflow.workflowID,
+        source: workflow.source || "builtin",
+        name: workflow.name,
+        definition:
+          workflow.definition ||
+          `# ${workflow.name}\n\n## Purpose\nFixture workflow.\n\n## Instructions\n- Work safely.`,
+        contentDigest: "fixture-digest",
+        enabled: workflow.enabled,
+        visible: workflow.visible ?? true,
+        featuredOrder: workflow.featuredOrder ?? null,
+        rowRevision: workflow.rowRevision || 1,
+      })),
+      includeSessionCleanupGuidance: true,
+      revision: 0,
+      updatedAt: "1970-01-01T00:00:00Z",
+    },
+    selection: {
+      sessionId: sessionOneID,
+      entries: [],
+      revision: 1,
+      bindingRevision: 1,
+    },
+    directConfigurations: {},
+  };
+}
+
+function directConfigurationFixture(providerID, overrides = {}) {
+  return {
+    providerID,
+    baseURL:
+      providerID === "customOpenAICompatible"
+        ? "https://models.example/v1"
+        : null,
+    preferredModel: null,
+    maximumOutputTokens: 4096,
+    customHeaders: {},
+    contentTypePolicy: "applicationJSON",
+    revision: 1,
+    updatedAt: "2026-08-11T20:00:00Z",
+    ...overrides,
+  };
+}
+
 function jsonResponse(body, status = 200) {
   const encoded = JSON.stringify(body);
   return {
@@ -474,6 +629,7 @@ async function createHarness({
   providers = providerCatalog(),
   bootstrap = bootstrapFixture(),
   desktopSettings = desktopSettingsFixture(),
+  typedSettings = null,
   handler,
 } = {}) {
   const dom = new JSDOM(htmlSource, {
@@ -483,7 +639,12 @@ async function createHarness({
   });
   const { window } = dom;
   const calls = [];
-  const context = { providers, bootstrap, desktopSettings };
+  const context = {
+    providers,
+    bootstrap,
+    desktopSettings,
+    typedSettings: typedSettings || typedSettingsFixtures(providers, bootstrap),
+  };
 
   window.__REPOPROMPT_PORTAL_TEST_HOOK__ = true;
   window.fetch = async (path, options = {}) => {
@@ -513,6 +674,194 @@ async function createHarness({
         values: { ...context.desktopSettings.values, ...payload.changes },
       };
       return jsonResponse(context.desktopSettings);
+    }
+    if (
+      call.path === "api/v1/settings/agent-models" ||
+      /^api\/v1\/projects\/[^/]+\/settings\/agent-models$/.test(call.path)
+    ) {
+      if (call.method === "PATCH") {
+        const payload = JSON.parse(call.body);
+        const project = call.path.includes("/projects/");
+        context.typedSettings.agentModels = {
+          ...context.typedSettings.agentModels,
+          ...(project
+            ? {
+                projectMode: payload.mode,
+                projectProfile: payload.profile,
+                projectRevision:
+                  context.typedSettings.agentModels.projectRevision + 1,
+                effectiveProfile:
+                  payload.mode === "projectOverride"
+                    ? payload.profile
+                    : context.typedSettings.agentModels.globalProfile,
+              }
+            : {
+                globalProfile: payload.profile,
+                globalRevision:
+                  context.typedSettings.agentModels.globalRevision + 1,
+                effectiveProfile: payload.profile,
+              }),
+        };
+      }
+      return jsonResponse(context.typedSettings.agentModels);
+    }
+    if (call.path.includes("settings/agent-models/copy-global")) {
+      context.typedSettings.agentModels = {
+        ...context.typedSettings.agentModels,
+        projectMode: "projectOverride",
+        projectProfile: context.typedSettings.agentModels.globalProfile,
+        effectiveProfile: context.typedSettings.agentModels.globalProfile,
+        projectRevision: context.typedSettings.agentModels.projectRevision + 1,
+      };
+      return jsonResponse(context.typedSettings.agentModels);
+    }
+    if (call.path.includes("settings/agent-models/apply-recommendations")) {
+      return jsonResponse(context.typedSettings.agentModels);
+    }
+    if (call.path === "api/v1/settings/subagent-permissions") {
+      if (call.method === "PATCH") {
+        const payload = JSON.parse(call.body);
+        context.typedSettings.subagentPermissions = {
+          ...context.typedSettings.subagentPermissions,
+          settings: payload.settings,
+          revision: context.typedSettings.subagentPermissions.revision + 1,
+        };
+      }
+      return jsonResponse(context.typedSettings.subagentPermissions);
+    }
+    if (
+      call.path === "api/v1/settings/context-builder" ||
+      /^api\/v1\/projects\/[^/]+\/settings\/context-builder$/.test(call.path)
+    ) {
+      if (call.method === "PATCH") {
+        const payload = JSON.parse(call.body);
+        const project = call.path.includes("/projects/");
+        context.typedSettings.contextBuilder = {
+          ...context.typedSettings.contextBuilder,
+          ...(project
+            ? {
+                projectMode: payload.mode,
+                projectProfile: payload.profile,
+                projectRevision:
+                  context.typedSettings.contextBuilder.projectRevision + 1,
+                effectiveProfile:
+                  payload.mode === "projectOverride"
+                    ? payload.profile
+                    : context.typedSettings.contextBuilder.globalProfile,
+              }
+            : {
+                globalProfile: payload.profile,
+                globalRevision:
+                  context.typedSettings.contextBuilder.globalRevision + 1,
+                effectiveProfile: payload.profile,
+              }),
+        };
+      }
+      return jsonResponse(context.typedSettings.contextBuilder);
+    }
+    if (call.path.includes("settings/context-builder/copy-global")) {
+      context.typedSettings.contextBuilder = {
+        ...context.typedSettings.contextBuilder,
+        projectMode: "projectOverride",
+        projectProfile: context.typedSettings.contextBuilder.globalProfile,
+        effectiveProfile: context.typedSettings.contextBuilder.globalProfile,
+        projectRevision:
+          context.typedSettings.contextBuilder.projectRevision + 1,
+      };
+      return jsonResponse(context.typedSettings.contextBuilder);
+    }
+    if (call.path === "api/v1/settings/model-presets") {
+      if (call.method === "PATCH") {
+        const payload = JSON.parse(call.body);
+        context.typedSettings.modelPresets = {
+          ...context.typedSettings.modelPresets,
+          presets: payload.presets,
+          revision: context.typedSettings.modelPresets.revision + 1,
+        };
+      }
+      return jsonResponse(context.typedSettings.modelPresets);
+    }
+    if (call.path === "api/v1/settings/advanced") {
+      if (call.method === "PATCH") {
+        const payload = JSON.parse(call.body);
+        context.typedSettings.advanced = {
+          ...context.typedSettings.advanced,
+          settings: payload.settings,
+          revision: context.typedSettings.advanced.revision + 1,
+          scannerPolicyGeneration:
+            context.typedSettings.advanced.scannerPolicyGeneration + 1,
+        };
+      }
+      return jsonResponse(context.typedSettings.advanced);
+    }
+    if (/^api\/v1\/projects\/[^/]+\/selection-presets$/.test(call.path)) {
+      return jsonResponse(context.typedSettings.selectionPresets);
+    }
+    if (/^api\/v1\/projects\/[^/]+\/selection-presets\/.+$/.test(call.path)) {
+      if (call.path.endsWith("/apply")) {
+        return jsonResponse({
+          ...context.typedSettings.selection,
+          revision: context.typedSettings.selection.revision + 1,
+        });
+      }
+      return jsonResponse(context.typedSettings.selectionPresets);
+    }
+    if (call.path === "api/v1/workflows") {
+      return jsonResponse(context.typedSettings.workflows);
+    }
+    if (/^api\/v1\/workflows(?:\/|$)/.test(call.path)) {
+      return jsonResponse(context.typedSettings.workflows);
+    }
+    const selectionMatch = call.path.match(
+      /^api\/v1\/sessions\/([^/]+)\/selection$/,
+    );
+    if (selectionMatch && call.method === "GET") {
+      return jsonResponse({
+        ...context.typedSettings.selection,
+        sessionId: decodeURIComponent(selectionMatch[1]),
+      });
+    }
+    const contextBuilderRun = call.path.match(
+      /^api\/v1\/sessions\/([^/]+)\/context-builder$/,
+    );
+    if (contextBuilderRun && call.method === "POST") {
+      const selection = context.typedSettings.selection;
+      return jsonResponse(
+        {
+          ...selection,
+          sessionId: decodeURIComponent(contextBuilderRun[1]),
+          revision: selection.revision + 1,
+          proposalArtifactId: "30000000-0000-0000-0000-000000000010",
+          response: "Context Builder completed",
+          chatId: "30000000-0000-0000-0000-000000000020",
+          followUpResponse: null,
+          followUpArtifactId: null,
+        },
+        202,
+      );
+    }
+    const directConfigurationMatch = call.path.match(
+      /^api\/v1\/provider-settings\/([^/]+)\/direct-configuration$/,
+    );
+    if (directConfigurationMatch) {
+      const providerID = decodeURIComponent(directConfigurationMatch[1]);
+      const current =
+        context.typedSettings.directConfigurations[providerID] ||
+        directConfigurationFixture(providerID);
+      if (call.method === "PATCH") {
+        const payload = JSON.parse(call.body);
+        context.typedSettings.directConfigurations[providerID] = {
+          providerID,
+          ...payload,
+          revision: current.revision + 1,
+          updatedAt: "2026-08-11T21:00:00Z",
+        };
+      } else {
+        context.typedSettings.directConfigurations[providerID] = current;
+      }
+      return jsonResponse(
+        context.typedSettings.directConfigurations[providerID],
+      );
     }
     if (
       call.path.startsWith("api/v1/provider-settings") &&
@@ -579,7 +928,9 @@ async function createHarness({
     document: window.document,
     calls,
     context,
-    close() {
+    async close() {
+      await window.RepoPromptPortalTest.whenIdle();
+      await settle();
       dom.window.close();
     },
   };
@@ -638,11 +989,12 @@ test("filtered Desktop settings hierarchy deep-links, searches, and excludes des
     "MCP Server",
     "Workspace Approvals",
     "Manage Workspaces",
+    "Portal Appearance",
+    "Advanced",
   ]) {
     assert.match(navText, new RegExp(included));
   }
   for (const excluded of [
-    "Appearance",
     "Keyboard Shortcuts",
     "Updates",
     "Telemetry",
@@ -665,9 +1017,9 @@ test("filtered Desktop settings hierarchy deep-links, searches, and excludes des
     document.getElementById("settings-content").textContent,
     /Provider Defaults/,
   );
-  assert.doesNotMatch(
+  assert.match(
     document.getElementById("settings-content").textContent,
-    /Workspace overrides inherit/,
+    /Use global settings/,
   );
 
   const search = document.getElementById("settings-search");
@@ -824,15 +1176,15 @@ test("connected CLI recommendation Check Now opens a live desktop-style assessme
   );
   const text = document.getElementById("settings-content").textContent;
   assert.match(text, /Recommendation check complete/);
-  assert.match(text, /Oracle Model.*Codex CLI · GPT-5\.6 Sol · High/s);
-  assert.match(text, /Context Builder Agent.*Codex CLI · GPT-5\.6 Sol · Low/s);
-  assert.match(text, /Explore.*Codex CLI · GPT-5\.6 Sol · Low/s);
-  assert.match(text, /Engineer.*Codex CLI · GPT-5\.6 Sol · Medium/s);
-  assert.match(text, /Pair.*Codex CLI · GPT-5\.6 Sol · High/s);
-  assert.match(text, /Design.*Codex CLI · GPT-5\.6 Sol · Medium/s);
-  assert.match(text, /desktop 2026-08 profile/);
+  assert.match(text, /Oracle.*Codex · gpt-5\.6-sol · High/s);
+  assert.match(text, /Context Builder.*Codex · gpt-5\.6-sol · Low/s);
+  assert.match(text, /Explore.*Codex · gpt-5\.6-sol · Low/s);
+  assert.match(text, /Engineer.*Codex · gpt-5\.6-sol · Medium/s);
+  assert.match(text, /Pair.*Codex · gpt-5\.6-sol · High/s);
+  assert.match(text, /Design.*Codex · gpt-5\.6-sol · Medium/s);
+  assert.match(text, /profile 202_608/);
   assert.match(text, /Provider Defaults/);
-  assert.match(text, /does not yet expose that routing authority/);
+  assert.match(text, /Save Agent Routes/);
 });
 
 test("desktop recommendation assessment explains OpenCode-only connections without inventing role assignments", async (t) => {
@@ -874,12 +1226,13 @@ test("desktop recommendation assessment explains OpenCode-only connections witho
       "Agent Models",
   );
   const text = document.getElementById("settings-content").textContent;
-  assert.match(text, /No desktop recommendation target available/);
-  assert.match(
-    text,
-    /OpenCode is not assigned to desktop recommendation roles/,
-  );
-  assert.doesNotMatch(text, /Oracle Model/);
+  assert.match(text, /OpenCode remains a connection signal/);
+  assert.match(text, /Unavailable/);
+  const assignedRoutes = [
+    ...document.querySelectorAll(".typed-route-row select"),
+  ].map((select) => select.value);
+  assert.equal(assignedRoutes.length, 6);
+  assert.ok(assignedRoutes.every((value) => !value.startsWith("openCodeACP|")));
 });
 
 test("MCP Tools renders and searches the complete canonical server catalog without fake toggles", async (t) => {
@@ -942,9 +1295,9 @@ test("Agent Permissions exposes every runtime-backed desktop direct-provider con
   ]) {
     assert.ok(text.includes(expected), `missing ${expected}`);
   }
-  assert.equal(content.querySelectorAll("select").length, 5);
+  assert.equal(content.querySelectorAll("select").length, 10);
   assert.equal(content.querySelectorAll('input[type="checkbox"]').length, 8);
-  assert.match(text, /does not yet expose a mutation authority/);
+  assert.match(text, /frozen into every child session/);
 });
 
 test("unsupported desktop authorities are explicit and do not expose inert controls", async (t) => {
@@ -958,19 +1311,10 @@ test("unsupported desktop authorities are explicit and do not expose inert contr
 
   const cases = [
     ["workspace-approvals", /Auto-approve All Operations/, /write operations/],
-    [
-      "model-presets",
-      /real server-side preset authority/i,
-      /No model presets configured/,
-    ],
-    ["openrouter", /Validate & Fetch/, /Include OpenRouter defaults/],
-    [
-      "custom-api",
-      /Base URL \+ write-only API key/,
-      /Include Content-Type header/,
-    ],
-    ["context-builder", /10k–200k · default 160k/, /Optional model override/],
-    ["manage-presets", /Workspace Selection Presets/, /Build/],
+    ["manage-workspaces", /Operator-provisioned here/, /Open Folder/],
+    ["openrouter", /Deployment-disabled/, /API key/],
+    ["custom-api", /pinned-address egress/, /Preferred Model/],
+    ["model-config", /Desktop Per-Model Overrides/, /Temperature slider/],
   ];
   for (const [route, expected, forbidden] of cases) {
     window.location.hash = `#settings/${route}`;
@@ -981,6 +1325,724 @@ test("unsupported desktop authorities are explicit and do not expose inert contr
     assert.doesNotMatch(content.textContent, forbidden);
     assert.equal(content.querySelectorAll("input, select, textarea").length, 0);
   }
+});
+
+test("typed settings pages mutate revisioned server authorities", async (t) => {
+  const harness = await createHarness({ hash: "#settings/agent-models" });
+  t.after(() => harness.close());
+  const { calls, document, window } = harness;
+
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /profile 202_608/,
+  );
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /Save Agent Routes/,
+  );
+  assert.doesNotMatch(scriptSource, /function agentModelRecommendations/);
+
+  const scope = document.querySelector(
+    'select[aria-label="Agent Models scope"]',
+  );
+  change(window, scope, "projectOverride");
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "PATCH" && call.path.endsWith("/settings/agent-models"),
+    ),
+  );
+  const agentModelsCall = calls.find(
+    (call) =>
+      call.method === "PATCH" && call.path.endsWith("/settings/agent-models"),
+  );
+  const agentModelsPayload = JSON.parse(agentModelsCall.body);
+  assert.deepEqual(Object.keys(agentModelsPayload).sort(), [
+    "expectedRevision",
+    "mode",
+    "profile",
+  ]);
+  assert.deepEqual(Object.keys(agentModelsPayload.profile).sort(), [
+    "contextBuilder",
+    "design",
+    "engineer",
+    "explore",
+    "oracle",
+    "pair",
+    "restrictDiscoveryToRoleModels",
+  ]);
+  assert.equal(agentModelsPayload.mode, "projectOverride");
+  await settle();
+  const oracleRoute = document.querySelector(
+    'select[aria-label="Oracle route"]',
+  );
+  oracleRoute.value =
+    [...oracleRoute.options].find((option) => option.value)?.value || "";
+  document.querySelector('input[aria-label="Pin Oracle route"]').checked = true;
+  submit(window, oracleRoute.closest("form"));
+  await waitFor(
+    () =>
+      calls.filter(
+        (call) =>
+          call.method === "PATCH" &&
+          call.path.endsWith("/settings/agent-models"),
+      ).length === 2,
+  );
+  const savedAgentModelsPayload = JSON.parse(
+    calls.filter(
+      (call) =>
+        call.method === "PATCH" && call.path.endsWith("/settings/agent-models"),
+    )[1].body,
+  );
+  assert.deepEqual(Object.keys(savedAgentModelsPayload.profile.oracle).sort(), [
+    "modelID",
+    "pinned",
+    "providerID",
+    "reasoningEffort",
+  ]);
+  assert.equal(savedAgentModelsPayload.profile.oracle.pinned, true);
+
+  window.location.hash = "#settings/agent-permissions";
+  window.dispatchEvent(new window.HashChangeEvent("hashchange"));
+  await settle();
+  const policy = document.querySelector(
+    'select[aria-label="Sub-agent permission policy"]',
+  );
+  change(window, policy, "custom");
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /Full Access can allow delegated agents/,
+  );
+  submit(
+    window,
+    [...document.querySelectorAll("form")].find((form) =>
+      form.textContent.includes("Save Sub-Agent Policy"),
+    ),
+  );
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/settings/subagent-permissions",
+    ),
+  );
+  const subagentPayload = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/settings/subagent-permissions",
+    ).body,
+  );
+  assert.deepEqual(Object.keys(subagentPayload).sort(), [
+    "expectedRevision",
+    "settings",
+  ]);
+  assert.deepEqual(Object.keys(subagentPayload.settings).sort(), [
+    "claude",
+    "codex",
+    "cursor",
+    "openCode",
+    "policy",
+  ]);
+  assert.equal(subagentPayload.settings.policy, "custom");
+
+  window.location.hash = "#settings/advanced";
+  window.dispatchEvent(new window.HashChangeEvent("hashchange"));
+  await settle();
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /scanner policy generation 0/,
+  );
+  const historyThreshold = document.querySelector(
+    'input[aria-label="Default history idle threshold"]',
+  );
+  assert.equal(historyThreshold.min, "0");
+  assert.equal(historyThreshold.max, "60");
+  assert.equal(historyThreshold.step, "1");
+  click(
+    window,
+    [...document.querySelectorAll("button")].find(
+      (button) => button.textContent === "Save Advanced Settings",
+    ),
+  );
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "PATCH" && call.path === "api/v1/settings/advanced",
+    ),
+  );
+  const advancedPayload = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "PATCH" && call.path === "api/v1/settings/advanced",
+    ).body,
+  );
+  assert.deepEqual(Object.keys(advancedPayload).sort(), [
+    "expectedRevision",
+    "settings",
+  ]);
+  assert.deepEqual(Object.keys(advancedPayload.settings).sort(), [
+    "codeMapsEnabled",
+    "followSymbolicLinks",
+    "historyIdleThresholdMinutes",
+    "respectCursorIgnore",
+    "respectNestedIgnoreFiles",
+    "respectRepoIgnore",
+    "showEmptyFolders",
+  ]);
+  assert.equal(advancedPayload.settings.historyIdleThresholdMinutes, 5);
+});
+
+test("Context Builder exposes stored defaults, prompt collection, and a manual portal consumer", async (t) => {
+  const harness = await createHarness({
+    hash: "#settings/context-builder",
+    bootstrap: bootstrapFixture({ sessions: [sessionFixture()] }),
+  });
+  t.after(() => harness.close());
+  const { calls, document, window } = harness;
+
+  for (const expected of [
+    "Context Budget",
+    "Prompt Enhancement",
+    "Question Timeout",
+    "Portal Clarifying Questions",
+    "MCP Clarifying Questions",
+    "Follow-up Analysis",
+    "Saved Prompt Collection",
+    "Manual Portal Run",
+  ]) {
+    assert.match(
+      document.getElementById("settings-content").textContent,
+      new RegExp(expected),
+    );
+  }
+  assert.doesNotMatch(
+    document.getElementById("settings-content").textContent,
+    /Invocation Overrides/,
+  );
+  const budget = document.querySelector('input[aria-label="Context Budget"]');
+  assert.deepEqual(
+    [budget.min, budget.max, budget.step],
+    ["10000", "200000", "5000"],
+  );
+  const followUpBudget = document.querySelector(
+    'input[aria-label="Follow-up Analysis Budget"]',
+  );
+  assert.deepEqual(
+    [followUpBudget.min, followUpBudget.max, followUpBudget.step],
+    ["40000", "200000", "5000"],
+  );
+  click(
+    window,
+    [...document.querySelectorAll("button")].find(
+      (button) => button.textContent === "Add Saved Prompt",
+    ),
+  );
+  const promptName = document.querySelector(
+    'input[aria-label="Saved Context Builder prompt name"]',
+  );
+  const promptInstructions = document.querySelector(
+    'textarea[aria-label="Instructions for saved prompt"]',
+  );
+  assert.equal(promptName.maxLength, 128);
+  assert.equal(promptInstructions.maxLength, 16384);
+  promptName.value = "Focused";
+  promptInstructions.value =
+    "Prioritize the files that implement the requested behavior.";
+  submit(
+    window,
+    [...document.querySelectorAll("form")].find((form) =>
+      form.textContent.includes("Save Context Builder Settings"),
+    ),
+  );
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/settings/context-builder",
+    ),
+  );
+  const settingsPayload = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/settings/context-builder",
+    ).body,
+  );
+  assert.deepEqual(Object.keys(settingsPayload).sort(), [
+    "expectedRevision",
+    "profile",
+  ]);
+  assert.deepEqual(Object.keys(settingsPayload.profile).sort(), [
+    "budget",
+    "enhancementMode",
+    "followUpAnalysis",
+    "followUpBudget",
+    "mcpClarifyingQuestions",
+    "portalClarifyingQuestions",
+    "prompts",
+    "questionTimeoutSeconds",
+  ]);
+  assert.deepEqual(Object.keys(settingsPayload.profile.prompts[0]).sort(), [
+    "enabled",
+    "instructions",
+    "name",
+    "order",
+    "promptID",
+  ]);
+  assert.equal(settingsPayload.profile.prompts[0].name, "Focused");
+  await settle();
+
+  const instructions = document.querySelector(
+    'textarea[aria-label="Context Builder instructions"]',
+  );
+  assert.equal(instructions.maxLength, 64000);
+  instructions.value = "Build a focused context for this task.";
+  submit(window, instructions.closest("form"));
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "POST" &&
+        call.path.endsWith(`/sessions/${sessionOneID}/context-builder`),
+    ),
+  );
+  const runPayload = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "POST" &&
+        call.path.endsWith(`/sessions/${sessionOneID}/context-builder`),
+    ).body,
+  );
+  assert.deepEqual(Object.keys(runPayload).sort(), [
+    "expectedSelectionRevision",
+    "instructions",
+    "selectedPromptIDs",
+  ]);
+  assert.equal(runPayload.expectedSelectionRevision, 1);
+  assert.equal(
+    runPayload.instructions,
+    "Build a focused context for this task.",
+  );
+  assert.deepEqual(runPayload.selectedPromptIDs, [
+    settingsPayload.profile.prompts[0].promptID,
+  ]);
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /Context Builder completed/,
+  );
+});
+
+test("model presets, workflows, and named selection presets render real management controls", async (t) => {
+  const bootstrap = bootstrapFixture({
+    sessions: [sessionFixture()],
+    workflows: [
+      {
+        workflowID: "build",
+        name: "Build",
+        source: "builtin",
+        enabled: true,
+        visible: true,
+        featuredOrder: 0,
+        rowRevision: 1,
+      },
+    ],
+  });
+  const typed = typedSettingsFixtures(providerCatalog(), bootstrap);
+  typed.selectionPresets.presets = [
+    {
+      presetID: "40000000-0000-0000-0000-000000000010",
+      projectID: projectOneID,
+      name: "Core Files",
+      entries: [],
+      order: 0,
+      rowRevision: 1,
+    },
+  ];
+  const harness = await createHarness({ bootstrap, typedSettings: typed });
+  t.after(() => harness.close());
+  const { calls, document, window } = harness;
+
+  for (const [route, expected, control] of [
+    ["model-presets", /Oracle Model Presets/, /Add Preset/],
+    [
+      "agent-workflows",
+      /Hidden-workflow lookup fails closed/i,
+      /Reload & Revalidate/,
+    ],
+    ["manage-presets", /Selection Presets/, /Apply to Session/],
+  ]) {
+    window.location.hash = `#settings/${route}`;
+    window.dispatchEvent(new window.HashChangeEvent("hashchange"));
+    await settle();
+    const content = document.getElementById("settings-content");
+    assert.match(content.textContent, expected);
+    assert.match(content.textContent, control);
+    assert.ok(content.querySelector("input, select, textarea, button"));
+  }
+
+  const coreFilesName = document.querySelector(
+    'input[aria-label="Preset name for Core Files"]',
+  );
+  assert.equal(coreFilesName.value, "Core Files");
+  assert.equal(coreFilesName.maxLength, 256);
+  assert.equal(
+    document.querySelector('input[aria-label="New selection preset name"]')
+      .maxLength,
+    256,
+  );
+  const applyPreset = [...document.querySelectorAll("button")].find(
+    (button) => button.textContent === "Apply to Session",
+  );
+  click(window, applyPreset);
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "POST" &&
+        call.path.endsWith("/selection-presets/apply"),
+    ),
+  );
+  const applyPayload = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "POST" &&
+        call.path.endsWith("/selection-presets/apply"),
+    ).body,
+  );
+  assert.deepEqual(Object.keys(applyPayload).sort(), [
+    "expectedCollectionRevision",
+    "expectedSelectionRevision",
+    "presetID",
+    "sessionID",
+  ]);
+  assert.equal(applyPayload.expectedCollectionRevision, 0);
+  assert.equal(applyPayload.expectedSelectionRevision, 1);
+
+  window.location.hash = "#settings/agent-workflows";
+  window.dispatchEvent(new window.HashChangeEvent("hashchange"));
+  await settle();
+  assert.equal(
+    document.querySelector('input[aria-label="New workflow name"]').maxLength,
+    128,
+  );
+  assert.equal(
+    document.querySelector(
+      'textarea[aria-label="New workflow markdown definition"]',
+    ).maxLength,
+    262144,
+  );
+  click(
+    window,
+    [...document.querySelectorAll("button")].find(
+      (button) => button.textContent === "Hide",
+    ),
+  );
+  await waitFor(() =>
+    calls.some(
+      (call) => call.method === "PATCH" && call.path.endsWith("/visibility"),
+    ),
+  );
+  const visibilityPayload = JSON.parse(
+    calls.find(
+      (call) => call.method === "PATCH" && call.path.endsWith("/visibility"),
+    ).body,
+  );
+  assert.deepEqual(Object.keys(visibilityPayload).sort(), [
+    "expectedRevision",
+    "expectedRowRevision",
+    "visible",
+  ]);
+  assert.deepEqual(visibilityPayload, {
+    expectedRevision: 0,
+    expectedRowRevision: 1,
+    visible: false,
+  });
+});
+
+test("model preset add, reorder, and delete keep ordering controls truthful", async (t) => {
+  const harness = await createHarness({ hash: "#settings/model-presets" });
+  t.after(() => harness.close());
+  const { calls, document, window } = harness;
+  const form = document.querySelector(".typed-settings-form");
+  const rowsContainer = form.querySelector(".model-preset-rows");
+  const formActions = form.querySelector(".model-preset-actions");
+  const add = [...formActions.querySelectorAll("button")].find(
+    (button) => button.textContent === "Add Preset",
+  );
+
+  assert.ok(rowsContainer.querySelector(".empty-inline"));
+  click(window, add);
+  assert.equal(rowsContainer.querySelector(".empty-inline"), null);
+  assert.equal(rowsContainer.nextElementSibling, formActions);
+  let rows = [...rowsContainer.querySelectorAll(".model-preset-row")];
+  assert.equal(rows.length, 1);
+  assert.equal(
+    [...rows[0].querySelectorAll("button")].find(
+      (button) => button.textContent === "Move Earlier",
+    ).disabled,
+    true,
+  );
+  assert.equal(
+    [...rows[0].querySelectorAll("button")].find(
+      (button) => button.textContent === "Move Later",
+    ).disabled,
+    true,
+  );
+  const firstName = rows[0].querySelector(
+    'input[aria-label="Model preset name"]',
+  );
+  const firstDescription = rows[0].querySelector("textarea");
+  assert.equal(firstName.maxLength, 128);
+  assert.equal(firstDescription.maxLength, 1024);
+  firstName.value = "First";
+
+  click(window, add);
+  rows = [...rowsContainer.querySelectorAll(".model-preset-row")];
+  rows[1].querySelector('input[aria-label="Model preset name"]').value =
+    "Second";
+  const firstEarlier = [...rows[0].querySelectorAll("button")].find(
+    (button) => button.textContent === "Move Earlier",
+  );
+  const firstLater = [...rows[0].querySelectorAll("button")].find(
+    (button) => button.textContent === "Move Later",
+  );
+  const secondEarlier = [...rows[1].querySelectorAll("button")].find(
+    (button) => button.textContent === "Move Earlier",
+  );
+  const secondLater = [...rows[1].querySelectorAll("button")].find(
+    (button) => button.textContent === "Move Later",
+  );
+  assert.deepEqual(
+    [
+      firstEarlier.disabled,
+      firstLater.disabled,
+      secondEarlier.disabled,
+      secondLater.disabled,
+    ],
+    [true, false, false, true],
+  );
+
+  click(window, secondEarlier);
+  rows = [...rowsContainer.querySelectorAll(".model-preset-row")];
+  assert.deepEqual(
+    rows.map(
+      (row) => row.querySelector('input[aria-label="Model preset name"]').value,
+    ),
+    ["Second", "First"],
+  );
+  assert.deepEqual(
+    rows.flatMap((row) => {
+      const buttons = [...row.querySelectorAll("button")];
+      return [
+        buttons.find((button) => button.textContent === "Move Earlier")
+          .disabled,
+        buttons.find((button) => button.textContent === "Move Later").disabled,
+      ];
+    }),
+    [true, false, false, true],
+  );
+
+  click(
+    window,
+    [...rows[0].querySelectorAll("button")].find(
+      (button) => button.textContent === "Delete",
+    ),
+  );
+  assert.equal(document.getElementById("confirm-dialog").hidden, false);
+  click(window, document.getElementById("confirm-action-button"));
+  await settle();
+  rows = [...rowsContainer.querySelectorAll(".model-preset-row")];
+  assert.equal(rows.length, 1);
+  const remainingButtons = [...rows[0].querySelectorAll("button")];
+  assert.equal(
+    remainingButtons.find((button) => button.textContent === "Move Earlier")
+      .disabled,
+    true,
+  );
+  assert.equal(
+    remainingButtons.find((button) => button.textContent === "Move Later")
+      .disabled,
+    true,
+  );
+
+  submit(window, form);
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/settings/model-presets",
+    ),
+  );
+  const payload = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/settings/model-presets",
+    ).body,
+  );
+  assert.deepEqual(Object.keys(payload).sort(), [
+    "expectedRevision",
+    "presets",
+  ]);
+  assert.equal(payload.presets.length, 1);
+  assert.deepEqual(Object.keys(payload.presets[0]).sort(), [
+    "availability",
+    "description",
+    "enabled",
+    "name",
+    "order",
+    "presetID",
+    "target",
+  ]);
+  assert.equal(payload.presets[0].name, "First");
+  assert.equal(payload.presets[0].order, 0);
+  assert.deepEqual(payload.presets[0].availability.sort(), [
+    "chat",
+    "plan",
+    "review",
+  ]);
+  assert.deepEqual(Object.keys(payload.presets[0].target).sort(), [
+    "modelID",
+    "pinned",
+    "providerID",
+    "reasoningEffort",
+  ]);
+});
+
+test("direct provider forms appear only for deployment-admitted complete runtimes", async (t) => {
+  const providers = providerCatalog();
+  providers.push(
+    providerFixture({
+      providerID: "openAIAPI",
+      displayName: "OpenAI API",
+      category: "apiProvider",
+      deploymentAllowed: true,
+      authenticationMethods: ["apiKey"],
+      authFlows: [],
+      models: [model("gpt-5.6-sol")],
+      preference: { enabled: false },
+    }),
+    providerFixture({
+      providerID: "openRouter",
+      displayName: "OpenRouter",
+      category: "apiProvider",
+      deploymentAllowed: true,
+      authenticationMethods: ["apiKey"],
+      authFlows: [],
+      models: [model("openai/gpt-5.6")],
+      preference: { enabled: false },
+    }),
+  );
+  const harness = await createHarness({
+    hash: "#settings/api-providers",
+    providers,
+  });
+  t.after(() => harness.close());
+  const { calls, document, window } = harness;
+
+  const openAI = document.querySelector('[data-provider-id="openAIAPI"]');
+  assert.ok(openAI);
+  assert.equal(
+    document.querySelector('[data-provider-id="anthropicAPI"]'),
+    null,
+  );
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /Save Runtime Configuration/,
+  );
+  const maximum = openAI.querySelector(
+    'input[aria-label="OpenAI API maximum output tokens"]',
+  );
+  assert.deepEqual(
+    [maximum.min, maximum.max, maximum.step],
+    ["1", "65536", "1"],
+  );
+  assert.equal(
+    openAI.querySelector('input[aria-label="OpenAI API preferred model"]')
+      .maxLength,
+    256,
+  );
+  maximum.value = "65536";
+  submit(window, openAI.querySelector(".direct-provider-form"));
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/provider-settings/openAIAPI/direct-configuration",
+    ),
+  );
+  const directPayload = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/provider-settings/openAIAPI/direct-configuration",
+    ).body,
+  );
+  assert.deepEqual(Object.keys(directPayload).sort(), [
+    "baseURL",
+    "contentTypePolicy",
+    "customHeaders",
+    "expectedRevision",
+    "maximumOutputTokens",
+    "preferredModel",
+  ]);
+  assert.equal(directPayload.maximumOutputTokens, 65536);
+  assert.equal(directPayload.contentTypePolicy, "applicationJSON");
+  assert.deepEqual(directPayload.customHeaders, {});
+  assert.equal("credential" in directPayload, false);
+
+  window.location.hash = "#settings/openrouter";
+  window.dispatchEvent(new window.HashChangeEvent("hashchange"));
+  await settle();
+  const openRouter = document.querySelector('[data-provider-id="openRouter"]');
+  assert.ok(openRouter);
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /Custom Headers \(JSON\)/,
+  );
+  const routerMaximum = openRouter.querySelector(
+    'input[aria-label="OpenRouter maximum output tokens"]',
+  );
+  assert.equal(routerMaximum.max, "65536");
+  openRouter.querySelector(
+    'textarea[aria-label="OpenRouter custom headers"]',
+  ).value = '{"X-Title":"Portal"}';
+  submit(window, openRouter.querySelector(".direct-provider-form"));
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path ===
+          "api/v1/provider-settings/openRouter/direct-configuration",
+    ),
+  );
+  const routerPayload = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path ===
+          "api/v1/provider-settings/openRouter/direct-configuration",
+    ).body,
+  );
+  assert.deepEqual(routerPayload.customHeaders, { "X-Title": "Portal" });
+});
+
+test("portal appearance is browser-local and uses a strict versioned cookie", async (t) => {
+  const harness = await createHarness({ hash: "#settings/portal-appearance" });
+  t.after(() => harness.close());
+  const { document, window } = harness;
+  const theme = document.querySelector('select[aria-label="Portal theme"]');
+  const density = document.querySelector(
+    'select[aria-label="Portal text density"]',
+  );
+  change(window, theme, "dark");
+  change(window, density, "extraLarge");
+  assert.equal(document.documentElement.dataset.portalTheme, "dark");
+  assert.equal(document.documentElement.dataset.textDensity, "extraLarge");
+  assert.match(document.cookie, /rpce_portal_appearance=v1.dark.extraLarge/);
+  assert.equal(
+    harness.calls.some((call) => call.path.includes("appearance")),
+    false,
+  );
 });
 
 test("compatible backends remain visible and save non-secret Linux runtime settings", async (t) => {

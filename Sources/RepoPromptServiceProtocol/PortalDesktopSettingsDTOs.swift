@@ -29,6 +29,12 @@ public struct UpdatePortalDesktopSettingsRequest: Codable, Sendable, Equatable {
     }
 }
 
+public enum PortalDesktopSettingMutability: String, Codable, Sendable {
+    case runtimeBackedP0
+    case supersededByTypedSettings
+    case compatibilityReadOnly
+}
+
 public enum PortalDesktopSettingKey: String, CaseIterable, Codable, Sendable {
     // Agent Mode overview and models
     case providerConversationCleanupAction
@@ -113,6 +119,69 @@ public enum PortalDesktopSettingKey: String, CaseIterable, Codable, Sendable {
     case worktreeBaseRef
     case removeCompletedWorktrees
     case serverDefaultExecutionMode
+
+    public var mutability: PortalDesktopSettingMutability {
+        switch self {
+        case .codexPermissionLevel,
+             .codexBashEnabled,
+             .codexSearchEnabled,
+             .codexGoalsEnabled,
+             .codexReasoningSummariesEnabled,
+             .codexMemoriesEnabled,
+             .codexEnabledMCPServers,
+             .claudePermissionLevel,
+             .claudeBashEnabled,
+             .claudeStrictMCPEnabled,
+             .claudeToolSearchEnabled,
+             .claudeGLMDisplayName,
+             .claudeGLMBaseURL,
+             .claudeGLMAuthHeader,
+             .claudeGLMHaikuModel,
+             .claudeGLMSonnetModel,
+             .claudeGLMOpusModel,
+             .claudeKimiDisplayName,
+             .claudeKimiBaseURL,
+             .claudeKimiAuthHeader,
+             .claudeCustomDisplayName,
+             .claudeCustomBaseURL,
+             .claudeCustomAuthHeader,
+             .claudeCustomModelBehavior,
+             .claudeCustomHaikuModel,
+             .claudeCustomSonnetModel,
+             .claudeCustomOpusModel,
+             .openCodePermissionLevel,
+             .cursorPermissionLevel,
+             .serverDefaultExecutionMode:
+            .runtimeBackedP0
+        case .oracleModel,
+             .contextBuilderAgent,
+             .contextBuilderModel,
+             .exploreRoleModel,
+             .engineerRoleModel,
+             .pairRoleModel,
+             .designRoleModel,
+             .restrictAgentDiscoveryToRoles,
+             .subagentPolicy,
+             .subagentCodexPermissionLevel,
+             .subagentClaudePermissionLevel,
+             .subagentOpenCodePermissionLevel,
+             .subagentCursorPermissionLevel,
+             .contextBuilderBudget,
+             .contextBuilderEnhancementMode,
+             .contextBuilderQuestionTimeout,
+             .contextBuilderUIClarifyingQuestions,
+             .contextBuilderFollowUpAnalysis,
+             .contextBuilderAnalysisBudget,
+             .contextBuilderMCPClarifyingQuestions,
+             .contextBuilderCustomInstructions,
+             .modelPresets:
+            .supersededByTypedSettings
+        default:
+            .compatibilityReadOnly
+        }
+    }
+
+    public var isMutable: Bool { mutability == .runtimeBackedP0 }
 
     public static var defaultValues: [String: String] {
         Dictionary(uniqueKeysWithValues: allCases.map { ($0.rawValue, $0.defaultValue) })

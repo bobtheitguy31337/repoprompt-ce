@@ -14,6 +14,7 @@ let benchmarkTestsEnabled = environment["RPCE_ENABLE_BENCHMARK_TESTS"] == "1"
 
 var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/apple/swift-crypto.git", exact: "4.5.0"),
+    .package(url: "https://github.com/apple/swift-nio.git", exact: "2.101.3"),
     .package(url: "https://github.com/vapor/sqlite-nio.git", exact: "1.13.0"),
     .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.22.0"),
     .package(url: "https://github.com/apple/swift-nio-ssl.git", exact: "2.34.1"),
@@ -146,6 +147,7 @@ private func makeServerPackage() -> Package {
         ],
         dependencies: [
             .package(url: "https://github.com/apple/swift-crypto.git", exact: "4.5.0"),
+            .package(url: "https://github.com/apple/swift-nio.git", exact: "2.101.3"),
             .package(url: "https://github.com/vapor/sqlite-nio.git", exact: "1.13.0"),
             .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.22.0"),
             .package(url: "https://github.com/apple/swift-nio-ssl.git", exact: "2.34.1"),
@@ -201,7 +203,7 @@ private func makeServerPackage() -> Package {
             ),
             .target(name: "RepoPromptWorkspaceRuntimeCore", dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptCodeMapCore", "RepoPromptC"], path: "Sources/RepoPromptWorkspaceRuntimeCore", resources: [.copy("Resources")], swiftSettings: swift6LanguageMode),
             .target(name: "RepoPromptServicePersistence", dependencies: ["RepoPromptServiceProtocol", .product(name: "Crypto", package: "swift-crypto"), .product(name: "SQLiteNIO", package: "sqlite-nio")], path: "Sources/RepoPromptServicePersistence", swiftSettings: swift6LanguageMode),
-            .target(name: "RepoPromptHeadlessRuntime", dependencies: ["RepoPromptServiceProtocol", "RepoPromptServicePersistence", "RepoPromptAgentRuntimeCore", "RepoPromptWorkspaceRuntimeCore", "RepoPromptDomainRuntime", "RepoPromptLinuxSupport", "RepoPromptC"], path: "Sources/RepoPromptHeadlessRuntime", swiftSettings: swift6LanguageMode),
+            .target(name: "RepoPromptHeadlessRuntime", dependencies: ["RepoPromptServiceProtocol", "RepoPromptServicePersistence", "RepoPromptAgentRuntimeCore", "RepoPromptWorkspaceRuntimeCore", "RepoPromptDomainRuntime", "RepoPromptLinuxSupport", "RepoPromptC", .product(name: "NIOCore", package: "swift-nio"), .product(name: "NIOPosix", package: "swift-nio"), .product(name: "NIOHTTP1", package: "swift-nio"), .product(name: "NIOSSL", package: "swift-nio-ssl")], path: "Sources/RepoPromptHeadlessRuntime", swiftSettings: swift6LanguageMode),
             .target(name: "RepoPromptServiceHTTP", dependencies: ["RepoPromptServiceProtocol", "RepoPromptServicePersistence", "RepoPromptHeadlessRuntime", "RepoPromptAgentRuntimeCore", "RepoPromptDomainRuntime", .product(name: "Crypto", package: "swift-crypto"), .product(name: "Hummingbird", package: "hummingbird"), .product(name: "HummingbirdTLS", package: "hummingbird"), .product(name: "NIOSSL", package: "swift-nio-ssl"), .product(name: "X509", package: "swift-certificates")], path: "Sources/RepoPromptServiceHTTP", resources: [.process("Resources")], swiftSettings: swift6LanguageMode),
             .target(name: "RepoPromptMCPAdapter", dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptHeadlessRuntime", "RepoPromptDomainRuntime", .product(name: "MCP", package: "swift-sdk")], path: "Sources/RepoPromptMCPAdapter", swiftSettings: swift6LanguageMode),
             .executableTarget(name: "RepoPromptServerExecutable", dependencies: ["RepoPromptServiceHTTP", "RepoPromptHeadlessRuntime", "RepoPromptServicePersistence"], path: "Sources/RepoPromptServerExecutable", swiftSettings: swift6LanguageMode),
@@ -345,7 +347,11 @@ private func makeServerPackage() -> Package {
                         "RepoPromptAgentRuntimeCore",
                         "RepoPromptWorkspaceRuntimeCore",
                         "RepoPromptDomainRuntime",
-                        "RepoPromptLinuxSupport"
+                        "RepoPromptLinuxSupport",
+                        .product(name: "NIOCore", package: "swift-nio"),
+                        .product(name: "NIOPosix", package: "swift-nio"),
+                        .product(name: "NIOHTTP1", package: "swift-nio"),
+                        .product(name: "NIOSSL", package: "swift-nio-ssl")
                     ],
                     path: "Sources/RepoPromptHeadlessRuntime",
                     swiftSettings: swift6LanguageMode

@@ -74,17 +74,23 @@ public struct ContextBuilderRuntimeRequest: Sendable {
     public let responseType: String?
     public let allowClarifyingQuestions: Bool
     public let provider: ProviderKind
+    public let providerSettingsID: ProviderSettingsID?
+    public let providerSettings: [String: String]
     public let model: String?
+    public let reasoningEffort: String?
     public let runID: UUID
 
-    public init(workspace: FrozenContextBuilderWorkspace, instructions: String, tokenBudget: Int, responseType: String?, allowClarifyingQuestions: Bool, provider: ProviderKind, model: String?, runID: UUID) {
+    public init(workspace: FrozenContextBuilderWorkspace, instructions: String, tokenBudget: Int, responseType: String?, allowClarifyingQuestions: Bool, provider: ProviderKind, providerSettingsID: ProviderSettingsID? = nil, providerSettings: [String: String] = [:], model: String?, reasoningEffort: String? = nil, runID: UUID) {
         self.workspace = workspace
         self.instructions = instructions
         self.tokenBudget = tokenBudget
         self.responseType = responseType
         self.allowClarifyingQuestions = allowClarifyingQuestions
         self.provider = provider
+        self.providerSettingsID = providerSettingsID
+        self.providerSettings = providerSettings
         self.model = model
+        self.reasoningEffort = reasoningEffort
         self.runID = runID
     }
 }
@@ -137,7 +143,14 @@ public struct ProviderContextBuilderRuntimeService: ContextBuilderRuntimeService
                 maximumBytes: 8_388_608,
                 runID: request.runID,
                 resumeProviderSessionID: providerSessionID,
-                policy: .init(mode: .readOnly)
+                policy: .init(
+                    mode: .readOnly,
+                    providerSettings: Self.providerIdentitySettings(
+                        base: request.providerSettings,
+                        providerSettingsID: request.providerSettingsID,
+                        reasoningEffort: request.reasoningEffort
+                    )
+                )
             )) { _ in }
             providerSessionID = result.providerSessionID ?? providerSessionID
             rawTurns.append(result.output)
@@ -403,6 +416,17 @@ public struct ProviderContextBuilderRuntimeService: ContextBuilderRuntimeService
         let path: String
     }
 
+    private static func providerIdentitySettings(
+        base: [String: String],
+        providerSettingsID: ProviderSettingsID?,
+        reasoningEffort: String?
+    ) -> [String: String] {
+        var settings = base
+        if let providerSettingsID { settings["provider.settingsID"] = providerSettingsID.rawValue }
+        if let reasoningEffort { settings["provider.reasoningEffort"] = reasoningEffort }
+        return settings
+    }
+
     private static func normalizedPath(_ raw: String) -> String? {
         let path = raw.replacingOccurrences(of: "\\", with: "/").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !path.isEmpty, !path.hasPrefix("/") else { return nil }
@@ -431,11 +455,15 @@ public struct OracleRuntimeRequest: Sendable {
     public let priorTurns: [OracleChatTurn]
     public let providerSessionID: String?
     public let provider: ProviderKind
+    public let providerSettingsID: ProviderSettingsID?
+    public let providerSettings: [String: String]
     public let model: String?
+    public let reasoningEffort: String?
+    public let tokenBudget: Int?
     public let workingDirectory: String
     public let runID: UUID
 
-    public init(sessionID: UUID, prompt: String, mode: String, selectedContext: String, priorTurns: [OracleChatTurn], providerSessionID: String?, provider: ProviderKind, model: String?, workingDirectory: String, runID: UUID) {
+    public init(sessionID: UUID, prompt: String, mode: String, selectedContext: String, priorTurns: [OracleChatTurn], providerSessionID: String?, provider: ProviderKind, providerSettingsID: ProviderSettingsID? = nil, providerSettings: [String: String] = [:], model: String?, reasoningEffort: String? = nil, tokenBudget: Int? = nil, workingDirectory: String, runID: UUID) {
         self.sessionID = sessionID
         self.prompt = prompt
         self.mode = mode
@@ -443,7 +471,11 @@ public struct OracleRuntimeRequest: Sendable {
         self.priorTurns = priorTurns
         self.providerSessionID = providerSessionID
         self.provider = provider
+        self.providerSettingsID = providerSettingsID
+        self.providerSettings = providerSettings
         self.model = model
+        self.reasoningEffort = reasoningEffort
+        self.tokenBudget = tokenBudget
         self.workingDirectory = workingDirectory
         self.runID = runID
     }
@@ -493,6 +525,7 @@ public struct ProviderOracleRuntimeService: OracleRuntimeService, Sendable {
         <selected_context>
         \(request.selectedContext)
         </selected_context>
+        <token_budget>\(request.tokenBudget.map { String($0) } ?? "provider-default")</token_budget>
         <request>
         \(request.prompt)
         </request>
@@ -505,7 +538,14 @@ public struct ProviderOracleRuntimeService: OracleRuntimeService, Sendable {
             maximumBytes: 8_388_608,
             runID: request.runID,
             resumeProviderSessionID: request.providerSessionID,
-            policy: .init(mode: .readOnly)
+            policy: .init(
+                mode: .readOnly,
+                providerSettings: Self.providerIdentitySettings(
+                    base: request.providerSettings,
+                    providerSettingsID: request.providerSettingsID,
+                    reasoningEffort: request.reasoningEffort
+                )
+            )
         )) { _ in }
         return OracleRuntimeResult(
             response: execution.output,
@@ -515,6 +555,17 @@ public struct ProviderOracleRuntimeService: OracleRuntimeService, Sendable {
                 .init(role: .assistant, content: execution.output)
             ]
         )
+    }
+
+    private static func providerIdentitySettings(
+        base: [String: String],
+        providerSettingsID: ProviderSettingsID?,
+        reasoningEffort: String?
+    ) -> [String: String] {
+        var settings = base
+        if let providerSettingsID { settings["provider.settingsID"] = providerSettingsID.rawValue }
+        if let reasoningEffort { settings["provider.reasoningEffort"] = reasoningEffort }
+        return settings
     }
 }
 

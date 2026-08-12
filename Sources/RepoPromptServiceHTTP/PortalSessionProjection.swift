@@ -35,6 +35,7 @@ enum RepoPromptPortalSessionProjection {
             parentSessionID: session.parentSessionID,
             title: title(for: session),
             provider: session.provider,
+            providerSettingsID: session.providerSettingsID,
             model: session.model,
             state: session.state,
             revision: session.revision,
@@ -132,6 +133,8 @@ enum RepoPromptPortalSessionProjection {
     static func validatedCreateInput(
         _ request: PortalCreateSessionRequest,
         provider: ProviderSettingsSnapshot,
+        resolvedModel: String?,
+        reasoningEffort: String?,
         runtimeDefaults: PortalDesktopSettingsService.RuntimeDefaults
     ) throws -> CreateSessionInput {
         let prompt = request.initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -141,14 +144,14 @@ enum RepoPromptPortalSessionProjection {
         guard prompt.utf8.count <= maximumPromptBytes else {
             throw ServiceAPIError(code: .invalidRequest, message: "Initial prompt exceeds its portal bound")
         }
-        guard provider.providerID == request.providerID,
+        guard (request.providerID == nil || provider.providerID == request.providerID),
               provider.deploymentAllowed,
               provider.effectiveEnabled,
               let runtimeKind = provider.providerID.runtimeKind
         else {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "The selected provider is not available for new sessions", retryable: true)
         }
-        if let model = request.model {
+        if let model = resolvedModel {
             guard model.utf8.count <= maximumModelBytes,
                   provider.capabilities.supportsModelSelection,
                   provider.models.contains(where: { $0.id == model })
@@ -156,15 +159,19 @@ enum RepoPromptPortalSessionProjection {
                 throw ServiceAPIError(code: .invalidRequest, message: "The selected model is not advertised by this provider")
             }
         }
+        var providerSettings = runtimeDefaults.providerSettings
+        providerSettings["provider.settingsID"] = provider.providerID.rawValue
+        if let reasoningEffort { providerSettings["provider.reasoningEffort"] = reasoningEffort }
         return CreateSessionInput(
             projectID: request.projectID,
             provider: runtimeKind,
-            model: request.model,
+            providerSettingsID: provider.providerID,
+            model: resolvedModel,
             visibility: .privateSession,
             initialPrompt: prompt,
             startImmediately: true,
             initialPermissionMode: runtimeDefaults.mode,
-            initialProviderSettings: runtimeDefaults.providerSettings
+            initialProviderSettings: providerSettings
         )
     }
 
