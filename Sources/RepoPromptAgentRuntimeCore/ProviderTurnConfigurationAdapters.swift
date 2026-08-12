@@ -104,7 +104,7 @@ public enum ProviderComposerStableControls {
         case .codex:
             let choices = [
                 ProviderComposerChoiceDescriptor(id: "codex.readOnly", displayName: "Read Only"),
-                .init(id: "codex.defaultPermission", displayName: "Default"),
+                .init(id: "codex.defaultPermission", displayName: "Require Approval"),
                 .init(id: "codex.autoReview", displayName: "Auto Review"),
                 .init(id: "codex.fullAccess", displayName: "Full Access", warning: true)
             ]
@@ -119,12 +119,12 @@ public enum ProviderComposerStableControls {
             return .init(id: "claude.permission", selectedID: selectedID ?? "claude.requireApproval", choices: choices, mutable: mutable, lockReasonCode: lockReasonCode)
         case .openCodeACP:
             return .init(id: "opencode.permission", selectedID: selectedID ?? "opencode.managedDefault", choices: [
-                .init(id: "opencode.managedDefault", displayName: "Default", detailText: "OpenCode asks before running tools that need approval."),
+                .init(id: "opencode.managedDefault", displayName: "Require Approval", detailText: "OpenCode asks before running tools that need approval."),
                 .init(id: "opencode.fullAccess", displayName: "Full Access", warning: true)
             ], mutable: mutable, lockReasonCode: lockReasonCode)
         case .cursorACP:
             return .init(id: "cursor.permission", selectedID: selectedID ?? "cursor.managedDefault", choices: [
-                .init(id: "cursor.managedDefault", displayName: "Default", detailText: "Cursor asks before running tools that need approval. RepoPrompt MCP is injected through the ACP session."),
+                .init(id: "cursor.managedDefault", displayName: "Require Approval", detailText: "Cursor asks before running tools that need approval. RepoPrompt MCP is injected through the ACP session."),
                 .init(id: "cursor.fullAccess", displayName: "Full Access", warning: true)
             ], mutable: mutable, lockReasonCode: lockReasonCode)
         case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:

@@ -267,34 +267,43 @@ extension SQLiteServiceStore: OwnedResourceRepository {
     }
 
     public func ownedResourceHealth(now: Date = Date()) async throws -> OwnedResourceHealthSnapshot {
-        let resources = try await ownedResources(states: nil)
-        let grouped = Dictionary(grouping: resources) { "\($0.kind.rawValue):\($0.lifecycleState.rawValue)" }
-        let aggregates = grouped.values.compactMap { values -> OwnedResourceAggregate? in
-            guard let first = values.first else { return nil }
-            return OwnedResourceAggregate(
-                kind: first.kind,
-                state: first.lifecycleState,
-                count: values.count,
-                bytes: values.compactMap(\.observedBytes).reduce(0, +),
-                oldestAgeSeconds: values.map { max(0, now.timeIntervalSince($0.updatedAt)) }.max() ?? 0
+        // Readiness is polled continuously and provider probes retain bounded
+        // lifecycle history. Aggregate in SQLite so health does not materialize
+        // and decode every historical provider row on each poll.
+        let aggregateRows = try await connection.query(
+            "SELECT kind,lifecycle_state,COUNT(*) AS resource_count,COALESCE(SUM(observed_bytes),0) AS resource_bytes,MIN(updated_at) AS oldest_updated_at FROM owned_resources GROUP BY kind,lifecycle_state ORDER BY kind,lifecycle_state"
+        )
+        let aggregates = try aggregateRows.map { row -> OwnedResourceAggregate in
+            guard let kind = row.column("kind")?.string.flatMap(OwnedResourceKind.init(rawValue:)),
+                  let state = row.column("lifecycle_state")?.string.flatMap(OwnedResourceLifecycleState.init(rawValue:))
+            else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Persisted owned resource aggregate is invalid")
+            }
+            let oldest = row.column("oldest_updated_at")?.double.map(Date.init(timeIntervalSince1970:)) ?? now
+            return .init(
+                kind: kind,
+                state: state,
+                count: row.column("resource_count")?.integer ?? 0,
+                bytes: Int64(row.column("resource_bytes")?.integer ?? 0),
+                oldestAgeSeconds: max(0, now.timeIntervalSince(oldest))
             )
-        }.sorted {
-            ($0.kind.rawValue, $0.state.rawValue) < ($1.kind.rawValue, $1.state.rawValue)
         }
-        let leases = try await worktreeMergeLeases(nonterminalOnly: true)
-        let providerLocalKinds: Set<OwnedResourceKind> = [.providerHome, .providerCredentialCopy, .providerOutput]
-        let coreResources = resources.filter { !providerLocalKinds.contains($0.kind) }
+        let core = try await connection.query(
+            "SELECT COALESCE(SUM(CASE WHEN cleanup_error IS NOT NULL AND lifecycle_state<>'deleted' THEN 1 ELSE 0 END),0) AS cleanup_failures,COALESCE(SUM(CASE WHEN kind='artifact' AND lifecycle_state='missing' THEN 1 ELSE 0 END),0) AS missing_artifacts,COALESCE(SUM(CASE WHEN lifecycle_state IN ('missing','corrupt') THEN 1 ELSE 0 END),0) AS unhealthy_resources,COALESCE(SUM(CASE WHEN lifecycle_state IN ('preparing','prepared','cleanup_pending','quarantined') AND retention_deadline IS NOT NULL AND retention_deadline<=? THEN 1 ELSE 0 END),0) AS abandoned_reservations FROM owned_resources WHERE kind NOT IN ('provider_home','provider_credential_copy','provider_output')",
+            [.float(now.timeIntervalSince1970)]
+        ).first
+        let lease = try await connection.query(
+            "SELECT COALESCE(SUM(CASE WHEN state='conflicted' THEN 1 ELSE 0 END),0) AS conflicted_leases,COALESCE(SUM(CASE WHEN expires_at<=? AND state<>'conflicted' THEN 1 ELSE 0 END),0) AS expired_leases FROM worktree_merge_leases WHERE state NOT IN ('aborted','committed','failed')",
+            [.float(now.timeIntervalSince1970)]
+        ).first
         return OwnedResourceHealthSnapshot(
             aggregates: aggregates,
-            cleanupFailures: coreResources.count { $0.cleanupError != nil && $0.lifecycleState != .deleted },
-            missingCommittedArtifacts: coreResources.count { $0.kind == .artifact && $0.lifecycleState == .missing },
-            unhealthyCommittedResources: coreResources.count { [.missing, .corrupt].contains($0.lifecycleState) },
-            abandonedReservations: coreResources.count {
-                [.preparing, .prepared, .cleanupPending, .quarantined].contains($0.lifecycleState)
-                    && ($0.retentionDeadline.map { $0 <= now } ?? false)
-            },
-            conflictedMergeLeases: leases.count { $0.state == .conflicted },
-            expiredMergeLeases: leases.count { $0.expiresAt <= now && $0.state != .conflicted }
+            cleanupFailures: core?.column("cleanup_failures")?.integer ?? 0,
+            missingCommittedArtifacts: core?.column("missing_artifacts")?.integer ?? 0,
+            unhealthyCommittedResources: core?.column("unhealthy_resources")?.integer ?? 0,
+            abandonedReservations: core?.column("abandoned_reservations")?.integer ?? 0,
+            conflictedMergeLeases: lease?.column("conflicted_leases")?.integer ?? 0,
+            expiredMergeLeases: lease?.column("expired_leases")?.integer ?? 0
         )
     }
 

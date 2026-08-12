@@ -11,6 +11,24 @@ public actor AgentTranscriptPresentationService {
         let digest: String
     }
 
+    private struct PresentationUnit {
+        let sequence: Int64
+        let beforeSequence: Int64
+        let turn: AgentPresentationTurnWire
+    }
+
+    private struct LegacyTextAccumulator {
+        var content = ""
+        var lastEntry: TranscriptEntry?
+        var revision: Int64 = 0
+
+        mutating func append(_ entry: TranscriptEntry) {
+            content = AgentTranscriptPresentationService.mergingLegacyFragment(content, entry.content)
+            lastEntry = entry
+            revision += 1
+        }
+    }
+
     private let store: SQLiteServiceStore
 
     public init(store: SQLiteServiceStore) {
@@ -35,8 +53,8 @@ public actor AgentTranscriptPresentationService {
             .filter { entry in
                 (before == nil || entry.sessionSequence < before!) && !coveredRanges.contains(where: { $0.contains(entry.sessionSequence) })
             }
-            .sorted { $0.sessionSequence > $1.sessionSequence }
-        var units: [(sequence: Int64, turn: AgentPresentationTurnWire)] = []
+        let legacyUnits = Self.reconstructedLegacyUnits(legacyCandidates)
+        var units: [PresentationUnit] = []
 
         for record in pageSemantic {
             let canonical = try JSONDecoder.serviceDecoder.decode(CanonicalUserTurn.self, from: record.canonicalUserTurnJSON)
@@ -83,20 +101,17 @@ public actor AgentTranscriptPresentationService {
                 activities: presentationActivities,
                 interactions: attachedInteractions
             ))
-            units.append((record.lastSequence, projected))
+            units.append(.init(sequence: record.lastSequence, beforeSequence: record.lastSequence, turn: projected))
         }
 
         let remaining = max(0, boundedLimit - units.count)
-        for entry in legacyCandidates.prefix(remaining) {
-            if let projected = AgentTranscriptPresentationCore.projectLegacy(entry) {
-                units.append((entry.sessionSequence, projected))
-            }
-        }
+        let pageLegacy = Array(legacyUnits.suffix(remaining))
+        units.append(contentsOf: pageLegacy)
         units.sort { $0.sequence < $1.sequence }
 
-        let oldest = units.first?.sequence
+        let oldest = units.first?.beforeSequence
         let hasMoreSemantic = semantic.count > pageSemantic.count
-        let hasMoreLegacy = oldest.map { sequence in legacyTranscript.contains { $0.sessionSequence < sequence } } ?? false
+        let hasMoreLegacy = legacyUnits.count > pageLegacy.count
         let next: String? = if let oldest, hasMoreSemantic || hasMoreLegacy { try encodePageToken(actorID: actorID, sessionID: sessionID, beforeSequence: oldest) } else { nil }
         var watermark = try await store.semanticWatermark(sessionID: sessionID)
         let latestSemanticSequence = try await store.latestSemanticSequence(sessionID: sessionID)
@@ -109,6 +124,107 @@ public actor AgentTranscriptPresentationService {
         let cursorSeed = "\(sessionID.uuidString.lowercased()):\(revision):\(legacyTranscript.last?.sessionSequence ?? 0)"
         let pending = interactions.filter { $0.state == .pending || $0.state == .deliveryIntent }.map { Self.interactionWire($0, turnID: "live-tail", mutable: mutableInteractions) }
         return .init(presentationRevision: revision, presentationCursor: CanonicalSigning.bodyDigest(Data(cursorSeed.utf8)), turns: units.map(\.turn), nextPageToken: next, pendingInteractions: pending)
+    }
+
+    private static func reconstructedLegacyUnits(_ transcript: [TranscriptEntry]) -> [PresentationUnit] {
+        let sorted = transcript.sorted {
+            $0.sessionSequence == $1.sessionSequence
+                ? $0.entryID.uuidString < $1.entryID.uuidString
+                : $0.sessionSequence < $1.sessionSequence
+        }
+        var groups: [[TranscriptEntry]] = []
+        var current: [TranscriptEntry] = []
+        for entry in sorted {
+            if entry.kind == .human, !current.isEmpty {
+                groups.append(current)
+                current.removeAll(keepingCapacity: true)
+            }
+            current.append(entry)
+        }
+        if !current.isEmpty { groups.append(current) }
+        return groups.compactMap(projectLegacyGroup)
+    }
+
+    private static func projectLegacyGroup(_ entries: [TranscriptEntry]) -> PresentationUnit? {
+        guard let first = entries.first, let last = entries.last else { return nil }
+        let request = entries.first { $0.kind == .human }
+        var assistant = LegacyTextAccumulator()
+        var reasoning = LegacyTextAccumulator()
+        var activities: [AgentSemanticPresentationActivity] = []
+
+        for entry in entries {
+            let id = "legacy:\(entry.entryID.uuidString.lowercased())"
+            switch entry.kind {
+            case .human:
+                continue
+            case .assistant:
+                assistant.append(entry)
+            case .reasoning:
+                reasoning.append(entry)
+            case .progress:
+                activities.append(.init(id: id, sequence: entry.sessionSequence, revision: 1, kind: "progress", content: entry.content))
+            case .tool:
+                activities.append(.init(id: id, sequence: entry.sessionSequence, revision: 1, kind: "note", content: entry.content, summary: "Tool activity"))
+            case .system:
+                activities.append(.init(id: id, sequence: entry.sessionSequence, revision: 1, kind: "note", content: entry.content))
+            }
+        }
+        if let entry = reasoning.lastEntry, !reasoning.content.isEmpty {
+            activities.append(.init(
+                id: "legacy:\(entry.entryID.uuidString.lowercased()):reasoning",
+                sequence: entry.sessionSequence,
+                revision: reasoning.revision,
+                kind: "reasoning",
+                content: reasoning.content
+            ))
+        }
+        if let entry = assistant.lastEntry, !assistant.content.isEmpty {
+            activities.append(.init(
+                id: "legacy:\(entry.entryID.uuidString.lowercased()):assistant",
+                sequence: entry.sessionSequence,
+                revision: assistant.revision,
+                kind: "assistant",
+                content: assistant.content
+            ))
+        }
+
+        let turnID = "legacy:\((request ?? first).entryID.uuidString.lowercased())"
+        let projected = AgentTranscriptPresentationCore.project(.init(
+            turnID: turnID,
+            responseSpanID: nil,
+            requestAnchorID: request?.entryID,
+            requestText: request?.content ?? "",
+            activities: activities
+        ))
+        let blocks = request == nil ? projected.blocks.filter { block in
+            if case .request = block { return false }
+            return true
+        } : projected.blocks
+        guard !blocks.isEmpty else { return nil }
+        let turn = AgentPresentationTurnWire(
+            turnID: turnID,
+            responseSpanID: projected.responseSpanID,
+            requestAnchorID: projected.requestAnchorID,
+            terminalState: projected.terminalState,
+            blocks: blocks,
+            interactions: projected.interactions,
+            legacyStandalone: true
+        )
+        return .init(sequence: last.sessionSequence, beforeSequence: first.sessionSequence, turn: turn)
+    }
+
+    private static func mergingLegacyFragment(_ current: String, _ incoming: String) -> String {
+        guard !incoming.isEmpty else { return current }
+        guard !current.isEmpty else { return String(incoming.prefix(262_144)) }
+        if incoming == current || current.hasPrefix(incoming) { return current }
+        if incoming.hasPrefix(current) { return String(incoming.prefix(262_144)) }
+
+        let normalizedCurrent = current.split(whereSeparator: \Character.isWhitespace).joined(separator: " ")
+        let normalizedIncoming = incoming.split(whereSeparator: \Character.isWhitespace).joined(separator: " ")
+        if normalizedIncoming == normalizedCurrent {
+            return current.count >= incoming.count ? current : String(incoming.prefix(262_144))
+        }
+        return String((current + incoming).prefix(262_144))
     }
 
     private func encodePageToken(actorID: String, sessionID: UUID, beforeSequence: Int64) throws -> String {

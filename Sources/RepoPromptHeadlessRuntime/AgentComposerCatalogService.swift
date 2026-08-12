@@ -35,6 +35,7 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
     private let workflows: [AgentComposerWorkflowDescriptor]
     private let suggestions: [ComposerSuggestionDescriptor]
     private let emptyState: AgentEmptyStateDescriptor
+    private let providerProfileLoader: (@Sendable (ProviderSettingsID) async throws -> AgentCatalogProviderProfile)?
     private let providerStateLoader: (@Sendable (Date) async throws -> [AgentCatalogProviderState])?
     private let now: @Sendable () -> Date
 
@@ -52,6 +53,7 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
                 "Use Shift+Return to add a new line."
             ]
         ),
+        providerProfileLoader: (@Sendable (ProviderSettingsID) async throws -> AgentCatalogProviderProfile)? = nil,
         providerStateLoader: (@Sendable (Date) async throws -> [AgentCatalogProviderState])? = nil,
         now: @escaping @Sendable () -> Date = Date.init
     ) {
@@ -61,6 +63,7 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
         self.workflows = workflows
         self.suggestions = suggestions
         self.emptyState = emptyState
+        self.providerProfileLoader = providerProfileLoader
         self.providerStateLoader = providerStateLoader
         self.now = now
     }
@@ -216,6 +219,14 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
             guard let settings = catalog.providers.first(where: { $0.providerID == matrix.providerID }) else { continue }
             let values = storedDefaults?.configuration.providerID == matrix.providerID ? storedDefaults?.configuration.toolValues ?? [:] : [:]
             let selectedPermission = storedDefaults?.configuration.providerID == matrix.providerID ? storedDefaults?.configuration.permissionID : nil
+            let providerProfile = try await providerProfileLoader?(matrix.providerID)
+            let toolControls = providerProfile?.toolControls
+                ?? ProviderComposerStableControls.descriptors(providerID: matrix.providerID, values: values, mutable: true, lockReasonCode: nil)
+            let permissionControl: ProviderPermissionDescriptor? = if let providerProfile {
+                providerProfile.permissionControl
+            } else {
+                ProviderComposerStableControls.permissionDescriptor(providerID: matrix.providerID, selectedID: selectedPermission, mutable: true, lockReasonCode: nil)
+            }
             var sources: [AgentCatalogModelSource] = []
             let cached = matrix.discoveryPolicy.allowsPersistedFallback
                 ? try await store.composerProviderCatalog(providerID: matrix.providerID)
@@ -247,8 +258,8 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
                 modelSources: sources,
                 preferredModelID: settings.preference.defaultModel,
                 preferredEffortID: settings.preference.reasoningEffort,
-                toolControls: ProviderComposerStableControls.descriptors(providerID: matrix.providerID, values: values, mutable: true, lockReasonCode: nil),
-                permissionControl: ProviderComposerStableControls.permissionDescriptor(providerID: matrix.providerID, selectedID: selectedPermission, mutable: true, lockReasonCode: nil)
+                toolControls: toolControls,
+                permissionControl: permissionControl
             ))
         }
         return AgentCatalogAuthority.resolve(

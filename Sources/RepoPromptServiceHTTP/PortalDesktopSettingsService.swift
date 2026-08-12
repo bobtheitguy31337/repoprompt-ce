@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentRuntimeCore
 import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 import RepoPromptHeadlessRuntime
@@ -52,6 +53,71 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
             updatedAt: Date()
         )
         return try await store.upsertPortalDesktopSettings(updated, expectedRevision: current.revision)
+    }
+
+    /// Projects persisted portal defaults into concrete composer controls. The
+    /// browser receives the effective choice instead of inventing a separate
+    /// "Default" permission with no execution meaning of its own.
+    public func composerCatalogProfile(for providerID: ProviderSettingsID) async throws -> AgentCatalogProviderProfile {
+        let values = try await snapshot().values
+        var toolValues: [String: AgentControlValue] = [:]
+        let permissionID: String?
+
+        switch providerID {
+        case .codex:
+            toolValues = [
+                "codex.bash": .boolean(Self.boolean(.codexBashEnabled, values: values)),
+                "codex.search": .boolean(Self.boolean(.codexSearchEnabled, values: values)),
+                "codex.goals": .boolean(Self.boolean(.codexGoalsEnabled, values: values)),
+                "codex.reasoningSummaries": .boolean(Self.boolean(.codexReasoningSummariesEnabled, values: values)),
+                "codex.memories": .boolean(Self.boolean(.codexMemoriesEnabled, values: values)),
+                "codex.mcpServers": .choices(["repoprompt"])
+            ]
+            permissionID = switch values[PortalDesktopSettingKey.codexPermissionLevel.rawValue] {
+            case "readOnly": "codex.readOnly"
+            case "defaultPermission": "codex.defaultPermission"
+            case "fullAccess": "codex.fullAccess"
+            default: "codex.autoReview"
+            }
+        case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom:
+            toolValues = [
+                "claude.bash": .boolean(Self.boolean(.claudeBashEnabled, values: values)),
+                "claude.mcpStrictMode": .boolean(Self.boolean(.claudeStrictMCPEnabled, values: values)),
+                "claude.toolSearch": .boolean(Self.boolean(.claudeToolSearchEnabled, values: values)),
+                "claude.promptDelivery": .choice("nativeSystemPrompt")
+            ]
+            permissionID = switch values[PortalDesktopSettingKey.claudePermissionLevel.rawValue] {
+            case "autoApproveEdits": "claude.autoApproveEdits"
+            case "auto": "claude.auto"
+            case "fullAccess": "claude.fullAccess"
+            default: "claude.requireApproval"
+            }
+        case .openCodeACP:
+            permissionID = values[PortalDesktopSettingKey.openCodePermissionLevel.rawValue] == "fullAccess"
+                ? "opencode.fullAccess"
+                : "opencode.managedDefault"
+        case .cursorACP:
+            permissionID = values[PortalDesktopSettingKey.cursorPermissionLevel.rawValue] == "fullAccess"
+                ? "cursor.fullAccess"
+                : "cursor.managedDefault"
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
+            permissionID = nil
+        }
+
+        return .init(
+            toolControls: ProviderComposerStableControls.descriptors(
+                providerID: providerID,
+                values: toolValues,
+                mutable: true,
+                lockReasonCode: nil
+            ),
+            permissionControl: ProviderComposerStableControls.permissionDescriptor(
+                providerID: providerID,
+                selectedID: permissionID,
+                mutable: true,
+                lockReasonCode: nil
+            )
+        )
     }
 
     public func directProviderRuntimeDefaults(for providerID: ProviderSettingsID) async throws -> DirectProviderRuntimeDefaults {
@@ -153,5 +219,9 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
         case "defaultPermission", "autoReview": "workspaceWrite"
         default: fallback
         }
+    }
+
+    private nonisolated static func boolean(_ key: PortalDesktopSettingKey, values: [String: String]) -> Bool {
+        values[key.rawValue] == "true"
     }
 }

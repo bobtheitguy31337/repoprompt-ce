@@ -296,6 +296,32 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         try await store.close()
     }
 
+    func testOperationalSnapshotAggregatesProviderHistoryWithoutMakingProviderFailuresCoreReadiness() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let now = Date(timeIntervalSince1970: 10_000)
+        let kinds: [OwnedResourceKind] = [.providerHome, .providerCredentialCopy, .providerOutput]
+        for index in 0 ..< 256 {
+            try await store.reserveOwnedResource(.init(
+                kind: kinds[index % kinds.count],
+                internalPathIdentity: "/provider-history/\(index)",
+                lifecycleState: index.isMultiple(of: 3) ? .missing : .deleted,
+                observedBytes: Int64(index),
+                metadata: ["probe": "\(index)"],
+                cleanupError: index.isMultiple(of: 7) ? "provider probe failed" : nil,
+                createdAt: now.addingTimeInterval(-100),
+                updatedAt: now.addingTimeInterval(-50)
+            ))
+        }
+
+        let snapshot = try await store.operationalSnapshot(now: now)
+        XCTAssertTrue(snapshot.integrityValid)
+        XCTAssertTrue(snapshot.migrationsValid)
+        XCTAssertTrue(snapshot.ownedResources.ready)
+        XCTAssertEqual(snapshot.ownedResources.aggregates.reduce(0) { $0 + $1.count }, 256)
+        XCTAssertEqual(snapshot.ownedResources.unhealthyCommittedResources, 0)
+        try await store.close()
+    }
+
     func testServerRecoversOnlyConnectedProviderStatusWithSingleFlight() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let connectedRuntime = CountingUnavailableProviderRuntime(kind: .openCodeACP)

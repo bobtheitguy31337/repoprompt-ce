@@ -70,6 +70,11 @@ final class ProviderSettingsPortalTests: XCTestCase {
         let kimi = try XCTUnwrap(kimiSettings)
         XCTAssertEqual(kimi.modelBehavior, .noModel)
         XCTAssertEqual(kimi.authHeader, .anthropicAPIKey)
+        let codexComposerProfile = try await service.composerCatalogProfile(for: .codex)
+        XCTAssertEqual(codexComposerProfile.permissionControl?.selectedID, "codex.readOnly")
+        XCTAssertFalse(codexComposerProfile.permissionControl?.choices.contains { $0.displayName == "Default" } == true)
+        XCTAssertEqual(Self.booleanValue("codex.bash", in: codexComposerProfile.toolControls), false)
+        XCTAssertEqual(Self.booleanValue("codex.goals", in: codexComposerProfile.toolControls), false)
 
         do {
             _ = try await service.update(.init(expectedRevision: 0, changes: [PortalDesktopSettingKey.codexBashEnabled.rawValue: "true"]))
@@ -99,6 +104,15 @@ final class ProviderSettingsPortalTests: XCTestCase {
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .invalidRequest)
         }
+    }
+
+    private static func booleanValue(_ id: String, in controls: [ProviderComposerControlDescriptor]) -> Bool? {
+        for control in controls {
+            if case let .toggle(controlID, _, _, value, _, _, _, _) = control, controlID == id {
+                return value
+            }
+        }
+        return nil
     }
 
     func testBrowserAuthenticationStatusContractHasNoSecretOrPathFields() throws {

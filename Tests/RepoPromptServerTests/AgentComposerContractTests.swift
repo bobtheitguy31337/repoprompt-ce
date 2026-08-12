@@ -558,6 +558,63 @@ final class AgentTranscriptPresentationTests: XCTestCase {
         XCTAssertTrue(semantic.isEmpty)
         try await store.close()
     }
+
+    func testLegacyStreamingFragmentsReconstructOneCoherentTurn() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let service = AgentTranscriptPresentationService(store: store)
+        let sessionID = UUID()
+        let now = Date()
+        let legacy = [
+            TranscriptEntry(entryID: UUID(), sessionSequence: 1, kind: .human, content: "Fix the transcript", actor: nil, timestamp: now),
+            TranscriptEntry(entryID: UUID(), sessionSequence: 2, kind: .assistant, content: "Implemented", actor: nil, timestamp: now),
+            TranscriptEntry(entryID: UUID(), sessionSequence: 3, kind: .assistant, content: " the", actor: nil, timestamp: now),
+            TranscriptEntry(entryID: UUID(), sessionSequence: 4, kind: .assistant, content: " complete fix.", actor: nil, timestamp: now),
+            TranscriptEntry(entryID: UUID(), sessionSequence: 5, kind: .assistant, content: "Implemented the complete fix.", actor: nil, timestamp: now)
+        ]
+
+        let page = try await service.page(sessionID: sessionID, actorID: "actor", legacyTranscript: legacy)
+        XCTAssertEqual(page.turns.count, 1)
+        XCTAssertTrue(page.turns[0].legacyStandalone)
+        XCTAssertEqual(page.turns[0].blocks.count, 2)
+        guard case let .request(_, request) = page.turns[0].blocks[0],
+              case let .userRequest(_, requestText, _, _) = request,
+              case let .standaloneAssistant(_, response) = page.turns[0].blocks[1],
+              case let .assistant(_, responseText) = response
+        else { return XCTFail("expected one reconstructed request and assistant response") }
+        XCTAssertEqual(requestText, "Fix the transcript")
+        XCTAssertEqual(responseText, "Implemented the complete fix.")
+        try await store.close()
+    }
+
+    func testLegacyPresentationPaginationUsesWholeTurnBoundaries() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let service = AgentTranscriptPresentationService(store: store)
+        let sessionID = UUID()
+        let now = Date()
+        var legacy: [TranscriptEntry] = []
+        for turn in 1 ... 3 {
+            legacy.append(TranscriptEntry(entryID: UUID(), sessionSequence: Int64(turn * 2 - 1), kind: .human, content: "request \(turn)", actor: nil, timestamp: now))
+            legacy.append(TranscriptEntry(entryID: UUID(), sessionSequence: Int64(turn * 2), kind: .assistant, content: "response \(turn)", actor: nil, timestamp: now))
+        }
+
+        let newest = try await service.page(sessionID: sessionID, actorID: "actor", legacyTranscript: legacy, limit: 2)
+        XCTAssertEqual(newest.turns.compactMap(Self.requestText), ["request 2", "request 3"])
+        let token = try XCTUnwrap(newest.nextPageToken)
+        let earlier = try await service.page(sessionID: sessionID, actorID: "actor", legacyTranscript: legacy, pageToken: token, limit: 2)
+        XCTAssertEqual(earlier.turns.compactMap(Self.requestText), ["request 1"])
+        XCTAssertNil(earlier.nextPageToken)
+        try await store.close()
+    }
+
+    private static func requestText(_ turn: AgentPresentationTurnWire) -> String? {
+        for block in turn.blocks {
+            guard case let .request(_, row) = block,
+                  case let .userRequest(_, text, _, _) = row
+            else { continue }
+            return text
+        }
+        return nil
+    }
 }
 
 final class NativeProviderRuntimeLifecycleTests: XCTestCase {
@@ -616,7 +673,24 @@ final class RepoPromptHTTPComposerContractTests: XCTestCase {
             store: fixture.store,
             workflows: [.init(id: "complete-workflow", displayName: "Complete workflow", guidance: completeWorkflowGuidance)],
             suggestions: [],
-            emptyState: .init(featuredWorkflowIDs: [], tips: [])
+            emptyState: .init(featuredWorkflowIDs: [], tips: []),
+            providerProfileLoader: { providerID in
+                guard providerID == .claudeCompatible else { return .init() }
+                return .init(
+                    toolControls: ProviderComposerStableControls.descriptors(
+                        providerID: providerID,
+                        values: ["claude.bash": .boolean(false)],
+                        mutable: true,
+                        lockReasonCode: nil
+                    ),
+                    permissionControl: ProviderComposerStableControls.permissionDescriptor(
+                        providerID: providerID,
+                        selectedID: "claude.autoApproveEdits",
+                        mutable: true,
+                        lockReasonCode: nil
+                    )
+                )
+            }
         )
         let authenticator = InternalRequestAuthenticator(keys: [key], store: fixture.store, now: { instant })
         let composedService = RepoPromptHTTPService(authority: fixture.authority, store: fixture.store, authenticator: authenticator, eventSigningKey: key, composerCatalog: composedCatalog)
@@ -630,6 +704,8 @@ final class RepoPromptHTTPComposerContractTests: XCTestCase {
                 XCTAssertEqual(group.models.map(\.id), [fixture.modelID])
                 XCTAssertEqual(group.models.first?.supportedEffortIDs, ["high"])
                 XCTAssertEqual(group.models.first?.defaultEffortID, "high")
+                XCTAssertEqual(snapshot.selected?.permissionID, "claude.autoApproveEdits")
+                XCTAssertEqual(snapshot.selected?.toolValues["claude.bash"], .boolean(false))
                 XCTAssertEqual(snapshot.workflows.first?.guidance, completeWorkflowGuidance)
                 XCTAssertGreaterThan(try XCTUnwrap(snapshot.workflows.first?.guidance).utf8.count, 16_384)
             }
