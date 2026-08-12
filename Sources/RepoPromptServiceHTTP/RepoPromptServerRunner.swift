@@ -463,7 +463,7 @@ public enum RepoPromptServerRunner {
         )
         try await authority.recover()
         let composerWorkflows = try await authority.workflowSnapshots().filter(\.enabled).map {
-            AgentComposerWorkflowDescriptor(id: $0.workflowID, displayName: $0.name, description: $0.source, guidance: String($0.definition.prefix(16_384)))
+            AgentComposerWorkflowDescriptor(id: $0.workflowID, displayName: $0.name, description: $0.source, guidance: $0.definition)
         }
         let composerSuggestions: [ComposerSuggestionDescriptor] = [
             .init(kind: .nativeCommand, id: "compact", insertionText: "/compact", displayName: "Compact context", detailText: "Ask Codex to compact the current context.", providerIDs: [.codex], expansion: "/compact")

@@ -610,10 +610,11 @@ final class RepoPromptHTTPComposerContractTests: XCTestCase {
         let instant = Date(timeIntervalSince1970: 1_786_400_000)
         let key = InternalSigningKey(keyID: "composer-http", role: .goblinApp, direction: "test", secret: Data("composer-http-contract-secret-32bytes".utf8))
         let path = "/internal/v1/catalog/composer?projectId=\(fixture.sessionInput.projectID.uuidString.lowercased())"
+        let completeWorkflowGuidance = String(repeating: "Desktop parity 🚫 ", count: 2_000)
         let composedCatalog = RepoPromptServerRunner.composeAgentCatalog(
             providerSettings: fixture.providerSettings,
             store: fixture.store,
-            workflows: [],
+            workflows: [.init(id: "complete-workflow", displayName: "Complete workflow", guidance: completeWorkflowGuidance)],
             suggestions: [],
             emptyState: .init(featuredWorkflowIDs: [], tips: [])
         )
@@ -629,6 +630,8 @@ final class RepoPromptHTTPComposerContractTests: XCTestCase {
                 XCTAssertEqual(group.models.map(\.id), [fixture.modelID])
                 XCTAssertEqual(group.models.first?.supportedEffortIDs, ["high"])
                 XCTAssertEqual(group.models.first?.defaultEffortID, "high")
+                XCTAssertEqual(snapshot.workflows.first?.guidance, completeWorkflowGuidance)
+                XCTAssertGreaterThan(try XCTUnwrap(snapshot.workflows.first?.guidance).utf8.count, 16_384)
             }
         }
 
