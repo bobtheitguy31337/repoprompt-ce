@@ -283,13 +283,6 @@ public struct RepoPromptHTTPService: Sendable {
             let sessionID = try context.parameters.require("id", as: UUID.self)
             return try await portalJSON(authority.selectionSnapshot(sessionID: sessionID))
         } }
-        router.post("/portal/api/v1/sessions/:id/context-builder") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
-            try validatePortalMutation(request)
-            let sessionID = try context.parameters.require("id", as: UUID.self)
-            let input = try await JSONDecoder.serviceDecoder.decode(ContextBuilderInput.self, from: bodyData(request))
-            return try await portalJSON(authority.runContextBuilder(sessionID: sessionID, input: input, actor: principal.externalActor, origin: .portal), status: .accepted)
-        } }
         router.get("/portal/api/v1/projects/:id/selection-presets") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(context: context)
             let projectID = try context.parameters.require("id", as: UUID.self)

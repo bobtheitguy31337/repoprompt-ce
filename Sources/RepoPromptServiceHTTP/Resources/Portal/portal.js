@@ -62,6 +62,11 @@
     desktopSettings: null,
     settingsMutation: null,
     domainMutations: {},
+    settingsFeedback: {
+      activeCount: 0,
+      outcome: null,
+      message: "No changes saved yet",
+    },
     typedSettings: {
       agentModels: null,
       subagentPermissions: null,
@@ -72,7 +77,6 @@
       workflows: null,
       selections: {},
       directConfigurations: {},
-      contextBuilderResult: null,
     },
     generatedAt: null,
     route: "home",
@@ -131,15 +135,21 @@
   }
 
   function savePortalAppearance(preference) {
-    const theme = appearanceThemes.has(preference.theme)
-      ? preference.theme
-      : "system";
-    const density = appearanceDensities.has(preference.density)
-      ? preference.density
-      : "normal";
-    document.cookie = `${appearanceCookieName}=${encodeURIComponent(`v1.${theme}.${density}`)}; Path=/portal; SameSite=Strict; Secure`;
-    applyPortalAppearance({ theme, density });
-    announce("Portal appearance updated");
+    beginSettingsMutation();
+    try {
+      const theme = appearanceThemes.has(preference.theme)
+        ? preference.theme
+        : "system";
+      const density = appearanceDensities.has(preference.density)
+        ? preference.density
+        : "normal";
+      document.cookie = `${appearanceCookieName}=${encodeURIComponent(`v1.${theme}.${density}`)}; Path=/portal; SameSite=Strict; Secure`;
+      applyPortalAppearance({ theme, density });
+      finishSettingsMutation();
+    } catch (error) {
+      finishSettingsMutation(error);
+      toast(error.message || "Browser appearance could not be saved.", true);
+    }
   }
 
   // Hand-authored web-safe semantic line glyphs substitute for non-portable
@@ -286,56 +296,118 @@
     window.setTimeout(() => node.remove(), 4_200);
   }
 
+  function renderSettingsFeedback() {
+    const node = document.getElementById("settings-save-status");
+    if (!node) return;
+    const feedback = state.settingsFeedback;
+    const phase =
+      feedback.outcome === "error"
+        ? "error"
+        : feedback.activeCount > 0
+          ? "saving"
+          : feedback.outcome || "idle";
+    node.dataset.state = phase;
+    node.textContent = feedback.message;
+    node.setAttribute("role", phase === "error" ? "alert" : "status");
+    node.setAttribute("aria-live", phase === "error" ? "assertive" : "polite");
+  }
+
+  function beginSettingsMutation() {
+    const feedback = state.settingsFeedback;
+    if (feedback.activeCount === 0) feedback.outcome = null;
+    feedback.activeCount += 1;
+    if (feedback.outcome !== "error") feedback.message = "Saving…";
+    renderSettingsFeedback();
+    announce("Saving settings");
+  }
+
+  function finishSettingsMutation(error = null) {
+    const feedback = state.settingsFeedback;
+    feedback.activeCount = Math.max(0, feedback.activeCount - 1);
+    if (error) {
+      feedback.outcome = "error";
+      feedback.message = `Save failed: ${error.message || "The change was not saved."} Review the setting and try again.`;
+    } else if (feedback.activeCount === 0 && feedback.outcome !== "error") {
+      feedback.outcome = "saved";
+      feedback.message = "Saved";
+    } else if (feedback.activeCount > 0 && feedback.outcome !== "error") {
+      feedback.message = "Saving…";
+    }
+    renderSettingsFeedback();
+    announce(feedback.message);
+  }
+
+  function isSettingsMutationPath(path, method) {
+    if (!["POST", "PUT", "PATCH", "DELETE"].includes(method)) return false;
+    return (
+      path === "api/v1/desktop-settings" ||
+      /^api\/v1\/settings\//.test(path) ||
+      /^api\/v1\/projects\/[^/]+\/settings\//.test(path) ||
+      /^api\/v1\/provider-settings\//.test(path) ||
+      /^api\/v1\/provider-auth-flows\//.test(path) ||
+      /^api\/v1\/workflows(?:\/|$)/.test(path) ||
+      /^api\/v1\/projects\/[^/]+\/selection-presets(?:\/|$)/.test(path)
+    );
+  }
+
   async function api(path, options = {}) {
     const method = (options.method || "GET").toUpperCase();
     const mutation = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
-    let response;
+    const reportsSettingsFeedback = isSettingsMutationPath(path, method);
+    if (reportsSettingsFeedback) beginSettingsMutation();
     try {
-      response = await fetch(path, {
-        cache: "no-store",
-        credentials: "same-origin",
-        ...options,
-        method,
-        headers: {
-          Accept: "application/json",
-          ...(options.body ? { "Content-Type": "application/json" } : {}),
-          ...(mutation ? { "X-RepoPrompt-Portal-CSRF": "1" } : {}),
-          ...(options.headers || {}),
-        },
-      });
-    } catch (_error) {
-      throw new PortalError(
-        "Cannot reach the RepoPrompt server. Check the connection and try again.",
-        {
-          network: true,
-          retryable: true,
-        },
-      );
-    }
-
-    const contentType = response.headers.get("content-type") || "";
-    const text = response.status === 204 ? "" : await response.text();
-    let body = null;
-    if (text && contentType.includes("application/json")) {
+      let response;
       try {
-        body = JSON.parse(text);
-      } catch (_error) {
-        throw new PortalError("The server returned an unreadable response.", {
-          status: response.status,
+        response = await fetch(path, {
+          cache: "no-store",
+          credentials: "same-origin",
+          ...options,
+          method,
+          headers: {
+            Accept: "application/json",
+            ...(options.body ? { "Content-Type": "application/json" } : {}),
+            ...(mutation ? { "X-RepoPrompt-Portal-CSRF": "1" } : {}),
+            ...(options.headers || {}),
+          },
         });
+      } catch (_error) {
+        throw new PortalError(
+          "Cannot reach the RepoPrompt server. Check the connection and try again.",
+          {
+            network: true,
+            retryable: true,
+          },
+        );
       }
+
+      const contentType = response.headers.get("content-type") || "";
+      const text = response.status === 204 ? "" : await response.text();
+      let body = null;
+      if (text && contentType.includes("application/json")) {
+        try {
+          body = JSON.parse(text);
+        } catch (_error) {
+          throw new PortalError("The server returned an unreadable response.", {
+            status: response.status,
+          });
+        }
+      }
+      if (!response.ok) {
+        throw new PortalError(
+          body?.message || `Request failed (${response.status}).`,
+          {
+            status: response.status,
+            code: body?.code,
+            retryable: body?.retryable,
+          },
+        );
+      }
+      if (reportsSettingsFeedback) finishSettingsMutation();
+      return body;
+    } catch (error) {
+      if (reportsSettingsFeedback) finishSettingsMutation(error);
+      throw error;
     }
-    if (!response.ok) {
-      throw new PortalError(
-        body?.message || `Request failed (${response.status}).`,
-        {
-          status: response.status,
-          code: body?.code,
-          retryable: body?.retryable,
-        },
-      );
-    }
-    return body;
   }
 
   function orderedProviders() {
@@ -579,8 +651,6 @@
       try {
         const result = await operation();
         applyResult(result);
-        document.getElementById("settings-freshness").textContent = "Saved";
-        announce("Setting saved");
         renderRoute();
         return result;
       } catch (error) {
@@ -671,7 +741,7 @@
       ? `Updated ${formatDate(state.generatedAt)}`
       : "Not yet loaded";
     document.getElementById("catalog-freshness").textContent = freshness;
-    document.getElementById("settings-freshness").textContent = freshness;
+    renderSettingsFeedback();
   }
 
   function selectedProject() {
@@ -1491,8 +1561,6 @@
             changes,
           }),
         });
-        document.getElementById("settings-freshness").textContent = "Saved";
-        announce("Setting saved");
         renderRoute();
       } catch (error) {
         toast(error.message, true);
@@ -3372,7 +3440,7 @@
     );
     const settings = desktopCard(
       projectOverride ? "Project Defaults" : "Global Defaults",
-      "These values are consumed by portal and MCP Context Builder runs, including origin-specific clarifying questions and follow-up Oracle analysis.",
+      "These values are consumed by Context Builder, including connected chat agents using RepoPrompt MCP and optional follow-up Oracle analysis.",
     );
     const form = element("form", "typed-settings-form");
     const budget = document.createElement("input");
@@ -3401,12 +3469,8 @@
       ],
       String(profile.questionTimeoutSeconds),
     );
-    const portalQuestions = typedToggle(
-      "Allow Clarifying Questions for portal runs",
-      profile.portalClarifyingQuestions,
-    );
-    const mcpQuestions = typedToggle(
-      "Allow Clarifying Questions for MCP runs",
+    const clarifyingQuestions = typedToggle(
+      "Allow Clarifying Questions",
       profile.mcpClarifyingQuestions,
     );
     const followUp = typedSelect(
@@ -3439,14 +3503,9 @@
         timeout,
       ),
       desktopRow(
-        "Portal Clarifying Questions",
-        "Used only for authenticated portal-origin runs.",
-        portalQuestions.toggle,
-      ),
-      desktopRow(
-        "MCP Clarifying Questions",
-        "Used only for MCP-origin runs.",
-        mcpQuestions.toggle,
+        "Allow Clarifying Questions",
+        "Connected chat agents using RepoPrompt MCP can ask clarifying questions during Context Builder.",
+        clarifyingQuestions.toggle,
       ),
       desktopRow(
         "Follow-up Analysis",
@@ -3527,8 +3586,8 @@
         budget: Number(budget.value),
         enhancementMode: enhancement.value,
         questionTimeoutSeconds: Number(timeout.value),
-        portalClarifyingQuestions: portalQuestions.input.checked,
-        mcpClarifyingQuestions: mcpQuestions.input.checked,
+        portalClarifyingQuestions: profile.portalClarifyingQuestions,
+        mcpClarifyingQuestions: clarifyingQuestions.input.checked,
         followUpAnalysis: followUp.value,
         followUpBudget: Number(followUpBudget.value),
         prompts: promptRows.map((row, order) => ({
@@ -3570,121 +3629,11 @@
     });
     settings.append(form);
 
-    const run = desktopCard(
-      "Manual Portal Run",
-      "Run Context Builder against an existing session. Stored portal defaults apply; enabled saved-prompt checkboxes are sent as the bounded selectedPromptIDs invocation field.",
-    );
-    const sessions = (state.bootstrap?.sessions || []).filter(
-      (session) => session.projectId === projectID,
-    );
-    if (sessions.length) {
-      const runForm = element(
-        "form",
-        "typed-settings-form context-builder-run-form",
-      );
-      const session = typedSelect(
-        "Context Builder session",
-        sessions.map((item) => [item.sessionId, item.title]),
-        state.agent.selectedSessionID || sessions[0].sessionId,
-      );
-      const instructions = document.createElement("textarea");
-      instructions.rows = 8;
-      instructions.maxLength = 64000;
-      instructions.placeholder = "Describe the task and the context you need.";
-      instructions.setAttribute("aria-label", "Context Builder instructions");
-      const selectedPrompts = element("fieldset", "manual-prompt-selection");
-      selectedPrompts.append(element("legend", "", "Saved prompts"));
-      (snapshot.effectiveProfile.prompts || [])
-        .filter((prompt) => prompt.enabled)
-        .forEach((prompt) => {
-          const label = element("label", "check-row");
-          const input = document.createElement("input");
-          input.type = "checkbox";
-          input.value = prompt.promptID;
-          input.checked = true;
-          label.append(input, document.createTextNode(prompt.name));
-          selectedPrompts.append(label);
-        });
-      const submit = element("button", "primary-button", "Run Context Builder");
-      submit.type = "submit";
-      runForm.append(
-        desktopRow(
-          "Session",
-          "Selection revision is loaded immediately before the run.",
-          session,
-        ),
-        instructions,
-        selectedPrompts,
-        submit,
-      );
-      runForm.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        const sessionID = session.value;
-        submit.disabled = true;
-        try {
-          const selection = await api(
-            `api/v1/sessions/${encodeURIComponent(sessionID)}/selection`,
-          );
-          state.typedSettings.selections[sessionID] = selection;
-          const result = await api(
-            `api/v1/sessions/${encodeURIComponent(sessionID)}/context-builder`,
-            {
-              method: "POST",
-              body: JSON.stringify({
-                expectedSelectionRevision: selection.revision,
-                instructions: instructions.value.trim(),
-                selectedPromptIDs: [
-                  ...selectedPrompts.querySelectorAll(
-                    'input[type="checkbox"]:checked',
-                  ),
-                ].map((input) => input.value),
-              }),
-            },
-          );
-          state.typedSettings.contextBuilderResult = result;
-          state.typedSettings.selections[sessionID] = {
-            ...selection,
-            entries: result.entries,
-            revision: result.revision,
-            bindingRevision: result.bindingRevision,
-          };
-          announce("Context Builder run completed");
-          renderRoute();
-        } catch (error) {
-          toast(error.message, true);
-        } finally {
-          submit.disabled = false;
-        }
-      });
-      run.append(runForm);
-      if (state.typedSettings.contextBuilderResult) {
-        const result = state.typedSettings.contextBuilderResult;
-        run.append(
-          informationalCard(
-            "Latest Result",
-            "The proposal and optional follow-up are durable server artifacts.",
-            [
-              ["Selection revision", String(result.revision)],
-              ["Proposal", result.response || "Completed"],
-              ["Follow-up", result.followUpResponse || "Disabled"],
-            ],
-          ),
-        );
-      }
-    } else {
-      run.append(
-        element(
-          "p",
-          "empty-inline",
-          "Create a session in the active project before running Context Builder manually.",
-        ),
-      );
-    }
     settingsPage(
       "Context Builder",
-      "Configure typed global/project defaults, saved prompts, and authenticated manual portal runs.",
+      "Configure typed global/project defaults and saved prompts for connected RepoPrompt MCP agents.",
       "context",
-      [scope, settings, run],
+      [scope, settings],
     );
   }
 
@@ -5021,7 +4970,7 @@
     );
     routeRow(
       "Context Builder",
-      "Typed defaults, saved prompts, and authenticated manual portal runs.",
+      "Typed defaults and saved prompts for connected RepoPrompt MCP agents.",
       "context-builder",
       "Editable",
     );

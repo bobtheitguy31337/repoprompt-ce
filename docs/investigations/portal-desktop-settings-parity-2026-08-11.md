@@ -1,7 +1,7 @@
 # RepoPrompt CE desktop ↔ web portal settings parity audit
 
 **Audit date:** 2026-08-11
-**Final implementation audit:** 2026-08-11
+**Final implementation audit:** 2026-08-12 correction against `origin/sandbox`
 **Desktop source:** this checkout's vanilla macOS Settings implementation
 **Portal source:** `RepoPromptServiceHTTP/Resources/Portal` plus typed shared-server DTO, persistence, HTTP, and runtime authorities
 
@@ -15,6 +15,8 @@
 | **Intentionally omitted** | The desktop feature has no meaningful Agent Mode web equivalent and receives no portal destination or control. |
 
 The portal never treats legacy `[String:String]` compatibility values as authorities for typed domains. Editable controls use typed snapshots, optimistic concurrency, authenticated/CSRF-protected HTTP routes, project/root confinement, and digest-only mutation attribution. Credential values remain write-only and outside settings documents.
+
+Every portal settings mutation uses one persistent accessible feedback contract in the settings header: `Saving…`, `Saved`, or an actionable `Save failed: … Review the setting and try again.` state. This status survives route re-rendering and remains separate from the provider catalog's `Updated …` freshness timestamp. The contract covers typed settings, retained legacy runtime settings, provider preferences/configuration/enablement, workflows, model/selection presets, and browser-local appearance.
 
 ## Preserved deployed P0 contract
 
@@ -39,8 +41,8 @@ The portal never treats legacy `[String:String]` compatibility values as authori
 | Agent Mode | CLI Providers | Complete deployed CLI/mounted-account/backend management | **Editable + Live read-only + Boundary shown** |
 | Agent Mode | Agent Models | Typed global/project six-target routing, pins, discovery filter, server recommendations, provider defaults | **Editable + Live read-only + Boundary shown** |
 | Agent Mode | Agent Permissions | Direct permissions plus typed Safe Managed/Inherit/Custom sub-agent policy | **Editable** |
-| Agent Mode | Agent Workflows | Server-native definition repository, visibility, feature order, clone, reload, cleanup guidance | **Editable + Boundary shown** |
-| Agent Mode | Context Builder | Typed defaults/prompts plus authenticated manual portal consumer | **Editable + Live read-only** |
+| Agent Mode | Agent Workflows | Stable `rp-*` IDs/commands with desktop built-in display names, server-native definitions, visibility, feature order, clone, reload, cleanup guidance | **Editable + Boundary shown** |
+| Agent Mode | Context Builder | Typed defaults/prompts plus the MCP-backed Allow Clarifying Questions control | **Editable** |
 | General | Appearance | Browser-native theme and text density; desktop component controls documented | **Editable + Boundary shown** |
 | General | Updates | Immutable CI/CD deployment owns server revisions | **Intentionally omitted** |
 | General | Keyboard Shortcuts | Browser/global shortcut design not copied from macOS registrar | **Intentionally omitted** |
@@ -138,6 +140,7 @@ The portal never treats legacy `[String:String]` compatibility values as authori
 ## 5. Agent Mode → Agent Workflows
 
 - **Editable:** Include Session Cleanup Guidance, create custom markdown, update custom definition/name/enabled/visible/featured state, clone built-in/custom, delete custom, show/hide, feature/unfeature, move featured earlier/later, and Reload & Revalidate.
+- **Desktop-faithful projection:** stable IDs and commands remain `rp-*`, while built-ins display exactly `Plan & Build`, `Review`, `Refactor`, `Investigate`, `ChatGPT Export`, `Orchestrate`, `Optimize`, `Deep Plan`, and `Reminder`. Clone defaults and portal/server summaries use these display names; no built-in `rp-*` value is exposed as a user-facing name.
 - **Security:** definitions are SQLite-owned, path-free, bounded, parsed/validated, secret-screened, and revisioned. Built-ins cannot be overwritten or deleted.
 - **Runtime consumption:** visible enabled definitions drive discovery; cleanup guidance is appended during workflow prompt assembly.
 - **Fail-closed durable-association boundary:** sessions do not persist a workflow association. Hidden workflows are excluded from new discovery and cannot be recovered through an alleged running-session association. Hiding therefore fails closed; the workflow must be re-enabled before a new run.
@@ -147,12 +150,13 @@ The portal never treats legacy `[String:String]` compatibility values as authori
 
 - **Editable:** global/project inheritance and Copy Global to Project.
 - **Editable:** Context Budget 10k–200k in 5k steps; Rewrite/Augment/Preserve; 30/60/120/300-second timeout.
-- **Editable:** portal clarifying questions and MCP clarifying questions are distinct trusted origins.
+- **Editable:** one user-facing **Allow Clarifying Questions** toggle mutates `mcpClarifyingQuestions`. Its copy explains that connected chat agents using RepoPrompt MCP can ask during Context Builder.
+- **Compatibility preservation:** `portalClarifyingQuestions` remains in the typed profile for compatibility but is hidden and copied unchanged by portal profile replacement; the portal does not invent a second origin control.
 - **Editable:** Disabled/Plan/Review/Question follow-up and 40k–200k follow-up budget.
 - **Editable:** ordered named saved prompts with enabled state, bounded names, and bounded instructions.
-- **Editable:** manual portal run selects an existing session, sends instructions and selected saved prompt IDs, reloads selection revision immediately before execution, and renders proposal/follow-up results.
-- **Runtime precedence:** `ContextBuilderInput` optional fields override project, global, and typed defaults for API/MCP consumers. The manual portal consumer deliberately sends only instructions plus the selected enabled prompt IDs; every other optional field is omitted and resolves from stored portal-origin settings.
-- **Runtime consumption:** budget, enhancement, prompts, origin clarify policy, timeout, follow-up mode/budget, Context Builder Agent route, Oracle follow-up route, frozen-state checks, and final selection/prompt commit.
+- **Runtime precedence:** `ContextBuilderInput` optional fields override project, global, and typed defaults for internal/MCP consumers.
+- **Runtime consumption:** `.mcp` resolution consumes `mcpClarifyingQuestions`; budget, enhancement, prompts, timeout, follow-up mode/budget, Context Builder Agent route, Oracle follow-up route, frozen-state checks, and final selection/prompt commit remain runtime-backed.
+- **Removed boundary:** the portal exposes no Manual Portal Run UI and registers no portal-only `POST /portal/api/v1/sessions/:id/context-builder` route. Internal and MCP Context Builder APIs remain intact. The authenticated session-selection GET remains because named selection presets use it.
 
 ## 7. General → Appearance
 
@@ -266,10 +270,9 @@ All routes require portal certificate authorization. Mutations additionally requ
 | Sub-agent permissions | `GET /portal/api/v1/settings/subagent-permissions` | `PATCH` |
 | Context Builder global | `GET /portal/api/v1/settings/context-builder` | `PATCH` |
 | Context Builder project | `GET /portal/api/v1/projects/:id/settings/context-builder` | `PATCH`, `POST .../copy-global` |
-| Manual Context Builder | `GET /portal/api/v1/sessions/:id/selection` | `POST /portal/api/v1/sessions/:id/context-builder` with trusted `.portal` origin |
 | MCP model presets | `GET /portal/api/v1/settings/model-presets` | `PATCH` |
 | Advanced | `GET /portal/api/v1/settings/advanced` | `PATCH` |
-| Selection presets | project collection route | create/update/delete/reorder/capture/apply routes |
+| Selection presets | project collection route plus `GET /portal/api/v1/sessions/:id/selection` | create/update/delete/reorder/capture/apply routes |
 | Workflows | `GET /portal/api/v1/workflows` | create/update/delete/clone/visibility/reorder/preferences/reload routes |
 | Direct provider configuration | `GET /portal/api/v1/provider-settings/:id/direct-configuration` | `PATCH /portal/api/v1/provider-settings/:id/direct-configuration` revisioned full replacement while disconnected |
 | Provider connection | provider catalog/connection routes | enable/disable/connect/test/disconnect/revoke |
@@ -284,7 +287,7 @@ The portal mutation producers were compared field-for-field with their Swift req
 |---|---|
 | Agent Models | Global `{expectedRevision, profile}`; project `{expectedRevision, mode, profile}`; copy `{expectedGlobalRevision, expectedProjectRevision}`; recommendations `{expectedRevision}`. A profile has the six routing keys plus `restrictDiscoveryToRoleModels`; each non-null target has `providerID`, optional catalog `modelID`/`reasoningEffort`, and `pinned`. |
 | Sub-agent settings | `{expectedRevision, settings}` with exactly `policy`, `codex`, `claude`, `openCode`, and `cursor`; every value comes from its Swift enum. |
-| Context Builder | Stored global/project/copy envelopes match the DTOs. Profiles carry budget 10,000–200,000/5,000, timeout 30/60/120/300, follow-up budget 40,000–200,000/5,000, both origin policies, follow-up mode, and at most 100 ordered prompts with 128-byte names and 16-KiB instructions. The manual portal body is exactly `{expectedSelectionRevision, instructions, selectedPromptIDs}`; the selected ID list is the only optional invocation field it sends. |
+| Context Builder | Stored global/project/copy envelopes match the DTOs. Profiles carry budget 10,000–200,000/5,000, timeout 30/60/120/300, follow-up budget 40,000–200,000/5,000, follow-up mode, and at most 100 ordered prompts with 128-byte names and 16-KiB instructions. The sole displayed clarification control writes `mcpClarifyingQuestions`; replacement payloads preserve the hidden `portalClarifyingQuestions` compatibility value unchanged. No portal execution body or route remains. |
 | Model presets | `{expectedRevision, presets}`; each preset carries `presetID`, name, nullable description, exact target, non-empty Chat/Plan/Review availability, enabled, and order. The collection cap is 100, name bound 128 bytes, and description bound 1,024 bytes. |
 | Advanced | `{expectedRevision, settings}` with the six Boolean scanner/tree/code-map keys and integer `historyIdleThresholdMinutes`; both DOM and client guard use the server's 0–60 bound. |
 | Workflows | Create/update/delete/clone/visibility/reorder/preferences/reload envelopes use their distinct revision and row-fence keys. Names are capped at 128 bytes, definitions at 256 KiB, custom count at 200, and the server retains path-free frontmatter/secret validation. |
@@ -340,7 +343,7 @@ The authenticated live catalog selects a complete editable provider form after d
 
 - [x] Agent Models typed authority and all six runtime targets.
 - [x] Safe Managed/Inherit/Custom sub-agent authority consumed at child launch.
-- [x] Context Builder typed settings, prompts, origin policy, timeout, follow-up, and manual portal consumer.
+- [x] Context Builder typed settings, prompts, MCP clarification policy, timeout, and follow-up, with the obsolete portal execution consumer removed.
 - [x] MCP model preset repository and Oracle/model discovery consumption.
 - [x] Advanced scanner/Code Maps/history authority and runtime consumption.
 - [x] Named project selection preset management and runtime apply.
@@ -363,7 +366,7 @@ The authenticated live catalog selects a complete editable provider form after d
 
 ## HTTP
 
-`SettingsCatalogAuthorityTests.testTypedSettingsDirectConfigurationWorkflowAndPresetHTTPContractsAreAuthenticatedAndRejectPathAuthorityFields` covers the complete authenticated-route matrix for Agent Models, sub-agent settings, Context Builder settings/copy/manual execution and selection read, model presets, Advanced, direct-provider-configuration GET/PATCH, selection presets, and workflows. It also covers strict workflow path-field rejection. Provider catalog/connection authorization remains in the existing provider HTTP coverage and is not claimed by this matrix test.
+`SettingsCatalogAuthorityTests.testTypedSettingsDirectConfigurationWorkflowAndPresetHTTPContractsAreAuthenticatedAndRejectPathAuthorityFields` covers the authenticated-route matrix for Agent Models, sub-agent settings, Context Builder settings/copy, retained session-selection read, model presets, Advanced, direct-provider-configuration GET/PATCH, selection presets, and workflows. It also asserts that the portal-only Context Builder POST route returns `404 Not Found` and covers strict workflow path-field rejection. `ServerSettingsFoundationTests.testRuntimeRouteResolutionContextDefaultsPresetsAndDiscovery` proves `.mcp` resolution consumes `mcpClarifyingQuestions` while explicit invocation overrides retain precedence. Provider catalog/connection authorization remains in the existing provider HTTP coverage and is not claimed by this matrix test.
 
 ## DOM
 
@@ -373,8 +376,10 @@ The authenticated live catalog selects a complete editable provider form after d
 - exact Agent Models project mutation keys/profile shape;
 - exact sub-agent mutation keys and Full Access warning;
 - exact Advanced mutation keys plus the authoritative 0–60 history bound;
-- exact Context Builder settings keys/bounds and the manual consumer's intentionally narrow `ContextBuilderInput` payload;
+- exact Context Builder settings keys/bounds, a single MCP clarification toggle, hidden portal-field preservation, and absence of Manual Portal Run;
+- persistent accessible `Saving…`, `Saved`, and actionable failure feedback that survives route re-rendering without replacing catalog freshness;
 - behavioral model-preset add/reorder/delete ordering controls plus exact preset payload keys;
+- exact workflow display labels with stable `rp-*` IDs, display-name clone defaults, and no visible built-in `rp-*` names;
 - exact workflow visibility and named selection-preset apply fences/keys;
 - fail-closed hidden-workflow durable-association explanation;
 - deployment-truth-gated direct-provider forms, exact configuration keys, and the authoritative 1–65,536 output-token bound;

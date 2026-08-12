@@ -354,8 +354,8 @@ final class ServerSettingsFoundationTests: XCTestCase {
                 budget: 120_000,
                 enhancementMode: .augment,
                 questionTimeoutSeconds: 120,
-                portalClarifyingQuestions: true,
-                mcpClarifyingQuestions: false,
+                portalClarifyingQuestions: false,
+                mcpClarifyingQuestions: true,
                 followUpAnalysis: .review,
                 followUpBudget: 60_000,
                 prompts: [.init(promptID: savedPromptID, name: "Safety", instructions: "Preserve compatibility.", order: 0)]
@@ -366,11 +366,12 @@ final class ServerSettingsFoundationTests: XCTestCase {
         let mcp = try await service.resolveContextBuilder(
             projectID: projectID,
             origin: .mcp,
-            overrides: .init(budget: 80_000, allowClarifyingQuestions: true, selectedPromptIDs: [savedPromptID])
+            overrides: .init(budget: 80_000, allowClarifyingQuestions: false, selectedPromptIDs: [savedPromptID])
         )
-        XCTAssertTrue(portal.allowClarifyingQuestions)
+        XCTAssertFalse(portal.allowClarifyingQuestions)
         let defaultMCP = try await service.resolveContextBuilder(projectID: projectID, origin: .mcp)
-        XCTAssertFalse(defaultMCP.allowClarifyingQuestions)
+        XCTAssertTrue(defaultMCP.allowClarifyingQuestions, "MCP Context Builder must consume mcpClarifyingQuestions")
+        XCTAssertFalse(mcp.allowClarifyingQuestions, "an explicit invocation override retains precedence")
         XCTAssertEqual(mcp.budget, 80_000)
         XCTAssertEqual(mcp.questionTimeoutSeconds, 120)
         XCTAssertEqual(mcp.followUpAnalysis, .review)

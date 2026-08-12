@@ -979,6 +979,20 @@ public actor ArtifactRuntimeService {
 }
 
 public struct BuiltinWorkflowCatalog: Sendable {
+    // Mirrors the vanilla desktop AgentWorkflow labels; Reminder is server-only.
+    // IDs and prompt frontmatter remain stable rp-* command identifiers.
+    private static let displayNames = [
+        "rp-build": "Plan & Build",
+        "rp-review": "Review",
+        "rp-refactor": "Refactor",
+        "rp-investigate": "Investigate",
+        "rp-oracle-export": "ChatGPT Export",
+        "rp-orchestrate": "Orchestrate",
+        "rp-optimize": "Optimize",
+        "rp-deep-plan": "Deep Plan",
+        "rp-reminder": "Reminder"
+    ]
+
     public init() {}
     public func workflows() throws -> [WorkflowSnapshot] {
         let rootURL = Bundle.module.url(forResource: "canonical-workflows-v62", withExtension: "json")
@@ -987,18 +1001,24 @@ public struct BuiltinWorkflowCatalog: Sendable {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Canonical workflow catalog resource is missing")
         }
         let definitions = try JSONDecoder().decode([BundledWorkflowDefinition].self, from: Data(contentsOf: url))
-        let expectedIDs = Set(["rp-build", "rp-investigate", "rp-deep-plan", "rp-reminder", "rp-oracle-export", "rp-review", "rp-refactor", "rp-orchestrate", "rp-optimize"])
+        let expectedIDs = Set(Self.displayNames.keys)
         guard definitions.count == expectedIDs.count, Set(definitions.map(\.id)) == expectedIDs else {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Canonical workflow catalog is incomplete or contains duplicate IDs")
         }
         return try definitions.map { definition in
-            guard definition.definition.contains("repoprompt_skills_version: 62"), definition.definition.contains("repoprompt_variant: mcp") else {
+            guard definition.name == definition.id,
+                  definition.definition.contains("repoprompt_skills_version: 62"),
+                  definition.definition.contains("repoprompt_variant: mcp")
+            else {
                 throw ServiceAPIError(code: .dependencyUnavailable, message: "Canonical workflow catalog version is invalid")
+            }
+            guard let displayName = Self.displayNames[definition.id] else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "Canonical workflow display name is missing")
             }
             return WorkflowSnapshot(
                 workflowID: definition.id,
                 source: "builtin",
-                name: definition.name,
+                name: displayName,
                 definition: definition.definition,
                 contentDigest: CanonicalSigning.bodyDigest(Data(definition.definition.utf8)),
                 enabled: true

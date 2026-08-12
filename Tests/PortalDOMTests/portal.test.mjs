@@ -821,25 +821,6 @@ async function createHarness({
         sessionId: decodeURIComponent(selectionMatch[1]),
       });
     }
-    const contextBuilderRun = call.path.match(
-      /^api\/v1\/sessions\/([^/]+)\/context-builder$/,
-    );
-    if (contextBuilderRun && call.method === "POST") {
-      const selection = context.typedSettings.selection;
-      return jsonResponse(
-        {
-          ...selection,
-          sessionId: decodeURIComponent(contextBuilderRun[1]),
-          revision: selection.revision + 1,
-          proposalArtifactId: "30000000-0000-0000-0000-000000000010",
-          response: "Context Builder completed",
-          chatId: "30000000-0000-0000-0000-000000000020",
-          followUpResponse: null,
-          followUpArtifactId: null,
-        },
-        202,
-      );
-    }
     const directConfigurationMatch = call.path.match(
       /^api\/v1\/provider-settings\/([^/]+)\/direct-configuration$/,
     );
@@ -1493,33 +1474,150 @@ test("typed settings pages mutate revisioned server authorities", async (t) => {
   assert.equal(advancedPayload.settings.historyIdleThresholdMinutes, 5);
 });
 
-test("Context Builder exposes stored defaults, prompt collection, and a manual portal consumer", async (t) => {
+test("settings save feedback persists across route rerenders and stays separate from catalog freshness", async (t) => {
+  let releaseMutation;
+  let mutationStarted = false;
+  const mutationGate = new Promise((resolvePromise) => {
+    releaseMutation = resolvePromise;
+  });
+  const harness = await createHarness({
+    hash: "#settings/advanced",
+    handler: async (call, context) => {
+      if (call.path === "api/v1/settings/advanced" && call.method === "PATCH") {
+        mutationStarted = true;
+        await mutationGate;
+        return jsonResponse({
+          ...context.typedSettings.advanced,
+          revision: context.typedSettings.advanced.revision + 1,
+        });
+      }
+      return null;
+    },
+  });
+  t.after(() => harness.close());
+  const { document, window } = harness;
+  const feedback = document.getElementById("settings-save-status");
+  const catalogFreshness = document.getElementById("catalog-freshness");
+
+  click(
+    window,
+    [...document.querySelectorAll("button")].find(
+      (button) => button.textContent === "Save Advanced Settings",
+    ),
+  );
+  await waitFor(() => mutationStarted);
+  assert.equal(feedback.textContent, "Saving…");
+  assert.equal(feedback.dataset.state, "saving");
+  assert.equal(feedback.getAttribute("role"), "status");
+  assert.match(catalogFreshness.textContent, /^Updated /);
+  window.RepoPromptPortalTest.renderRoute();
+  assert.equal(feedback.textContent, "Saving…");
+
+  releaseMutation();
+  await window.RepoPromptPortalTest.whenIdle();
+  await settle();
+  assert.equal(feedback.textContent, "Saved");
+  assert.equal(feedback.dataset.state, "saved");
+  assert.match(catalogFreshness.textContent, /^Updated /);
+
+  window.location.hash = "#settings/portal-appearance";
+  window.dispatchEvent(new window.HashChangeEvent("hashchange"));
+  await settle();
+  assert.equal(feedback.textContent, "Saved");
+  const theme = document.querySelector('select[aria-label="Portal theme"]');
+  theme.value = "dark";
+  theme.dispatchEvent(new window.Event("change", { bubbles: true }));
+  assert.equal(feedback.textContent, "Saved");
+  assert.equal(feedback.dataset.state, "saved");
+});
+
+test("settings save failures remain actionable and accessible after rerender", async (t) => {
+  const harness = await createHarness({
+    hash: "#settings/agent-permissions",
+    handler: async (call) => {
+      if (call.path === "api/v1/desktop-settings" && call.method === "PATCH") {
+        return jsonResponse(
+          {
+            message: "The execution mode was rejected.",
+            code: "invalidRequest",
+          },
+          422,
+        );
+      }
+      return null;
+    },
+  });
+  t.after(() => harness.close());
+  const { calls, document, window } = harness;
+  const mode = document.querySelector(
+    'select[aria-label="Default Execution Mode"]',
+  );
+  mode.value = "fullAccess";
+  mode.dispatchEvent(new window.Event("change", { bubbles: true }));
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.path === "api/v1/desktop-settings" && call.method === "PATCH",
+    ),
+  );
+  await window.RepoPromptPortalTest.whenIdle();
+  await settle();
+
+  const feedback = document.getElementById("settings-save-status");
+  assert.equal(feedback.dataset.state, "error");
+  assert.equal(feedback.getAttribute("role"), "alert");
+  assert.equal(feedback.getAttribute("aria-live"), "assertive");
+  assert.match(
+    feedback.textContent,
+    /Save failed: The execution mode was rejected\. Review the setting and try again\./,
+  );
+  assert.match(
+    document.getElementById("catalog-freshness").textContent,
+    /^Updated /,
+  );
+
+  window.RepoPromptPortalTest.renderRoute();
+  assert.match(feedback.textContent, /^Save failed:/);
+});
+
+test("Context Builder exposes one MCP clarification setting and no manual portal run", async (t) => {
   const harness = await createHarness({
     hash: "#settings/context-builder",
     bootstrap: bootstrapFixture({ sessions: [sessionFixture()] }),
   });
   t.after(() => harness.close());
   const { calls, document, window } = harness;
+  const content = document.getElementById("settings-content");
 
   for (const expected of [
     "Context Budget",
     "Prompt Enhancement",
     "Question Timeout",
-    "Portal Clarifying Questions",
-    "MCP Clarifying Questions",
+    "Allow Clarifying Questions",
     "Follow-up Analysis",
     "Saved Prompt Collection",
-    "Manual Portal Run",
   ]) {
-    assert.match(
-      document.getElementById("settings-content").textContent,
-      new RegExp(expected),
-    );
+    assert.match(content.textContent, new RegExp(expected));
   }
-  assert.doesNotMatch(
-    document.getElementById("settings-content").textContent,
-    /Invocation Overrides/,
+  assert.match(
+    content.textContent,
+    /Connected chat agents using RepoPrompt MCP can ask clarifying questions during Context Builder\./,
   );
+  assert.doesNotMatch(
+    content.textContent,
+    /Portal Clarifying Questions|MCP Clarifying Questions|Manual Portal Run|Run Context Builder|Invocation Overrides/,
+  );
+  assert.equal(
+    document.querySelectorAll('input[aria-label="Allow Clarifying Questions"]')
+      .length,
+    1,
+  );
+  const clarifyingQuestions = document.querySelector(
+    'input[aria-label="Allow Clarifying Questions"]',
+  );
+  assert.equal(clarifyingQuestions.checked, false);
+  clarifyingQuestions.checked = true;
+
   const budget = document.querySelector('input[aria-label="Context Budget"]');
   assert.deepEqual(
     [budget.min, budget.max, budget.step],
@@ -1583,6 +1681,12 @@ test("Context Builder exposes stored defaults, prompt collection, and a manual p
     "prompts",
     "questionTimeoutSeconds",
   ]);
+  assert.equal(settingsPayload.profile.mcpClarifyingQuestions, true);
+  assert.equal(
+    settingsPayload.profile.portalClarifyingQuestions,
+    true,
+    "the hidden portal compatibility field must be preserved",
+  );
   assert.deepEqual(Object.keys(settingsPayload.profile.prompts[0]).sort(), [
     "enabled",
     "instructions",
@@ -1591,44 +1695,78 @@ test("Context Builder exposes stored defaults, prompt collection, and a manual p
     "promptID",
   ]);
   assert.equal(settingsPayload.profile.prompts[0].name, "Focused");
-  await settle();
-
-  const instructions = document.querySelector(
-    'textarea[aria-label="Context Builder instructions"]',
-  );
-  assert.equal(instructions.maxLength, 64000);
-  instructions.value = "Build a focused context for this task.";
-  submit(window, instructions.closest("form"));
-  await waitFor(() =>
+  assert.equal(
     calls.some(
       (call) =>
         call.method === "POST" &&
-        call.path.endsWith(`/sessions/${sessionOneID}/context-builder`),
+        /\/sessions\/[^/]+\/context-builder$/.test(call.path),
+    ),
+    false,
+  );
+});
+
+test("workflow settings retain rp IDs while showing only desktop built-in names", async (t) => {
+  const builtins = [
+    ["rp-build", "Plan & Build"],
+    ["rp-review", "Review"],
+    ["rp-refactor", "Refactor"],
+    ["rp-investigate", "Investigate"],
+    ["rp-oracle-export", "ChatGPT Export"],
+    ["rp-orchestrate", "Orchestrate"],
+    ["rp-optimize", "Optimize"],
+    ["rp-deep-plan", "Deep Plan"],
+    ["rp-reminder", "Reminder"],
+  ];
+  const bootstrap = bootstrapFixture({
+    workflows: builtins.map(([workflowID, name], featuredOrder) => ({
+      workflowID,
+      name,
+      source: "builtin",
+      enabled: true,
+      visible: true,
+      featuredOrder,
+      rowRevision: 1,
+    })),
+  });
+  const harness = await createHarness({
+    hash: "#settings/agent-workflows",
+    bootstrap,
+  });
+  t.after(() => harness.close());
+  const { calls, document, window } = harness;
+  const names = [
+    ...document.querySelectorAll(".workflow-editor-summary strong"),
+  ].map((node) => node.textContent);
+  assert.deepEqual(
+    names,
+    builtins.map(([, name]) => name),
+  );
+  assert.doesNotMatch(
+    document.getElementById("settings-content").textContent,
+    /\brp-[a-z-]+\b/,
+  );
+
+  click(
+    window,
+    document.querySelector(
+      ".workflow-editor-row button.secondary-button:nth-child(2)",
     ),
   );
-  const runPayload = JSON.parse(
-    calls.find(
+  await waitFor(() =>
+    calls.some(
       (call) =>
-        call.method === "POST" &&
-        call.path.endsWith(`/sessions/${sessionOneID}/context-builder`),
-    ).body,
+        call.path === "api/v1/workflows/rp-build/clone" &&
+        call.method === "POST",
+    ),
   );
-  assert.deepEqual(Object.keys(runPayload).sort(), [
-    "expectedSelectionRevision",
-    "instructions",
-    "selectedPromptIDs",
-  ]);
-  assert.equal(runPayload.expectedSelectionRevision, 1);
+  const clonePayload = JSON.parse(
+    calls.find((call) => call.path === "api/v1/workflows/rp-build/clone").body,
+  );
+  assert.equal(clonePayload.name, "Plan & Build Copy");
+  await window.RepoPromptPortalTest.whenIdle();
   assert.equal(
-    runPayload.instructions,
-    "Build a focused context for this task.",
-  );
-  assert.deepEqual(runPayload.selectedPromptIDs, [
-    settingsPayload.profile.prompts[0].promptID,
-  ]);
-  assert.match(
-    document.getElementById("settings-content").textContent,
-    /Context Builder completed/,
+    document.getElementById("settings-save-status").textContent,
+    "Saved",
   );
 });
 
@@ -1989,6 +2127,11 @@ test("direct provider forms appear only for deployment-admitted complete runtime
   assert.equal(directPayload.contentTypePolicy, "applicationJSON");
   assert.deepEqual(directPayload.customHeaders, {});
   assert.equal("credential" in directPayload, false);
+  await window.RepoPromptPortalTest.whenIdle();
+  assert.equal(
+    document.getElementById("settings-save-status").textContent,
+    "Saved",
+  );
 
   window.location.hash = "#settings/openrouter";
   window.dispatchEvent(new window.HashChangeEvent("hashchange"));

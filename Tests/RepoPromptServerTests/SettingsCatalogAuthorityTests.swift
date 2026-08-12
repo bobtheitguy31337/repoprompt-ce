@@ -188,7 +188,23 @@ final class SettingsCatalogAuthorityTests: XCTestCase {
         var authority = RepoPromptHeadlessAuthority(store: store)
         try await authority.recover()
         let initial = try await authority.workflowRepositorySnapshot()
-        XCTAssertEqual(initial.workflows.filter { $0.source == .builtin }.count, 9)
+        let builtinNames = Dictionary(
+            uniqueKeysWithValues: initial.workflows
+                .filter { $0.source == .builtin }
+                .map { ($0.workflowID, $0.name) }
+        )
+        XCTAssertEqual(builtinNames, [
+            "rp-build": "Plan & Build",
+            "rp-review": "Review",
+            "rp-refactor": "Refactor",
+            "rp-investigate": "Investigate",
+            "rp-oracle-export": "ChatGPT Export",
+            "rp-orchestrate": "Orchestrate",
+            "rp-optimize": "Optimize",
+            "rp-deep-plan": "Deep Plan",
+            "rp-reminder": "Reminder"
+        ])
+        XCTAssertFalse(builtinNames.values.contains { $0.hasPrefix("rp-") })
         XCTAssertEqual(initial.revision, 0)
 
         let created = try await authority.createWorkflow(
@@ -383,7 +399,6 @@ final class SettingsCatalogAuthorityTests: XCTestCase {
             (.get, "/portal/api/v1/provider-settings/openAIAPI/direct-configuration"),
             (.patch, "/portal/api/v1/provider-settings/openAIAPI/direct-configuration"),
             (.get, "/portal/api/v1/sessions/\(presetID)/selection"),
-            (.post, "/portal/api/v1/sessions/\(presetID)/context-builder"),
             (.get, "/portal/api/v1/projects/\(projectID)/selection-presets"),
             (.post, "/portal/api/v1/projects/\(projectID)/selection-presets"),
             (.patch, "/portal/api/v1/projects/\(projectID)/selection-presets/\(presetID)"),
@@ -406,6 +421,13 @@ final class SettingsCatalogAuthorityTests: XCTestCase {
                 try await client.execute(uri: route.1, method: route.0, body: ByteBuffer(string: "{}")) { response in
                     XCTAssertEqual(response.status, .unauthorized, "route was not protected: \(route.1)")
                 }
+            }
+            try await client.execute(
+                uri: "/portal/api/v1/sessions/\(presetID)/context-builder",
+                method: .post,
+                body: ByteBuffer(string: "{}")
+            ) { response in
+                XCTAssertEqual(response.status, .notFound, "portal-only Context Builder execution route must remain removed")
             }
         }
         try await store.close()

@@ -144,9 +144,12 @@ final class CanonicalWorkspaceRuntimeTests: XCTestCase {
     func testBuiltinCatalogIsExactVersionedNineWorkflowSnapshot() throws {
         let workflows = try BuiltinWorkflowCatalog().workflows()
         XCTAssertEqual(workflows.map(\.workflowID), ["rp-investigate", "rp-build", "rp-reminder", "rp-oracle-export", "rp-review", "rp-refactor", "rp-orchestrate", "rp-optimize", "rp-deep-plan"])
+        XCTAssertEqual(workflows.map(\.name), ["Investigate", "Plan & Build", "Reminder", "ChatGPT Export", "Review", "Refactor", "Orchestrate", "Optimize", "Deep Plan"])
+        XCTAssertFalse(workflows.map(\.name).contains { $0.hasPrefix("rp-") })
         XCTAssertEqual(Set(workflows.map(\.contentDigest)).count, 9)
         for workflow in workflows {
             XCTAssertEqual(workflow.source, "builtin")
+            XCTAssertTrue(workflow.definition.contains("name: \"\(workflow.workflowID)\""), workflow.workflowID)
             XCTAssertTrue(workflow.definition.contains("repoprompt_skills_version: 62"), workflow.workflowID)
             XCTAssertTrue(workflow.definition.contains("repoprompt_variant: mcp"), workflow.workflowID)
             XCTAssertEqual(workflow.contentDigest, CanonicalSigning.bodyDigest(Data(workflow.definition.utf8)))
