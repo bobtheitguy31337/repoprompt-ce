@@ -93,7 +93,14 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
     }
 
     private func preflight(kind: ProviderKind) async -> ProviderCapability {
-        guard enabledProviders.contains(kind), let runtime = runtimes[kind] else {
+        guard enabledProviders.contains(kind) else {
+            return unavailableCapability(for: kind)
+        }
+        return await validate(kind: kind)
+    }
+
+    public func validate(kind: ProviderKind) async -> ProviderCapability {
+        guard let runtime = runtimes[kind] else {
             return unavailableCapability(for: kind)
         }
         let clock = ContinuousClock()
@@ -247,6 +254,10 @@ public actor ProviderCLIAdapter: AgentProviderDispatcher, InteractionDeliveryPor
 
     public func preflight() async -> [ProviderCapability] {
         await dispatcher.preflight()
+    }
+
+    public func preflight(kind: ProviderKind) async -> ProviderCapability {
+        await dispatcher.validate(kind: kind)
     }
 
     public func recoverProcessFamilies() async throws {

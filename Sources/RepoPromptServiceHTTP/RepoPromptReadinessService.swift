@@ -167,6 +167,11 @@ public actor RepoPromptReadinessService {
             observedAt: Date()
         )
         cached = result
+        if ready {
+            // Startup provider recovery begins only after core readiness has
+            // succeeded. Scheduling is non-blocking and never changes readiness.
+            await providerSettings?.startConnectedProviderRecovery()
+        }
         return result
     }
 

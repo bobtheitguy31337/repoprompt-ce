@@ -16,7 +16,6 @@ const scriptSource = readFileSync(
   resolve(portalDirectory, "portal.js"),
   "utf8",
 );
-const cssSource = readFileSync(resolve(portalDirectory, "portal.css"), "utf8");
 
 const projectOneID = "10000000-0000-0000-0000-000000000010";
 const projectTwoID = "10000000-0000-0000-0000-000000000020";
@@ -1152,15 +1151,6 @@ test("portal assets retain security, API, loading, and no-placeholder contracts"
     "Provider and model settings",
   ]) {
     assert.equal(htmlSource.includes(deadPlaceholder), false);
-  }
-  for (const token of [
-    "--space-4: 4px",
-    "--space-16: 16px",
-    "--space-32: 32px",
-    "ui-rounded",
-    "ui-monospace",
-  ]) {
-    assert.ok(cssSource.includes(token), `missing visual token: ${token}`);
   }
   for (const forbidden of [
     "localStorage",

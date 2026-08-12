@@ -217,20 +217,13 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         try await store.close()
     }
 
-    func testProviderOptionalityZeroProvidersKeepsReadinessHealthy() async throws {
+    func testServerIsReadyWithZeroConfiguredProviders() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let provider = ProviderCLIAdapter(
-            configurations: [
-                .init(kind: .codex, executable: "/usr/bin/true", expectedVersion: "1.0", protocolVersion: "app-server-v2")
-            ],
-            enabledProviders: []
-        )
+        let provider = ProviderCLIAdapter(configurations: [], enabledProviders: [])
         let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
         let readiness = RepoPromptReadinessService(
             authority: authority,
             store: store,
-            requiredProviders: [],
-            expectedProviderProtocols: [.codex: "app-server-v2"],
             minimumFreeBytes: 0,
             minimumFreeNodes: 0,
             maximumActiveSessions: 10,
@@ -251,20 +244,18 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         try await store.close()
     }
 
-    func testProviderOptionalityAllFailingKeepsReadinessHealthyAndRefreshSingleFlight() async throws {
+    func testServerRemainsReadyWhenAllProviderChecksFail() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let runtime = CountingUnavailableProviderRuntime()
-        let adapter = ProviderCLIAdapter(runtimes: [runtime], preflightCacheDuration: .milliseconds(50))
-        let configuration = ProviderCLIConfiguration(
-            kind: .openCodeACP,
-            executable: "/usr/bin/true",
-            protocolVersion: "acp-v1"
-        )
+        let runtimes = ProviderKind.allCases.map { CountingUnavailableProviderRuntime(kind: $0) }
+        let adapter = ProviderCLIAdapter(runtimes: runtimes, preflightCacheDuration: .milliseconds(50))
+        let configurations = ProviderKind.allCases.map {
+            ProviderCLIConfiguration(kind: $0, executable: "/usr/bin/false", protocolVersion: "unavailable")
+        }
         let providerSettings = ProviderSettingsService(
             store: store,
             adapter: adapter,
-            configurations: [configuration],
-            initiallyEnabled: [.openCodeACP]
+            configurations: configurations,
+            initiallyEnabled: Set(ProviderKind.allCases)
         )
         try await providerSettings.bootstrap()
 
@@ -272,8 +263,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         let readiness = RepoPromptReadinessService(
             authority: authority,
             store: store,
-            requiredProviders: [.openCodeACP],
-            expectedProviderProtocols: [.openCodeACP: "acp-v1"],
+            requiredProviders: Set(ProviderKind.allCases),
             minimumFreeBytes: 0,
             minimumFreeNodes: 0,
             maximumActiveSessions: 10,
@@ -291,22 +281,70 @@ final class AuthenticationAndHTTPTests: XCTestCase {
             }
         }
 
-        let clock = ContinuousClock()
-        let started = clock.now
-        try await withThrowingTaskGroup(of: ProviderSettingsCatalogResponse.self) { group in
-            for _ in 0 ..< 12 {
-                group.addTask { try await providerSettings.catalog(refreshRuntime: true) }
-            }
-            for try await catalog in group {
-                let provider = try XCTUnwrap(catalog.providers.first { $0.providerID == .openCodeACP })
-                XCTAssertFalse(provider.runtimePreflightVerified)
-                XCTAssertFalse(provider.effectiveEnabled)
-            }
+        _ = try await providerSettings.catalog(refreshCLI: true, refreshRuntime: true)
+        try await Task.sleep(for: .milliseconds(50))
+        for runtime in runtimes {
+            let count = await runtime.preflightCount()
+            XCTAssertEqual(count, 0)
         }
-        XCTAssertLessThan(started.duration(to: clock.now), .milliseconds(100))
+        try await store.close()
+    }
+
+    func testServerRecoversOnlyConnectedProviderStatusWithSingleFlight() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let connectedRuntime = CountingUnavailableProviderRuntime(kind: .openCodeACP)
+        let unconfiguredRuntime = CountingUnavailableProviderRuntime(kind: .cursorACP)
+        let adapter = ProviderCLIAdapter(runtimes: [connectedRuntime, unconfiguredRuntime], preflightCacheDuration: .seconds(1))
+        let configurations = [
+            ProviderCLIConfiguration(kind: .openCodeACP, executable: "/usr/bin/true", protocolVersion: "acp-v1"),
+            ProviderCLIConfiguration(kind: .cursorACP, executable: "/usr/bin/true", protocolVersion: "acp-v1")
+        ]
+        let now = Date()
+        let connection = ProviderConnectionRecord(
+            connectionID: UUID(),
+            providerID: .openCodeACP,
+            authenticationMethod: .providerSpecific,
+            state: .connected,
+            accountLabel: "sandbox",
+            lastTestedAt: now,
+            testState: .valid,
+            detail: "Connected",
+            keyHelperConfigured: false,
+            workloadIdentityConfigured: false,
+            createdAt: now,
+            updatedAt: now,
+            revision: 1
+        )
+        _ = try await store.upsertProviderConnection(.init(record: connection, credentialReference: nil), expectedRevision: 0)
+        let providerSettings = ProviderSettingsService(
+            store: store,
+            adapter: adapter,
+            configurations: configurations,
+            initiallyEnabled: [.openCodeACP, .cursorACP]
+        )
+        try await providerSettings.bootstrap()
+
+        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: adapter)
+        let readiness = RepoPromptReadinessService(
+            authority: authority,
+            store: store,
+            minimumFreeBytes: 0,
+            minimumFreeNodes: 0,
+            maximumActiveSessions: 10,
+            cacheDuration: 0,
+            providerSettings: providerSettings
+        )
+        let snapshot = await readiness.snapshot(forceRefresh: true)
+        XCTAssertTrue(snapshot.ready)
+        for _ in 0 ..< 12 {
+            _ = try await providerSettings.catalog(refreshCLI: true, refreshRuntime: true)
+        }
+        await providerSettings.startConnectedProviderRecovery()
         try await Task.sleep(for: .milliseconds(350))
-        let preflightCount = await runtime.preflightCount()
-        XCTAssertEqual(preflightCount, 1)
+        let connectedCount = await connectedRuntime.preflightCount()
+        let unconfiguredCount = await unconfiguredRuntime.preflightCount()
+        XCTAssertEqual(connectedCount, 1)
+        XCTAssertEqual(unconfiguredCount, 0)
         try await store.close()
     }
 
@@ -499,17 +537,21 @@ final class AuthenticationAndHTTPTests: XCTestCase {
 }
 
 private actor CountingUnavailableProviderRuntime: AgentProviderRuntime {
-    let kind = ProviderKind.openCodeACP
+    let kind: ProviderKind
     private var count = 0
 
+    init(kind: ProviderKind) {
+        self.kind = kind
+    }
+
     func capability() -> ProviderCapability {
-        .init(kind: kind, enabled: true, executable: "/usr/bin/true", supportsResume: true, supportsSteering: true, protocolVersion: "acp-v1")
+        .init(kind: kind, enabled: true, executable: "/usr/bin/true", supportsResume: true, supportsSteering: true, protocolVersion: "unavailable")
     }
 
     func preflight() async -> ProviderCapability {
         count += 1
         try? await Task.sleep(for: .milliseconds(200))
-        return .init(kind: kind, enabled: false, executable: "/usr/bin/true", supportsResume: true, supportsSteering: true, protocolVersion: "acp-v1", reasonUnavailable: "ACP initialize handshake timed out")
+        return .init(kind: kind, enabled: false, executable: "/usr/bin/true", supportsResume: true, supportsSteering: true, protocolVersion: "unavailable", reasonUnavailable: "Provider handshake failed")
     }
 
     func preflightCount() -> Int { count }

@@ -62,8 +62,9 @@ public actor ProviderSettingsService {
     private var managedAuthFlowDescriptors: [ProviderSettingsID: [ProviderAuthFlowDescriptor]] = [:]
     private var managedAccountSummaries: [ProviderSettingsID: ProviderManagedAccountSummary] = [:]
     private var authFlowContexts: [UUID: AuthFlowContext] = [:]
-    private var statusRefreshTask: Task<Void, Never>?
-    private var statusRefreshedAt: Date?
+    private var statusRefreshTasks: [ProviderSettingsID: Task<Void, Never>] = [:]
+    private var statusRefreshedAt: [ProviderSettingsID: Date] = [:]
+    private var connectedRecoveryStarted = false
     private let statusRefreshTTL: TimeInterval = 15
 
     public init(
@@ -139,7 +140,7 @@ public actor ProviderSettingsService {
             if preferences[providerID] == nil {
                 let initial = ProviderSettingsPreference(
                     providerID: providerID,
-                    enabled: providerID.ownsRuntimeAdmission && (providerID.runtimeKind.map(initiallyEnabled.contains) ?? false),
+                    enabled: false,
                     defaultModel: defaultCatalog(for: providerID).first(where: \.isProviderDefault)?.id,
                     revision: 1
                 )
@@ -147,13 +148,9 @@ public actor ProviderSettingsService {
             }
             try await applyRuntimePreference(providerID)
         }
-        requestProviderStatusRefresh(force: true)
     }
 
-    public func catalog(refreshCLI: Bool = false, refreshRuntime: Bool = false) async throws -> ProviderSettingsCatalogResponse {
-        if refreshCLI || refreshRuntime {
-            requestProviderStatusRefresh()
-        }
+    public func catalog(refreshCLI _: Bool = false, refreshRuntime _: Bool = false) async throws -> ProviderSettingsCatalogResponse {
         let snapshots = try ProviderSettingsID.allCases.map { try snapshot(for: $0) }
         return ProviderSettingsCatalogResponse(providers: snapshots)
     }
@@ -225,7 +222,7 @@ public actor ProviderSettingsService {
     }
 
     public func startAuthFlow(providerID: ProviderSettingsID, request: StartProviderAuthFlowRequest, attribution: ProviderMutationAttribution) async throws -> ProviderAuthTransactionStatus {
-        await refreshManagedAuthenticationCapabilities(forceRefresh: true)
+        await refreshManagedAuthenticationCapabilities(providerID: providerID, forceRefresh: true)
         let descriptor = managedAuthFlowDescriptors[providerID, default: []].first { $0.kind == request.kind }
         guard descriptor?.startable == true else {
             throw ServiceAPIError(code: .capabilityMissing, message: descriptor?.detail ?? "Provider authentication flow is unavailable")
@@ -363,7 +360,9 @@ public actor ProviderSettingsService {
             // bootstrap reconciliation removes it after SQLite is authoritative.
             try? await vault?.delete(providerID: providerID, connectionID: oldReference)
         }
-        await refreshRuntimePreflight()
+        if initialState == .connected {
+            requestProviderStatusRefresh(providerID: providerID, force: true)
+        }
         return try snapshot(for: providerID)
     }
 
@@ -373,7 +372,7 @@ public actor ProviderSettingsService {
         }
         if stored.record.authenticationMethod == .deviceCodeBeta {
             try await reconcileManagedAuthentication(attribution: attribution)
-            await refreshRuntimePreflight()
+            await refreshProviderStatus(providerID: providerID, force: true)
             return try snapshot(for: providerID)
         }
         let secret: Data?
@@ -406,7 +405,7 @@ public actor ProviderSettingsService {
             expectedRevision: stored.record.revision,
             audit: .init(operation: "test", attribution: attribution, authenticationMethod: stored.record.authenticationMethod, result: testState.rawValue)
         )
-        await refreshRuntimePreflight()
+        await refreshProviderStatus(providerID: providerID, force: true)
         return try snapshot(for: providerID)
     }
 
@@ -430,17 +429,14 @@ public actor ProviderSettingsService {
             try? await vault?.delete(providerID: providerID, connectionID: reference)
         }
         await credentialTester.logout(providerID: providerID, method: stored.record.authenticationMethod)
-        await refreshRuntimePreflight()
         return try snapshot(for: providerID)
     }
 
-    private func refreshManagedAuthenticationCapabilities(forceRefresh: Bool) async {
-        for providerID in ProviderSettingsID.allCases {
-            if let descriptor = await managedAuthentication.authFlowDescriptor(providerID: providerID, forceRefresh: forceRefresh), descriptor.startable {
-                managedAuthFlowDescriptors[providerID] = [descriptor]
-            } else {
-                managedAuthFlowDescriptors[providerID] = []
-            }
+    private func refreshManagedAuthenticationCapabilities(providerID: ProviderSettingsID, forceRefresh: Bool) async {
+        if let descriptor = await managedAuthentication.authFlowDescriptor(providerID: providerID, forceRefresh: forceRefresh), descriptor.startable {
+            managedAuthFlowDescriptors[providerID] = [descriptor]
+        } else {
+            managedAuthFlowDescriptors[providerID] = []
         }
     }
 
@@ -484,7 +480,7 @@ public actor ProviderSettingsService {
         if let oldReference = current?.credentialReference {
             try? await vault?.delete(providerID: context.providerID, connectionID: oldReference)
         }
-        await refreshRuntimePreflight()
+        requestProviderStatusRefresh(providerID: context.providerID, force: true)
     }
 
     private func reconcileManagedAuthentication(attribution: ProviderMutationAttribution) async throws {
@@ -620,12 +616,7 @@ public actor ProviderSettingsService {
         guard let kind = providerID.runtimeKind else { return }
         let ownerID = providerID.runtimeSettingsOwner
         guard let preference = preferences[ownerID] else { return }
-        guard configurations[kind] != nil else {
-            if preferences.values.contains(where: { $0.providerID.runtimeKind == kind && $0.enabled }) {
-                throw ServiceAPIError(code: .providerUnavailable, message: "Provider executable is not configured")
-            }
-            return
-        }
+        guard configurations[kind] != nil else { return }
         let effectiveAdmission = initiallyEnabled.contains(kind) && preferences.values.contains {
             $0.providerID.runtimeKind == kind && $0.enabled
         }
@@ -641,60 +632,93 @@ public actor ProviderSettingsService {
         )
     }
 
-    private func requestProviderStatusRefresh(force: Bool = false) {
-        if statusRefreshTask != nil { return }
-        if !force, let statusRefreshedAt, Date().timeIntervalSince(statusRefreshedAt) < statusRefreshTTL { return }
-        statusRefreshTask = Task { [weak self] in
-            await self?.performProviderStatusRefresh()
+    public func startConnectedProviderRecovery() {
+        guard !connectedRecoveryStarted else { return }
+        connectedRecoveryStarted = true
+        let connectedProviders = Set(connections.compactMap { providerID, stored -> ProviderSettingsID? in
+            guard stored.record.state == .connected,
+                  stored.record.expiresAt.map({ $0 > Date() }) ?? true
+            else { return nil }
+            return providerID.runtimeSettingsOwner
+        })
+        for providerID in connectedProviders {
+            requestProviderStatusRefresh(providerID: providerID, force: true)
         }
     }
 
-    private func performProviderStatusRefresh() async {
-        await refreshCLIHealth()
-        await refreshManagedAuthenticationCapabilities(forceRefresh: true)
-        try? await reconcileManagedAuthentication(attribution: Self.lifecycleAttribution)
-        await refreshRuntimePreflight()
-        statusRefreshedAt = Date()
-        statusRefreshTask = nil
-    }
-
-    private func refreshCLIHealth() async {
-        for (kind, configuration) in configurations {
-            guard let providerID = Self.settingsID(kind) else { continue }
-            guard FileManager.default.isExecutableFile(atPath: configuration.executable) else {
-                cliHealth[providerID] = ProviderCLIHealth(installed: false, healthy: false, expectedVersion: configuration.expectedVersion, detail: "Configured CLI is not executable")
-                continue
-            }
-            do {
-                let environment = try ProviderCLIProbeEnvironment.prepare(for: kind)
-                let output = try await runner.run(
-                    executable: configuration.executable,
-                    arguments: ["--version"],
-                    workingDirectory: FileManager.default.currentDirectoryPath,
-                    maximumBytes: 65536,
-                    environment: environment
-                )
-                let reported = Self.validCLIVersionOutput(output)
-                let matches = configuration.expectedVersion.map { reported?.contains($0) == true } ?? (reported != nil)
-                cliHealth[providerID] = ProviderCLIHealth(
-                    installed: true,
-                    healthy: matches,
-                    version: matches ? configuration.expectedVersion : nil,
-                    expectedVersion: configuration.expectedVersion,
-                    detail: reported == nil ? "CLI returned invalid version output" : (matches ? nil : "Installed version does not match the pinned server contract")
-                )
-            } catch {
-                cliHealth[providerID] = ProviderCLIHealth(installed: true, healthy: false, expectedVersion: configuration.expectedVersion, detail: "CLI version probe failed")
-            }
+    private func requestProviderStatusRefresh(providerID: ProviderSettingsID, force: Bool = false) {
+        Task { [weak self] in
+            guard let self else { return }
+            await self.refreshProviderStatus(providerID: providerID, force: force)
         }
     }
 
-    private func refreshRuntimePreflight() async {
-        let capabilities = await adapter.preflight()
-        for capability in capabilities {
-            guard let providerID = Self.settingsID(capability.kind) else { continue }
-            runtimePreflight[providerID] = capability.enabled && capability.reasonUnavailable == nil
+    private func refreshProviderStatus(providerID: ProviderSettingsID, force: Bool = false) async {
+        let statusID = providerID.runtimeSettingsOwner
+        guard statusID.runtimeKind != nil else { return }
+        if let task = statusRefreshTasks[statusID] {
+            await task.value
+            return
         }
+        if !force,
+           let refreshedAt = statusRefreshedAt[statusID],
+           Date().timeIntervalSince(refreshedAt) < statusRefreshTTL
+        {
+            return
+        }
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.performProviderStatusRefresh(providerID: statusID)
+        }
+        statusRefreshTasks[statusID] = task
+        await task.value
+        statusRefreshTasks[statusID] = nil
+        statusRefreshedAt[statusID] = Date()
+    }
+
+    private func performProviderStatusRefresh(providerID: ProviderSettingsID) async {
+        guard let kind = providerID.runtimeKind,
+              let configuration = configurations[kind]
+        else { return }
+        await refreshCLIHealth(providerID: providerID, kind: kind, configuration: configuration)
+        if providerID == .codex {
+            await refreshManagedAuthenticationCapabilities(providerID: providerID, forceRefresh: true)
+            try? await reconcileManagedAuthentication(attribution: Self.lifecycleAttribution)
+        }
+        await refreshRuntimePreflight(providerID: providerID, kind: kind)
+    }
+
+    private func refreshCLIHealth(providerID: ProviderSettingsID, kind: ProviderKind, configuration: ProviderCLIConfiguration) async {
+        guard FileManager.default.isExecutableFile(atPath: configuration.executable) else {
+            cliHealth[providerID] = ProviderCLIHealth(installed: false, healthy: false, expectedVersion: configuration.expectedVersion, detail: "Configured CLI is not executable")
+            return
+        }
+        do {
+            let environment = try ProviderCLIProbeEnvironment.prepare(for: kind)
+            let output = try await runner.run(
+                executable: configuration.executable,
+                arguments: ["--version"],
+                workingDirectory: FileManager.default.currentDirectoryPath,
+                maximumBytes: 65536,
+                environment: environment
+            )
+            let reported = Self.validCLIVersionOutput(output)
+            let matches = configuration.expectedVersion.map { reported?.contains($0) == true } ?? (reported != nil)
+            cliHealth[providerID] = ProviderCLIHealth(
+                installed: true,
+                healthy: matches,
+                version: matches ? configuration.expectedVersion : nil,
+                expectedVersion: configuration.expectedVersion,
+                detail: reported == nil ? "CLI returned invalid version output" : (matches ? nil : "Installed version does not match the pinned server contract")
+            )
+        } catch {
+            cliHealth[providerID] = ProviderCLIHealth(installed: true, healthy: false, expectedVersion: configuration.expectedVersion, detail: "CLI version probe failed")
+        }
+    }
+
+    private func refreshRuntimePreflight(providerID: ProviderSettingsID, kind: ProviderKind) async {
+        let capability = await adapter.preflight(kind: kind)
+        runtimePreflight[providerID] = capability.enabled && capability.reasonUnavailable == nil
     }
 
     private func snapshot(for providerID: ProviderSettingsID) throws -> ProviderSettingsSnapshot {
