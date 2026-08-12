@@ -325,6 +325,36 @@ final class SQLiteServiceStoreV6CompatibilityTests: XCTestCase {
         try await store.close()
     }
 
+    func testTypedSettingsV6DigestUpgradesInPlaceToCombinedSchema() async throws {
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-combined-v6-\(UUID().uuidString).sqlite").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        var store: SQLiteServiceStore? = try await SQLiteServiceStore.open(storage: .file(path))
+        let composerTables = [
+            "composer_provider_catalog_cache", "agent_submissions", "effective_turn_configurations",
+            "session_next_turn_defaults", "composer_attachments", "accepted_attachment_manifests",
+            "run_presentations", "semantic_turns", "semantic_activities", "semantic_tools",
+            "semantic_ingestion_watermarks"
+        ]
+        for table in composerTables {
+            _ = try await store?.connection.query("DROP TABLE \(table)")
+        }
+        _ = try await store?.connection.query(
+            "UPDATE schema_migrations SET description='typed revisioned server settings and digest-only audit',digest=? WHERE version=6",
+            [.text("repoprompt-service-schema-v6-typed-settings-workflows-direct-providers-cas-audit")]
+        )
+        try await store?.close()
+        store = nil
+
+        let upgraded = try await SQLiteServiceStore.open(storage: .file(path))
+        let tables = try await upgraded.connection.query("SELECT name FROM sqlite_master WHERE type='table'").compactMap { $0.column("name")?.string }
+        XCTAssertTrue(Set(["advanced_server_settings", "settings_audit", "provider_direct_configurations"]).isSubset(of: Set(tables)))
+        XCTAssertTrue(Set(composerTables).isSubset(of: Set(tables)))
+        let digest = try await upgraded.connection.query("SELECT digest FROM schema_migrations WHERE version=6").first?.column("digest")?.string
+        XCTAssertEqual(digest, "repoprompt-service-schema-v6-typed-settings-agent-composer-semantic-acceptance")
+        try await upgraded.close()
+    }
+
     func testCreatesV6DatabaseForExactPreviousV5SourceProbe() async throws {
         guard let path = ProcessInfo.processInfo.environment["REPOPROMPT_SCHEMA_COMPAT_DB"] else {
             throw XCTSkip("External rollback compatibility probe only")
