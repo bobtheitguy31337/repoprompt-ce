@@ -703,6 +703,13 @@ final class NativeProviderRuntimeLifecycleTests: XCTestCase {
         let config = CodexAppServerProviderRuntime.codexConfig([
             "codex.enabledMCPServers": "[\"repoprompt\",\"RepoPromptCE\",\"external-tools\"]"
         ])
+        XCTAssertEqual(CodexAppServerProviderRuntime.appServerArguments, [
+            "--disable", "plugins",
+            "--disable", "remote_plugin",
+            "app-server",
+        ])
+        XCTAssertEqual(config["features.plugins"] as? Bool, false)
+        XCTAssertEqual(config["features.remote_plugin"] as? Bool, false)
         XCTAssertNil(config["mcp_servers.repoprompt.enabled"])
         XCTAssertNil(config["mcp_servers.RepoPromptCE.enabled"])
         XCTAssertEqual(config["mcp_servers.external-tools.enabled"] as? Bool, true)

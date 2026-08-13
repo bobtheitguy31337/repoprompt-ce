@@ -80,6 +80,67 @@ public actor OwnedResourceReconciliationService {
         return await reconcile(now: now, recoverInterruptedPreparations: true)
     }
 
+    /// Reclaims provider files left active by an interrupted service instance.
+    /// Call only after persisted provider process families have been recovered;
+    /// resources owned by a still-active family are deliberately preserved.
+    public func reconcileProviderResourcesAfterProcessRecovery(
+        activeRunIDs: Set<UUID>,
+        now: Date = Date()
+    ) async -> OwnedResourceReconciliationReport {
+        let records: [OwnedResourceRecord]
+        do {
+            records = try await repository.ownedResources(states: nil).filter {
+                isProviderResource($0)
+                    && $0.lifecycleState != .deleted
+                    && $0.lifecycleState != .failed
+                    && $0.runID.map { !activeRunIDs.contains($0) } != false
+            }
+        } catch {
+            return .init(inspected: 0, transitioned: 0, deleted: 0, quarantined: 0, failed: 1, observedAt: now)
+        }
+
+        var transitioned = 0
+        var deleted = 0
+        var quarantined = 0
+        var failed = 0
+        for record in records {
+            do {
+                try removeProviderResource(record)
+                _ = try await repository.transitionOwnedResource(
+                    resourceID: record.resourceID,
+                    expectedStates: [record.lifecycleState],
+                    to: .deleted,
+                    observedBytes: nil,
+                    contentDigest: record.contentDigest,
+                    cleanupError: nil
+                )
+                transitioned += 1
+                deleted += 1
+            } catch {
+                failed += 1
+                if (try? await repository.transitionOwnedResource(
+                    resourceID: record.resourceID,
+                    expectedStates: [record.lifecycleState],
+                    to: .quarantined,
+                    observedBytes: observedSize(at: record.internalPathIdentity),
+                    contentDigest: record.contentDigest,
+                    cleanupError: "orphaned_provider_resource_cleanup_failed"
+                )) != nil {
+                    transitioned += 1
+                    quarantined += 1
+                }
+            }
+        }
+        return .init(
+            inspected: records.count,
+            transitioned: transitioned,
+            deleted: deleted,
+            quarantined: quarantined,
+            failed: failed,
+            observedAt: now
+        )
+    }
+
     private func reconcile(
         now: Date,
         recoverInterruptedPreparations: Bool

@@ -270,6 +270,49 @@ final class AuthorityTests: XCTestCase {
         try await store.close()
     }
 
+    func testAutomaticFollowupResumesDurableProviderIdentity() async throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+            .appendingPathComponent(".build/authority-tests/\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let runtime = ResumeRecordingProviderRuntime()
+        let authority = RepoPromptHeadlessAuthority(
+            store: store,
+            providerAdapter: ProviderCLIAdapter(runtimes: [runtime])
+        )
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(
+            input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "p-auto-resume",
+            requestDigest: "p-auto-resume"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "s-auto-resume",
+            requestDigest: "s-auto-resume"
+        )
+
+        for index in 1 ... 2 {
+            _ = try await authority.startEmbeddedProviderRun(
+                sessionID: session.sessionID,
+                actor: actor,
+                userMessage: "turn \(index)",
+                providerPrompt: "turn \(index)",
+                idempotencyKey: "auto-resume-\(index)",
+                requestDigest: "auto-resume-\(index)"
+            )
+            await authority.waitForProviderRunsToSettle()
+        }
+
+        let resumeIdentities = await runtime.resumeIdentities()
+        XCTAssertEqual(resumeIdentities, [nil, "durable-thread"])
+        try await authority.quiesce()
+        try await store.close()
+    }
+
     func testProviderEventsAndInteractionDeliveryUseDurableAuthority() async throws {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
             .appendingPathComponent(".build/authority-tests/\(UUID().uuidString)", isDirectory: true)
@@ -956,6 +999,34 @@ private actor PolicyRecordingProviderRuntime: AgentProviderRuntime {
 
     func lastPolicy() -> ProviderExecutionPolicy? {
         policy
+    }
+}
+
+private actor ResumeRecordingProviderRuntime: AgentProviderRuntime {
+    let kind = ProviderKind.codex
+    private var recordedResumeIdentities: [String?] = []
+
+    func capability() -> ProviderCapability {
+        .init(kind: kind, enabled: true, executable: "/test/codex", supportsResume: true, supportsSteering: false)
+    }
+
+    func preflight() -> ProviderCapability { capability() }
+
+    func execute(
+        _ request: ProviderExecutionRequest,
+        onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
+    ) async throws -> ProviderExecutionResult {
+        recordedResumeIdentities.append(request.resumeProviderSessionID)
+        await onEvent(.providerIdentity("durable-thread"))
+        await onEvent(.assistantFinal("done"))
+        await onEvent(.completed(providerSessionID: "durable-thread"))
+        return .init(output: "done", providerSessionID: "durable-thread")
+    }
+
+    func interrupt(runID _: UUID) {}
+
+    func resumeIdentities() -> [String?] {
+        recordedResumeIdentities
     }
 }
 

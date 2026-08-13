@@ -5,6 +5,81 @@ import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 final class ResourceReconciliationTests: XCTestCase {
+    func testPostRecoveryReconciliationDeletesOnlyOrphanedProviderResources() async throws {
+        let directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".test-provider-reconciliation-\(UUID().uuidString)", isDirectory: true)
+        let artifacts = directory.appendingPathComponent("artifacts", isDirectory: true)
+        let worktrees = directory.appendingPathComponent("worktrees", isDirectory: true)
+        let providerHomes = directory.appendingPathComponent("provider-homes", isDirectory: true)
+        let providerOutput = directory.appendingPathComponent("provider-output", isDirectory: true)
+        for path in [artifacts, worktrees, providerHomes, providerOutput] {
+            try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        }
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let orphanedRunID = UUID()
+        let activeRunID = UUID()
+        let orphanedHome = providerHomes.appendingPathComponent(orphanedRunID.uuidString, isDirectory: true)
+        let activeHome = providerHomes.appendingPathComponent(activeRunID.uuidString, isDirectory: true)
+        let unrecordedHome = providerHomes.appendingPathComponent("unrecorded", isDirectory: true)
+        let orphanedOutput = providerOutput.appendingPathComponent("orphaned.stdout")
+        for path in [orphanedHome, activeHome, unrecordedHome] {
+            try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        }
+        try Data("output".utf8).write(to: orphanedOutput)
+
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let orphanedHomeRecord = OwnedResourceRecord(
+            kind: .providerHome,
+            runID: orphanedRunID,
+            externalID: UUID(),
+            internalPathIdentity: orphanedHome.path,
+            lifecycleState: .active
+        )
+        let activeHomeRecord = OwnedResourceRecord(
+            kind: .providerHome,
+            runID: activeRunID,
+            externalID: UUID(),
+            internalPathIdentity: activeHome.path,
+            lifecycleState: .active
+        )
+        let orphanedOutputRecord = OwnedResourceRecord(
+            kind: .providerOutput,
+            runID: orphanedRunID,
+            externalID: UUID(),
+            internalPathIdentity: orphanedOutput.path,
+            lifecycleState: .active
+        )
+        for record in [orphanedHomeRecord, activeHomeRecord, orphanedOutputRecord] {
+            try await store.reserveOwnedResource(record)
+        }
+
+        let reconciler = try OwnedResourceReconciliationService(
+            repository: store,
+            artifactRoot: artifacts.path,
+            worktreeRoot: worktrees.path,
+            providerHomeRoot: providerHomes.path,
+            providerOutputRoot: providerOutput.path
+        )
+        let report = await reconciler.reconcileProviderResourcesAfterProcessRecovery(
+            activeRunIDs: [activeRunID]
+        )
+
+        XCTAssertEqual(report.inspected, 2)
+        XCTAssertEqual(report.deleted, 2)
+        XCTAssertEqual(report.failed, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphanedHome.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphanedOutput.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: activeHome.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unrecordedHome.path))
+        let retained = try await store.ownedResource(
+            externalID: XCTUnwrap(activeHomeRecord.externalID),
+            kind: .providerHome
+        )
+        XCTAssertEqual(retained?.lifecycleState, .active)
+        try await store.close()
+    }
+
     func testReconciliationDeletesOnlyRecordedExpiredArtifactsAndPreservesDirtyWorktrees() async throws {
         let directory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".test-resource-reconciliation-\(UUID().uuidString)", isDirectory: true)
         let artifacts = directory.appendingPathComponent("artifacts", isDirectory: true)

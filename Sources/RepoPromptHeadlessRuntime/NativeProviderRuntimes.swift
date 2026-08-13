@@ -474,6 +474,11 @@ private actor NativeJSONLineProcess {
 
 actor CodexAppServerProviderRuntime: AgentProviderRuntime {
     let kind = ProviderKind.codex
+    nonisolated static let appServerArguments = [
+        "--disable", "plugins",
+        "--disable", "remote_plugin",
+        "app-server",
+    ]
     private let support: NativeProviderProcessSupport
     private var sessions: [UUID: NativeJSONLineProcess] = [:]
     private var threadIDs: [UUID: String] = [:]
@@ -493,7 +498,7 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
         let runID = UUID()
         var preflightProcess: NativeJSONLineProcess?
         do {
-            let process = try await support.makeSession(runID: runID, arguments: ["app-server"], workingDirectory: FileManager.default.currentDirectoryPath, includeCredentials: false)
+            let process = try await support.makeSession(runID: runID, arguments: Self.appServerArguments, workingDirectory: FileManager.default.currentDirectoryPath, includeCredentials: false)
             preflightProcess = process
             _ = try await process.request(method: "initialize", params: ["clientInfo": ["name": "repoprompt-server-preflight", "title": "RepoPrompt Server Preflight", "version": "1"], "capabilities": ["experimentalApi": true]], timeout: .seconds(2), onFrame: { _ in })
             try await process.notify(method: "initialized")
@@ -514,7 +519,7 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
     }
 
     func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
-        let process = try await support.makeSession(runID: request.runID, arguments: ["app-server"], workingDirectory: request.workingDirectory, launchValidation: { try request.validateLaunch() })
+        let process = try await support.makeSession(runID: request.runID, arguments: Self.appServerArguments, workingDirectory: request.workingDirectory, launchValidation: { try request.validateLaunch() })
         sessions[request.runID] = process
         defer { sessions[request.runID] = nil
             threadIDs[request.runID] = nil
@@ -611,6 +616,7 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             "features.memories": memories,
             "features.computer_use": false,
             "features.plugins": false,
+            "features.remote_plugin": false,
             "features.tool_call_mcp_elicitation": false,
             "features.tool_suggest": false,
             "memories.generate_memories": memories,

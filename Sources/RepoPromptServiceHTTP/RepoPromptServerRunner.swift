@@ -448,6 +448,10 @@ public enum RepoPromptServerRunner {
             directProviderAllowlist: configuration.enabledDirectProviders
         )
         try await providers.recoverProcessFamilies()
+        let activeProviderRunIDs = Set(try await store.activeProcessFamilies().map(\.runID))
+        _ = await reconciler.reconcileProviderResourcesAfterProcessRecovery(
+            activeRunIDs: activeProviderRunIDs
+        )
         try await providerSettings.bootstrap()
         let serverSettings = ServerSettingsService(
             store: store,

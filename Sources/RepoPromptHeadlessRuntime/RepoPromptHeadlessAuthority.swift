@@ -1424,7 +1424,8 @@ public actor RepoPromptHeadlessAuthority {
             await eventHub.publish(event)
         }
         let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "dispatchAcceptedTurn", key: accepted.receipt.submissionID.uuidString.lowercased(), requestDigest: requestDigest)
-        _ = try await startProviderRun(command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh), sessionID: sessionID, session: session, actor: actor, idempotency: idempotency, acceptedSubmission: accepted)
+        let resumeMode: ProviderResumeMode = accepted.receipt.operation == "startSession" ? .fresh : .auto
+        _ = try await startProviderRun(command: .resumeSession(expectedRunID: nil, providerResumeMode: resumeMode), sessionID: sessionID, session: session, actor: actor, idempotency: idempotency, acceptedSubmission: accepted)
     }
 
     public func projectSnapshot(projectID: UUID) async throws -> ProjectSnapshot {
@@ -3020,7 +3021,9 @@ public actor RepoPromptHeadlessAuthority {
         default: .fresh
         }
         let previousRun = try await store.latestRun(sessionID: sessionID)
-        let resumeIdentity = resumeMode == .fresh ? nil : previousRun?.providerSessionID
+        let resumeIdentity = resumeMode == .fresh || !capability.supportsResume
+            ? nil
+            : previousRun?.providerSessionID
         if resumeMode == .resume, !capability.supportsResume || resumeIdentity == nil {
             throw ServiceAPIError(code: .resumeUnsupported, message: "No durable provider identity is available for native resume")
         }
@@ -3047,6 +3050,12 @@ public actor RepoPromptHeadlessAuthority {
         if try await store.runPresentation(sessionID: sessionID)?.runID != binding.runID {
             try await store.upsertRunPresentation(.init(sessionID: sessionID, runID: binding.runID, generation: binding.generation, turnEpoch: binding.turnEpoch, phase: .preparing, phaseRevision: 1, runningStatusCode: "provider_preparing", runStartedAt: run.startedAt))
         }
+        try await transitionRunPresentation(
+            sessionID: sessionID,
+            runID: binding.runID,
+            phase: .thinking,
+            statusCode: "provider_launching"
+        )
         await providerAdapter.prepareRun(kind: executionProvider, runID: binding.runID)
         let prompt = acceptedSubmission?.providerInput.prompt
             ?? providerPrompt
