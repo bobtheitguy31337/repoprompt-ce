@@ -62,13 +62,15 @@ final class CodexDeviceAuthRuntimeTests: XCTestCase {
         }
     }
 
-    func testCapabilityIsNotAdvertisedWhenPinnedVersionDoesNotMatch() async throws {
+    func testCapabilityRemainsVisibleButUnavailableWhenPinnedVersionDoesNotMatch() async throws {
         let fixture = try Fixture(version: "0.146.0")
         defer { fixture.cleanup() }
         let driver = try fixture.makeDriver()
 
         let descriptor = await driver.authFlowDescriptor(providerID: .codex, forceRefresh: true)
-        XCTAssertNil(descriptor)
+        XCTAssertEqual(descriptor?.kind, .deviceCodeBeta)
+        XCTAssertEqual(descriptor?.startable, false)
+        XCTAssertTrue(descriptor?.detail.contains("temporarily unavailable") == true)
     }
 
     func testModelCatalogUsesPaginatedDesktopAppServerDiscoveryAndExplicitFastTierMetadata() async throws {

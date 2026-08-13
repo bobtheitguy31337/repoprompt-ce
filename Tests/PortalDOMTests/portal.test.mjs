@@ -2288,6 +2288,63 @@ test("connected Codex disclosure shows Desktop account and runtime controls with
   );
 });
 
+test("Codex keeps device authorization visible during probe failure and renders API credentials once", async (t) => {
+  const providers = providerCatalog();
+  providers[0] = providerFixture({
+    connection: connectionFixture({
+      authenticationMethod: "deviceCodeBeta",
+      state: "attention",
+      testState: "unavailable",
+      detail: "Codex authentication status is temporarily unavailable",
+    }),
+    authenticationMethods: [
+      "apiKey",
+      "enterpriseAccessToken",
+      "deviceCodeBeta",
+    ],
+    authFlows: [
+      {
+        kind: "deviceCodeBeta",
+        displayName: "ChatGPT device authorization",
+        startable: false,
+        detail:
+          "Device authorization is temporarily unavailable because RepoPrompt could not verify the Codex runtime. Existing settings are preserved.",
+      },
+    ],
+    authentication: {
+      authenticated: false,
+      state: "attention",
+      method: "deviceCodeBeta",
+      detail: "Codex authentication status is temporarily unavailable",
+    },
+  });
+  const harness = await createHarness({ providers });
+  t.after(() => harness.close());
+  const { document } = harness;
+  const codex = document.querySelector('[data-provider-id="codex"]');
+  codex.open = true;
+
+  const choices = [...codex.querySelectorAll(".auth-choice")];
+  assert.deepEqual(
+    choices.map((choice) => choice.dataset.authenticationMethod),
+    ["deviceCodeBeta"],
+  );
+  assert.match(
+    choices[0].textContent,
+    /ChatGPT device authorization.*temporarily unavailable.*Reconnect/s,
+  );
+  assert.equal(choices[0].querySelector("button").disabled, true);
+  assert.equal(codex.querySelectorAll(".credential-card").length, 1);
+  assert.deepEqual(
+    [
+      ...codex.querySelectorAll(
+        '.credential-card select[name="authenticationMethod"] option',
+      ),
+    ].map((option) => option.value),
+    ["apiKey", "enterpriseAccessToken"],
+  );
+});
+
 test("Desktop setting controls persist through the versioned settings contract", async (t) => {
   const harness = await createHarness({ hash: "#settings/agent-permissions" });
   t.after(() => harness.close());

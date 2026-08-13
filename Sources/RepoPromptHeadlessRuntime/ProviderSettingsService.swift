@@ -594,7 +594,7 @@ public actor ProviderSettingsService {
     }
 
     private func refreshManagedAuthenticationCapabilities(providerID: ProviderSettingsID, forceRefresh: Bool) async {
-        if let descriptor = await managedAuthentication.authFlowDescriptor(providerID: providerID, forceRefresh: forceRefresh), descriptor.startable {
+        if let descriptor = await managedAuthentication.authFlowDescriptor(providerID: providerID, forceRefresh: forceRefresh) {
             managedAuthFlowDescriptors[providerID] = [descriptor]
         } else {
             managedAuthFlowDescriptors[providerID] = []
@@ -1012,7 +1012,7 @@ public actor ProviderSettingsService {
             authentication: authenticationStatus(providerID),
             connection: connection,
             preflight: preflight,
-            capabilities: projectedCapabilities(definition.capabilities, providerID: providerID),
+            capabilities: projectedCapabilities(definition.capabilities, providerID: providerID, deploymentAllowed: deploymentAllowed),
             models: models
         )
     }
@@ -1232,10 +1232,22 @@ public actor ProviderSettingsService {
 
     private func projectedCapabilities(
         _ capabilities: ProviderSettingsCapabilities,
-        providerID: ProviderSettingsID
+        providerID: ProviderSettingsID,
+        deploymentAllowed: Bool
     ) -> ProviderSettingsCapabilities {
         var supported = supportedAuthenticationMethods[providerID, default: []]
-        let flows = managedAuthFlowDescriptors[providerID, default: []].filter(\.startable)
+        var flows = managedAuthFlowDescriptors[providerID, default: []]
+        if providerID == .codex,
+           deploymentAllowed,
+           !flows.contains(where: { $0.kind == .deviceCodeBeta })
+        {
+            flows.append(.init(
+                kind: .deviceCodeBeta,
+                displayName: "ChatGPT device authorization",
+                startable: false,
+                detail: "RepoPrompt is checking the Codex runtime. Device authorization settings remain available while this status refreshes."
+            ))
+        }
         if flows.contains(where: { $0.kind == .deviceCodeBeta }) { supported.insert(.deviceCodeBeta) }
         return .init(
             supportsModelSelection: capabilities.supportsModelSelection,

@@ -241,6 +241,35 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertFalse(encoded.contains("usercode"), "catalog capability must not retain a transient device challenge")
     }
 
+    func testPortalKeepsCodexDeviceAuthorizationVisibleWhileRuntimeProbeIsUnavailable() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let configuration = ProviderCLIConfiguration(kind: .codex, executable: "/usr/bin/swift")
+        let service = ProviderSettingsService(
+            store: store,
+            adapter: ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.codex], runner: StaticProviderVersionRunner(output: "Swift version 6.2")),
+            configurations: [configuration],
+            initiallyEnabled: [.codex],
+            managedAuthentication: PortalManagedAuthentication(startable: false),
+            runner: StaticProviderVersionRunner(output: "Swift version 6.2")
+        )
+        try await service.bootstrap()
+
+        let initial = try await service.catalog()
+        let initialCodex = try XCTUnwrap(initial.providers.first { $0.providerID == .codex })
+        XCTAssertEqual(initialCodex.capabilities.authenticationMethods, [.deviceCodeBeta])
+        XCTAssertEqual(initialCodex.capabilities.authFlows.map(\.kind), [.deviceCodeBeta])
+        XCTAssertEqual(initialCodex.capabilities.authFlows.first?.startable, false)
+        XCTAssertTrue(initialCodex.capabilities.authFlows.first?.detail.contains("settings remain available") == true)
+
+        let refreshed = try await service.catalog(refreshCLI: true)
+        let refreshedCodex = try XCTUnwrap(refreshed.providers.first { $0.providerID == .codex })
+        XCTAssertEqual(refreshedCodex.capabilities.authenticationMethods, [.deviceCodeBeta])
+        XCTAssertEqual(refreshedCodex.capabilities.authFlows.map(\.kind), [.deviceCodeBeta])
+        XCTAssertEqual(refreshedCodex.capabilities.authFlows.first?.startable, false)
+        XCTAssertTrue(refreshedCodex.capabilities.authFlows.first?.detail.contains("temporarily unavailable") == true)
+    }
+
     func testPortalMutationProtectionRequiresSameOriginJSONAndCustomHeader() throws {
         XCTAssertNoThrow(try RepoPromptPortalRequestProtection.validateMutation(
             origin: "https://server.example:9443",
@@ -460,13 +489,21 @@ final class ProviderSettingsPortalTests: XCTestCase {
 }
 
 private struct PortalManagedAuthentication: ProviderManagedAuthenticationDriving {
+    let startable: Bool
+
+    init(startable: Bool = true) {
+        self.startable = startable
+    }
+
     func authFlowDescriptor(providerID: ProviderSettingsID, forceRefresh _: Bool) async -> ProviderAuthFlowDescriptor? {
         guard providerID == .codex else { return nil }
         return .init(
             kind: .deviceCodeBeta,
             displayName: "ChatGPT device authorization",
-            startable: true,
-            detail: "Authorize the server on another device"
+            startable: startable,
+            detail: startable
+                ? "Authorize the server on another device"
+                : "Device authorization is temporarily unavailable while RepoPrompt checks the Codex runtime."
         )
     }
 

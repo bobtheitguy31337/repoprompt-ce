@@ -5375,7 +5375,11 @@
   function authenticationMethodChoices(provider, flowMessage) {
     const choices = element("div", "auth-choice-grid");
     const flows = provider.capabilities.authFlows || [];
-    const methods = [...(provider.capabilities.authenticationMethods || [])];
+    const methods = (provider.capabilities.authenticationMethods || []).filter(
+      (method) =>
+        provider.providerID !== "codex" ||
+        !directAuthenticationMethods.has(method),
+    );
     if (provider.providerID === "codex") {
       const releaseOrder = ["deviceCodeBeta", "browserOAuth", "apiKey"];
       methods.sort((left, right) => {
@@ -5401,26 +5405,30 @@
         ),
       );
       const active = provider.connection?.authenticationMethod === method;
+      const activelyConnected =
+        active && provider.connection?.state === "connected";
       const direct = directAuthenticationMethods.has(method);
       const action = element(
         "button",
         active
           ? "secondary-button auth-choice-action active"
           : "secondary-button auth-choice-action",
-        active
+        activelyConnected
           ? "Connected"
-          : direct
-            ? provider.connection
-              ? "Change"
-              : "Validate & Save"
-            : methodName,
+          : active
+            ? "Reconnect"
+            : direct
+              ? provider.connection
+                ? "Change"
+                : "Validate & Save"
+              : methodName,
       );
       action.type = "button";
       action.dataset.action = direct ? "choose-auth-method" : "start-auth-flow";
       if (flow) action.dataset.flowKind = flow.kind;
       const anotherFlow =
         state.activeFlow && state.activeFlow.providerID !== provider.providerID;
-      if (active) {
+      if (activelyConnected) {
         setDisabledReason(
           action,
           true,

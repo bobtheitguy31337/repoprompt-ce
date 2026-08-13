@@ -321,12 +321,15 @@ public actor CodexDeviceAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuth
     }
 
     public func authFlowDescriptor(providerID: ProviderSettingsID, forceRefresh: Bool = false) async -> ProviderAuthFlowDescriptor? {
-        guard providerID == .codex, await startable(forceRefresh: forceRefresh) else { return nil }
+        guard providerID == .codex else { return nil }
+        let available = await startable(forceRefresh: forceRefresh)
         return .init(
             kind: .deviceCodeBeta,
             displayName: "ChatGPT device authorization",
-            startable: true,
-            detail: "Sign in to the server's separate Codex account with a code entered on another device"
+            startable: available,
+            detail: available
+                ? "Sign in to the server's separate Codex account with a code entered on another device"
+                : "Device authorization is temporarily unavailable because RepoPrompt could not verify the Codex runtime. Existing settings are preserved; retry after runtime status recovers."
         )
     }
 
