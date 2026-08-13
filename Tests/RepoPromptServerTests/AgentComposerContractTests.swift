@@ -845,7 +845,8 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
         let body = try JSONEncoder.serviceEncoder.encode(AgentStartSessionWire(projectID: fixture.sessionInput.projectID, visibility: fixture.sessionInput.visibility, turn: submission, selectedMessageContext: selectedContext))
         let instant = Date(timeIntervalSince1970: 1_786_400_000)
         let signingKey = InternalSigningKey(keyID: "atomic-http", role: .goblinApp, direction: "test", secret: Data("atomic-http-secret".utf8))
-        let service = RepoPromptHTTPService(authority: fixture.authority, store: fixture.store, authenticator: InternalRequestAuthenticator(keys: [signingKey], store: fixture.store, now: { instant }), eventSigningKey: signingKey, submissionCoordinator: fixture.coordinator)
+        let dispatchQueue = AgentSubmissionDispatchQueue(authority: fixture.authority, coordinator: fixture.coordinator)
+        let service = RepoPromptHTTPService(authority: fixture.authority, store: fixture.store, authenticator: InternalRequestAuthenticator(keys: [signingKey], store: fixture.store, now: { instant }), eventSigningKey: signingKey, submissionCoordinator: fixture.coordinator, submissionDispatchQueue: dispatchQueue)
         let app = Application(router: service.internalRouter())
         let receipt = try await app.test(.router) { client in
             let headers = try structuredStartHeaders(body: body, actor: fixture.actor, projectID: fixture.sessionInput.projectID, idempotencyKey: submissionKey, nonce: "atomiccontext001", instant: instant, key: signingKey)
@@ -854,6 +855,7 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
                 return try JSONDecoder.serviceDecoder.decode(SubmissionReceipt.self, from: Data(response.body.readableBytesView))
             }
         }
+        await dispatchQueue.waitForIdle()
         let frozen = selectedContext.frozenPrompt(userPrompt: submission.content.text)
         XCTAssertEqual(receipt.session?.transcript.map(\.content), [frozen])
         let turns = try await fixture.store.semanticTurns(sessionID: receipt.sessionID)
@@ -868,6 +870,53 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
         XCTAssertTrue(selection.entries.isEmpty)
     }
 
+    func testStructuredStartReturnsDurableReceiptBeforeProviderDispatchCompletes() async throws {
+        let fixture = try await StructuredStartFixture.make()
+        defer { Task { try? await fixture.store.close(); try? FileManager.default.removeItem(at: fixture.root) } }
+        let submissionKey = UUID().uuidString.lowercased()
+        let submission = AgentTurnSubmissionWire(
+            content: .init(text: "accept before launch"),
+            configuration: .init(catalogRevision: fixture.catalogRevision, providerID: .claudeCompatible, modelID: fixture.modelID, effortID: fixture.effortID, permissionID: "claude.requireApproval", toolValues: ["claude.mcpStrictMode": .boolean(true)])
+        )
+        let body = try JSONEncoder.serviceEncoder.encode(AgentStartSessionWire(projectID: fixture.sessionInput.projectID, visibility: fixture.sessionInput.visibility, turn: submission))
+        let instant = Date(timeIntervalSince1970: 1_786_400_000)
+        let signingKey = InternalSigningKey(keyID: "atomic-http", role: .goblinApp, direction: "test", secret: Data("atomic-http-secret".utf8))
+        let gate = SubmissionDispatchGate()
+        let coordinator = fixture.coordinator
+        let dispatchQueue = AgentSubmissionDispatchQueue { accepted, _, _ in
+            await gate.hold()
+            try? await coordinator.markDispatched(submissionID: accepted.receipt.submissionID)
+        }
+        let service = RepoPromptHTTPService(authority: fixture.authority, store: fixture.store, authenticator: InternalRequestAuthenticator(keys: [signingKey], store: fixture.store, now: { instant }), eventSigningKey: signingKey, submissionCoordinator: fixture.coordinator, submissionDispatchQueue: dispatchQueue)
+        let app = Application(router: service.internalRouter())
+        let fallbackRelease = Task {
+            try? await Task.sleep(for: .seconds(1))
+            await gate.release()
+        }
+        let clock = ContinuousClock()
+        let startedAt = clock.now
+        let receipt = try await app.test(.router) { client in
+            let headers = try structuredStartHeaders(body: body, actor: fixture.actor, projectID: fixture.sessionInput.projectID, idempotencyKey: submissionKey, nonce: "atomiclatency001", instant: instant, key: signingKey)
+            return try await client.execute(uri: "/internal/v1/sessions", method: .post, headers: headers, body: ByteBuffer(bytes: body)) { response in
+                XCTAssertEqual(response.status, .accepted)
+                return try JSONDecoder.serviceDecoder.decode(SubmissionReceipt.self, from: Data(response.body.readableBytesView))
+            }
+        }
+        let responseTime = startedAt.duration(to: clock.now)
+        XCTAssertLessThan(responseTime, .milliseconds(500))
+        XCTAssertEqual(receipt.runPhase, "preparing")
+        await gate.waitUntilStarted()
+        let pendingRecord = try await fixture.store.agentSubmission(submissionID: receipt.submissionID)
+        let pending = try XCTUnwrap(pendingRecord)
+        XCTAssertEqual(pending.dispatchState, "pending")
+        fallbackRelease.cancel()
+        await gate.release()
+        await dispatchQueue.waitForIdle()
+        let dispatchedRecord = try await fixture.store.agentSubmission(submissionID: receipt.submissionID)
+        let dispatched = try XCTUnwrap(dispatchedRecord)
+        XCTAssertEqual(dispatched.dispatchState, "dispatched")
+    }
+
     func testLostResponseReplayReturnsOneSessionTurnAndStoredReceipt() async throws {
         let fixture = try await StructuredStartFixture.make()
         defer { Task { try? await fixture.store.close(); try? FileManager.default.removeItem(at: fixture.root) } }
@@ -880,7 +929,8 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
         let body = try JSONEncoder.serviceEncoder.encode(AgentStartSessionWire(projectID: fixture.sessionInput.projectID, visibility: fixture.sessionInput.visibility, turn: submission))
         let instant = Date(timeIntervalSince1970: 1_786_400_000)
         let signingKey = InternalSigningKey(keyID: "atomic-http", role: .goblinApp, direction: "test", secret: Data("atomic-http-secret".utf8))
-        let service = RepoPromptHTTPService(authority: fixture.authority, store: fixture.store, authenticator: InternalRequestAuthenticator(keys: [signingKey], store: fixture.store, now: { instant }), eventSigningKey: signingKey, submissionCoordinator: fixture.coordinator)
+        let dispatchQueue = AgentSubmissionDispatchQueue(authority: fixture.authority, coordinator: fixture.coordinator)
+        let service = RepoPromptHTTPService(authority: fixture.authority, store: fixture.store, authenticator: InternalRequestAuthenticator(keys: [signingKey], store: fixture.store, now: { instant }), eventSigningKey: signingKey, submissionCoordinator: fixture.coordinator, submissionDispatchQueue: dispatchQueue)
         let app = Application(router: service.internalRouter())
         let receipts = try await app.test(.router) { client in
             let firstHeaders = try structuredStartHeaders(body: body, actor: fixture.actor, projectID: fixture.sessionInput.projectID, idempotencyKey: key, nonce: "atomicreplay0001", instant: instant, key: signingKey)
@@ -902,6 +952,7 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
             }
             return (first, replay, detail)
         }
+        await dispatchQueue.waitForIdle()
         let accepted = receipts.0
         XCTAssertEqual(accepted, receipts.1)
         XCTAssertEqual(accepted.session?.effectiveTurnConfiguration?.configuration.modelID, fixture.modelID)
@@ -922,6 +973,30 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
         XCTAssertEqual(sessionEvents.first { $0.column("event_type")?.string == EventType.agentStarted.rawValue }?.column("count")?.integer, 1)
         let storedReceipts = try await fixture.store.connection.query("SELECT COUNT(*) AS count FROM agent_submissions WHERE state='accepted' AND receipt_json IS NOT NULL")
         XCTAssertEqual(storedReceipts.first?.column("count")?.integer, 1)
+    }
+}
+
+private actor SubmissionDispatchGate {
+    private var started = false
+    private var released = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func hold() async {
+        started = true
+        guard !released else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitUntilStarted() async {
+        while !started {
+            await Task.yield()
+        }
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
     }
 }
 

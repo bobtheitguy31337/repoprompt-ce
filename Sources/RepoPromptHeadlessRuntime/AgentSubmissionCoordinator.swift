@@ -109,12 +109,6 @@ public actor AgentSubmissionCoordinator {
         mcpControlled: Bool = false,
         now: Date = Date()
     ) async throws -> AcceptedAgentSubmission {
-        guard activeRun == nil || activeRun?.endedAt != nil else {
-            throw ServiceAPIError(code: .runAlreadyActive, message: "A configurable follow-up cannot start during an active run")
-        }
-        guard submission.expectedSessionRevision == nil || submission.expectedSessionRevision == session.revision else {
-            throw ServiceAPIError(code: .staleRevision, message: "Session revision is stale", currentRevision: session.revision)
-        }
         guard let submissionID = UUID(uuidString: publicSubmissionKey) else {
             throw ServiceAPIError(code: .invalidRequest, message: "Idempotency-Key must be the submission UUID")
         }
@@ -128,6 +122,15 @@ public actor AgentSubmissionCoordinator {
             case .rejected:
                 throw ServiceAPIError(code: .authorizationDecisionRejected, message: prior.rejectionCode ?? "Submission was rejected")
             }
+        }
+        guard activeRun == nil || activeRun?.endedAt != nil else {
+            throw ServiceAPIError(code: .runAlreadyActive, message: "A configurable follow-up cannot start during an active run")
+        }
+        if let presentation = try await store.runPresentation(sessionID: session.sessionID), presentation.terminalSettlementCode == nil {
+            throw ServiceAPIError(code: .runAlreadyActive, message: "A configurable follow-up is already being prepared")
+        }
+        guard submission.expectedSessionRevision == nil || submission.expectedSessionRevision == session.revision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Session revision is stale", currentRevision: session.revision)
         }
 
         let identity = CanonicalTurnIdentity(

@@ -26,6 +26,7 @@ public struct RepoPromptHTTPService: Sendable {
     private let composerCatalog: (any AgentComposerCatalogProviding)?
     private let composerAttachments: AgentComposerAttachmentStore?
     private let submissionCoordinator: AgentSubmissionCoordinator?
+    private let submissionDispatchQueue: AgentSubmissionDispatchQueue?
     private let transcriptPresentation: AgentTranscriptPresentationService?
     private let portalDesktopSettings: PortalDesktopSettingsService
 
@@ -43,6 +44,7 @@ public struct RepoPromptHTTPService: Sendable {
         composerCatalog: (any AgentComposerCatalogProviding)? = nil,
         composerAttachments: AgentComposerAttachmentStore? = nil,
         submissionCoordinator: AgentSubmissionCoordinator? = nil,
+        submissionDispatchQueue: AgentSubmissionDispatchQueue? = nil,
         transcriptPresentation: AgentTranscriptPresentationService? = nil,
         portalDesktopSettings: PortalDesktopSettingsService? = nil
     ) {
@@ -58,6 +60,9 @@ public struct RepoPromptHTTPService: Sendable {
         self.composerCatalog = composerCatalog
         self.composerAttachments = composerAttachments
         self.submissionCoordinator = submissionCoordinator
+        self.submissionDispatchQueue = submissionDispatchQueue ?? submissionCoordinator.map {
+            AgentSubmissionDispatchQueue(authority: authority, coordinator: $0)
+        }
         self.transcriptPresentation = transcriptPresentation
         self.portalDesktopSettings = portalDesktopSettings ?? PortalDesktopSettingsService(store: store)
         self.readiness = readiness ?? RepoPromptReadinessService(
@@ -869,14 +874,7 @@ public struct RepoPromptHTTPService: Sendable {
                 let selectedMessageContext = try structured.selectedMessageContext?.validated()
                 let shell = CreateSessionInput(projectID: structured.projectID, provider: provider, model: structured.turn.configuration.modelID, visibility: structured.visibility, startImmediately: false)
                 let accepted = try await authority.acceptStructuredSession(input: shell, coordinator: requireSubmissionCoordinator(), actor: actor, publicSubmissionKey: key, requestDigest: requestDigest, submission: structured.turn, selectedMessageContext: selectedMessageContext)
-                if !accepted.replayed {
-                    do {
-                        try await authority.dispatchAcceptedFollowup(accepted, actor: actor, requestDigest: requestDigest)
-                        try await requireSubmissionCoordinator().markDispatched(submissionID: accepted.receipt.submissionID)
-                    } catch {
-                        try await requireSubmissionCoordinator().markLaunchFailed(submissionID: accepted.receipt.submissionID, message: String(describing: error))
-                    }
-                }
+                try await requireSubmissionDispatchQueue().enqueue(accepted, actor: actor, requestDigest: requestDigest)
                 return try HTTPResponses.privateJSON(accepted.receipt, status: .accepted)
             }
             let input = try JSONDecoder.serviceDecoder.decode(CreateSessionInput.self, from: data)
@@ -913,15 +911,9 @@ public struct RepoPromptHTTPService: Sendable {
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(AgentTurnSubmissionWire.self, from: data)
             let snapshot = try await authority.authoritySessionSnapshot(sessionID: sessionID)
-            let accepted = try await requireSubmissionCoordinator().acceptFollowup(session: snapshot.session, activeRun: snapshot.activeRun, actor: actor, publicSubmissionKey: key, requestDigest: CanonicalSigning.bodyDigest(data), submission: input)
-            if !accepted.replayed {
-                do {
-                    try await authority.dispatchAcceptedFollowup(accepted, actor: actor, requestDigest: CanonicalSigning.bodyDigest(data))
-                    try await requireSubmissionCoordinator().markDispatched(submissionID: accepted.receipt.submissionID)
-                } catch {
-                    try? await requireSubmissionCoordinator().markLaunchFailed(submissionID: accepted.receipt.submissionID, message: "Accepted provider dispatch failed")
-                }
-            }
+            let requestDigest = CanonicalSigning.bodyDigest(data)
+            let accepted = try await requireSubmissionCoordinator().acceptFollowup(session: snapshot.session, activeRun: snapshot.activeRun, actor: actor, publicSubmissionKey: key, requestDigest: requestDigest, submission: input)
+            try await requireSubmissionDispatchQueue().enqueue(accepted, actor: actor, requestDigest: requestDigest)
             return try HTTPResponses.privateJSON(accepted.receipt, status: .accepted)
         } }
         router.post("/internal/v1/sessions/:id/commands") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
@@ -1263,6 +1255,11 @@ public struct RepoPromptHTTPService: Sendable {
     private func requireSubmissionCoordinator() throws -> AgentSubmissionCoordinator {
         guard let submissionCoordinator else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Agent submission coordinator is unavailable", retryable: true) }
         return submissionCoordinator
+    }
+
+    private func requireSubmissionDispatchQueue() throws -> AgentSubmissionDispatchQueue {
+        guard let submissionDispatchQueue else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Agent submission dispatch queue is unavailable", retryable: true) }
+        return submissionDispatchQueue
     }
 
     private func requireTranscriptPresentation() throws -> AgentTranscriptPresentationService {
