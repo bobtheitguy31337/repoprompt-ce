@@ -34,6 +34,57 @@ private func tinyPNG() -> Data {
 }
 
 final class AgentComposerCatalogTests: XCTestCase {
+    func testDesktopFallbackPopulatesCodexComposerWithoutDiscoveredCatalog() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        _ = try await store.upsertProviderSettings(
+            ProviderSettingsPreference(providerID: .codex, enabled: true, revision: 1),
+            expectedRevision: 0
+        )
+        let instant = Date(timeIntervalSince1970: 1_786_400_000)
+        let connection = ProviderConnectionRecord(
+            connectionID: UUID(),
+            providerID: .codex,
+            authenticationMethod: .deviceCodeBeta,
+            state: .attention,
+            accountLabel: "sandbox",
+            lastTestedAt: instant,
+            testState: .unavailable,
+            detail: "Authentication status is temporarily unavailable",
+            keyHelperConfigured: false,
+            workloadIdentityConfigured: false,
+            createdAt: instant,
+            updatedAt: instant,
+            revision: 1
+        )
+        _ = try await store.upsertProviderConnection(.init(record: connection, credentialReference: nil), expectedRevision: 0)
+        let runner = StructuredStartProviderRunner()
+        let configuration = ProviderCLIConfiguration(kind: .codex, executable: "/usr/bin/swift", expectedVersion: "6.2")
+        let settings = ProviderSettingsService(
+            store: store,
+            adapter: ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.codex], runner: runner),
+            configurations: [configuration],
+            initiallyEnabled: [.codex],
+            runner: runner
+        )
+        try await settings.bootstrap()
+
+        let snapshot = try await AgentComposerCatalogService(providerSettings: settings, store: store).snapshot(
+            context: .init(kind: .project, projectID: UUID(), actorID: "catalog-reader")
+        )
+
+        let group = try XCTUnwrap(snapshot.providerGroups.first { $0.providerID == .codex })
+        let sol = try XCTUnwrap(group.models.first { $0.id == "gpt-5.6-sol" })
+        XCTAssertEqual(sol.supportedEffortIDs, ["low", "medium", "high", "xhigh", "max", "ultra"])
+        XCTAssertEqual(sol.defaultEffortID, "medium")
+        XCTAssertTrue(group.models.contains { $0.id == "gpt-5.6-sol-fast" })
+        XCTAssertEqual(snapshot.selected?.providerID, .codex)
+        XCTAssertEqual(snapshot.selected?.modelID, "gpt-5.6-sol")
+        XCTAssertEqual(snapshot.selected?.effortID, "medium")
+        XCTAssertNotNil(group.permissionControl)
+        XCTAssertFalse(group.toolControls.isEmpty)
+    }
+
     func testDurableProviderCatalogRemainsVisibleDuringTransientRuntimeFailure() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -88,7 +139,8 @@ final class AgentComposerCatalogTests: XCTestCase {
         try await settings.bootstrap()
         let beforeRefresh = try await settings.catalog()
         let codex = try XCTUnwrap(beforeRefresh.providers.first { $0.providerID == .codex })
-        XCTAssertFalse(codex.runtimePreflightVerified)
+        XCTAssertTrue(codex.runtimePreflightVerified)
+        XCTAssertFalse(codex.preflight.ready)
         XCTAssertEqual(codex.authentication.state, .attention)
 
         let snapshot = try await AgentComposerCatalogService(providerSettings: settings, store: store).snapshot(
@@ -96,7 +148,8 @@ final class AgentComposerCatalogTests: XCTestCase {
         )
 
         let group = try XCTUnwrap(snapshot.providerGroups.first { $0.providerID == .codex })
-        XCTAssertEqual(group.models.map(\.id), [modelID])
+        XCTAssertEqual(group.models.first?.id, modelID)
+        XCTAssertTrue(group.models.contains { $0.id == "gpt-5.6-sol-fast" })
         XCTAssertNotNil(group.permissionControl)
         XCTAssertFalse(group.toolControls.isEmpty)
     }

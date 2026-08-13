@@ -247,6 +247,10 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
             if let cached {
                 sources.append(.init(kind: .persisted, observedAt: cached.observedAt, models: cached.models.map(Self.candidate)))
             }
+            let desktopFallback = DesktopProviderModelFallbackCatalog.candidates(for: matrix.providerID)
+            if matrix.discoveryPolicy.allowsStaticFallbackAfterSuccessfulPreflight, !desktopFallback.isEmpty {
+                sources.append(.init(kind: .providerFallback, models: desktopFallback))
+            }
             // The composer is a projection of durable provider choices, not a live
             // health check. A transient CLI/auth probe must not make already-known
             // models (and their tools/permissions) disappear while a chat opens.
