@@ -176,6 +176,7 @@ public struct AgentPresentationInteractionWire: Codable, Hashable, Sendable {
     public let state: String
     public let prompt: String
     public let choices: [String]
+    public let resolution: String?
     public let turnID: String
     public let activityID: String?
     public let liveTail: Bool
@@ -183,12 +184,13 @@ public struct AgentPresentationInteractionWire: Codable, Hashable, Sendable {
     public let mutable: Bool
     public let revision: Int64
 
-    public init(interactionID: UUID, kind: Kind, state: String, prompt: String, choices: [String] = [], turnID: String, activityID: String? = nil, liveTail: Bool = false, requiresAttention: Bool = true, mutable: Bool, revision: Int64) {
+    public init(interactionID: UUID, kind: Kind, state: String, prompt: String, choices: [String] = [], resolution: String? = nil, turnID: String, activityID: String? = nil, liveTail: Bool = false, requiresAttention: Bool = true, mutable: Bool, revision: Int64) {
         self.interactionID = interactionID
         self.kind = kind
         self.state = state
         self.prompt = prompt
         self.choices = choices
+        self.resolution = resolution
         self.turnID = turnID
         self.activityID = activityID
         self.liveTail = liveTail
@@ -197,7 +199,7 @@ public struct AgentPresentationInteractionWire: Codable, Hashable, Sendable {
         self.revision = revision
     }
 
-    private enum CodingKeys: String, CodingKey { case interactionID = "interactionId", kind, state, prompt, choices, turnID = "turnId", activityID = "activityId", liveTail, requiresAttention, mutable, revision }
+    private enum CodingKeys: String, CodingKey { case interactionID = "interactionId", kind, state, prompt, choices, resolution, turnID = "turnId", activityID = "activityId", liveTail, requiresAttention, mutable, revision }
 }
 
 public struct AgentPresentationTurnWire: Codable, Hashable, Sendable {

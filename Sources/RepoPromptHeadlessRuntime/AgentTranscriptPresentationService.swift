@@ -93,8 +93,12 @@ public actor AgentTranscriptPresentationService {
                 )
             }
             let attachedInteractions = interactions.compactMap { interaction -> AgentPresentationInteractionWire? in
-                guard interaction.runID == record.identity.runID, Self.isActionable(interaction) else { return nil }
-                return Self.interactionWire(interaction, turnID: record.identity.turnID.uuidString.lowercased(), mutable: mutableInteractions)
+                guard interaction.runID == record.identity.runID else { return nil }
+                return Self.interactionWire(
+                    interaction,
+                    turnID: record.identity.turnID.uuidString.lowercased(),
+                    mutable: mutableInteractions && Self.isActionable(interaction)
+                )
             }
             let projected = AgentTranscriptPresentationCore.project(.init(
                 turnID: record.identity.turnID.uuidString.lowercased(),
@@ -299,9 +303,10 @@ public actor AgentTranscriptPresentationService {
             state: value.state.rawValue,
             prompt: prompt,
             choices: providerPayload?.choices ?? [],
+            resolution: providerPayload?.resolution,
             turnID: turnID,
-            liveTail: true,
-            requiresAttention: value.state == .pending,
+            liveTail: isActionable(value),
+            requiresAttention: isActionable(value),
             mutable: mutable && value.state == .pending,
             revision: value.revision
         )

@@ -42,11 +42,13 @@ public struct ProviderInteractionPayload: Codable, Hashable, Sendable {
     public let providerRequestID: String
     public let prompt: String
     public let choices: [String]
+    public let resolution: String?
 
-    public init(providerRequestID: String, prompt: String, choices: [String]) {
+    public init(providerRequestID: String, prompt: String, choices: [String], resolution: String? = nil) {
         self.providerRequestID = providerRequestID
         self.prompt = prompt
         self.choices = choices
+        self.resolution = resolution
     }
 }
 
@@ -68,7 +70,7 @@ public enum ProviderRuntimeEvent: Sendable, Equatable {
     case runStatusChanged(phase: RunPresentationPhase, statusCode: String?, statusText: String?)
     case toolStarted(providerToolID: String, name: String, arguments: Data?)
     case toolUpdated(providerToolID: String, output: String)
-    case toolCompleted(providerToolID: String, name: String, output: String?, failed: Bool)
+    case toolCompleted(providerToolID: String, name: String, output: String?, status: AgentPresentationToolStatus)
     case interactionRequested(providerRequestID: String, kind: ProviderInteractionKind, prompt: String, choices: [String])
     case interactionCancelled(providerRequestID: String)
     case completed(providerSessionID: String?)

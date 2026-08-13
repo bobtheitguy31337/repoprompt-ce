@@ -2091,20 +2091,39 @@ public actor RepoPromptHeadlessAuthority {
         // never allowed to replace routing metadata before acknowledgement.
         let intent = InteractionSnapshot(interactionID: current.interactionID, runID: current.runID, agentID: current.agentID, kind: current.kind, state: .deliveryIntent, payload: current.payload, revision: current.revision + 1, expiresAt: current.expiresAt)
         try await store.persistInteractionDeliveryState(intent, sessionID: sessionID, actor: actor)
+        let settledPayload = Self.providerInteractionResolutionPayload(request: current.payload, answer: payload)
         do {
             try await interactionDelivery.deliverAnswer(session: session, interaction: intent, answer: payload)
         } catch {
-            let interrupted = InteractionSnapshot(interactionID: current.interactionID, runID: current.runID, agentID: current.agentID, kind: current.kind, state: .interrupted, payload: payload, revision: intent.revision + 1, expiresAt: current.expiresAt)
+            let interrupted = InteractionSnapshot(interactionID: current.interactionID, runID: current.runID, agentID: current.agentID, kind: current.kind, state: .interrupted, payload: settledPayload, revision: intent.revision + 1, expiresAt: current.expiresAt)
             try await store.persistInteractionDeliveryState(interrupted, sessionID: sessionID, actor: actor)
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider interaction delivery was not acknowledged", retryable: false)
         }
-        let resolved = InteractionSnapshot(interactionID: current.interactionID, runID: current.runID, agentID: current.agentID, kind: current.kind, state: .resolved, payload: current.payload, revision: intent.revision + 1, expiresAt: current.expiresAt)
+        let resolved = InteractionSnapshot(interactionID: current.interactionID, runID: current.runID, agentID: current.agentID, kind: current.kind, state: .resolved, payload: settledPayload, revision: intent.revision + 1, expiresAt: current.expiresAt)
         let event = try await store.persistInteraction(resolved, session: session, actor: actor, correlationID: ids.next(), idempotency: idempotency)
         await eventHub.publish(event)
         if let runID = resolved.runID {
             try? await transitionRunPresentation(sessionID: sessionID, runID: runID, phase: .working, statusCode: "interaction_resolved")
         }
         return resolved
+    }
+
+    private nonisolated static func providerInteractionResolutionPayload(request: Data, answer: Data) -> Data {
+        guard let original = try? JSONDecoder.serviceDecoder.decode(ProviderInteractionPayload.self, from: request) else {
+            return request
+        }
+        let answerObject = (try? JSONSerialization.jsonObject(with: answer)) as? [String: Any]
+        let resolution = (answerObject?["decision"] as? String)
+            ?? (answerObject?["optionId"] as? String)
+            ?? ((answerObject?["accepted"] as? Bool).map { $0 ? "accept" : "decline" })
+            ?? "answered"
+        let settled = ProviderInteractionPayload(
+            providerRequestID: original.providerRequestID,
+            prompt: original.prompt,
+            choices: original.choices,
+            resolution: resolution
+        )
+        return (try? JSONEncoder.serviceEncoder.encode(settled)) ?? request
     }
 
     public func worktreeSnapshots(projectID: UUID) async throws -> [WorktreeBindingSnapshot] {
@@ -3416,12 +3435,13 @@ public actor RepoPromptHeadlessAuthority {
                 try await recordSemanticTool(runID: run.runID, activityID: invocation.invocationID, executionID: providerToolID, name: invocation.toolName, status: .running, displayArguments: nil, displayResult: output, argumentDigest: invocation.argumentDigest, resultDigest: update.resultDigest)
                 let envelope = try await store.persistToolInvocation(update, session: snapshot, actor: nil, correlationID: invocation.invocationID, eventType: .toolUpdated)
                 await eventHub.publish(envelope)
-            case let .toolCompleted(providerToolID, name, output, failed):
+            case let .toolCompleted(providerToolID, name, output, status):
                 guard let snapshot = try? await sessionSnapshot(sessionID: sessionID) else { return }
                 let prior = providerToolInvocations[binding.runID]?[providerToolID]
-                let invocation = ToolInvocationSnapshot(invocationID: prior?.invocationID ?? ids.next(), toolName: prior?.toolName ?? name, state: failed ? "failed" : "completed", argumentDigest: prior?.argumentDigest ?? CanonicalSigning.bodyDigest(Data()), resultDigest: output.map { CanonicalSigning.bodyDigest(Data($0.utf8)) }, errorCode: failed ? .dependencyUnavailable : nil)
+                let failed = status == .failed
+                let invocation = ToolInvocationSnapshot(invocationID: prior?.invocationID ?? ids.next(), toolName: prior?.toolName ?? name, state: status.rawValue, argumentDigest: prior?.argumentDigest ?? CanonicalSigning.bodyDigest(Data()), resultDigest: output.map { CanonicalSigning.bodyDigest(Data($0.utf8)) }, errorCode: failed ? .dependencyUnavailable : nil)
                 providerToolInvocations[binding.runID]?[providerToolID] = nil
-                try await recordSemanticTool(runID: run.runID, activityID: invocation.invocationID, executionID: providerToolID, name: invocation.toolName, status: failed ? .failed : .success, displayArguments: nil, displayResult: output, argumentDigest: invocation.argumentDigest, resultDigest: invocation.resultDigest)
+                try await recordSemanticTool(runID: run.runID, activityID: invocation.invocationID, executionID: providerToolID, name: invocation.toolName, status: status, displayArguments: nil, displayResult: output, argumentDigest: invocation.argumentDigest, resultDigest: invocation.resultDigest)
                 let envelope = try await store.persistToolInvocation(invocation, session: snapshot, actor: nil, correlationID: invocation.invocationID, eventType: failed ? .toolFailed : .toolCompleted)
                 await eventHub.publish(envelope)
             case let .interactionRequested(providerRequestID, kind, prompt, choices):

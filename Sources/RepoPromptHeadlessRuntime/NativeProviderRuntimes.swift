@@ -783,22 +783,22 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
         case "item/started":
             let item = params["item"] as? [String: Any] ?? params
             let id = item["id"] as? String ?? UUID().uuidString
-            let name = item["type"] as? String ?? "tool"
-            let normalizedName = normalizedItemType(name)
+            let itemType = item["type"] as? String ?? "tool"
+            let normalizedName = normalizedItemType(itemType)
             if normalizedName == "usermessage" { return ([], false) }
             if normalizedName == "agentmessage" {
                 return ([.runStatusChanged(phase: .working, statusCode: "provider_responding", statusText: nil)], false)
             }
             guard visibleToolItemTypes.contains(normalizedName) else { return ([], false) }
-            let arguments = try? JSONSerialization.data(withJSONObject: item)
-            return ([.toolStarted(providerToolID: id, name: name, arguments: arguments)], false)
-        case "item/commandExecution/outputDelta", "item/mcpToolCall/progress", "item/fileChange/outputDelta":
+            let name = canonicalToolName(item: item, itemType: itemType)
+            return ([.toolStarted(providerToolID: id, name: name, arguments: toolArguments(item: item, name: name))], false)
+        case "item/commandExecution/outputDelta", "item/mcpToolCall/progress", "item/dynamicToolCall/outputDelta", "item/toolCall/outputDelta", "item/fileChange/outputDelta", "item/webSearch/outputDelta":
             let id = string(in: params, paths: [["itemId"], ["id"]]) ?? "tool"
             return ([.toolUpdated(providerToolID: id, output: string(in: params, paths: [["delta"], ["output"], ["message"]]) ?? "")], false)
         case "item/completed":
             let item = params["item"] as? [String: Any] ?? params
-            let name = item["type"] as? String ?? "tool"
-            let normalizedName = normalizedItemType(name)
+            let itemType = item["type"] as? String ?? "tool"
+            let normalizedName = normalizedItemType(itemType)
             if normalizedName == "agentmessage" {
                 let text = string(in: item, paths: [["text"], ["content"]]) ?? ""
                 if let itemID = item["id"] as? String, !itemID.isEmpty {
@@ -807,7 +807,14 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
                 return ([.assistantFinal(text)], false)
             }
             guard visibleToolItemTypes.contains(normalizedName) else { return ([], false) }
-            return ([.toolCompleted(providerToolID: item["id"] as? String ?? "tool", name: name, output: string(in: item, paths: [["output"], ["aggregatedOutput"]]), failed: false)], false)
+            let name = canonicalToolName(item: item, itemType: itemType)
+            let status = toolCompletionStatus(item: item, normalizedItemType: normalizedName)
+            return ([.toolCompleted(
+                providerToolID: item["id"] as? String ?? "tool",
+                name: name,
+                output: toolResult(item: item, name: name, status: status),
+                status: status
+            )], false)
         case "turn/completed", "codex/event/turn_completed":
             return ([], true)
         case "thread/status/changed":
@@ -840,7 +847,225 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
         "mcptoolcall",
         "dynamictoolcall",
         "filechange",
+        "functioncall",
+        "toolcall",
+        "websearch",
     ]
+
+    /// Keep the server projection on the same provider vocabulary as Desktop.
+    /// The browser is a viewer of this canonical name, not a second Codex parser.
+    private nonisolated static func canonicalToolName(item: [String: Any], itemType: String) -> String {
+        let explicit = string(in: item, paths: [
+            ["name"], ["toolName"], ["tool_name"], ["functionName"], ["function_name"], ["callName"], ["call_name"], ["tool"],
+        ])?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw = explicit?.lowercased() ?? ""
+        let suffix = raw.split(separator: ".").last.map(String.init) ?? raw
+        if ["local_shell", "shell", "unified_exec", "exec_command", "run_shell_command"].contains(suffix) {
+            return "bash"
+        }
+        if ["search", "web_search", "web_search_request", "google_web_search", "search_web", "websearch"].contains(suffix) {
+            return "search"
+        }
+        if ["webfetch", "web_fetch", "web_read", "read_web", "browser.open", "browser_open", "open_url", "read_url", "fetch_url", "web_page", "webpage", "read_web_page"].contains(raw) {
+            return "web_read"
+        }
+        if let explicit, !explicit.isEmpty { return explicit }
+
+        let normalizedType = normalizedItemType(itemType)
+        if normalizedType.contains("command") || normalizedType.contains("exec") || normalizedType.contains("shell") {
+            return "bash"
+        }
+        if normalizedType.contains("filechange") { return "apply_patch" }
+        if normalizedType.contains("search") { return "search" }
+        if normalizedType.contains("mcp") { return "MCP tool" }
+        return itemType
+    }
+
+    private nonisolated static func toolArguments(item: [String: Any], name: String) -> Data? {
+        for key in ["arguments", "args", "input", "parameters", "params"] {
+            if let value = item[key], let data = encodedJSON(value) { return data }
+        }
+        if name == "search" || name == "web_read" {
+            let payload = compactWebPayload(item, includeResultMetadata: false)
+            return payload.isEmpty ? nil : encodedJSON(payload)
+        }
+
+        var payload: [String: Any] = [:]
+        copyString(item, from: ["command", "cmd"], to: "command", into: &payload)
+        copyString(item, from: ["cwd"], to: "cwd", into: &payload)
+        copyString(item, from: ["processId", "process_id"], to: "processId", into: &payload)
+        return payload.isEmpty ? nil : encodedJSON(payload)
+    }
+
+    private nonisolated static func toolResult(
+        item: [String: Any],
+        name: String,
+        status: AgentPresentationToolStatus
+    ) -> String? {
+        if name == "bash" {
+            let wireStatus: String = switch status {
+            case .failed: "failed"
+            case .cancelled: "cancelled"
+            case .warning, .unknown: "unknown"
+            default: "completed"
+            }
+            var payload: [String: Any] = [
+                "type": "commandExecution",
+                "status": wireStatus,
+            ]
+            copyString(item, from: ["id"], to: "id", into: &payload)
+            copyString(item, from: ["command", "cmd"], to: "command", into: &payload)
+            copyString(item, from: ["cwd"], to: "cwd", into: &payload)
+            copyString(item, from: ["processId", "process_id"], to: "processId", into: &payload)
+            copyString(item, from: ["source"], to: "source", into: &payload)
+            if let exitCode = intValue(item["exitCode"]) ?? intValue(item["exit_code"]) ?? intValue(item["code"]), exitCode >= 0 {
+                payload["exitCode"] = exitCode
+            }
+            if let duration = intValue(item["durationMs"]) ?? intValue(item["duration_ms"]), duration >= 0 {
+                payload["durationMs"] = duration
+            }
+            copyString(item, from: ["aggregatedOutput", "aggregated_output", "formattedOutput", "formatted_output", "output", "stdout", "stderr", "text", "message"], to: "aggregatedOutput", into: &payload)
+            if let error = item["error"] { payload["error"] = error }
+            return encodedJSONString(payload)
+        }
+        if name == "search" || name == "web_read" {
+            let payload = compactWebPayload(item, includeResultMetadata: true)
+            return payload.isEmpty ? nil : encodedJSONString(payload)
+        }
+        for key in ["result", "output", "response", "content"] {
+            guard let value = item[key] else { continue }
+            if let value = value as? String, !value.isEmpty { return value }
+            if let encoded = encodedJSONString(value) { return encoded }
+        }
+        if let error = item["error"] { return encodedJSONString(error) }
+        return encodedJSONString(item)
+    }
+
+    private nonisolated static func toolCompletionStatus(
+        item: [String: Any],
+        normalizedItemType: String
+    ) -> AgentPresentationToolStatus {
+        if let exitCode = intValue(item["exitCode"]) ?? intValue(item["exit_code"]) ?? intValue(item["code"]), exitCode >= 0 {
+            return exitCode == 0 ? .success : .failed
+        }
+        if boolValue(item["isError"]) == true || boolValue(item["is_error"]) == true || hasNonEmptyErrorSignal(item) {
+            return .failed
+        }
+        let rawStatus = string(in: item, paths: [["status"]])?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        switch rawStatus {
+        case "failed", "failure", "error", "declined": return .failed
+        case "cancelled", "canceled": return .cancelled
+        case "ok", "success", "succeeded", "complete", "completed": return .success
+        default: break
+        }
+
+        if normalizedItemType == "commandexecution" {
+            let source = string(in: item, paths: [["source"]])?.lowercased() ?? ""
+            let output = string(in: item, paths: [["aggregatedOutput"], ["aggregated_output"], ["output"], ["stderr"], ["message"]]) ?? ""
+            if source.contains("startup"), !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return .failed
+            }
+            // A completed notification carrying a still-running payload has no
+            // trustworthy terminal result. Preserve that uncertainty instead of
+            // manufacturing the green success state the browser previously showed.
+            return .warning
+        }
+        return .success
+    }
+
+    private nonisolated static func compactWebPayload(
+        _ item: [String: Any],
+        includeResultMetadata: Bool
+    ) -> [String: Any] {
+        var payload: [String: Any] = [:]
+        let action = item["action"] as? [String: Any]
+        let sources = [item, action].compactMap { $0 }
+        for source in sources {
+            copyString(source, from: ["query", "q", "searchQuery", "search_query"], to: "query", into: &payload)
+            copyString(source, from: ["url", "uri", "href", "link", "pageUrl", "page_url"], to: "url", into: &payload)
+            copyString(source, from: ["refId", "ref_id", "ref"], to: "refId", into: &payload)
+            copyString(source, from: ["pattern", "needle", "find", "findText", "find_text", "phrase"], to: "pattern", into: &payload)
+            if payload["queries"] == nil, let queries = source["queries"] as? [String] {
+                payload["queries"] = Array(queries.prefix(10)).map { compactWebText($0) }
+            }
+        }
+        let actionType = string(in: action ?? [:], paths: [["type"], ["actionType"], ["action_type"]])
+            ?? (item["action"] as? String)
+        if let actionType {
+            payload["action"] = canonicalWebAction(actionType)
+        }
+        if includeResultMetadata {
+            for key in ["status", "title", "summary", "description", "resultCount", "result_count", "sourceCount", "source_count", "citationCount", "citation_count"] {
+                if let value = item[key], value is String || value is NSNumber { payload[key] = value }
+            }
+            if let error = item["error"] { payload["error"] = error }
+        }
+        return payload
+    }
+
+    private nonisolated static func canonicalWebAction(_ raw: String) -> String {
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "openpage", "open_page": "open_page"
+        case "findinpage", "find_in_page": "find_in_page"
+        case "search": "search"
+        default: raw
+        }
+    }
+
+    private nonisolated static func compactWebText(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.count <= 500 ? trimmed : String(trimmed.prefix(499)) + "…"
+    }
+
+    private nonisolated static func copyString(
+        _ source: [String: Any],
+        from keys: [String],
+        to target: String,
+        into payload: inout [String: Any]
+    ) {
+        guard payload[target] == nil else { return }
+        for key in keys {
+            guard let value = source[key] as? String else { continue }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            payload[target] = target == "aggregatedOutput" ? value : compactWebText(value)
+            return
+        }
+    }
+
+    private nonisolated static func encodedJSON(_ value: Any) -> Data? {
+        guard JSONSerialization.isValidJSONObject(value) else { return nil }
+        return try? JSONSerialization.data(withJSONObject: value)
+    }
+
+    private nonisolated static func encodedJSONString(_ value: Any) -> String? {
+        encodedJSON(value).flatMap { String(data: $0, encoding: .utf8) }
+    }
+
+    private nonisolated static func intValue(_ value: Any?) -> Int? {
+        if let value = value as? Int { return value }
+        if let value = value as? NSNumber { return value.intValue }
+        if let value = value as? String { return Int(value) }
+        return nil
+    }
+
+    private nonisolated static func boolValue(_ value: Any?) -> Bool? {
+        if let value = value as? Bool { return value }
+        if let value = value as? NSNumber { return value.boolValue }
+        return nil
+    }
+
+    private nonisolated static func hasNonEmptyErrorSignal(_ item: [String: Any]) -> Bool {
+        for key in ["error", "errors", "errorMessage", "error_message"] {
+            guard let value = item[key] else { continue }
+            if let value = value as? String, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+            if let value = value as? [Any], !value.isEmpty { return true }
+            if let value = value as? [String: Any], !value.isEmpty { return true }
+        }
+        return false
+    }
 
     private nonisolated static func normalizedItemType(_ value: String) -> String {
         value
@@ -1099,7 +1324,7 @@ private actor ACPProviderRuntime: AgentProviderRuntime {
             let status = update["status"] as? String ?? ""
             let output = CodexAppServerProviderRuntime.string(in: update, paths: [["content", "text"], ["output"]])
             if ["completed", "failed"].contains(status) {
-                return [.toolCompleted(providerToolID: id, name: update["title"] as? String ?? "tool", output: output, failed: status == "failed")]
+                return [.toolCompleted(providerToolID: id, name: update["title"] as? String ?? "tool", output: output, status: status == "failed" ? .failed : .success)]
             }
             return [.toolUpdated(providerToolID: id, output: output ?? status)]
         default:
@@ -1301,7 +1526,7 @@ private actor NormalizedHeadlessProviderRuntime: AgentProviderRuntime {
             case "reasoning": await onEvent(.reasoning(frame["content"] as? String ?? ""))
             case "progress", "system": await onEvent(.progress(frame["message"] as? String ?? ""))
             case "toolCall": await onEvent(.toolStarted(providerToolID: frame["id"] as? String ?? UUID().uuidString, name: frame["name"] as? String ?? "tool", arguments: try? JSONSerialization.data(withJSONObject: frame["args"] ?? [:])))
-            case "toolResult": await onEvent(.toolCompleted(providerToolID: frame["id"] as? String ?? "tool", name: frame["name"] as? String ?? "tool", output: frame["result"] as? String, failed: frame["failed"] as? Bool ?? false))
+            case "toolResult": await onEvent(.toolCompleted(providerToolID: frame["id"] as? String ?? "tool", name: frame["name"] as? String ?? "tool", output: frame["result"] as? String, status: frame["failed"] as? Bool == true ? .failed : .success))
             case "interaction": await onEvent(.interactionRequested(providerRequestID: frame["requestID"] as? String ?? UUID().uuidString, kind: (frame["kind"] as? String) == "question" ? .question : .approval, prompt: frame["prompt"] as? String ?? "Provider input required", choices: frame["choices"] as? [String] ?? []))
             case "completion": identity = frame["providerSessionID"] as? String ?? identity
                 await onEvent(.completed(providerSessionID: identity))

@@ -786,6 +786,74 @@ final class AgentTranscriptPresentationTests: XCTestCase {
         try await store.close()
     }
 
+    func testResolvedProviderApprovalRemainsAttachedToItsTurnAsReadOnlyHistory() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let service = AgentTranscriptPresentationService(store: store)
+        let sessionID = UUID()
+        let runID = UUID()
+        let now = Date(timeIntervalSince1970: 1_786_400_000)
+        let configuration = testConfiguration(at: now)
+        let identity = CanonicalTurnIdentity(
+            requestAnchorID: UUID(),
+            runID: runID,
+            generation: 1,
+            turnEpoch: 1,
+            turnID: UUID(),
+            responseSpanID: UUID()
+        )
+        let turn = CanonicalUserTurn(
+            identity: identity,
+            text: "Run a read-only command",
+            suggestionTokens: [],
+            taggedFiles: [],
+            attachments: [],
+            effectiveConfiguration: configuration
+        )
+        try await store.upsertSemanticTurn(.init(
+            sessionID: sessionID,
+            identity: identity,
+            firstSequence: 1,
+            lastSequence: 1,
+            canonicalUserTurnJSON: JSONEncoder.serviceEncoder.encode(turn),
+            effectiveConfiguration: configuration,
+            createdAt: now,
+            acceptedAt: now
+        ))
+        let payload = try JSONEncoder.serviceEncoder.encode(ProviderInteractionPayload(
+            providerRequestID: "provider-request-1",
+            prompt: "Allow the read-only command?",
+            choices: ["accept", "decline"],
+            resolution: "accept"
+        ))
+        let interaction = InteractionSnapshot(
+            interactionID: UUID(),
+            runID: runID,
+            kind: .approval,
+            state: .resolved,
+            payload: payload,
+            revision: 3,
+            expiresAt: nil
+        )
+
+        let page = try await service.page(
+            sessionID: sessionID,
+            actorID: "controller",
+            legacyTranscript: [],
+            interactions: [interaction],
+            mutableInteractions: true
+        )
+
+        XCTAssertTrue(page.pendingInteractions.isEmpty)
+        let presented = try XCTUnwrap(page.turns.first?.interactions.first)
+        XCTAssertEqual(presented.state, "resolved")
+        XCTAssertEqual(presented.prompt, "Allow the read-only command?")
+        XCTAssertEqual(presented.resolution, "accept")
+        XCTAssertFalse(presented.mutable)
+        XCTAssertFalse(presented.liveTail)
+        XCTAssertFalse(presented.requiresAttention)
+        try await store.close()
+    }
+
     func testLegacyRollbackGapIsDetectedWithoutInventingSemanticTurns() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let service = AgentTranscriptPresentationService(store: store)

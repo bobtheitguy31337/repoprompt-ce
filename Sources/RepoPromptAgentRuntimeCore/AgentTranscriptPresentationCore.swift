@@ -133,7 +133,20 @@ public enum AgentTranscriptPresentationCore {
 
     public static func normalizedToolName(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let aliases = ["shell": "Bash", "bash": "Bash", "exec_command": "Command", "read_file": "Read file", "apply_patch": "Edit", "web_search": "Web search"]
+        let aliases = [
+            "shell": "Bash",
+            "bash": "Bash",
+            "commandexecution": "Bash",
+            "exec_command": "Command",
+            "read_file": "Read file",
+            "apply_patch": "Edit",
+            "filechange": "Edit",
+            "search": "Web search",
+            "web_search": "Web search",
+            "websearch": "Web search",
+            "web_read": "Read web page",
+            "mcptoolcall": "MCP tool",
+        ]
         return aliases[trimmed.lowercased()] ?? (trimmed.isEmpty ? "Tool" : trimmed)
     }
 

@@ -655,6 +655,63 @@ final class ProviderSupervisorTests: XCTestCase {
         XCTAssertTrue(interruptedLog.contains(#"turn\/interrupt"#), interruptedLog)
     }
 
+    func testNativeCodexProjectsDesktopToolNamesWebActionsAndHonestTerminalStates() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let executable = directory.appendingPathComponent("codex")
+        try Data(Self.toolLifecycleCodexScript().utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let adapter = try ProviderCLIAdapter(
+            configurations: [.init(kind: .codex, executable: executable.path)],
+            processPort: PortableProcessSupervisionPort(),
+            outputDirectory: directory.appendingPathComponent("output").path,
+            ephemeralHomeRoot: directory.appendingPathComponent("homes").path
+        )
+        let events = ProviderEventRecorder()
+
+        let result = try await adapter.executeStreaming(.init(
+            kind: .codex,
+            model: nil,
+            prompt: "show tool activity",
+            workingDirectory: directory.path,
+            runID: UUID()
+        )) { event in
+            await events.record(event)
+        }
+
+        XCTAssertEqual(result.output, "done")
+        let observed = await events.values()
+        var commandStarted = false
+        var commandFailed = false
+        var uncertainCommandWarned = false
+        var webStarted = false
+        var webCompleted = false
+        for event in observed {
+            switch event {
+            case let .toolStarted(providerToolID, name, arguments) where providerToolID == "command-startup":
+                commandStarted = name == "bash" && String(decoding: arguments ?? Data(), as: UTF8.self).contains(#""command":"pwd""#)
+            case let .toolCompleted(providerToolID, name, output, status) where providerToolID == "command-startup":
+                commandFailed = name == "bash" && status == .failed && output?.contains(#""status":"failed""#) == true
+            case let .toolCompleted(providerToolID, name, _, status) where providerToolID == "command-unknown":
+                uncertainCommandWarned = name == "bash" && status == .warning
+            case let .toolStarted(providerToolID, name, arguments) where providerToolID == "web-open":
+                let payload = arguments.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: String] }
+                webStarted = name == "search" && payload?["action"] == "open_page" && payload?["url"] == "https://example.com"
+            case let .toolCompleted(providerToolID, name, output, status) where providerToolID == "web-open":
+                let payload = output.flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: String] }
+                webCompleted = name == "search" && status == .success && payload?["action"] == "open_page"
+            default:
+                break
+            }
+        }
+        XCTAssertTrue(commandStarted)
+        XCTAssertTrue(commandFailed)
+        XCTAssertTrue(uncertainCommandWarned)
+        XCTAssertTrue(webStarted)
+        XCTAssertTrue(webCompleted)
+    }
+
     func testNativeACPResumeSteerAndApprovalFenceTheLatestPrompt() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -820,6 +877,28 @@ final class ProviderSupervisorTests: XCTestCase {
               printf '{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"message-1","type":"agentMessage","text":"%s"}}}\n' "\(finalTextShell)"
               echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"turn-1"}}}'
               ;;
+          esac
+        done
+        """
+    }
+
+    private static func toolLifecycleCodexScript() -> String {
+        """
+        #!/bin/sh
+        while IFS= read -r line; do
+          case "$line" in
+            *'"method":"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+            *method*thread*start*) echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"tool-thread"}}}' ;;
+            *method*turn*start*)
+              echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"tool-turn"}}}'
+              echo '{"jsonrpc":"2.0","method":"item/started","params":{"item":{"id":"command-startup","type":"commandExecution","command":"pwd","status":"inProgress","source":"unifiedExecStartup"}}}'
+              echo '{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"command-startup","type":"commandExecution","command":"pwd","status":"inProgress","source":"unifiedExecStartup","aggregatedOutput":"bwrap: No permissions to create a new namespace"}}}'
+              echo '{"jsonrpc":"2.0","method":"item/started","params":{"item":{"id":"command-unknown","type":"commandExecution","command":"printf ok","status":"inProgress","source":"agent"}}}'
+              echo '{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"command-unknown","type":"commandExecution","command":"printf ok","status":"inProgress","source":"agent","aggregatedOutput":"ok"}}}'
+              echo '{"jsonrpc":"2.0","method":"item/started","params":{"item":{"id":"web-open","type":"webSearch","action":{"type":"openPage","url":"https://example.com"}}}}'
+              echo '{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"web-open","type":"webSearch","status":"completed","action":{"type":"openPage","url":"https://example.com"},"title":"Example Domain"}}}'
+              echo '{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"message-1","type":"agentMessage","text":"done"}}}'
+              echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"tool-turn"}}}' ;;
           esac
         done
         """
