@@ -87,7 +87,7 @@ public actor AgentTranscriptPresentationService {
                 )
             }
             let attachedInteractions = interactions.compactMap { interaction -> AgentPresentationInteractionWire? in
-                guard interaction.runID == record.identity.runID else { return nil }
+                guard interaction.runID == record.identity.runID, Self.isActionable(interaction) else { return nil }
                 return Self.interactionWire(interaction, turnID: record.identity.turnID.uuidString.lowercased(), mutable: mutableInteractions)
             }
             let projected = AgentTranscriptPresentationCore.project(.init(
@@ -122,8 +122,12 @@ public actor AgentTranscriptPresentationService {
         }
         let revision = watermark?.presentationRevision ?? 0
         let cursorSeed = "\(sessionID.uuidString.lowercased()):\(revision):\(legacyTranscript.last?.sessionSequence ?? 0)"
-        let pending = interactions.filter { $0.state == .pending || $0.state == .deliveryIntent }.map { Self.interactionWire($0, turnID: "live-tail", mutable: mutableInteractions) }
+        let pending = interactions.filter(Self.isActionable).map { Self.interactionWire($0, turnID: "live-tail", mutable: mutableInteractions) }
         return .init(presentationRevision: revision, presentationCursor: CanonicalSigning.bodyDigest(Data(cursorSeed.utf8)), turns: units.map(\.turn), nextPageToken: next, pendingInteractions: pending)
+    }
+
+    nonisolated static func isActionable(_ interaction: InteractionSnapshot) -> Bool {
+        interaction.state == .pending || interaction.state == .deliveryIntent
     }
 
     private static func reconstructedLegacyUnits(_ transcript: [TranscriptEntry]) -> [PresentationUnit] {
@@ -231,12 +235,19 @@ public actor AgentTranscriptPresentationService {
         let binding = "\(actorID)\u{0}\(sessionID.uuidString.lowercased())\u{0}\(beforeSequence)"
         let token = PageToken(actorID: actorID, sessionID: sessionID, beforeSequence: beforeSequence, digest: CanonicalSigning.bodyDigest(Data(binding.utf8)))
         return try JSONEncoder.serviceEncoder.encode(token).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "="))
     }
 
     private func decodePageToken(_ value: String?, actorID: String, sessionID: UUID) throws -> Int64? {
         guard let value else { return nil }
+        var standardBase64 = value
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        standardBase64 += String(repeating: "=", count: (4 - standardBase64.count % 4) % 4)
         guard value.utf8.count <= 2048,
-              let data = Data(base64Encoded: value),
+              let data = Data(base64Encoded: standardBase64),
               let token = try? JSONDecoder.serviceDecoder.decode(PageToken.self, from: data),
               token.actorID == actorID,
               token.sessionID == sessionID

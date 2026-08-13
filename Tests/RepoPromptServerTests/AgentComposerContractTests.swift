@@ -529,6 +529,18 @@ final class SQLiteServiceStoreV6CompatibilityTests: XCTestCase {
 }
 
 final class AgentTranscriptPresentationTests: XCTestCase {
+    func testOnlyPendingInteractionStatesRemainActionableInPresentation() {
+        let runID = UUID()
+        func interaction(_ state: InteractionSnapshot.State) -> InteractionSnapshot {
+            .init(interactionID: UUID(), runID: runID, kind: .approval, state: state, payload: Data(), revision: 1, expiresAt: nil)
+        }
+        XCTAssertTrue(AgentTranscriptPresentationService.isActionable(interaction(.pending)))
+        XCTAssertTrue(AgentTranscriptPresentationService.isActionable(interaction(.deliveryIntent)))
+        XCTAssertFalse(AgentTranscriptPresentationService.isActionable(interaction(.resolved)))
+        XCTAssertFalse(AgentTranscriptPresentationService.isActionable(interaction(.expired)))
+        XCTAssertFalse(AgentTranscriptPresentationService.isActionable(interaction(.interrupted)))
+    }
+
     func testSuppressesExactTurnStartedAndClustersMeaningfulActivity() {
         let turnStarted = TranscriptEntry(entryID: UUID(), sessionSequence: 1, kind: .progress, content: "Turn started.", actor: nil, timestamp: Date())
         XCTAssertNil(AgentTranscriptPresentationCore.projectLegacy(turnStarted))
@@ -601,6 +613,7 @@ final class AgentTranscriptPresentationTests: XCTestCase {
         let newest = try await service.page(sessionID: sessionID, actorID: "actor", legacyTranscript: legacy, limit: 2)
         XCTAssertEqual(newest.turns.compactMap(Self.requestText), ["request 2", "request 3"])
         let token = try XCTUnwrap(newest.nextPageToken)
+        XCTAssertNotNil(token.range(of: #"^[A-Za-z0-9_-]+$"#, options: .regularExpression))
         let earlier = try await service.page(sessionID: sessionID, actorID: "actor", legacyTranscript: legacy, pageToken: token, limit: 2)
         XCTAssertEqual(earlier.turns.compactMap(Self.requestText), ["request 1"])
         XCTAssertNil(earlier.nextPageToken)

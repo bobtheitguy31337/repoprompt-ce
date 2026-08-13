@@ -271,7 +271,8 @@ final class AuthorityTests: XCTestCase {
     }
 
     func testProviderEventsAndInteractionDeliveryUseDurableAuthority() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+            .appendingPathComponent(".build/authority-tests/\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try await SQLiteServiceStore.open(storage: .memory)
@@ -292,6 +293,10 @@ final class AuthorityTests: XCTestCase {
         let pending = try XCTUnwrap(interaction)
         let answer = try JSONSerialization.data(withJSONObject: ["decision": "accept"])
         _ = try await authority.answerInteraction(sessionID: session.sessionID, interactionID: pending.interactionID, expectedRevision: pending.revision, payload: answer, actor: actor, idempotencyKey: "answer-events", requestDigest: "answer-events")
+        let resumedPresentation = try await store.runPresentation(sessionID: session.sessionID)
+        XCTAssertEqual(resumedPresentation?.phase, .working)
+        XCTAssertEqual(resumedPresentation?.runningStatusCode, "interaction_resolved")
+        await runtime.allowCompletion()
 
         var completed = try await authority.sessionSnapshot(sessionID: session.sessionID)
         for _ in 0 ..< 100 where completed.state != .completed {
@@ -872,6 +877,7 @@ private actor InteractiveEventProviderRuntime: AgentProviderRuntime {
     private var activeRunID: UUID?
     private var deliveredID: String?
     private var answered = false
+    private var canFinish = false
 
     func capability() -> ProviderCapability {
         .init(kind: kind, enabled: true, executable: "/test/codex", supportsResume: true, supportsSteering: true, protocolVersion: "app-server-v2")
@@ -889,6 +895,10 @@ private actor InteractiveEventProviderRuntime: AgentProviderRuntime {
         deliveredID
     }
 
+    func allowCompletion() {
+        canFinish = true
+    }
+
     func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
         activeRunID = request.runID
         defer { activeRunID = nil }
@@ -900,6 +910,9 @@ private actor InteractiveEventProviderRuntime: AgentProviderRuntime {
         await onEvent(.toolCompleted(providerToolID: "tool-1", name: "read_file", output: "done", failed: false))
         await onEvent(.interactionRequested(providerRequestID: "approval-1", kind: .approval, prompt: "Approve tool", choices: ["accept", "decline"]))
         while !answered {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        while !canFinish {
             try await Task.sleep(for: .milliseconds(5))
         }
         await onEvent(.assistantFinal("finished"))

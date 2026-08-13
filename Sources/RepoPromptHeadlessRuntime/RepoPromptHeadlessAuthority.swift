@@ -2098,6 +2098,9 @@ public actor RepoPromptHeadlessAuthority {
         let resolved = InteractionSnapshot(interactionID: current.interactionID, runID: current.runID, agentID: current.agentID, kind: current.kind, state: .resolved, payload: current.payload, revision: intent.revision + 1, expiresAt: current.expiresAt)
         let event = try await store.persistInteraction(resolved, session: session, actor: actor, correlationID: ids.next(), idempotency: idempotency)
         await eventHub.publish(event)
+        if let runID = resolved.runID {
+            try? await transitionRunPresentation(sessionID: sessionID, runID: runID, phase: .working, statusCode: "interaction_resolved")
+        }
         return resolved
     }
 
