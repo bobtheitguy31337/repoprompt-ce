@@ -625,9 +625,12 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
            let names = try? JSONDecoder().decode([String].self, from: data)
         {
             for configuredName in names {
-                let name = configuredName == "repoprompt" ? "RepoPromptCE" : configuredName
-                guard name.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-")).contains($0) }) else { continue }
-                config["mcp_servers.\(name).enabled"] = true
+                // The Linux service's isolated Codex home is auth-only. Until a server-owned
+                // RepoPrompt MCP transport is provisioned there, emitting either the stable
+                // portal ID or native display name makes Codex reject thread/start outright.
+                guard configuredName != "repoprompt", configuredName != "RepoPromptCE" else { continue }
+                guard configuredName.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-")).contains($0) }) else { continue }
+                config["mcp_servers.\(configuredName).enabled"] = true
             }
         }
         return config
@@ -674,6 +677,10 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             let item = params["item"] as? [String: Any] ?? params
             let id = item["id"] as? String ?? UUID().uuidString
             let name = item["type"] as? String ?? "tool"
+            if name == "userMessage" || name == "user_message" { return ([], false) }
+            if name == "agentMessage" || name == "agent_message" {
+                return ([.runStatusChanged(phase: .working, statusCode: "provider_responding", statusText: nil)], false)
+            }
             let arguments = try? JSONSerialization.data(withJSONObject: item)
             return ([.toolStarted(providerToolID: id, name: name, arguments: arguments)], false)
         case "item/commandExecution/outputDelta", "item/mcpToolCall/progress", "item/fileChange/outputDelta":
@@ -684,9 +691,14 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             if item["type"] as? String == "agentMessage" || item["type"] as? String == "agent_message" {
                 return ([.assistantFinal(string(in: item, paths: [["text"], ["content"]]) ?? "")], false)
             }
+            if item["type"] as? String == "userMessage" || item["type"] as? String == "user_message" {
+                return ([], false)
+            }
             return ([.toolCompleted(providerToolID: item["id"] as? String ?? "tool", name: item["type"] as? String ?? "tool", output: string(in: item, paths: [["output"], ["aggregatedOutput"]]), failed: false)], false)
         case "turn/completed", "codex/event/turn_completed":
             return ([], true)
+        case "thread/status/changed":
+            return ([], string(in: params, paths: [["status", "type"], ["status"]]) == "idle")
         default:
             return ([], false)
         }

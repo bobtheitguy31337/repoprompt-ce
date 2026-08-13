@@ -174,16 +174,12 @@ public struct CodexTurnConfigurationAdapter: ProviderTurnConfigurationAdapter {
         }
         var settings = try normalizedValues(input.toolValues)
         settings["codex.mcpServers"] = .choices(requiredRepoPromptMCP(from: settings["codex.mcpServers"]))
-        let mcpServers = requiredRepoPromptMCP(from: settings["codex.mcpServers"])
-        let nativeMCPServers = mcpServers.map { $0 == "repoprompt" ? "RepoPromptCE" : $0 }
-        let encodedMCPServers = String(decoding: (try? JSONEncoder().encode(nativeMCPServers)) ?? Data("[\"RepoPromptCE\"]".utf8), as: UTF8.self)
         var native: [String: String] = [
             "codex.bashEnabled": String(ProviderComposerStableControls.boolean(settings["codex.bash"], fallback: true)),
             "codex.searchEnabled": String(ProviderComposerStableControls.boolean(settings["codex.search"], fallback: true)),
             "codex.goalsEnabled": String(ProviderComposerStableControls.boolean(settings["codex.goals"], fallback: true)),
             "codex.reasoningSummariesEnabled": String(ProviderComposerStableControls.boolean(settings["codex.reasoningSummaries"], fallback: false)),
             "codex.memoriesEnabled": String(ProviderComposerStableControls.boolean(settings["codex.memories"], fallback: false)),
-            "codex.enabledMCPServers": encodedMCPServers,
             "provider.permissionId": permission
         ]
         if let effort { native["provider.reasoningEffort"] = effort }

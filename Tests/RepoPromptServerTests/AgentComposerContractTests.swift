@@ -200,7 +200,7 @@ final class AgentComposerCatalogTests: XCTestCase {
         let compiled = try adapter.compile(.init(providerID: .codex, model: model, effortID: "high", permissionID: "codex.defaultPermission", toolValues: ["codex.mcpServers": .choices([])]))
         XCTAssertEqual(compiled.providerRawModelValue, "gpt-5.6-sol")
         XCTAssertEqual(compiled.executionPolicy.providerSettings["provider.serviceTier"], "fast")
-        XCTAssertEqual(compiled.executionPolicy.providerSettings["codex.enabledMCPServers"], "[\"RepoPromptCE\"]")
+        XCTAssertNil(compiled.executionPolicy.providerSettings["codex.enabledMCPServers"])
         XCTAssertEqual(compiled.normalizedToolValues["codex.mcpServers"], .choices(["repoprompt"]))
         XCTAssertThrowsError(try adapter.compile(.init(providerID: .codex, model: model, toolValues: ["codex.unknown": .boolean(true)])))
     }
@@ -619,12 +619,13 @@ final class AgentTranscriptPresentationTests: XCTestCase {
 }
 
 final class NativeProviderRuntimeLifecycleTests: XCTestCase {
-    func testCodexConfigMapsStableRepoPromptChoiceToNativeMCPName() {
+    func testCodexConfigDoesNotEnableUnprovisionedRepoPromptTransport() {
         let config = CodexAppServerProviderRuntime.codexConfig([
-            "codex.enabledMCPServers": "[\"repoprompt\"]"
+            "codex.enabledMCPServers": "[\"repoprompt\",\"RepoPromptCE\",\"external-tools\"]"
         ])
-        XCTAssertEqual(config["mcp_servers.RepoPromptCE.enabled"] as? Bool, true)
         XCTAssertNil(config["mcp_servers.repoprompt.enabled"])
+        XCTAssertNil(config["mcp_servers.RepoPromptCE.enabled"])
+        XCTAssertEqual(config["mcp_servers.external-tools.enabled"] as? Bool, true)
     }
 
     func testCodexTurnStartedIsLifecycleOnlyAndPhaseRevisionAdvances() throws {
@@ -639,6 +640,27 @@ final class NativeProviderRuntimeLifecycleTests: XCTestCase {
         let thinking = try preparing.transitioning(to: .thinking, statusCode: code)
         XCTAssertEqual(thinking.phaseRevision, 2)
         XCTAssertEqual(thinking.phase, .thinking)
+    }
+
+    func testCodexMessageItemsDriveWorkingWithoutFakeToolRowsAndIdleCompletes() throws {
+        let userStarted = try CodexAppServerProviderRuntime.normalize(Data(#"{"method":"item/started","params":{"item":{"id":"user-1","type":"userMessage"}}}"#.utf8))
+        XCTAssertTrue(userStarted.events.isEmpty)
+        XCTAssertFalse(userStarted.completed)
+
+        let assistantStarted = try CodexAppServerProviderRuntime.normalize(Data(#"{"method":"item/started","params":{"item":{"id":"assistant-1","type":"agentMessage"}}}"#.utf8))
+        XCTAssertEqual(assistantStarted.events.count, 1)
+        guard case let .runStatusChanged(phase, code, _) = assistantStarted.events[0] else { return XCTFail("agent message start must advance lifecycle") }
+        XCTAssertEqual(phase, .working)
+        XCTAssertEqual(code, "provider_responding")
+
+        let assistantCompleted = try CodexAppServerProviderRuntime.normalize(Data(#"{"method":"item/completed","params":{"item":{"id":"assistant-1","type":"agentMessage","text":"one coherent response"}}}"#.utf8))
+        XCTAssertEqual(assistantCompleted.events.count, 1)
+        guard case let .assistantFinal(text) = assistantCompleted.events[0] else { return XCTFail("agent message completion must be a final response") }
+        XCTAssertEqual(text, "one coherent response")
+
+        let idle = try CodexAppServerProviderRuntime.normalize(Data(#"{"method":"thread/status/changed","params":{"status":{"type":"idle"}}}"#.utf8))
+        XCTAssertTrue(idle.events.isEmpty)
+        XCTAssertTrue(idle.completed)
     }
 
     func testReconnectReadsEveryDurablePhaseAndTerminalSettlement() async throws {
