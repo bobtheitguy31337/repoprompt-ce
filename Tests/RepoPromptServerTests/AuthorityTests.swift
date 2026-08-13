@@ -270,7 +270,7 @@ final class AuthorityTests: XCTestCase {
         try await store.close()
     }
 
-    func testAutomaticFollowupResumesDurableProviderIdentity() async throws {
+    func testAcceptedFollowupStartsInFreshTurnScopedProviderHome() async throws {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
             .appendingPathComponent(".build/authority-tests/\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -308,7 +308,7 @@ final class AuthorityTests: XCTestCase {
         }
 
         let resumeIdentities = await runtime.resumeIdentities()
-        XCTAssertEqual(resumeIdentities, [nil, "durable-thread"])
+        XCTAssertEqual(resumeIdentities, [nil, nil])
         try await authority.quiesce()
         try await store.close()
     }

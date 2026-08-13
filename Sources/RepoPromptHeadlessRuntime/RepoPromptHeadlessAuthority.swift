@@ -1424,8 +1424,10 @@ public actor RepoPromptHeadlessAuthority {
             await eventHub.publish(event)
         }
         let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "dispatchAcceptedTurn", key: accepted.receipt.submissionID.uuidString.lowercased(), requestDigest: requestDigest)
-        let resumeMode: ProviderResumeMode = accepted.receipt.operation == "startSession" ? .fresh : .auto
-        _ = try await startProviderRun(command: .resumeSession(expectedRunID: nil, providerResumeMode: resumeMode), sessionID: sessionID, session: session, actor: actor, idempotency: idempotency, acceptedSubmission: accepted)
+        // Native provider homes are deliberately turn-scoped and removed when the
+        // subprocess exits. Starting a later process with the prior thread ID would
+        // ask it to resume state that no longer exists in that fresh home.
+        _ = try await startProviderRun(command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh), sessionID: sessionID, session: session, actor: actor, idempotency: idempotency, acceptedSubmission: accepted)
     }
 
     public func projectSnapshot(projectID: UUID) async throws -> ProjectSnapshot {
