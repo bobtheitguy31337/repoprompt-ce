@@ -397,9 +397,22 @@ final class ProviderSupervisorTests: XCTestCase {
             XCTAssertEqual(identity.sessionID, identity.pid)
             XCTAssertNotEqual(URL(fileURLWithPath: identity.executablePath).lastPathComponent, "setsid")
 
+            var providerMembers: [ProcessIdentity] = []
+            for _ in 0 ..< 20 where providerMembers.isEmpty {
+                providerMembers = try await port.descendants(of: identity.pid)
+                if providerMembers.isEmpty {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+            }
+            XCTAssertFalse(providerMembers.isEmpty)
+            XCTAssertTrue(providerMembers.allSatisfy { $0.processGroupID == identity.processGroupID })
+
             try await supervisor.cancel(runID: runID, graceScans: 1)
             let reaped = try await port.inspect(pid: identity.pid)
             XCTAssertNil(reaped)
+            for member in providerMembers {
+                XCTAssertNil(try await port.inspect(pid: member.pid))
+            }
         }
     #endif
 

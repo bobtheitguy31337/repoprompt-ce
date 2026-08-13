@@ -21,6 +21,9 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
     private var standardInputs: [Int32: FileHandle] = [:]
     private var standardInputPipes: [Int32: Pipe] = [:]
     private var cgroupPaths: [Int32: String] = [:]
+    private var wrapperPIDs: [Int32: Int32] = [:]
+    private var leaderPIDsByWrapper: [Int32: Int32] = [:]
+    private var launchControlDirectories: [Int32: String] = [:]
     private let bootID: String
     private let delegatedCgroupRoot: String?
 
@@ -269,17 +272,26 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         guard FileManager.default.isExecutableFile(atPath: executable) else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider executable is unavailable") }
         let process = Process()
         #if os(Linux)
-            if FileManager.default.isExecutableFile(atPath: "/usr/bin/setsid") {
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/setsid")
-                // `setsid` conditionally forks when its caller is already a
-                // process-group leader. Without --wait, the PID returned by
-                // Foundation can disappear while the provider child remains,
-                // invalidating the recorded family identity before controls
-                // can be delivered. Keep the wrapper as a stable leader.
-                process.arguments = ["--wait", executable] + arguments
-            } else {
+            guard FileManager.default.isExecutableFile(atPath: "/usr/bin/setsid"),
+                  FileManager.default.isExecutableFile(atPath: "/bin/sh")
+            else {
                 throw ServiceAPIError(code: .dependencyUnavailable, message: "Linux setsid executable is required for isolated provider process groups")
             }
+            let controlDirectory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("repoprompt-provider-launch", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try Self.prepareOutputDirectory(controlDirectory.path)
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = [
+                "-c",
+                Self.linuxProviderWrapperScript,
+                "repoprompt-provider-wrapper",
+                "/usr/bin/setsid",
+                "/bin/sh",
+                Self.linuxProviderAnchorScript,
+                controlDirectory.path,
+                executable,
+            ] + arguments
         #else
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = arguments
@@ -294,36 +306,160 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         process.standardInput = stdin
         process.standardOutput = stdout
         process.standardError = stderr
-        try launchValidation()
-        try process.run()
-        let pid = process.processIdentifier
-        processes[pid] = process
         let digest = CanonicalSigning.bodyDigest(Data(helperToken.utf8))
-        try attachToDelegatedCgroupIfAvailable(pid: pid, helperTokenDigest: digest)
+        do {
+            try launchValidation()
+            try process.run()
+        } catch {
+            #if os(Linux)
+                try? FileManager.default.removeItem(at: controlDirectory)
+            #endif
+            throw error
+        }
+        let pid = process.processIdentifier
         #if !os(Linux)
+            processes[pid] = process
             let observed = ProcessIdentity(pid: pid, parentPID: getpid(), processGroupID: getpgid(pid), sessionID: getsid(pid), startTimeTicks: UInt64(ProcessInfo.processInfo.systemUptime * 100), bootID: bootID, executablePath: executable, helperTokenDigest: digest)
             identities[pid] = observed
             return observed
         #else
-            for _ in 0 ..< 100 {
-                if let observed = try await inspectLinux(pid: pid, helperTokenDigest: digest),
-                   observed.processGroupID == pid,
-                   observed.sessionID == pid,
-                   URL(fileURLWithPath: observed.executablePath).lastPathComponent != "setsid"
-                {
-                    // `Process.run()` returns as soon as the setsid wrapper is
-                    // spawned. Record authority only after setsid and exec have
-                    // completed, otherwise the persisted PGID/executable can
-                    // describe the short-lived wrapper rather than the provider.
-                    identities[pid] = observed
-                    return observed
+            do {
+                let observed = try await waitForLinuxProviderAnchor(
+                    wrapperPID: pid,
+                    helperTokenDigest: digest,
+                    process: process,
+                    controlDirectory: controlDirectory.path
+                )
+                processes[observed.pid] = process
+                identities[observed.pid] = observed
+                wrapperPIDs[observed.pid] = pid
+                leaderPIDsByWrapper[pid] = observed.pid
+                launchControlDirectories[observed.pid] = controlDirectory.path
+                try attachToDelegatedCgroupIfAvailable(pid: observed.pid, helperTokenDigest: digest)
+                guard FileManager.default.createFile(
+                    atPath: controlDirectory.appendingPathComponent("release").path,
+                    contents: Data(),
+                    attributes: [.posixPermissions: 0o600]
+                ) else {
+                    throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider launch gate could not be released")
                 }
-                try await Task.sleep(for: .milliseconds(10))
+                return observed
+            } catch {
+                await cleanupFailedLinuxLaunch(
+                    process: process,
+                    wrapperPID: pid,
+                    helperTokenDigest: digest,
+                    controlDirectory: controlDirectory.path
+                )
+                throw error
             }
-            process.terminate()
-            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider process did not establish a verifiable identity")
         #endif
     }
+
+    #if os(Linux)
+        /// Foundation launches its child as a process-group leader. Invoking
+        /// `setsid --wait` directly therefore makes `setsid` fork, leaving the
+        /// Foundation-owned PID as a wrapper and the provider in an untracked
+        /// session. A stable anchor avoids that split-brain identity: the
+        /// Foundation wrapper starts an isolated shell, the shell reports its
+        /// PID before launching the provider, and the provider inherits the
+        /// anchor's session/process group and any delegated cgroup.
+        private nonisolated static let linuxProviderWrapperScript = """
+        set -eu
+        setsid_path=$1
+        shell_path=$2
+        anchor_script=$3
+        control_dir=$4
+        shift 4
+        exec 3<&0
+        "$setsid_path" "$shell_path" -c "$anchor_script" repoprompt-provider-anchor "$control_dir" "$@" <&3 &
+        anchor_pid=$!
+        wait "$anchor_pid"
+        """
+
+        private nonisolated static let linuxProviderAnchorScript = """
+        set -eu
+        control_dir=$1
+        shift
+        umask 077
+        printf '%s\n' "$$" > "$control_dir/pid"
+        attempts=0
+        while [ ! -e "$control_dir/release" ]; do
+            attempts=$((attempts + 1))
+            [ "$attempts" -lt 500 ] || exit 125
+            sleep 0.01
+        done
+        exec 3<&0
+        set +e
+        "$@" <&3 3<&- &
+        provider_pid=$!
+        wait "$provider_pid"
+        status=$?
+        exit "$status"
+        """
+
+        private func waitForLinuxProviderAnchor(
+            wrapperPID: Int32,
+            helperTokenDigest: String,
+            process: Process,
+            controlDirectory: String
+        ) async throws -> ProcessIdentity {
+            let pidPath = URL(fileURLWithPath: controlDirectory).appendingPathComponent("pid").path
+            for _ in 0 ..< 100 {
+                if let pidText = try? String(contentsOfFile: pidPath, encoding: .utf8),
+                   let anchorPID = Int32(pidText.trimmingCharacters(in: .whitespacesAndNewlines)),
+                   anchorPID > 1,
+                   let observed = try await inspectLinux(pid: anchorPID, helperTokenDigest: helperTokenDigest),
+                   observed.parentPID == wrapperPID,
+                   observed.processGroupID == anchorPID,
+                   observed.sessionID == anchorPID,
+                   URL(fileURLWithPath: observed.executablePath).lastPathComponent != "setsid"
+                {
+                    return observed
+                }
+                guard process.isRunning else { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider process did not establish a verifiable identity")
+        }
+
+        private func cleanupFailedLinuxLaunch(
+            process: Process,
+            wrapperPID: Int32,
+            helperTokenDigest: String,
+            controlDirectory: String
+        ) async {
+            let pidPath = URL(fileURLWithPath: controlDirectory).appendingPathComponent("pid").path
+            let anchorPID = (try? String(contentsOfFile: pidPath, encoding: .utf8))
+                .flatMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            if let anchorPID,
+               anchorPID > 1,
+               let observed = try? await inspectLinux(pid: anchorPID, helperTokenDigest: helperTokenDigest),
+               observed.parentPID == wrapperPID,
+               observed.processGroupID == anchorPID,
+               observed.sessionID == anchorPID
+            {
+                _ = systemKill(-anchorPID, SIGKILL)
+            }
+            if process.isRunning {
+                process.terminate()
+                for _ in 0 ..< 20 where process.isRunning {
+                    try? await Task.sleep(for: .milliseconds(10))
+                }
+            }
+            if let anchorPID {
+                processes[anchorPID] = nil
+                identities[anchorPID] = nil
+                wrapperPIDs[anchorPID] = nil
+                launchControlDirectories[anchorPID] = nil
+                if let cgroup = cgroupPaths.removeValue(forKey: anchorPID) {
+                    try? FileManager.default.removeItem(atPath: cgroup)
+                }
+            }
+            leaderPIDsByWrapper[wrapperPID] = nil
+            try? FileManager.default.removeItem(atPath: controlDirectory)
+        }
+    #endif
 
     public func inspect(pid: Int32) async throws -> ProcessIdentity? {
         try await inspectLinux(pid: pid, helperTokenDigest: identities[pid]?.helperTokenDigest ?? "")
@@ -355,9 +491,10 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
     public func descendants(of pid: Int32) async throws -> [ProcessIdentity] {
         #if os(Linux)
             guard let expectedDigest = identities[pid]?.helperTokenDigest, !expectedDigest.isEmpty else { return [] }
+            let wrapperPID = wrapperPIDs[pid]
             let proc = try FileManager.default.contentsOfDirectory(atPath: "/proc").compactMap(Int32.init)
             var result: [ProcessIdentity] = []
-            for candidate in proc where candidate != pid {
+            for candidate in proc where candidate != pid && candidate != wrapperPID {
                 if let identity = try? await inspectLinux(pid: candidate, helperTokenDigest: expectedDigest) {
                     result.append(identity)
                 }
@@ -370,6 +507,11 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
 
     public func signal(_ signal: Int32, processGroupID: Int32, verifiedMembers: [ProcessIdentity]) async throws {
         guard !verifiedMembers.isEmpty else { return }
+        #if os(Linux)
+            guard processGroupID > 1, processGroupID != getpgrp() else {
+                throw ServiceAPIError(code: .staleRevision, message: "Provider process group is not isolated from the service")
+            }
+        #endif
         for expected in verifiedMembers {
             guard try await inspect(pid: expected.pid) == expected else { throw ServiceAPIError(code: .staleRevision, message: "Process identity changed before signaling") }
         }
@@ -389,10 +531,26 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
     }
 
     public func reap(pid: Int32) async throws {
+        if let leaderPID = leaderPIDsByWrapper[pid], processes[leaderPID] != nil {
+            // Foundation owns this wrapper's wait status through the Process
+            // stored under the provider anchor. The anchor reap performs the
+            // corresponding record cleanup.
+            return
+        }
         // Foundation owns the wait status for every child launched through
         // `Process`. Reaping it with waitpid, or redundantly waiting after
         // `isRunning` observed exit, can leave another Process blocked.
-        if processes[pid] == nil {
+        if let process = processes[pid] {
+            for _ in 0 ..< 20 where process.isRunning {
+                try? await Task.sleep(for: .milliseconds(25))
+            }
+            if process.isRunning {
+                process.terminate()
+                for _ in 0 ..< 20 where process.isRunning {
+                    try? await Task.sleep(for: .milliseconds(25))
+                }
+            }
+        } else {
             var status: Int32 = 0
             _ = rp_waitpid_nohang(pid, &status)
         }
@@ -401,6 +559,12 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         try? standardInputs.removeValue(forKey: pid)?.close()
         standardInputPipes[pid] = nil
         if let cgroup = cgroupPaths.removeValue(forKey: pid) { try? FileManager.default.removeItem(atPath: cgroup) }
+        if let wrapperPID = wrapperPIDs.removeValue(forKey: pid) {
+            leaderPIDsByWrapper[wrapperPID] = nil
+        }
+        if let controlDirectory = launchControlDirectories.removeValue(forKey: pid) {
+            try? FileManager.default.removeItem(atPath: controlDirectory)
+        }
         // Never use waitpid(-1) here. This service also launches short-lived
         // Foundation `Process` commands outside this port (for example CLI
         // health probes). A wildcard wait can consume one of those commands'
