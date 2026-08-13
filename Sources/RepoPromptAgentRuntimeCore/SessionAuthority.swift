@@ -1,6 +1,12 @@
 import Foundation
 import RepoPromptServiceProtocol
 
+public enum ProviderOutputMutation: Sendable, Equatable {
+    case appendToActiveEntry
+    case replaceActiveEntry
+    case appendEntry
+}
+
 public actor SessionAuthority {
     public struct State: Sendable {
         public var snapshot: SessionSnapshot
@@ -9,6 +15,7 @@ public actor SessionAuthority {
     }
 
     private var state: State
+    private var activeProviderEntryIDs: [String: UUID] = [:]
     private let clock: any RuntimeClock
     private let ids: any RuntimeIDGenerator
 
@@ -28,17 +35,55 @@ public actor SessionAuthority {
         let binding = RunBindingIdentity(runID: runID, generation: state.snapshot.runGeneration + 1, turnEpoch: state.snapshot.turnEpoch + 1, connectionGeneration: connectionGeneration)
         state.activeRunID = runID
         state.gate = AgentRunLifecycleGate(binding: binding)
+        activeProviderEntryIDs.removeAll(keepingCapacity: true)
         replaceSnapshot(state: .running, generation: binding.generation, epoch: binding.turnEpoch)
         return binding
     }
 
-    public func acceptProviderOutput(binding: RunBindingIdentity, kind: TranscriptEntry.Kind, content: String) -> LifecycleAcceptance {
+    public func acceptProviderOutput(binding: RunBindingIdentity, kind: TranscriptEntry.Kind, content: String, mutation: ProviderOutputMutation) -> LifecycleAcceptance {
         guard var gate = state.gate else { return .staleGeneration }
         let result = gate.accept(binding: binding)
         state.gate = gate
         guard result == .accepted else { return result }
         var transcript = state.snapshot.transcript
-        transcript.append(TranscriptEntry(entryID: ids.next(), sessionSequence: Int64(transcript.count + 1), kind: kind, content: content, actor: nil, timestamp: clock.now()))
+        let bounded = String(content.prefix(262_144))
+        let key = kind.rawValue
+        if mutation != .appendEntry,
+           let entryID = activeProviderEntryIDs[key],
+           let index = transcript.firstIndex(where: { $0.entryID == entryID })
+        {
+            let current = transcript[index]
+            let nextContent = switch mutation {
+            case .appendToActiveEntry:
+                String((current.content + bounded).prefix(262_144))
+            case .replaceActiveEntry:
+                bounded
+            case .appendEntry:
+                bounded
+            }
+            transcript[index] = TranscriptEntry(
+                entryID: current.entryID,
+                sessionSequence: current.sessionSequence,
+                kind: current.kind,
+                content: nextContent,
+                actor: current.actor,
+                timestamp: current.timestamp,
+                presentationPayload: current.presentationPayload
+            )
+        } else {
+            let entryID = ids.next()
+            transcript.append(TranscriptEntry(
+                entryID: entryID,
+                sessionSequence: (transcript.map(\.sessionSequence).max() ?? 0) + 1,
+                kind: kind,
+                content: bounded,
+                actor: nil,
+                timestamp: clock.now()
+            ))
+            if mutation != .appendEntry {
+                activeProviderEntryIDs[key] = entryID
+            }
+        }
         replaceSnapshot(transcript: transcript)
         return .accepted
     }
@@ -49,6 +94,7 @@ public actor SessionAuthority {
         state.gate = gate
         guard result == .accepted else { return result }
         state.activeRunID = nil
+        activeProviderEntryIDs.removeAll(keepingCapacity: true)
         replaceSnapshot(state: lifecycle)
         return .accepted
     }
@@ -122,6 +168,7 @@ public actor SessionAuthority {
         transcript.append(TranscriptEntry(entryID: ids.next(), sessionSequence: Int64(transcript.count + 1), kind: .human, content: text, actor: actor, timestamp: clock.now()))
         gate.advanceTurn(runID: gate.binding.runID)
         state.gate = gate
+        activeProviderEntryIDs.removeAll(keepingCapacity: true)
         replaceSnapshot(epoch: gate.binding.turnEpoch, transcript: transcript)
         return gate.binding
     }

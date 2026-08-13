@@ -595,6 +595,55 @@ final class SQLiteServiceStoreV6CompatibilityTests: XCTestCase {
     }
 }
 
+final class SessionAuthorityStreamingTests: XCTestCase {
+    func testProviderDeltasAndFinalReplaceOneStableTranscriptEntry() async throws {
+        let sessionID = UUID()
+        let snapshot = SessionSnapshot(
+            sessionID: sessionID,
+            projectID: UUID(),
+            parentSessionID: nil,
+            rootSessionID: sessionID,
+            creator: .init(goblinUserID: "owner", username: "owner", displayName: "Owner"),
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            visibility: .privateSession,
+            state: .idle,
+            runGeneration: 0,
+            turnEpoch: 0,
+            revision: 1,
+            transcript: [],
+            interactions: [],
+            cursor: .init(storeID: UUID(), globalSequence: 0)
+        )
+        let authority = SessionAuthority(snapshot: snapshot, clock: SystemRuntimeClock(), ids: SystemRuntimeIDGenerator())
+        let binding = try await authority.beginRun(connectionGeneration: 1)
+
+        let firstAcceptance = await authority.acceptProviderOutput(binding: binding, kind: .assistant, content: "Hello", mutation: .appendToActiveEntry)
+        XCTAssertEqual(firstAcceptance, .accepted)
+        let firstSnapshot = await authority.snapshot()
+        let firstEntry = try XCTUnwrap(firstSnapshot.transcript.first)
+        let deltaAcceptance = await authority.acceptProviderOutput(binding: binding, kind: .assistant, content: ", world", mutation: .appendToActiveEntry)
+        XCTAssertEqual(deltaAcceptance, .accepted)
+        let finalAcceptance = await authority.acceptProviderOutput(binding: binding, kind: .assistant, content: "Hello, world!", mutation: .replaceActiveEntry)
+        XCTAssertEqual(finalAcceptance, .accepted)
+
+        let streamed = await authority.snapshot()
+        XCTAssertEqual(streamed.transcript.count, 1)
+        XCTAssertEqual(streamed.transcript[0].entryID, firstEntry.entryID)
+        XCTAssertEqual(streamed.transcript[0].sessionSequence, firstEntry.sessionSequence)
+        XCTAssertEqual(streamed.transcript[0].content, "Hello, world!")
+
+        let settlement = await authority.settle(binding: binding, terminal: .sessionCompleted, lifecycle: .completed)
+        XCTAssertEqual(settlement, .accepted)
+        let nextBinding = try await authority.beginRun(connectionGeneration: 1)
+        let nextAcceptance = await authority.acceptProviderOutput(binding: nextBinding, kind: .assistant, content: "Next turn", mutation: .appendToActiveEntry)
+        XCTAssertEqual(nextAcceptance, .accepted)
+        let nextRun = await authority.snapshot()
+        XCTAssertEqual(nextRun.transcript.map(\.content), ["Hello, world!", "Next turn"])
+        XCTAssertEqual(nextRun.transcript.map(\.sessionSequence), [1, 2])
+    }
+}
+
 final class AgentTranscriptPresentationTests: XCTestCase {
     func testOnlyPendingInteractionStatesRemainActionableInPresentation() {
         let runID = UUID()
@@ -666,6 +715,50 @@ final class AgentTranscriptPresentationTests: XCTestCase {
         try await store.close()
     }
 
+    func testSemanticCoverageConsumesTheCompleteLegacySpanWithoutAttachingTailToOlderMessage() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let service = AgentTranscriptPresentationService(store: store)
+        let sessionID = UUID()
+        let now = Date(timeIntervalSince1970: 1_786_400_000)
+        let configuration = testConfiguration(at: now)
+        let helloAnchor = UUID()
+        let testingAnchor = UUID()
+        let spaceXAnchor = UUID()
+        let testingIdentity = CanonicalTurnIdentity(requestAnchorID: testingAnchor, runID: UUID(), generation: 2, turnEpoch: 2, turnID: UUID(), responseSpanID: UUID())
+        let spaceXIdentity = CanonicalTurnIdentity(requestAnchorID: spaceXAnchor, runID: UUID(), generation: 3, turnEpoch: 3, turnID: UUID(), responseSpanID: UUID())
+
+        let testingTurn = CanonicalUserTurn(identity: testingIdentity, text: "Testing", suggestionTokens: [], taggedFiles: [], attachments: [], effectiveConfiguration: configuration)
+        try await store.upsertSemanticTurn(.init(sessionID: sessionID, identity: testingIdentity, firstSequence: 10, lastSequence: 10, canonicalUserTurnJSON: JSONEncoder.serviceEncoder.encode(testingTurn), effectiveConfiguration: configuration, createdAt: now, acceptedAt: now))
+        try await store.upsertSemanticActivity(.init(activityID: UUID(), sessionID: sessionID, identity: testingIdentity, canonicalSequence: 60, revision: 1, kind: .assistant, content: "Received—everything's working.", createdAt: now, updatedAt: now))
+
+        let spaceXTurn = CanonicalUserTurn(identity: spaceXIdentity, text: "Tell me what SpaceX's stock did today", suggestionTokens: [], taggedFiles: [], attachments: [], effectiveConfiguration: configuration)
+        try await store.upsertSemanticTurn(.init(sessionID: sessionID, identity: spaceXIdentity, firstSequence: 18, lastSequence: 18, canonicalUserTurnJSON: JSONEncoder.serviceEncoder.encode(spaceXTurn), effectiveConfiguration: configuration, createdAt: now, acceptedAt: now))
+        try await store.upsertSemanticActivity(.init(activityID: UUID(), sessionID: sessionID, identity: spaceXIdentity, canonicalSequence: 68, revision: 1, kind: .assistant, content: "SpaceX is privately held.", createdAt: now, updatedAt: now))
+
+        let legacy = [
+            TranscriptEntry(entryID: helloAnchor, sessionSequence: 9, kind: .human, content: "hello?", actor: nil, timestamp: now),
+            TranscriptEntry(entryID: testingIdentity.turnID, sessionSequence: 10, kind: .human, content: "Testing", actor: nil, timestamp: now),
+            TranscriptEntry(entryID: UUID(), sessionSequence: 11, kind: .assistant, content: "Received", actor: nil, timestamp: now),
+            TranscriptEntry(entryID: UUID(), sessionSequence: 17, kind: .assistant, content: "Received—everything's working.", actor: nil, timestamp: now),
+            TranscriptEntry(entryID: spaceXIdentity.turnID, sessionSequence: 18, kind: .human, content: "Tell me what SpaceX's stock did today", actor: nil, timestamp: now),
+            TranscriptEntry(entryID: UUID(), sessionSequence: 19, kind: .assistant, content: "I'll check", actor: nil, timestamp: now),
+            TranscriptEntry(entryID: UUID(), sessionSequence: 69, kind: .assistant, content: "SpaceX", actor: nil, timestamp: now),
+            TranscriptEntry(entryID: UUID(), sessionSequence: 195, kind: .assistant, content: "SpaceX is privately held.", actor: nil, timestamp: now),
+        ]
+
+        let newest = try await service.page(sessionID: sessionID, actorID: "actor", legacyTranscript: legacy, limit: 2)
+        XCTAssertEqual(newest.turns.compactMap(Self.requestText), ["Testing", "Tell me what SpaceX's stock did today"])
+        let spaceX = try XCTUnwrap(newest.turns.first { Self.requestText($0) == "Tell me what SpaceX's stock did today" })
+        XCTAssertEqual(Self.assistantTexts(spaceX), ["SpaceX is privately held."])
+
+        let token = try XCTUnwrap(newest.nextPageToken)
+        let earlier = try await service.page(sessionID: sessionID, actorID: "actor", legacyTranscript: legacy, pageToken: token, limit: 2)
+        XCTAssertEqual(earlier.turns.compactMap(Self.requestText), ["hello?"])
+        XCTAssertTrue(Self.assistantTexts(try XCTUnwrap(earlier.turns.first)).isEmpty)
+        XCTAssertNil(earlier.nextPageToken)
+        try await store.close()
+    }
+
     func testLegacyPresentationPaginationUsesWholeTurnBoundaries() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let service = AgentTranscriptPresentationService(store: store)
@@ -695,6 +788,20 @@ final class AgentTranscriptPresentationTests: XCTestCase {
             return text
         }
         return nil
+    }
+
+    private static func assistantTexts(_ turn: AgentPresentationTurnWire) -> [String] {
+        turn.blocks.compactMap { block in
+            let row: AgentPresentationRowWire
+            switch block {
+            case let .standaloneAssistant(_, value), let .conclusion(_, value):
+                row = value
+            default:
+                return nil
+            }
+            guard case let .assistant(_, text) = row else { return nil }
+            return text
+        }
     }
 }
 

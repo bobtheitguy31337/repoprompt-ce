@@ -3225,7 +3225,7 @@ public actor RepoPromptHeadlessAuthority {
             if let durableIdentity { try await updateAgentProviderIdentity(sessionID: sessionID, providerSessionID: durableIdentity) }
             if !result.output.isEmpty, await !eventState.hasPublishedAssistant() {
                 try await recordSemanticActivity(runID: run.runID, channel: "assistant", kind: .assistant, content: result.output, replace: true)
-                try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .assistant, content: result.output, eventType: .transcriptMessage)
+                try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .assistant, content: result.output, mutation: .replaceActiveEntry, eventType: .transcriptMessage)
             }
             guard let terminalBinding = await session.activeBinding(), terminalBinding.runID == binding.runID else { return }
             try await store.persistRun(ProviderRunSnapshot(runID: run.runID, sessionID: run.sessionID, provider: run.provider, providerSessionID: durableIdentity, state: "completed", generation: run.generation, turnEpoch: terminalBinding.turnEpoch, startReason: run.startReason, endReason: "completed", startedAt: run.startedAt, endedAt: clock.now()))
@@ -3266,24 +3266,24 @@ public actor RepoPromptHeadlessAuthority {
             case let .assistantDelta(text):
                 if !text.isEmpty {
                     try await recordSemanticActivity(runID: run.runID, channel: "assistant", kind: .assistant, content: text, replace: false)
-                    try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .assistant, content: text, eventType: .transcriptMessage)
+                    try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .assistant, content: text, mutation: .appendToActiveEntry, eventType: .transcriptMessage)
                 }
             case let .assistantFinal(text):
                 if !text.isEmpty {
                     try await recordSemanticActivity(runID: run.runID, channel: "assistant", kind: .assistant, content: text, replace: true)
-                    try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .assistant, content: text, eventType: .transcriptMessage)
+                    try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .assistant, content: text, mutation: .replaceActiveEntry, eventType: .transcriptMessage)
                 }
             case let .reasoning(text):
                 if !text.isEmpty {
                     try await transitionRunPresentation(sessionID: sessionID, runID: run.runID, phase: .thinking, statusCode: "provider_reasoning")
                     try await recordSemanticActivity(runID: run.runID, channel: "reasoning", kind: .reasoning, content: text, replace: false)
-                    try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .reasoning, content: text, eventType: .transcriptProgress)
+                    try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .reasoning, content: text, mutation: .appendToActiveEntry, eventType: .transcriptProgress)
                 }
             case let .progress(text):
                 if !text.isEmpty {
                     try await transitionRunPresentation(sessionID: sessionID, runID: run.runID, phase: .working, statusCode: "provider_working")
                     try await recordSemanticActivity(runID: run.runID, channel: "progress:\(CanonicalSigning.bodyDigest(Data(text.utf8)))", kind: .progress, content: text, replace: true)
-                    try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .progress, content: text, eventType: .transcriptProgress)
+                    try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .progress, content: text, mutation: .appendEntry, eventType: .transcriptProgress)
                 }
             case let .runStatusChanged(phase, statusCode, statusText):
                 try await transitionRunPresentation(sessionID: sessionID, runID: run.runID, phase: phase, statusCode: statusCode, statusText: statusText)
@@ -3391,9 +3391,9 @@ public actor RepoPromptHeadlessAuthority {
         switch kind { case .reasoning: 10; case .progress: 20; case .tool: 30; case .note: 40; case .assistant: 50; case .error: 90; case .conclusion: 100 }
     }
 
-    private func publishProviderTranscript(sessionID: UUID, binding: RunBindingIdentity, kind: TranscriptEntry.Kind, content: String, eventType: EventType) async throws {
+    private func publishProviderTranscript(sessionID: UUID, binding: RunBindingIdentity, kind: TranscriptEntry.Kind, content: String, mutation: ProviderOutputMutation, eventType: EventType) async throws {
         guard let session = sessions[sessionID], let activeBinding = await session.activeBinding(), activeBinding.runID == binding.runID,
-              await session.acceptProviderOutput(binding: activeBinding, kind: kind, content: content) == .accepted
+              await session.acceptProviderOutput(binding: activeBinding, kind: kind, content: content, mutation: mutation) == .accepted
         else { return }
         let cursor = try await store.nextCursor()
         let event = try await store.persistSession(replacingCursor(session.snapshot(), cursor: cursor), eventType: eventType, actor: nil, correlationID: ids.next(), idempotency: nil)

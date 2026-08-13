@@ -29,6 +29,11 @@ public actor AgentTranscriptPresentationService {
         }
     }
 
+    private struct LegacyCoverage {
+        var entryIDs: Set<UUID> = []
+        var fallbackRanges: [ClosedRange<Int64>] = []
+    }
+
     private let store: SQLiteServiceStore
 
     public init(store: SQLiteServiceStore) {
@@ -47,16 +52,17 @@ public actor AgentTranscriptPresentationService {
         let boundedLimit = max(1, min(limit, 50))
         let before = try decodePageToken(pageToken, actorID: actorID, sessionID: sessionID)
         let semantic = try await store.semanticTurns(sessionID: sessionID, beforeSequence: before, limit: boundedLimit + 1)
-        let pageSemantic = Array(semantic.prefix(boundedLimit))
-        let coveredRanges = pageSemantic.map { $0.firstSequence ... $0.lastSequence }
+        let coverage = Self.legacyCoverage(for: semantic, in: legacyTranscript)
         let legacyCandidates = legacyTranscript
             .filter { entry in
-                (before == nil || entry.sessionSequence < before!) && !coveredRanges.contains(where: { $0.contains(entry.sessionSequence) })
+                (before == nil || entry.sessionSequence < before!)
+                    && !coverage.entryIDs.contains(entry.entryID)
+                    && !coverage.fallbackRanges.contains(where: { $0.contains(entry.sessionSequence) })
             }
         let legacyUnits = Self.reconstructedLegacyUnits(legacyCandidates)
         var units: [PresentationUnit] = []
 
-        for record in pageSemantic {
+        for record in semantic {
             let canonical = try JSONDecoder.serviceDecoder.decode(CanonicalUserTurn.self, from: record.canonicalUserTurnJSON)
             let activities = try await store.semanticActivities(turnID: record.identity.turnID)
             let tools = try await store.semanticTools(turnID: record.identity.turnID)
@@ -101,18 +107,15 @@ public actor AgentTranscriptPresentationService {
                 activities: presentationActivities,
                 interactions: attachedInteractions
             ))
-            units.append(.init(sequence: record.lastSequence, beforeSequence: record.lastSequence, turn: projected))
+            units.append(.init(sequence: record.firstSequence, beforeSequence: record.firstSequence, turn: projected))
         }
 
-        let remaining = max(0, boundedLimit - units.count)
-        let pageLegacy = Array(legacyUnits.suffix(remaining))
-        units.append(contentsOf: pageLegacy)
+        units.append(contentsOf: legacyUnits)
         units.sort { $0.sequence < $1.sequence }
 
-        let oldest = units.first?.beforeSequence
-        let hasMoreSemantic = semantic.count > pageSemantic.count
-        let hasMoreLegacy = legacyUnits.count > pageLegacy.count
-        let next: String? = if let oldest, hasMoreSemantic || hasMoreLegacy { try encodePageToken(actorID: actorID, sessionID: sessionID, beforeSequence: oldest) } else { nil }
+        let pageUnits = Array(units.suffix(boundedLimit))
+        let oldest = pageUnits.first?.beforeSequence
+        let next: String? = if let oldest, units.count > pageUnits.count { try encodePageToken(actorID: actorID, sessionID: sessionID, beforeSequence: oldest) } else { nil }
         var watermark = try await store.semanticWatermark(sessionID: sessionID)
         let latestSemanticSequence = try await store.latestSemanticSequence(sessionID: sessionID)
         let latestLegacySequence = legacyTranscript.map(\.sessionSequence).max() ?? 0
@@ -123,11 +126,37 @@ public actor AgentTranscriptPresentationService {
         let revision = watermark?.presentationRevision ?? 0
         let cursorSeed = "\(sessionID.uuidString.lowercased()):\(revision):\(legacyTranscript.last?.sessionSequence ?? 0)"
         let pending = interactions.filter(Self.isActionable).map { Self.interactionWire($0, turnID: "live-tail", mutable: mutableInteractions) }
-        return .init(presentationRevision: revision, presentationCursor: CanonicalSigning.bodyDigest(Data(cursorSeed.utf8)), turns: units.map(\.turn), nextPageToken: next, pendingInteractions: pending)
+        return .init(presentationRevision: revision, presentationCursor: CanonicalSigning.bodyDigest(Data(cursorSeed.utf8)), turns: pageUnits.map(\.turn), nextPageToken: next, pendingInteractions: pending)
     }
 
     nonisolated static func isActionable(_ interaction: InteractionSnapshot) -> Bool {
         interaction.state == .pending || interaction.state == .deliveryIntent
+    }
+
+    private static func legacyCoverage(for records: [SemanticTurnRecord], in transcript: [TranscriptEntry]) -> LegacyCoverage {
+        let sorted = transcript.sorted {
+            $0.sessionSequence == $1.sessionSequence
+                ? $0.entryID.uuidString < $1.entryID.uuidString
+                : $0.sessionSequence < $1.sessionSequence
+        }
+        var coverage = LegacyCoverage()
+        for record in records {
+            let anchorIndex = sorted.firstIndex {
+                $0.entryID == record.identity.requestAnchorID || $0.entryID == record.identity.turnID
+            }
+                ?? sorted.firstIndex { $0.kind == .human && $0.sessionSequence == record.firstSequence }
+            guard let anchorIndex else {
+                coverage.fallbackRanges.append(record.firstSequence ... record.lastSequence)
+                continue
+            }
+            coverage.entryIDs.insert(sorted[anchorIndex].entryID)
+            var index = anchorIndex + 1
+            while index < sorted.count, sorted[index].kind != .human {
+                coverage.entryIDs.insert(sorted[index].entryID)
+                index += 1
+            }
+        }
+        return coverage
     }
 
     private static func reconstructedLegacyUnits(_ transcript: [TranscriptEntry]) -> [PresentationUnit] {
@@ -150,7 +179,7 @@ public actor AgentTranscriptPresentationService {
     }
 
     private static func projectLegacyGroup(_ entries: [TranscriptEntry]) -> PresentationUnit? {
-        guard let first = entries.first, let last = entries.last else { return nil }
+        guard let first = entries.first else { return nil }
         let request = entries.first { $0.kind == .human }
         var assistant = LegacyTextAccumulator()
         var reasoning = LegacyTextAccumulator()
@@ -214,7 +243,7 @@ public actor AgentTranscriptPresentationService {
             interactions: projected.interactions,
             legacyStandalone: true
         )
-        return .init(sequence: last.sessionSequence, beforeSequence: first.sessionSequence, turn: turn)
+        return .init(sequence: first.sessionSequence, beforeSequence: first.sessionSequence, turn: turn)
     }
 
     private static func mergingLegacyFragment(_ current: String, _ incoming: String) -> String {

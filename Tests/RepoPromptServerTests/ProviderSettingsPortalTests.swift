@@ -160,6 +160,19 @@ final class ProviderSettingsPortalTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let statusURL = directory.appendingPathComponent("status.json")
         try Data(#"{"authenticated":true,"method":"apiKey","accountLabel":"/run/secrets/provider-token","detail":"raw helper output"}"#.utf8).write(to: statusURL)
+        let modelCatalogURL = directory.appendingPathComponent("codex-models.json")
+        try JSONEncoder.serviceEncoder.encode([
+            ProviderModelCatalogEntry(
+                id: "gpt-5.6-sol",
+                providerRawValue: "gpt-5.6-sol",
+                displayName: "GPT-5.6 Sol",
+                isProviderDefault: true,
+                reasoningEfforts: ["low", "high"],
+                defaultReasoningEffort: "high",
+                supportsNativeImages: true,
+                supportsSteering: true
+            )
+        ]).write(to: modelCatalogURL)
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let configuration = ProviderCLIConfiguration(kind: .codex, executable: "/usr/bin/swift", protocolVersion: "app-server-v2")
@@ -169,7 +182,8 @@ final class ProviderSettingsPortalTests: XCTestCase {
             adapter: adapter,
             configurations: [configuration],
             initiallyEnabled: [],
-            authenticationStatusFiles: [.codex: statusURL.path]
+            authenticationStatusFiles: [.codex: statusURL.path],
+            modelCatalogFiles: [.codex: modelCatalogURL.path]
         )
         try await service.bootstrap()
         let catalog = try await service.catalog(refreshCLI: true)

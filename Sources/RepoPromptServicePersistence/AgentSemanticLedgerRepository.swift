@@ -397,9 +397,9 @@ public extension SQLiteServiceStore {
     func semanticTurns(sessionID: UUID, beforeSequence: Int64? = nil, limit: Int = 50) async throws -> [SemanticTurnRecord] {
         let bounded = max(1, min(limit, 100))
         let rows = if let beforeSequence {
-            try await connection.query("SELECT * FROM semantic_turns WHERE session_id=? AND last_sequence<? ORDER BY last_sequence DESC LIMIT ?", [.text(sessionID.uuidString), .integer(Int(beforeSequence)), .integer(bounded)])
+            try await connection.query("SELECT * FROM semantic_turns WHERE session_id=? AND first_sequence<? ORDER BY first_sequence DESC LIMIT ?", [.text(sessionID.uuidString), .integer(Int(beforeSequence)), .integer(bounded)])
         } else {
-            try await connection.query("SELECT * FROM semantic_turns WHERE session_id=? ORDER BY last_sequence DESC LIMIT ?", [.text(sessionID.uuidString), .integer(bounded)])
+            try await connection.query("SELECT * FROM semantic_turns WHERE session_id=? ORDER BY first_sequence DESC LIMIT ?", [.text(sessionID.uuidString), .integer(bounded)])
         }
         return try rows.map(decodeSemanticTurn)
     }
