@@ -200,6 +200,7 @@ final class AgentComposerCatalogTests: XCTestCase {
         let compiled = try adapter.compile(.init(providerID: .codex, model: model, effortID: "high", permissionID: "codex.defaultPermission", toolValues: ["codex.mcpServers": .choices([])]))
         XCTAssertEqual(compiled.providerRawModelValue, "gpt-5.6-sol")
         XCTAssertEqual(compiled.executionPolicy.providerSettings["provider.serviceTier"], "fast")
+        XCTAssertEqual(compiled.executionPolicy.providerSettings["codex.enabledMCPServers"], "[\"RepoPromptCE\"]")
         XCTAssertEqual(compiled.normalizedToolValues["codex.mcpServers"], .choices(["repoprompt"]))
         XCTAssertThrowsError(try adapter.compile(.init(providerID: .codex, model: model, toolValues: ["codex.unknown": .boolean(true)])))
     }
@@ -618,6 +619,14 @@ final class AgentTranscriptPresentationTests: XCTestCase {
 }
 
 final class NativeProviderRuntimeLifecycleTests: XCTestCase {
+    func testCodexConfigMapsStableRepoPromptChoiceToNativeMCPName() {
+        let config = CodexAppServerProviderRuntime.codexConfig([
+            "codex.enabledMCPServers": "[\"repoprompt\"]"
+        ])
+        XCTAssertEqual(config["mcp_servers.RepoPromptCE.enabled"] as? Bool, true)
+        XCTAssertNil(config["mcp_servers.repoprompt.enabled"])
+    }
+
     func testCodexTurnStartedIsLifecycleOnlyAndPhaseRevisionAdvances() throws {
         let frame = Data(#"{"method":"turn/started","params":{}}"#.utf8)
         let normalized = try CodexAppServerProviderRuntime.normalize(frame)

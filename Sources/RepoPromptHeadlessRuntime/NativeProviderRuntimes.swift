@@ -598,7 +598,7 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
         try await process.sendResponse(id: id, result: payload)
     }
 
-    private nonisolated static func codexConfig(_ settings: [String: String]) -> [String: Any] {
+    nonisolated static func codexConfig(_ settings: [String: String]) -> [String: Any] {
         let bash = settings["codex.bashEnabled"] != "false"
         let search = settings["codex.searchEnabled"] != "false"
         let goals = settings["codex.goalsEnabled"] != "false"
@@ -624,7 +624,9 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
            let data = encoded.data(using: .utf8),
            let names = try? JSONDecoder().decode([String].self, from: data)
         {
-            for name in names where name.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-")).contains($0) }) {
+            for configuredName in names {
+                let name = configuredName == "repoprompt" ? "RepoPromptCE" : configuredName
+                guard name.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-")).contains($0) }) else { continue }
                 config["mcp_servers.\(name).enabled"] = true
             }
         }
