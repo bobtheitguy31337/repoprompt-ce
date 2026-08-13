@@ -270,7 +270,7 @@ final class AuthorityTests: XCTestCase {
         try await store.close()
     }
 
-    func testAcceptedFollowupStartsInFreshTurnScopedProviderHome() async throws {
+    func testFollowupResumesDurableProviderConversationAutomatically() async throws {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
             .appendingPathComponent(".build/authority-tests/\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -308,7 +308,15 @@ final class AuthorityTests: XCTestCase {
         }
 
         let resumeIdentities = await runtime.resumeIdentities()
-        XCTAssertEqual(resumeIdentities, [nil, nil])
+        XCTAssertEqual(resumeIdentities.count, 2)
+        XCTAssertNil(resumeIdentities[0])
+        XCTAssertEqual(resumeIdentities[1], "durable-thread")
+        let fallbackPrompts = await runtime.fallbackPrompts()
+        XCTAssertNil(fallbackPrompts[0])
+        let recoveredContext = try XCTUnwrap(fallbackPrompts[1])
+        XCTAssertTrue(recoveredContext.contains("User:\nturn 1"))
+        XCTAssertTrue(recoveredContext.contains("Assistant:\ndone"))
+        XCTAssertTrue(recoveredContext.contains("<current_turn>\nturn 2"))
         try await authority.quiesce()
         try await store.close()
     }
@@ -1005,6 +1013,7 @@ private actor PolicyRecordingProviderRuntime: AgentProviderRuntime {
 private actor ResumeRecordingProviderRuntime: AgentProviderRuntime {
     let kind = ProviderKind.codex
     private var recordedResumeIdentities: [String?] = []
+    private var recordedFallbackPrompts: [String?] = []
 
     func capability() -> ProviderCapability {
         .init(kind: kind, enabled: true, executable: "/test/codex", supportsResume: true, supportsSteering: false)
@@ -1017,6 +1026,7 @@ private actor ResumeRecordingProviderRuntime: AgentProviderRuntime {
         onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
     ) async throws -> ProviderExecutionResult {
         recordedResumeIdentities.append(request.resumeProviderSessionID)
+        recordedFallbackPrompts.append(request.resumeFallbackPrompt)
         await onEvent(.providerIdentity("durable-thread"))
         await onEvent(.assistantFinal("done"))
         await onEvent(.completed(providerSessionID: "durable-thread"))
@@ -1027,6 +1037,10 @@ private actor ResumeRecordingProviderRuntime: AgentProviderRuntime {
 
     func resumeIdentities() -> [String?] {
         recordedResumeIdentities
+    }
+
+    func fallbackPrompts() -> [String?] {
+        recordedFallbackPrompts
     }
 }
 

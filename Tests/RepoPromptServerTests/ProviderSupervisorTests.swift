@@ -273,6 +273,84 @@ final class ProviderSupervisorTests: XCTestCase {
         try await store.close()
     }
 
+    func testManagedCodexRuntimeUsesDesktopStylePersistentHome() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let executable = directory.appendingPathComponent("provider")
+        let managed = directory.appendingPathComponent("managed-codex", isDirectory: true)
+        let processHome = managed.appendingPathComponent("process-home", isDirectory: true)
+        let configHome = managed.appendingPathComponent("config", isDirectory: true)
+        let cacheHome = managed.appendingPathComponent("cache", isDirectory: true)
+        let codexHome = managed.appendingPathComponent("home", isDirectory: true)
+        let sqliteHome = managed.appendingPathComponent("sqlite", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        for path in [processHome, configHome, cacheHome, codexHome, sqliteHome] {
+            try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        }
+        try Data("keep".utf8).write(to: codexHome.appendingPathComponent("conversation-state"))
+        try Data(Self.fakeCodexAppServerScript(finalTextShell: "$CODEX_HOME", version: "provider 1.0").utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let source = PersistentProviderRuntimeSource(environment: [
+            "HOME": processHome.path,
+            "XDG_CONFIG_HOME": configHome.path,
+            "XDG_CACHE_HOME": cacheHome.path,
+            "CODEX_HOME": codexHome.path,
+            "CODEX_SQLITE_HOME": sqliteHome.path,
+            "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
+        ])
+        let adapter = ProviderCLIAdapter(
+            configurations: [.init(kind: .codex, executable: executable.path, expectedVersion: "1.0")],
+            processPort: try PortableProcessSupervisionPort(),
+            processStore: store,
+            outputDirectory: directory.appendingPathComponent("output").path,
+            ephemeralHomeRoot: directory.appendingPathComponent("ephemeral-homes").path,
+            credentialSource: source
+        )
+
+        let result = try await adapter.complete(kind: .codex, model: nil, prompt: "prompt", workingDirectory: directory.path, runID: UUID())
+
+        XCTAssertEqual(result.trimmingCharacters(in: .whitespacesAndNewlines), codexHome.path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: codexHome.appendingPathComponent("conversation-state").path))
+        let resources = try await store.ownedResources(states: nil)
+        XCTAssertFalse(resources.contains { $0.kind == .providerHome })
+        try await store.close()
+    }
+
+    func testMissingCodexRolloutStartsReplacementThreadWithRepoPromptHistory() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let executable = directory.appendingPathComponent("provider")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data(Self.missingRolloutCodexScript().utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let adapter = ProviderCLIAdapter(
+            configurations: [.init(kind: .codex, executable: executable.path)],
+            processPort: try PortableProcessSupervisionPort(),
+            outputDirectory: directory.appendingPathComponent("output").path,
+            ephemeralHomeRoot: directory.appendingPathComponent("homes").path
+        )
+        let fallback = "User:\nfirst question\n\nAssistant:\nfirst answer\n\nUser:\nfollow-up"
+        let result = try await adapter.executeStreaming(.init(
+            kind: .codex,
+            model: nil,
+            prompt: "follow-up",
+            workingDirectory: directory.path,
+            runID: UUID(),
+            resumeProviderSessionID: "missing-thread",
+            resumeFallbackPrompt: fallback
+        )) { _ in }
+
+        XCTAssertEqual(result.providerSessionID, "replacement-thread")
+        let log = try Data(contentsOf: directory.appendingPathComponent("fallback-turn.json"))
+        let frame = try XCTUnwrap(JSONSerialization.jsonObject(with: log) as? [String: Any])
+        let params = try XCTUnwrap(frame["params"] as? [String: Any])
+        let input = try XCTUnwrap(params["input"] as? [[String: Any]])
+        XCTAssertEqual(input.first?["text"] as? String, fallback)
+    }
+
     func testNativePortableProviderMatrixExecutesProtocolContracts() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -747,6 +825,25 @@ final class ProviderSupervisorTests: XCTestCase {
         """
     }
 
+    private static func missingRolloutCodexScript() -> String {
+        """
+        #!/bin/sh
+        while IFS= read -r line; do
+          case "$line" in
+            *'"method":"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+            *method*thread*resume*) echo '{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"no rollout found for thread id missing-thread"}}' ;;
+            *method*thread*start*) echo '{"jsonrpc":"2.0","id":3,"result":{"thread":{"id":"replacement-thread"}}}' ;;
+            *method*turn*start*)
+              printf '%s' "$line" > "$PWD/fallback-turn.json"
+              echo '{"jsonrpc":"2.0","id":4,"result":{"turn":{"id":"replacement-turn"}}}'
+              echo '{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"id":"message-1","type":"agentMessage","text":"done"}}}'
+              echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"replacement-turn"}}}'
+              ;;
+          esac
+        done
+        """
+    }
+
     private static func fakeClaudeScript() -> String {
         """
         #!/bin/sh
@@ -945,5 +1042,15 @@ private actor ProviderEventRecorder {
 
     func values() -> [ProviderRuntimeEvent] {
         events
+    }
+}
+
+private struct PersistentProviderRuntimeSource: ProviderCredentialSourceProviding {
+    let environment: [String: String]
+
+    func sourceDirectory(for _: ProviderKind) async throws -> String? { nil }
+
+    func persistentRuntimeEnvironment(for kind: ProviderKind) async throws -> [String: String]? {
+        kind == .codex ? environment : nil
     }
 }

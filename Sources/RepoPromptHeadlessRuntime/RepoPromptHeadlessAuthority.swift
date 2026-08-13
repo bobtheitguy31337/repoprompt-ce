@@ -1424,10 +1424,10 @@ public actor RepoPromptHeadlessAuthority {
             await eventHub.publish(event)
         }
         let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "dispatchAcceptedTurn", key: accepted.receipt.submissionID.uuidString.lowercased(), requestDigest: requestDigest)
-        // Native provider homes are deliberately turn-scoped and removed when the
-        // subprocess exits. Starting a later process with the prior thread ID would
-        // ask it to resume state that no longer exists in that fresh home.
-        _ = try await startProviderRun(command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh), sessionID: sessionID, session: session, actor: actor, idempotency: idempotency, acceptedSubmission: accepted)
+        // Follow-ups continue the provider-native conversation exactly as the
+        // Desktop engine does. `.auto` starts a new thread only when this session
+        // has no durable provider identity or the provider cannot resume.
+        _ = try await startProviderRun(command: .resumeSession(expectedRunID: nil, providerResumeMode: .auto), sessionID: sessionID, session: session, actor: actor, idempotency: idempotency, acceptedSubmission: accepted)
     }
 
     public func projectSnapshot(projectID: UUID) async throws -> ProjectSnapshot {
@@ -3204,6 +3204,17 @@ public actor RepoPromptHeadlessAuthority {
             }
             var providerSettings = permissions.providerSettings
             if let acceptedSubmission { providerSettings.merge(acceptedSubmission.executionPolicy.providerSettings) { _, accepted in accepted } }
+            let resumeFallbackPrompt: String?
+            if run.providerSessionID == nil {
+                resumeFallbackPrompt = nil
+            } else {
+                resumeFallbackPrompt = await providerResumeFallbackPrompt(
+                    sessionID: sessionID,
+                    excludingRunID: run.runID,
+                    legacyTranscript: initial.transcript,
+                    currentPrompt: prompt
+                )
+            }
             let result = try await providerAdapter.executeStreaming(
                 .init(
                     kind: acceptedSubmission?.providerKind ?? initial.provider,
@@ -3214,6 +3225,7 @@ public actor RepoPromptHeadlessAuthority {
                     maximumBytes: 8_388_608,
                     runID: binding.runID,
                     resumeProviderSessionID: run.providerSessionID,
+                    resumeFallbackPrompt: resumeFallbackPrompt,
                     policy: .init(mode: executionMode, writableRoots: executionMode == .workspaceWrite ? executionLocation.writableRoots : [], providerSettings: providerSettings),
                     launchValidation: { try executionLocation.validateLaunch() }
                 )
@@ -3257,6 +3269,93 @@ public actor RepoPromptHeadlessAuthority {
         providerControlReadyRuns.remove(binding.runID)
     }
 
+    /// Builds a one-time context bridge for legacy sessions whose native Codex
+    /// rollout was deleted by the old turn-scoped home implementation. Steady-
+    /// state follow-ups never use this text: a successful native resume receives
+    /// only the current turn and lets the provider own its conversation state.
+    private func providerResumeFallbackPrompt(
+        sessionID: UUID,
+        excludingRunID: UUID,
+        legacyTranscript: [TranscriptEntry],
+        currentPrompt: String
+    ) async -> String {
+        var history = ""
+        if let records = try? await store.semanticTurns(sessionID: sessionID, limit: 100) {
+            for record in records.reversed() where record.identity.runID != excludingRunID {
+                guard let userTurn = try? JSONDecoder.serviceDecoder.decode(CanonicalUserTurn.self, from: record.canonicalUserTurnJSON) else { continue }
+                var parts = ["User:\n\(userTurn.text)"]
+                let activities = (try? await store.semanticActivities(turnID: record.identity.turnID)) ?? []
+                let tools = (try? await store.semanticTools(turnID: record.identity.turnID)) ?? []
+                let toolsByActivity = Dictionary(grouping: tools, by: \.activityID)
+                for activity in activities {
+                    switch activity.kind {
+                    case .assistant, .conclusion, .error:
+                        if let content = activity.content?.trimmingCharacters(in: .whitespacesAndNewlines), !content.isEmpty {
+                            parts.append("Assistant:\n\(content)")
+                        }
+                    case .tool:
+                        guard let tool = toolsByActivity[activity.activityID]?.max(by: { $0.revision < $1.revision }),
+                              !Self.isLegacyNonToolActivity(tool.normalizedName)
+                        else { continue }
+                        var detail = "Tool \(tool.normalizedName) [\(tool.status.rawValue)]"
+                        if let arguments = tool.displayArguments, !arguments.isEmpty { detail += "\nInput: \(arguments)" }
+                        if let result = tool.displayResult, !result.isEmpty { detail += "\nResult: \(result)" }
+                        parts.append(detail)
+                    case .reasoning, .progress, .note:
+                        continue
+                    }
+                }
+                history += parts.joined(separator: "\n\n") + "\n\n"
+            }
+        }
+
+        if history.isEmpty {
+            var prior = legacyTranscript
+            if prior.last?.kind == .human { prior.removeLast() }
+            history = prior.compactMap { entry -> String? in
+                let role: String
+                switch entry.kind {
+                case .human: role = "User"
+                case .assistant: role = "Assistant"
+                case .system: role = "System"
+                case .tool: role = "Tool"
+                case .reasoning, .progress: return nil
+                }
+                let content = entry.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                return content.isEmpty ? nil : "\(role):\n\(content)"
+            }.joined(separator: "\n\n")
+        }
+
+        let prefix = """
+        RepoPrompt Server could not load the provider's saved native conversation. RepoPrompt owns the canonical conversation below. Treat it as the preceding conversation and continue naturally; do not claim the earlier context is unavailable.
+
+        <repoprompt_conversation>
+        """
+        let divider = """
+
+        </repoprompt_conversation>
+
+        <current_turn>
+        """
+        let suffix = "\n</current_turn>"
+        let maximumCharacters = 262_144
+        let framingCount = prefix.count + divider.count + suffix.count
+        let boundedCurrent = String(currentPrompt.prefix(max(0, maximumCharacters - framingCount)))
+        let fixedCount = framingCount + boundedCurrent.count
+        let historyBudget = max(0, maximumCharacters - fixedCount)
+        let boundedHistory = String(history.suffix(historyBudget))
+        return prefix + boundedHistory + divider + boundedCurrent + suffix
+    }
+
+    private nonisolated static func isLegacyNonToolActivity(_ name: String) -> Bool {
+        let normalized = name
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+        return ["reasoning", "agentmessage", "usermessage", "contextcompaction"].contains(normalized)
+    }
+
     private func handleProviderEvent(_ event: ProviderRuntimeEvent, sessionID: UUID, run: ProviderRunSnapshot, binding: RunBindingIdentity) async {
         do {
             switch event {
@@ -3273,11 +3372,27 @@ public actor RepoPromptHeadlessAuthority {
                     try await recordSemanticActivity(runID: run.runID, channel: "assistant", kind: .assistant, content: text, replace: true)
                     try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .assistant, content: text, mutation: .replaceActiveEntry, eventType: .transcriptMessage)
                 }
+            case let .assistantItemDelta(providerItemID, text):
+                if !text.isEmpty {
+                    try await recordSemanticActivity(runID: run.runID, channel: "assistant:\(providerItemID)", kind: .assistant, content: text, replace: false)
+                    try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .assistant, content: text, mutation: .appendToActiveEntry, eventType: .transcriptMessage, channel: providerItemID)
+                }
+            case let .assistantItemFinal(providerItemID, text):
+                if !text.isEmpty {
+                    try await recordSemanticActivity(runID: run.runID, channel: "assistant:\(providerItemID)", kind: .assistant, content: text, replace: true)
+                    try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .assistant, content: text, mutation: .replaceActiveEntry, eventType: .transcriptMessage, channel: providerItemID)
+                }
             case let .reasoning(text):
                 if !text.isEmpty {
                     try await transitionRunPresentation(sessionID: sessionID, runID: run.runID, phase: .thinking, statusCode: "provider_reasoning")
                     try await recordSemanticActivity(runID: run.runID, channel: "reasoning", kind: .reasoning, content: text, replace: false)
                     try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .reasoning, content: text, mutation: .appendToActiveEntry, eventType: .transcriptProgress)
+                }
+            case let .reasoningItemDelta(providerItemID, text):
+                if !text.isEmpty {
+                    try await transitionRunPresentation(sessionID: sessionID, runID: run.runID, phase: .thinking, statusCode: "provider_reasoning")
+                    try await recordSemanticActivity(runID: run.runID, channel: "reasoning:\(providerItemID)", kind: .reasoning, content: text, replace: false)
+                    try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .reasoning, content: text, mutation: .appendToActiveEntry, eventType: .transcriptProgress, channel: providerItemID)
                 }
             case let .progress(text):
                 if !text.isEmpty {
@@ -3359,14 +3474,14 @@ public actor RepoPromptHeadlessAuthority {
         } else {
             nextContent = String(((existing?.content ?? "") + bounded).prefix(262_144))
         }
-        let sequence = turn.firstSequence + Self.semanticOffset(kind)
+        let sequence = existing?.canonicalSequence ?? turn.lastSequence + 1
         try await store.upsertSemanticActivity(.init(activityID: activityID, sessionID: turn.sessionID, identity: turn.identity, canonicalSequence: sequence, revision: (existing?.revision ?? 0) + 1, kind: kind, content: nextContent, status: status, createdAt: existing?.createdAt ?? clock.now(), updatedAt: clock.now()))
     }
 
     private func recordSemanticTool(runID: UUID, activityID: UUID, executionID: String, name: String, status: AgentPresentationToolStatus, displayArguments: String?, displayResult: String?, argumentDigest: String?, resultDigest: String?) async throws {
         guard let turn = try await store.semanticTurn(runID: runID) else { return }
         let current = try await store.semanticTools(turnID: turn.identity.turnID).first { $0.executionID == executionID }
-        let sequence = turn.firstSequence + Self.semanticOffset(.tool)
+        let sequence = current?.canonicalSequence ?? turn.lastSequence + 1
         let safeName = AgentTranscriptPresentationCore.normalizedToolName(String(name.prefix(256)))
         try await store.upsertSemanticActivity(.init(activityID: activityID, sessionID: turn.sessionID, identity: turn.identity, canonicalSequence: sequence, revision: (current?.revision ?? 0) + 1, kind: .tool, summary: safeName, status: status.rawValue, createdAt: current?.createdAt ?? clock.now(), updatedAt: clock.now()))
         try await store.upsertSemanticTool(.init(executionID: String(executionID.prefix(512)), activityID: activityID, turnID: turn.identity.turnID, sessionID: turn.sessionID, canonicalSequence: sequence, revision: (current?.revision ?? 0) + 1, normalizedName: safeName, status: status, displayArguments: Self.semanticDisplay(displayArguments, prior: current?.displayArguments, maximum: 32_768), displayResult: Self.semanticDisplay(displayResult, prior: current?.displayResult, maximum: 65_536), summary: safeName, argumentDigest: argumentDigest ?? current?.argumentDigest, resultDigest: resultDigest ?? current?.resultDigest, createdAt: current?.createdAt ?? clock.now(), updatedAt: clock.now()))
@@ -3387,13 +3502,9 @@ public actor RepoPromptHeadlessAuthority {
         return UUID(uuidString: value) ?? runID
     }
 
-    private static func semanticOffset(_ kind: SemanticActivityKind) -> Int64 {
-        switch kind { case .reasoning: 10; case .progress: 20; case .tool: 30; case .note: 40; case .assistant: 50; case .error: 90; case .conclusion: 100 }
-    }
-
-    private func publishProviderTranscript(sessionID: UUID, binding: RunBindingIdentity, kind: TranscriptEntry.Kind, content: String, mutation: ProviderOutputMutation, eventType: EventType) async throws {
+    private func publishProviderTranscript(sessionID: UUID, binding: RunBindingIdentity, kind: TranscriptEntry.Kind, content: String, mutation: ProviderOutputMutation, eventType: EventType, channel: String? = nil) async throws {
         guard let session = sessions[sessionID], let activeBinding = await session.activeBinding(), activeBinding.runID == binding.runID,
-              await session.acceptProviderOutput(binding: activeBinding, kind: kind, content: content, mutation: mutation) == .accepted
+              await session.acceptProviderOutput(binding: activeBinding, kind: kind, content: content, mutation: mutation, channel: channel) == .accepted
         else { return }
         let cursor = try await store.nextCursor()
         let event = try await store.persistSession(replacingCursor(session.snapshot(), cursor: cursor), eventType: eventType, actor: nil, correlationID: ids.next(), idempotency: nil)
@@ -3614,7 +3725,7 @@ private actor ProviderEventPublicationState {
 
     func observe(_ event: ProviderRuntimeEvent) {
         switch event {
-        case .assistantDelta, .assistantFinal:
+        case .assistantDelta, .assistantFinal, .assistantItemDelta, .assistantItemFinal:
             didPublishAssistant = true
         default:
             break

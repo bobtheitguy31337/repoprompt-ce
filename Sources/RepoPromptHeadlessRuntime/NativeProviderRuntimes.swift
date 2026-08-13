@@ -50,6 +50,8 @@ private struct NativeProviderProcessSupport {
     private struct PreparedHome {
         let url: URL
         let resources: [OwnedResourceRecord]
+        let baseEnvironment: [String: String]?
+        let disposable: Bool
     }
 
     let configuration: ProviderCLIConfiguration
@@ -109,8 +111,8 @@ private struct NativeProviderProcessSupport {
     }
 
     func makeSession(runID: UUID, arguments: [String], workingDirectory: String, model: String? = nil, policy: ProviderExecutionPolicy = .init(), includeCredentials: Bool = true, launchValidation: @escaping @Sendable () throws -> Void = {}) async throws -> NativeJSONLineProcess {
-        let preparedHome = try await prepareEphemeralHome(runID: runID, includeCredentials: includeCredentials)
-        var environment = providerEnvironment(home: preparedHome.url, workingDirectory: workingDirectory, policy: policy)
+        let preparedHome = try await prepareProviderHome(runID: runID, includeCredentials: includeCredentials)
+        var environment = providerEnvironment(home: preparedHome.url, baseEnvironment: preparedHome.baseEnvironment, workingDirectory: workingDirectory, policy: policy)
         let injected = includeCredentials ? try await credentialEnvironment.environment(for: configuration.kind, model: model, policy: policy) : [:]
         let reserved = Set(["HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "CODEX_HOME", "CODEX_SQLITE_HOME", "CLAUDE_CONFIG_DIR", "PATH", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD"])
         guard injected.keys.allSatisfy({ !reserved.contains($0) }) else {
@@ -131,10 +133,11 @@ private struct NativeProviderProcessSupport {
                 outputDirectory: outputDirectory,
                 resourceRepository: processStore,
                 homeResources: preparedHome.resources,
+                disposableHome: preparedHome.disposable,
                 launchValidation: launchValidation
             )
         } catch {
-            try? FileManager.default.removeItem(at: preparedHome.url)
+            if preparedHome.disposable { try? FileManager.default.removeItem(at: preparedHome.url) }
             for resource in preparedHome.resources {
                 let remains = FileManager.default.fileExists(atPath: resource.internalPathIdentity)
                 _ = try? await processStore?.transitionOwnedResource(
@@ -154,16 +157,19 @@ private struct NativeProviderProcessSupport {
         try await ProviderProcessSupervisor(processPort: processPort, store: processStore).recoverPersistedFamilies()
     }
 
-    private func providerEnvironment(home: URL, workingDirectory: String, policy: ProviderExecutionPolicy) -> [String: String] {
+    private func providerEnvironment(home: URL, baseEnvironment: [String: String]?, workingDirectory: String, policy: ProviderExecutionPolicy) -> [String: String] {
         let source = ProcessInfo.processInfo.environment
         let inheritedKeys = ["PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]
-        var environment = Dictionary(uniqueKeysWithValues: inheritedKeys.compactMap { key in source[key].map { (key, $0) } })
-        environment["HOME"] = home.path
-        environment["XDG_CONFIG_HOME"] = home.appendingPathComponent(".config", isDirectory: true).path
-        environment["XDG_CACHE_HOME"] = home.appendingPathComponent(".cache", isDirectory: true).path
-        environment["CODEX_HOME"] = home.appendingPathComponent(".codex", isDirectory: true).path
-        environment["CODEX_SQLITE_HOME"] = home.appendingPathComponent(".codex-sqlite", isDirectory: true).path
-        environment["CLAUDE_CONFIG_DIR"] = home.appendingPathComponent(".claude", isDirectory: true).path
+        var environment = baseEnvironment
+            ?? Dictionary(uniqueKeysWithValues: inheritedKeys.compactMap { key in source[key].map { (key, $0) } })
+        if baseEnvironment == nil {
+            environment["HOME"] = home.path
+            environment["XDG_CONFIG_HOME"] = home.appendingPathComponent(".config", isDirectory: true).path
+            environment["XDG_CACHE_HOME"] = home.appendingPathComponent(".cache", isDirectory: true).path
+            environment["CODEX_HOME"] = home.appendingPathComponent(".codex", isDirectory: true).path
+            environment["CODEX_SQLITE_HOME"] = home.appendingPathComponent(".codex-sqlite", isDirectory: true).path
+            environment["CLAUDE_CONFIG_DIR"] = home.appendingPathComponent(".claude", isDirectory: true).path
+        }
         environment["DISABLE_AUTOUPDATER"] = "1"
         environment["CURSOR_AGENT_DISABLE_AUTO_UPDATE"] = "1"
         if configuration.kind == .claudeCompatible {
@@ -189,6 +195,28 @@ private struct NativeProviderProcessSupport {
             environment["REPOPROMPT_MCP_WORKING_DIRS"] = workingDirectory
         }
         return environment
+    }
+
+    private func prepareProviderHome(runID: UUID, includeCredentials: Bool) async throws -> PreparedHome {
+        if includeCredentials,
+           let environment = try await credentialSource.persistentRuntimeEnvironment(for: configuration.kind)
+        {
+            let required = ["HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "CODEX_HOME", "CODEX_SQLITE_HOME"]
+            guard required.allSatisfy({ key in
+                guard let value = environment[key] else { return false }
+                return value.hasPrefix("/") && FileManager.default.fileExists(atPath: value)
+            }), let processHome = environment["HOME"]
+            else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "Managed provider runtime home is unavailable")
+            }
+            return PreparedHome(
+                url: URL(fileURLWithPath: processHome, isDirectory: true),
+                resources: [],
+                baseEnvironment: environment,
+                disposable: false
+            )
+        }
+        return try await prepareEphemeralHome(runID: runID, includeCredentials: includeCredentials)
     }
 
     private func prepareEphemeralHome(runID: UUID, includeCredentials: Bool) async throws -> PreparedHome {
@@ -257,7 +285,7 @@ private struct NativeProviderProcessSupport {
         for record in records {
             try await activated.append(processStore?.transitionOwnedResource(resourceID: record.resourceID, expectedStates: [.preparing], to: .active, observedBytes: nil, contentDigest: nil, cleanupError: nil) ?? record.replacing(lifecycleState: .active))
         }
-        return PreparedHome(url: home, resources: activated)
+        return PreparedHome(url: home, resources: activated, baseEnvironment: nil, disposable: true)
     }
 }
 
@@ -269,12 +297,13 @@ private actor NativeJSONLineProcess {
     private let supervisor: ProviderProcessSupervisor
     private let resourceRepository: (any OwnedResourceRepository)?
     private let ownedResources: [OwnedResourceRecord]
+    private let disposableHome: Bool
     private var offset = 0
     private var buffer = Data()
     private var nextRequestID = 1
     private var finished = false
 
-    private init(runID: UUID, captured: PortableProcessSupervisionPort.CapturedProcess, home: URL, processPort: PortableProcessSupervisionPort, supervisor: ProviderProcessSupervisor, resourceRepository: (any OwnedResourceRepository)?, ownedResources: [OwnedResourceRecord]) {
+    private init(runID: UUID, captured: PortableProcessSupervisionPort.CapturedProcess, home: URL, processPort: PortableProcessSupervisionPort, supervisor: ProviderProcessSupervisor, resourceRepository: (any OwnedResourceRepository)?, ownedResources: [OwnedResourceRecord], disposableHome: Bool) {
         self.runID = runID
         self.captured = captured
         self.home = home
@@ -282,9 +311,10 @@ private actor NativeJSONLineProcess {
         self.supervisor = supervisor
         self.resourceRepository = resourceRepository
         self.ownedResources = ownedResources
+        self.disposableHome = disposableHome
     }
 
-    static func launch(runID: UUID, executable: String, arguments: [String], environment: [String: String], workingDirectory: String, home: URL, processPort: PortableProcessSupervisionPort, supervisor: ProviderProcessSupervisor, outputDirectory: String, resourceRepository: (any OwnedResourceRepository)?, homeResources: [OwnedResourceRecord], launchValidation: @escaping @Sendable () throws -> Void) async throws -> NativeJSONLineProcess {
+    static func launch(runID: UUID, executable: String, arguments: [String], environment: [String: String], workingDirectory: String, home: URL, processPort: PortableProcessSupervisionPort, supervisor: ProviderProcessSupervisor, outputDirectory: String, resourceRepository: (any OwnedResourceRepository)?, homeResources: [OwnedResourceRecord], disposableHome: Bool, launchValidation: @escaping @Sendable () throws -> Void) async throws -> NativeJSONLineProcess {
         let captureID = UUID()
         let outputRoot = URL(fileURLWithPath: outputDirectory, isDirectory: true)
         let outputRecord = OwnedResourceRecord(
@@ -313,7 +343,7 @@ private actor NativeJSONLineProcess {
             capturedProcess = captured
             try await supervisor.register(runID: runID, leader: captured.identity)
             let activeOutput = try await resourceRepository?.transitionOwnedResource(resourceID: outputRecord.resourceID, expectedStates: [.preparing], to: .active, observedBytes: 0, contentDigest: nil, cleanupError: nil) ?? outputRecord.replacing(lifecycleState: .active, observedBytes: 0)
-            return NativeJSONLineProcess(runID: runID, captured: captured, home: home, processPort: processPort, supervisor: supervisor, resourceRepository: resourceRepository, ownedResources: homeResources + [activeOutput])
+            return NativeJSONLineProcess(runID: runID, captured: captured, home: home, processPort: processPort, supervisor: supervisor, resourceRepository: resourceRepository, ownedResources: homeResources + [activeOutput], disposableHome: disposableHome)
         } catch {
             if let capturedProcess {
                 try? await supervisor.cancel(runID: runID, graceScans: 5)
@@ -346,6 +376,21 @@ private actor NativeJSONLineProcess {
 
     func request(method: String, params: [String: Any]? = nil, timeout: Duration? = nil, onFrame: @escaping @Sendable (Data) async throws -> Void) async throws -> Data {
         let id = try await beginRequest(method: method, params: params)
+        return try await awaitResponse(id: id, method: method, timeout: timeout, onFrame: onFrame)
+    }
+
+    /// Data is Sendable across the runtime/process actor boundary. Use this for
+    /// request payloads assembled by a native runtime when more than one request
+    /// path may execute (for example resume followed by missing-rollout start).
+    func request(method: String, encodedParams: Data, timeout: Duration? = nil, onFrame: @escaping @Sendable (Data) async throws -> Void) async throws -> Data {
+        guard let params = try JSONSerialization.jsonObject(with: encodedParams) as? [String: Any] else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Provider protocol request parameters are invalid")
+        }
+        let id = try await beginRequest(method: method, params: params)
+        return try await awaitResponse(id: id, method: method, timeout: timeout, onFrame: onFrame)
+    }
+
+    private func awaitResponse(id: Int, method: String, timeout: Duration?, onFrame: @escaping @Sendable (Data) async throws -> Void) async throws -> Data {
         let clock = ContinuousClock()
         let deadline = timeout.map { clock.now.advanced(by: $0) }
         while true {
@@ -457,7 +502,7 @@ private actor NativeJSONLineProcess {
             )
         }
         await processPort.cleanupCapturedFiles(captured)
-        try? FileManager.default.removeItem(at: home)
+        if disposableHome { try? FileManager.default.removeItem(at: home) }
         for resource in ownedResources {
             let remains = resourcePaths(resource).contains { FileManager.default.fileExists(atPath: $0) }
             _ = try? await resourceRepository?.transitionOwnedResource(
@@ -540,27 +585,43 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             _ = try await process.request(method: "initialize", params: ["clientInfo": ["name": "repoprompt-server", "title": "RepoPrompt Server", "version": "1"], "capabilities": ["experimentalApi": true]], onFrame: { _ in })
             try await process.notify(method: "initialized")
             let policy = Self.codexPolicy(request.policy, workingDirectory: request.workingDirectory)
-            var threadParams: [String: Any] = ["cwd": request.workingDirectory, "approvalPolicy": policy.approvalPolicy, "sandbox": policy.sandbox]
-            let config = Self.codexConfig(request.policy.providerSettings)
-            if !config.isEmpty { threadParams["config"] = config }
-            if let model = request.model { threadParams["model"] = model }
-            if let effort = request.policy.providerSettings["provider.reasoningEffort"] { threadParams["effort"] = effort }
-            if let tier = request.policy.providerSettings["provider.serviceTier"] { threadParams["serviceTier"] = tier }
-            let threadMethod: String
+            let threadData: Data
+            var turnPrompt = request.prompt
+            var responseIdentityFallback = request.resumeProviderSessionID
             if let existing = request.resumeProviderSessionID {
-                threadMethod = "thread/resume"
-                threadParams["threadId"] = existing
+                do {
+                    threadData = try await process.request(
+                        method: "thread/resume",
+                        encodedParams: try Self.codexThreadParameters(request, policy: policy, threadID: existing),
+                        onFrame: { line in try await Self.forward(line, output: onEvent) }
+                    )
+                } catch where Self.shouldStartFreshAfterMissingConversation(error) {
+                    // This is the same bounded missing-rollout recovery Desktop
+                    // applies. The server additionally owns a canonical transcript,
+                    // so the one-time replacement thread can retain conversation
+                    // context instead of silently becoming an unrelated chat.
+                    threadData = try await process.request(
+                        method: "thread/start",
+                        encodedParams: try Self.codexThreadParameters(request, policy: policy, threadID: nil),
+                        onFrame: { line in try await Self.forward(line, output: onEvent) }
+                    )
+                    turnPrompt = request.resumeFallbackPrompt ?? request.prompt
+                    responseIdentityFallback = nil
+                }
             } else {
-                threadMethod = "thread/start"
+                threadData = try await process.request(
+                    method: "thread/start",
+                    encodedParams: try Self.codexThreadParameters(request, policy: policy, threadID: nil),
+                    onFrame: { line in try await Self.forward(line, output: onEvent) }
+                )
             }
-            let threadData = try await process.request(method: threadMethod, params: threadParams, onFrame: { line in try await Self.forward(line, output: onEvent) })
             let threadResult = try Self.object(threadData)
-            guard let threadID = Self.string(in: threadResult, paths: [["thread", "id"], ["threadId"], ["id"]]) ?? request.resumeProviderSessionID else {
+            guard let threadID = Self.string(in: threadResult, paths: [["thread", "id"], ["threadId"], ["id"]]) ?? responseIdentityFallback else {
                 throw ServiceAPIError(code: .dependencyUnavailable, message: "Codex app-server did not return a thread identity")
             }
             threadIDs[request.runID] = threadID
             await onEvent(.providerIdentity(threadID))
-            var turnInput: [[String: Any]] = [["type": "text", "text": request.prompt]]
+            var turnInput: [[String: Any]] = [["type": "text", "text": turnPrompt]]
             turnInput += request.structuredInput?.nativeImages.map { ["type": "localImage", "path": $0.filePath] } ?? []
             var turnParams: [String: Any] = ["threadId": threadID, "input": turnInput, "cwd": request.workingDirectory, "approvalPolicy": policy.approvalPolicy, "sandboxPolicy": policy.sandboxPolicy]
             if let model = request.model { turnParams["model"] = model }
@@ -577,6 +638,8 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
                     switch event {
                     case let .assistantDelta(text): output += text
                     case let .assistantFinal(text): output = text
+                    case let .assistantItemDelta(_, text): output += text
+                    case let .assistantItemFinal(_, text): output = text
                     default: break
                     }
                     await onEvent(event)
@@ -667,6 +730,25 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
         }
     }
 
+    private nonisolated static func codexThreadParameters(
+        _ request: ProviderExecutionRequest,
+        policy: (approvalPolicy: String, sandbox: String, sandboxPolicy: [String: Any]),
+        threadID: String?
+    ) throws -> Data {
+        var params: [String: Any] = [
+            "cwd": request.workingDirectory,
+            "approvalPolicy": policy.approvalPolicy,
+            "sandbox": policy.sandbox,
+        ]
+        let config = codexConfig(request.policy.providerSettings)
+        if !config.isEmpty { params["config"] = config }
+        if let model = request.model { params["model"] = model }
+        if let effort = request.policy.providerSettings["provider.reasoningEffort"] { params["effort"] = effort }
+        if let tier = request.policy.providerSettings["provider.serviceTier"] { params["serviceTier"] = tier }
+        if let threadID { params["threadId"] = threadID }
+        return try JSONSerialization.data(withJSONObject: params)
+    }
+
     private nonisolated static func forward(_ line: Data, output: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws {
         for event in try normalize(line).events {
             await output(event)
@@ -685,19 +767,29 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
         }
         switch method {
         case "item/agentMessage/delta", "codex/event/agent_message_delta":
-            return ([.assistantDelta(string(in: params, paths: [["delta"], ["text"]]) ?? "")], false)
+            let text = string(in: params, paths: [["delta"], ["text"]]) ?? ""
+            if let itemID = string(in: params, paths: [["itemId"], ["item_id"], ["item", "id"]]) {
+                return ([.assistantItemDelta(providerItemID: itemID, text: text)], false)
+            }
+            return ([.assistantDelta(text)], false)
         case "item/reasoning/summaryTextDelta", "item/reasoning/textDelta":
-            return ([.reasoning(string(in: params, paths: [["delta"], ["text"]]) ?? "")], false)
+            let text = string(in: params, paths: [["delta"], ["text"]]) ?? ""
+            if let itemID = string(in: params, paths: [["itemId"], ["item_id"], ["item", "id"]]) {
+                return ([.reasoningItemDelta(providerItemID: itemID, text: text)], false)
+            }
+            return ([.reasoning(text)], false)
         case "turn/started", "codex/event/turn_started":
             return ([.runStatusChanged(phase: .thinking, statusCode: "turn_started", statusText: nil)], false)
         case "item/started":
             let item = params["item"] as? [String: Any] ?? params
             let id = item["id"] as? String ?? UUID().uuidString
             let name = item["type"] as? String ?? "tool"
-            if name == "userMessage" || name == "user_message" { return ([], false) }
-            if name == "agentMessage" || name == "agent_message" {
+            let normalizedName = normalizedItemType(name)
+            if normalizedName == "usermessage" { return ([], false) }
+            if normalizedName == "agentmessage" {
                 return ([.runStatusChanged(phase: .working, statusCode: "provider_responding", statusText: nil)], false)
             }
+            guard visibleToolItemTypes.contains(normalizedName) else { return ([], false) }
             let arguments = try? JSONSerialization.data(withJSONObject: item)
             return ([.toolStarted(providerToolID: id, name: name, arguments: arguments)], false)
         case "item/commandExecution/outputDelta", "item/mcpToolCall/progress", "item/fileChange/outputDelta":
@@ -705,13 +797,17 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             return ([.toolUpdated(providerToolID: id, output: string(in: params, paths: [["delta"], ["output"], ["message"]]) ?? "")], false)
         case "item/completed":
             let item = params["item"] as? [String: Any] ?? params
-            if item["type"] as? String == "agentMessage" || item["type"] as? String == "agent_message" {
-                return ([.assistantFinal(string(in: item, paths: [["text"], ["content"]]) ?? "")], false)
+            let name = item["type"] as? String ?? "tool"
+            let normalizedName = normalizedItemType(name)
+            if normalizedName == "agentmessage" {
+                let text = string(in: item, paths: [["text"], ["content"]]) ?? ""
+                if let itemID = item["id"] as? String, !itemID.isEmpty {
+                    return ([.assistantItemFinal(providerItemID: itemID, text: text)], false)
+                }
+                return ([.assistantFinal(text)], false)
             }
-            if item["type"] as? String == "userMessage" || item["type"] as? String == "user_message" {
-                return ([], false)
-            }
-            return ([.toolCompleted(providerToolID: item["id"] as? String ?? "tool", name: item["type"] as? String ?? "tool", output: string(in: item, paths: [["output"], ["aggregatedOutput"]]), failed: false)], false)
+            guard visibleToolItemTypes.contains(normalizedName) else { return ([], false) }
+            return ([.toolCompleted(providerToolID: item["id"] as? String ?? "tool", name: name, output: string(in: item, paths: [["output"], ["aggregatedOutput"]]), failed: false)], false)
         case "turn/completed", "codex/event/turn_completed":
             return ([], true)
         case "thread/status/changed":
@@ -737,6 +833,48 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             if let string = value as? String, !string.isEmpty { return string }
         }
         return nil
+    }
+
+    private nonisolated static let visibleToolItemTypes: Set<String> = [
+        "commandexecution",
+        "mcptoolcall",
+        "dynamictoolcall",
+        "filechange",
+    ]
+
+    private nonisolated static func normalizedItemType(_ value: String) -> String {
+        value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+    }
+
+    /// Ported from Desktop's mature Codex resume recovery classifier. Only an
+    /// explicitly missing rollout/conversation may create a replacement thread;
+    /// transport, authentication, permission, and timeout failures still fail
+    /// closed rather than duplicating a live conversation.
+    private nonisolated static func shouldStartFreshAfterMissingConversation(_ error: Error) -> Bool {
+        guard !(error is CancellationError) else { return false }
+        let message = (error as? ServiceAPIError)?.message ?? error.localizedDescription
+        let normalized = message
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let noRolloutFound = "no rollout found for thread id "
+        if let range = normalized.range(of: noRolloutFound) {
+            let threadID = normalized[range.upperBound...]
+            if !threadID.isEmpty, !threadID.contains(where: \.isWhitespace) {
+                return true
+            }
+        }
+        guard normalized.contains("rollout") else { return false }
+        let loadFailure = normalized.contains("failed to load rollout")
+            || normalized.contains("failed loading rollout")
+            || normalized.contains("failed to open rollout")
+        let missingFile = normalized.contains("no such file")
+            || normalized.contains("os error 2")
+            || normalized.contains("enoent")
+        return loadFailure && missingFile
     }
 }
 
@@ -1196,6 +1334,8 @@ private actor ProviderOutputAccumulator {
         switch event {
         case let .assistantDelta(text): output += text
         case let .assistantFinal(text): output = text
+        case let .assistantItemDelta(_, text): output += text
+        case let .assistantItemFinal(_, text): output = text
         default: break
         }
     }

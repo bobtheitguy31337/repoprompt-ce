@@ -289,12 +289,16 @@ public actor AgentTranscriptPresentationService {
     }
 
     private static func interactionWire(_ value: InteractionSnapshot, turnID: String, mutable: Bool) -> AgentPresentationInteractionWire {
-        let prompt = String(data: value.payload, encoding: .utf8).map { String($0.prefix(8_192)) } ?? "Provider interaction"
+        let providerPayload = try? JSONDecoder.serviceDecoder.decode(ProviderInteractionPayload.self, from: value.payload)
+        let prompt = providerPayload?.prompt
+            ?? String(data: value.payload, encoding: .utf8).map { String($0.prefix(8_192)) }
+            ?? "Provider interaction"
         return .init(
             interactionID: value.interactionID,
             kind: value.kind == .approval ? .approval : .question,
             state: value.state.rawValue,
             prompt: prompt,
+            choices: providerPayload?.choices ?? [],
             turnID: turnID,
             liveTail: true,
             requiresAttention: value.state == .pending,

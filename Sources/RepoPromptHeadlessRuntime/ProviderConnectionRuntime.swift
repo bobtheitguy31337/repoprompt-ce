@@ -30,6 +30,15 @@ public struct UnavailableProviderCredentialTester: ProviderCredentialTesting {
 /// child environment and are never rendered into arguments or result DTOs.
 public protocol ProviderCredentialSourceProviding: Sendable {
     func sourceDirectory(for kind: ProviderKind) async throws -> String?
+    /// Returns a protected, durable provider environment when the provider's
+    /// native conversation state must survive across turns. RepoPrompt Desktop
+    /// uses one managed Codex home for authentication and thread persistence;
+    /// the server runtime must not replace it with a disposable per-turn copy.
+    func persistentRuntimeEnvironment(for kind: ProviderKind) async throws -> [String: String]?
+}
+
+public extension ProviderCredentialSourceProviding {
+    func persistentRuntimeEnvironment(for _: ProviderKind) async throws -> [String: String]? { nil }
 }
 
 public struct StaticProviderCredentialSource: ProviderCredentialSourceProviding {
@@ -54,6 +63,7 @@ public actor VaultProviderProcessEnvironment: ProviderProcessEnvironmentProvidin
     private let externallyProvisionedKinds: Set<ProviderKind>
     private let credentialSourceDirectories: [ProviderKind: String]
     private let managedCodexCredentialSource: String?
+    private let managedCodexRuntimeHome: CodexManagedAuthHome?
     private let backendSettings: (any ClaudeCompatibleBackendSettingsProviding)?
 
     public init(
@@ -62,6 +72,7 @@ public actor VaultProviderProcessEnvironment: ProviderProcessEnvironmentProvidin
         externallyProvisionedKinds: Set<ProviderKind> = [],
         credentialSourceDirectories: [ProviderKind: String] = [:],
         managedCodexCredentialSource: String? = nil,
+        managedCodexRuntimeHome: CodexManagedAuthHome? = nil,
         backendSettings: (any ClaudeCompatibleBackendSettingsProviding)? = nil
     ) {
         self.store = store
@@ -69,6 +80,7 @@ public actor VaultProviderProcessEnvironment: ProviderProcessEnvironmentProvidin
         self.externallyProvisionedKinds = externallyProvisionedKinds
         self.credentialSourceDirectories = credentialSourceDirectories
         self.managedCodexCredentialSource = managedCodexCredentialSource
+        self.managedCodexRuntimeHome = managedCodexRuntimeHome
         self.backendSettings = backendSettings
     }
 
@@ -170,6 +182,17 @@ public actor VaultProviderProcessEnvironment: ProviderProcessEnvironmentProvidin
             return managedCodexCredentialSource
         }
         return credentialSourceDirectories[kind]
+    }
+
+    public func persistentRuntimeEnvironment(for kind: ProviderKind) async throws -> [String: String]? {
+        guard kind == .codex,
+              let stored = try await store.providerConnection(providerID: .codex),
+              stored.record.authenticationMethod == .deviceCodeBeta,
+              stored.record.state == .connected,
+              stored.record.testState == .valid,
+              let managedCodexRuntimeHome
+        else { return nil }
+        return try managedCodexRuntimeHome.environment()
     }
 
     private nonisolated static func providerID(_ kind: ProviderKind) -> ProviderSettingsID? {

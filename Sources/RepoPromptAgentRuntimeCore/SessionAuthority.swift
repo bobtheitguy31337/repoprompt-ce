@@ -40,14 +40,14 @@ public actor SessionAuthority {
         return binding
     }
 
-    public func acceptProviderOutput(binding: RunBindingIdentity, kind: TranscriptEntry.Kind, content: String, mutation: ProviderOutputMutation) -> LifecycleAcceptance {
+    public func acceptProviderOutput(binding: RunBindingIdentity, kind: TranscriptEntry.Kind, content: String, mutation: ProviderOutputMutation, channel: String? = nil) -> LifecycleAcceptance {
         guard var gate = state.gate else { return .staleGeneration }
         let result = gate.accept(binding: binding)
         state.gate = gate
         guard result == .accepted else { return result }
         var transcript = state.snapshot.transcript
         let bounded = String(content.prefix(262_144))
-        let key = kind.rawValue
+        let key = "\(kind.rawValue):\(channel ?? "default")"
         if mutation != .appendEntry,
            let entryID = activeProviderEntryIDs[key],
            let index = transcript.firstIndex(where: { $0.entryID == entryID })

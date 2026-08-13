@@ -58,6 +58,12 @@ public enum ProviderRuntimeEvent: Sendable, Equatable {
     case assistantDelta(String)
     case assistantFinal(String)
     case reasoning(String)
+    /// Canonical native item events preserve the same item boundary used by
+    /// RepoPrompt Desktop so narration, tools, and final responses retain
+    /// provider emission order instead of collapsing into one run-wide row.
+    case assistantItemDelta(providerItemID: String, text: String)
+    case assistantItemFinal(providerItemID: String, text: String)
+    case reasoningItemDelta(providerItemID: String, text: String)
     case progress(String)
     case runStatusChanged(phase: RunPresentationPhase, statusCode: String?, statusText: String?)
     case toolStarted(providerToolID: String, name: String, arguments: Data?)
@@ -156,10 +162,15 @@ public struct ProviderExecutionRequest: Sendable {
     public let maximumBytes: Int
     public let runID: UUID
     public let resumeProviderSessionID: String?
+    /// RepoPrompt-owned recovery input for a native conversation whose durable
+    /// provider identity can no longer be loaded. Native runtimes must use this
+    /// only after a provider explicitly reports that the saved conversation is
+    /// missing; successful native resume continues to receive `prompt` alone.
+    public let resumeFallbackPrompt: String?
     public let policy: ProviderExecutionPolicy
     private let launchValidation: @Sendable () throws -> Void
 
-    public init(kind: ProviderKind, model: String?, prompt: String, structuredInput: CompiledProviderTurnInput? = nil, workingDirectory: String, maximumBytes: Int = 8_388_608, runID: UUID, resumeProviderSessionID: String? = nil, policy: ProviderExecutionPolicy = .init(), launchValidation: @escaping @Sendable () throws -> Void = {}) {
+    public init(kind: ProviderKind, model: String?, prompt: String, structuredInput: CompiledProviderTurnInput? = nil, workingDirectory: String, maximumBytes: Int = 8_388_608, runID: UUID, resumeProviderSessionID: String? = nil, resumeFallbackPrompt: String? = nil, policy: ProviderExecutionPolicy = .init(), launchValidation: @escaping @Sendable () throws -> Void = {}) {
         self.kind = kind
         self.model = model
         self.prompt = structuredInput?.prompt ?? prompt
@@ -168,6 +179,7 @@ public struct ProviderExecutionRequest: Sendable {
         self.maximumBytes = maximumBytes
         self.runID = runID
         self.resumeProviderSessionID = resumeProviderSessionID
+        self.resumeFallbackPrompt = resumeFallbackPrompt
         self.policy = policy
         self.launchValidation = launchValidation
     }
@@ -191,6 +203,7 @@ public struct ProviderExecutionRequest: Sendable {
             maximumBytes: maximumBytes,
             runID: runID,
             resumeProviderSessionID: resumeProviderSessionID,
+            resumeFallbackPrompt: resumeFallbackPrompt,
             policy: ProviderExecutionPolicy(mode: policy.mode, writableRoots: policy.writableRoots, providerSettings: settings),
             launchValidation: launchValidation
         )

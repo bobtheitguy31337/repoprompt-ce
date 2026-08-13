@@ -138,7 +138,18 @@ public enum AgentTranscriptPresentationCore {
     }
 
     private static func isVisibleTool(_ tool: AgentPresentationToolWire) -> Bool {
-        let placeholder = ["", "tool", "other", "unknown"].contains(tool.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+        let normalizedName = tool.name
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+        // Older server builds persisted Codex item lifecycle frames as tools.
+        // Suppress those malformed rows at the presentation boundary so existing
+        // transcripts repair immediately without rewriting durable history.
+        if ["reasoning", "agentmessage", "usermessage", "contextcompaction"].contains(normalizedName) {
+            return false
+        }
+        let placeholder = ["", "tool", "other", "unknown"].contains(normalizedName)
         let meaningful = tool.summary?.isEmpty == false || tool.displayArguments?.isEmpty == false || tool.displayResult?.isEmpty == false || !tool.keyPaths.isEmpty
         return !placeholder || meaningful || [.failed, .warning].contains(tool.status)
     }

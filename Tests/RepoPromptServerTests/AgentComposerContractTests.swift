@@ -642,6 +642,36 @@ final class SessionAuthorityStreamingTests: XCTestCase {
         XCTAssertEqual(nextRun.transcript.map(\.content), ["Hello, world!", "Next turn"])
         XCTAssertEqual(nextRun.transcript.map(\.sessionSequence), [1, 2])
     }
+
+    func testNativeAssistantItemsRetainSeparateTranscriptEntries() async throws {
+        let sessionID = UUID()
+        let snapshot = SessionSnapshot(
+            sessionID: sessionID,
+            projectID: UUID(),
+            parentSessionID: nil,
+            rootSessionID: sessionID,
+            creator: .init(goblinUserID: "owner", username: "owner", displayName: "Owner"),
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            visibility: .privateSession,
+            state: .idle,
+            runGeneration: 0,
+            turnEpoch: 0,
+            revision: 1,
+            transcript: [],
+            interactions: [],
+            cursor: .init(storeID: UUID(), globalSequence: 0)
+        )
+        let authority = SessionAuthority(snapshot: snapshot, clock: SystemRuntimeClock(), ids: SystemRuntimeIDGenerator())
+        let binding = try await authority.beginRun(connectionGeneration: 1)
+
+        _ = await authority.acceptProviderOutput(binding: binding, kind: .assistant, content: "I’ll inspect it.", mutation: .replaceActiveEntry, channel: "message-1")
+        _ = await authority.acceptProviderOutput(binding: binding, kind: .assistant, content: "The inspection is complete.", mutation: .replaceActiveEntry, channel: "message-2")
+
+        let transcript = await authority.snapshot().transcript
+        XCTAssertEqual(transcript.map(\.content), ["I’ll inspect it.", "The inspection is complete."])
+        XCTAssertEqual(transcript.map(\.sessionSequence), [1, 2])
+    }
 }
 
 final class AgentTranscriptPresentationTests: XCTestCase {
@@ -671,6 +701,89 @@ final class AgentTranscriptPresentationTests: XCTestCase {
         guard case let .activityCluster(_, rows, summary) = projected.blocks[1] else { return XCTFail("expected activity cluster") }
         XCTAssertEqual(rows.count, 2)
         XCTAssertEqual(summary.toolGroups, ["read_file"])
+    }
+
+    func testProviderEmissionOrderKeepsNarrationBeforeToolsAndConclusionAfterThem() {
+        let tool = AgentPresentationToolWire(executionID: "e1", name: "read_file", status: .success)
+        let projected = AgentTranscriptPresentationCore.project(.init(
+            turnID: "turn",
+            responseSpanID: "span",
+            requestAnchorID: UUID(),
+            requestText: "Inspect the workspace",
+            activities: [
+                .init(id: "narration", sequence: 2, revision: 1, kind: "assistant", content: "I’ll take a look."),
+                .init(id: "tool", sequence: 3, revision: 1, kind: "tool", tool: tool),
+                .init(id: "conclusion", sequence: 4, revision: 1, kind: "assistant", content: "The inspection is complete."),
+            ]
+        ))
+
+        XCTAssertEqual(projected.blocks.map(\.id), [
+            "turn:request-block",
+            "narration",
+            "turn:activity:0",
+            "conclusion",
+        ])
+    }
+
+    func testLegacyReasoningLifecycleRowsAreNotPresentedAsTools() {
+        let reasoning = AgentPresentationToolWire(
+            executionID: "legacy-reasoning",
+            name: "reasoning",
+            status: .success,
+            summary: "reasoning",
+            displayArguments: #"{"type":"reasoning"}"#
+        )
+        let command = AgentPresentationToolWire(executionID: "command", name: "Command", status: .success)
+        let projected = AgentTranscriptPresentationCore.project(.init(
+            turnID: "turn",
+            responseSpanID: "span",
+            requestAnchorID: UUID(),
+            requestText: "Inspect",
+            activities: [
+                .init(id: "legacy-reasoning", sequence: 2, revision: 1, kind: "tool", tool: reasoning),
+                .init(id: "command", sequence: 3, revision: 1, kind: "tool", tool: command),
+            ]
+        ))
+
+        guard case let .activityCluster(_, rows, summary) = projected.blocks[1] else { return XCTFail("expected activity cluster") }
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(summary.toolCount, 1)
+        XCTAssertEqual(summary.toolGroups, ["Command"])
+    }
+
+    func testPresentationPublishesProviderApprovalChoicesAsCanonicalClientActions() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let service = AgentTranscriptPresentationService(store: store)
+        let sessionID = UUID()
+        let runID = UUID()
+        let payload = try JSONEncoder.serviceEncoder.encode(ProviderInteractionPayload(
+            providerRequestID: "provider-request-1",
+            prompt: "Allow the read-only command?",
+            choices: ["accept", "decline"]
+        ))
+        let interaction = InteractionSnapshot(
+            interactionID: UUID(),
+            runID: runID,
+            kind: .approval,
+            state: .pending,
+            payload: payload,
+            revision: 1,
+            expiresAt: nil
+        )
+
+        let page = try await service.page(
+            sessionID: sessionID,
+            actorID: "controller",
+            legacyTranscript: [],
+            interactions: [interaction],
+            mutableInteractions: true
+        )
+
+        let presented = try XCTUnwrap(page.pendingInteractions.first)
+        XCTAssertEqual(presented.prompt, "Allow the read-only command?")
+        XCTAssertEqual(presented.choices, ["accept", "decline"])
+        XCTAssertTrue(presented.mutable)
+        try await store.close()
     }
 
     func testLegacyRollbackGapIsDetectedWithoutInventingSemanticTurns() async throws {
@@ -847,10 +960,26 @@ final class NativeProviderRuntimeLifecycleTests: XCTestCase {
         XCTAssertEqual(phase, .working)
         XCTAssertEqual(code, "provider_responding")
 
+        let assistantDelta = try CodexAppServerProviderRuntime.normalize(Data(#"{"method":"item/agentMessage/delta","params":{"itemId":"assistant-1","delta":"one coherent "}}"#.utf8))
+        guard case let .assistantItemDelta(providerItemID, delta) = assistantDelta.events.first else { return XCTFail("agent message delta must retain its native item identity") }
+        XCTAssertEqual(providerItemID, "assistant-1")
+        XCTAssertEqual(delta, "one coherent ")
+
         let assistantCompleted = try CodexAppServerProviderRuntime.normalize(Data(#"{"method":"item/completed","params":{"item":{"id":"assistant-1","type":"agentMessage","text":"one coherent response"}}}"#.utf8))
         XCTAssertEqual(assistantCompleted.events.count, 1)
-        guard case let .assistantFinal(text) = assistantCompleted.events[0] else { return XCTFail("agent message completion must be a final response") }
+        guard case let .assistantItemFinal(completedItemID, text) = assistantCompleted.events[0] else { return XCTFail("agent message completion must retain its native item identity") }
+        XCTAssertEqual(completedItemID, "assistant-1")
         XCTAssertEqual(text, "one coherent response")
+
+        let reasoningStarted = try CodexAppServerProviderRuntime.normalize(Data(#"{"method":"item/started","params":{"item":{"id":"reasoning-1","type":"reasoning"}}}"#.utf8))
+        let reasoningCompleted = try CodexAppServerProviderRuntime.normalize(Data(#"{"method":"item/completed","params":{"item":{"id":"reasoning-1","type":"reasoning","summary":["Checked the workspace"]}}}"#.utf8))
+        XCTAssertTrue(reasoningStarted.events.isEmpty)
+        XCTAssertTrue(reasoningCompleted.events.isEmpty)
+
+        let reasoningDelta = try CodexAppServerProviderRuntime.normalize(Data(#"{"method":"item/reasoning/summaryTextDelta","params":{"itemId":"reasoning-1","delta":"Checking"}}"#.utf8))
+        guard case let .reasoningItemDelta(reasoningItemID, reasoningText) = reasoningDelta.events.first else { return XCTFail("reasoning delta must not become a tool") }
+        XCTAssertEqual(reasoningItemID, "reasoning-1")
+        XCTAssertEqual(reasoningText, "Checking")
 
         let idle = try CodexAppServerProviderRuntime.normalize(Data(#"{"method":"thread/status/changed","params":{"status":{"type":"idle"}}}"#.utf8))
         XCTAssertTrue(idle.events.isEmpty)

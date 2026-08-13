@@ -415,6 +415,7 @@ public enum RepoPromptServerRunner {
             externallyProvisionedKinds: Set(configuration.providerCredentialSources.keys),
             credentialSourceDirectories: configuration.providerCredentialSources,
             managedCodexCredentialSource: managedCodexHome.credentialSourceDirectory,
+            managedCodexRuntimeHome: managedCodexHome,
             backendSettings: portalDesktopSettings
         )
         let providers = ProviderCLIAdapter(
