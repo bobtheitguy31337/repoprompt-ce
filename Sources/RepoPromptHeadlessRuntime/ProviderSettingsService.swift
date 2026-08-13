@@ -220,23 +220,13 @@ public actor ProviderSettingsService {
         return ProviderSettingsCatalogResponse(providers: snapshots)
     }
 
-    /// Composer reads require a current runtime/authentication projection and the
-    /// account-backed model catalog. Refreshes are coalesced and TTL bounded by
-    /// the same provider status path used by the settings portal.
+    /// Composer reads are served from the durable settings/model projection. Runtime
+    /// and authentication health are refreshed opportunistically so opening a chat
+    /// never waits for CLI process startup or an external authentication probe.
     public func composerCatalog() async throws -> ProviderSettingsCatalogResponse {
         for providerID in ProviderSettingsID.allCases where providerID.ownsRuntimeAdmission && !providerID.isDirectAPI {
             guard preferences[providerID]?.enabled == true else { continue }
-            await refreshProviderStatus(providerID: providerID)
-            if providerID == .codex,
-               try snapshot(for: providerID).preflight.ready
-            {
-                guard let models = try await managedAuthentication.discoverModelCatalog(providerID: providerID, forceRefresh: false),
-                      !models.isEmpty
-                else {
-                    throw ServiceAPIError(code: .dependencyUnavailable, message: "Codex account model discovery is temporarily unavailable", retryable: true)
-                }
-                try await persistDiscoveredCatalog(models, providerID: providerID)
-            }
+            requestProviderStatusRefresh(providerID: providerID)
         }
         return try ProviderSettingsCatalogResponse(providers: ProviderSettingsID.allCases.map { try snapshot(for: $0) })
     }

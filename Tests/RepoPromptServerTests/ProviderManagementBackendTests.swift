@@ -12,6 +12,30 @@ import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 final class ProviderManagementBackendTests: XCTestCase {
+    func testComposerCatalogReturnsBeforeProviderStatusProbeCompletes() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        _ = try await store.upsertProviderSettings(
+            ProviderSettingsPreference(providerID: .codex, enabled: true, revision: 1),
+            expectedRevision: 0
+        )
+        let runner = SlowVersionRunner()
+        let configuration = ProviderCLIConfiguration(kind: .codex, executable: "/usr/bin/swift")
+        let service = ProviderSettingsService(
+            store: store,
+            adapter: ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.codex], runner: runner),
+            configurations: [configuration],
+            initiallyEnabled: [.codex],
+            runner: runner
+        )
+        try await service.bootstrap()
+
+        let startedAt = Date()
+        _ = try await service.composerCatalog()
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.2)
+        await runner.waitForVersionProbe()
+    }
+
     func testBootstrapReconcilesRetiredModelToConcreteCatalogDefaultsAndPersistsRestartSafeSelection() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
@@ -733,6 +757,36 @@ private actor StaticVersionRunner: WorkspaceCommandRunning {
         arguments == ["auth", "status", "--json"]
             ? #"{"loggedIn":true,"email":"must-not-project@example.test","tokenSource":"must-not-project"}"#
             : "Swift version 6.2"
+    }
+}
+
+private actor SlowVersionRunner: WorkspaceCommandRunning {
+    private var versionProbeFinished = false
+    private var completionWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func run(executable _: String, arguments: [String], workingDirectory _: String, maximumBytes _: Int) async throws -> String {
+        try await response(for: arguments)
+    }
+
+    func run(executable _: String, arguments: [String], workingDirectory _: String, maximumBytes _: Int, environment _: [String: String]) async throws -> String {
+        try await response(for: arguments)
+    }
+
+    func waitForVersionProbe() async {
+        if versionProbeFinished { return }
+        await withCheckedContinuation { continuation in
+            completionWaiters.append(continuation)
+        }
+    }
+
+    private func response(for arguments: [String]) async throws -> String {
+        guard arguments == ["--version"] else { return "" }
+        try await Task.sleep(for: .milliseconds(500))
+        versionProbeFinished = true
+        let waiters = completionWaiters
+        completionWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        return "Swift version 6.2"
     }
 }
 

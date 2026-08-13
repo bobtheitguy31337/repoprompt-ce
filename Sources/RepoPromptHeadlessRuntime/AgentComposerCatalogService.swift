@@ -247,12 +247,20 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
             if let cached {
                 sources.append(.init(kind: .persisted, observedAt: cached.observedAt, models: cached.models.map(Self.candidate)))
             }
+            // The composer is a projection of durable provider choices, not a live
+            // health check. A transient CLI/auth probe must not make already-known
+            // models (and their tools/permissions) disappear while a chat opens.
+            // Submission still traverses the provider runtime and reports a genuine
+            // admission/authentication failure if the provider cannot execute.
+            let hasKnownModels = sources.contains { !$0.models.isEmpty }
+            let catalogReady = settings.runtimePreflightVerified && settings.preflight.ready
+                || (hasKnownModels && settings.authentication.state != .notConfigured)
             states.append(.init(
                 providerID: matrix.providerID,
                 displayName: settings.displayName,
                 enabled: settings.preference.enabled && settings.deploymentAllowed,
                 configured: settings.preflight.ready || settings.authentication.state != .notConfigured,
-                preflightReady: settings.runtimePreflightVerified && settings.preflight.ready,
+                preflightReady: catalogReady,
                 adapterAvailable: adapters[matrix.providerID] != nil,
                 discoveryPolicy: matrix.discoveryPolicy,
                 modelSources: sources,

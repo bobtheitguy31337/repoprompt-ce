@@ -34,6 +34,73 @@ private func tinyPNG() -> Data {
 }
 
 final class AgentComposerCatalogTests: XCTestCase {
+    func testDurableProviderCatalogRemainsVisibleDuringTransientRuntimeFailure() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let modelID = "gpt-5.6-sol"
+        let catalogURL = root.appendingPathComponent("codex-models.json")
+        try JSONEncoder.serviceEncoder.encode([
+            ProviderModelCatalogEntry(
+                id: modelID,
+                providerRawValue: modelID,
+                displayName: "GPT-5.6 Sol",
+                isProviderDefault: true,
+                reasoningEfforts: ["low", "high"],
+                defaultReasoningEffort: "high",
+                supportsNativeImages: true,
+                supportsSteering: true
+            )
+        ]).write(to: catalogURL)
+        _ = try await store.upsertProviderSettings(
+            ProviderSettingsPreference(providerID: .codex, enabled: true, defaultModel: modelID, reasoningEffort: "high", revision: 1),
+            expectedRevision: 0
+        )
+        let instant = Date(timeIntervalSince1970: 1_786_400_000)
+        let connection = ProviderConnectionRecord(
+            connectionID: UUID(),
+            providerID: .codex,
+            authenticationMethod: .deviceCodeBeta,
+            state: .attention,
+            accountLabel: "sandbox",
+            lastTestedAt: instant,
+            testState: .unavailable,
+            detail: "Authentication status is temporarily unavailable",
+            keyHelperConfigured: false,
+            workloadIdentityConfigured: false,
+            createdAt: instant,
+            updatedAt: instant,
+            revision: 1
+        )
+        _ = try await store.upsertProviderConnection(.init(record: connection, credentialReference: nil), expectedRevision: 0)
+        let runner = StructuredStartProviderRunner()
+        let configuration = ProviderCLIConfiguration(kind: .codex, executable: "/usr/bin/swift", expectedVersion: "6.2")
+        let settings = ProviderSettingsService(
+            store: store,
+            adapter: ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.codex], runner: runner),
+            configurations: [configuration],
+            initiallyEnabled: [.codex],
+            modelCatalogFiles: [.codex: catalogURL.path],
+            runner: runner
+        )
+        try await settings.bootstrap()
+        let beforeRefresh = try await settings.catalog()
+        let codex = try XCTUnwrap(beforeRefresh.providers.first { $0.providerID == .codex })
+        XCTAssertFalse(codex.runtimePreflightVerified)
+        XCTAssertEqual(codex.authentication.state, .attention)
+
+        let snapshot = try await AgentComposerCatalogService(providerSettings: settings, store: store).snapshot(
+            context: .init(kind: .project, projectID: UUID(), actorID: "catalog-reader")
+        )
+
+        let group = try XCTUnwrap(snapshot.providerGroups.first { $0.providerID == .codex })
+        XCTAssertEqual(group.models.map(\.id), [modelID])
+        XCTAssertNotNil(group.permissionControl)
+        XCTAssertFalse(group.toolControls.isEmpty)
+    }
+
     func testProviderMatrixAndDiscoveryPoliciesAreExact() throws {
         XCTAssertEqual(AgentComposerProviderMatrix.entries.map(\.providerID), [.codex, .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom, .openCodeACP, .cursorACP, .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI])
         XCTAssertEqual(AgentComposerProviderMatrix.liveFreshnessSeconds, 900)
