@@ -406,6 +406,7 @@ private actor CommandCompatibilityProviderRuntime: AgentProviderRuntime {
     func preflight() async -> ProviderCapability {
         let base = capability()
         guard base.enabled else { return base }
+        if configuration.expectedVersion != nil { return base }
         do {
             let environment = try ProviderCLIProbeEnvironment.prepare(for: kind)
             let output = try await runner.run(

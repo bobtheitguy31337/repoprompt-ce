@@ -306,7 +306,15 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
             return observed
         #else
             for _ in 0 ..< 100 {
-                if let observed = try await inspectLinux(pid: pid, helperTokenDigest: digest) {
+                if let observed = try await inspectLinux(pid: pid, helperTokenDigest: digest),
+                   observed.processGroupID == pid,
+                   observed.sessionID == pid,
+                   URL(fileURLWithPath: observed.executablePath).lastPathComponent != "setsid"
+                {
+                    // `Process.run()` returns as soon as the setsid wrapper is
+                    // spawned. Record authority only after setsid and exec have
+                    // completed, otherwise the persisted PGID/executable can
+                    // describe the short-lived wrapper rather than the provider.
                     identities[pid] = observed
                     return observed
                 }
@@ -393,14 +401,12 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
         try? standardInputs.removeValue(forKey: pid)?.close()
         standardInputPipes[pid] = nil
         if let cgroup = cgroupPaths.removeValue(forKey: pid) { try? FileManager.default.removeItem(atPath: cgroup) }
-        try reapAdoptedChildren()
-    }
-
-    public func reapAdoptedChildren() throws {
-        #if os(Linux)
-            var status: Int32 = 0
-            while rp_waitpid_nohang(-1, &status) > 0 {}
-        #endif
+        // Never use waitpid(-1) here. This service also launches short-lived
+        // Foundation `Process` commands outside this port (for example CLI
+        // health probes). A wildcard wait can consume one of those commands'
+        // statuses before Foundation observes it, making healthy providers
+        // fail nondeterministically. Provider descendants are discovered by
+        // the supervisor and passed back to this method by exact PID instead.
     }
 
     private func inspectLinux(pid: Int32, helperTokenDigest expectedHelperTokenDigest: String) async throws -> ProcessIdentity? {

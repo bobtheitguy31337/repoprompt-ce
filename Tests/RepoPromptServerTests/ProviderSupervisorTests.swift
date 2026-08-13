@@ -6,6 +6,10 @@ import RepoPromptServiceProtocol
 import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
+#if os(Linux)
+    import Glibc
+#endif
+
 private struct ImmediateClock: RuntimeClock {
     func now() -> Date {
         Date(timeIntervalSince1970: 0)
@@ -165,7 +169,7 @@ final class ProviderSupervisorTests: XCTestCase {
                     .appendingPathComponent("repoprompt-provider-probes/openCodeACP", isDirectory: true)
             )
         }
-        let configuration = ProviderCLIConfiguration(kind: .openCodeACP, executable: executable.path, expectedVersion: "1.0", protocolVersion: "acp-v1")
+        let configuration = ProviderCLIConfiguration(kind: .openCodeACP, executable: executable.path, protocolVersion: "acp-v1")
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let adapter = ProviderCLIAdapter(
             configurations: [configuration],
@@ -180,10 +184,11 @@ final class ProviderSupervisorTests: XCTestCase {
         let clock = ContinuousClock()
         let started = clock.now
         try await settings.bootstrap()
-        let catalog = try await settings.catalog(refreshRuntime: false)
+        let catalog = try await settings.catalog(refreshCLI: true, refreshRuntime: false)
         let provider = try XCTUnwrap(catalog.providers.first { $0.providerID == .openCodeACP })
         XCTAssertLessThan(started.duration(to: clock.now), .seconds(5))
         XCTAssertTrue(provider.cli?.healthy == true)
+        XCTAssertEqual(provider.cli?.version, "fixture 1.0")
         XCTAssertFalse(provider.preflight.ready)
         XCTAssertTrue(
             FileManager.default.fileExists(
@@ -192,6 +197,44 @@ final class ProviderSupervisorTests: XCTestCase {
                     .path
             )
         )
+        try await store.close()
+    }
+
+    func testPackagedProviderAuthorityDoesNotLaunchVersionProbe() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let runner = RecordingProviderRunner()
+        let configuration = ProviderCLIConfiguration(
+            kind: .openCodeACP,
+            executable: "/usr/bin/true",
+            expectedVersion: "1.2.3",
+            protocolVersion: "acp-v1"
+        )
+        let adapter = ProviderCLIAdapter(
+            configurations: [configuration],
+            enabledProviders: [.openCodeACP],
+            runner: runner
+        )
+        let settings = ProviderSettingsService(
+            store: store,
+            adapter: adapter,
+            configurations: [configuration],
+            initiallyEnabled: [.openCodeACP],
+            runner: runner
+        )
+
+        try await settings.bootstrap()
+        let initial = try await settings.catalog()
+        let initialProvider = try XCTUnwrap(initial.providers.first { $0.providerID == .openCodeACP })
+        XCTAssertEqual(initialProvider.cli?.version, "1.2.3")
+        XCTAssertTrue(initialProvider.cli?.healthy == true)
+        XCTAssertTrue(initialProvider.runtimePreflightVerified)
+
+        let refreshed = try await settings.catalog(refreshCLI: true, refreshRuntime: false)
+        let refreshedProvider = try XCTUnwrap(refreshed.providers.first { $0.providerID == .openCodeACP })
+        XCTAssertEqual(refreshedProvider.cli?.version, "1.2.3")
+        XCTAssertTrue(refreshedProvider.cli?.healthy == true)
+        let calls = await runner.calls()
+        XCTAssertTrue(calls.isEmpty)
         try await store.close()
     }
 
@@ -211,7 +254,7 @@ final class ProviderSupervisorTests: XCTestCase {
         let adapter = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: executable.path, expectedVersion: "1.0", credentialSourceDirectory: credentials.path)], processPort: port, processStore: store, outputDirectory: directory.appendingPathComponent("output").path, ephemeralHomeRoot: homes.path)
         let capabilities = await adapter.preflight()
         XCTAssertEqual(capabilities.first { $0.kind == .codex }?.enabled, true)
-        XCTAssertEqual(capabilities.first { $0.kind == .codex }?.version, "provider 1.0")
+        XCTAssertEqual(capabilities.first { $0.kind == .codex }?.version, "1.0")
         let runID = UUID()
 
         let output = try await adapter.complete(kind: .codex, model: nil, prompt: "prompt", workingDirectory: directory.path, runID: runID)
@@ -288,6 +331,77 @@ final class ProviderSupervisorTests: XCTestCase {
         let reaped = try await port.inspect(pid: captured.identity.pid)
         XCTAssertNil(reaped)
     }
+
+    #if os(Linux)
+        func testReapingTrackedProviderDoesNotConsumeUnrelatedChildStatus() async throws {
+            let unrelatedPID = fork()
+            if unrelatedPID == 0 {
+                _exit(0)
+            }
+            guard unrelatedPID > 0 else {
+                XCTFail("fork failed")
+                return
+            }
+            defer {
+                var status: Int32 = 0
+                _ = waitpid(unrelatedPID, &status, WNOHANG)
+            }
+
+            for _ in 0 ..< 100 {
+                guard let stat = try? String(contentsOfFile: "/proc/\(unrelatedPID)/stat", encoding: .utf8) else { break }
+                if stat.contains(") Z ") { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+
+            let sleep = try XCTUnwrap(["/bin/sleep", "/usr/bin/sleep"].first { FileManager.default.isExecutableFile(atPath: $0) })
+            let output = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: output) }
+            let port = try PortableProcessSupervisionPort()
+            let captured = try await port.launchCaptured(
+                executable: sleep,
+                arguments: ["0.05"],
+                environment: [:],
+                workingDirectory: FileManager.default.temporaryDirectory.path,
+                helperToken: UUID().uuidString,
+                outputDirectory: output.path
+            )
+            _ = try await port.waitForCapturedProcess(captured, maximumBytes: 1024)
+
+            var unrelatedStatus: Int32 = 0
+            XCTAssertEqual(waitpid(unrelatedPID, &unrelatedStatus, WNOHANG), unrelatedPID)
+        }
+
+        func testPortableLaunchRecordsPostSetsidProviderIdentity() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            let executable = directory.appendingPathComponent("provider")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            try """
+            #!/bin/sh
+            sleep 30
+            """.write(to: executable, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+
+            let port = try PortableProcessSupervisionPort()
+            let identity = try await port.launch(
+                executable: executable.path,
+                arguments: [],
+                environment: ["PATH": "/usr/bin:/bin"],
+                workingDirectory: directory.path,
+                helperToken: UUID().uuidString
+            )
+            let supervisor = ProviderProcessSupervisor(processPort: port)
+            let runID = UUID()
+            try await supervisor.register(runID: runID, leader: identity)
+            XCTAssertEqual(identity.processGroupID, identity.pid)
+            XCTAssertEqual(identity.sessionID, identity.pid)
+            XCTAssertNotEqual(URL(fileURLWithPath: identity.executablePath).lastPathComponent, "setsid")
+
+            try await supervisor.cancel(runID: runID, graceScans: 1)
+            let reaped = try await port.inspect(pid: identity.pid)
+            XCTAssertNil(reaped)
+        }
+    #endif
 
     func testPortableProcessLaunchValidationRejectsBeforeProviderSpawn() async throws {
         let executable = try XCTUnwrap(["/usr/bin/touch", "/bin/touch"].first { FileManager.default.isExecutableFile(atPath: $0) })

@@ -161,6 +161,7 @@ private actor CodexManagedAuthRPCProcess {
 
     static func launch(
         executable: String,
+        expectedVersion: String,
         home: CodexManagedAuthHome,
         processPort: PortableProcessSupervisionPort,
         processStore: SQLiteServiceStore?,
@@ -180,11 +181,17 @@ private actor CodexManagedAuthRPCProcess {
         do {
             try await supervisor.register(runID: runID, leader: captured.identity)
             let process = CodexManagedAuthRPCProcess(runID: runID, captured: captured, processPort: processPort, supervisor: supervisor)
-            _ = try await process.request(
+            let initialized = try await process.request(
                 method: "initialize",
                 params: ["clientInfo": ["name": "repoprompt-server", "title": "RepoPrompt Server", "version": "1"]],
                 timeout: timeout
             )
+            let expectedUserAgent = "repoprompt-server/\(expectedVersion)"
+            guard let userAgent = initialized.result["userAgent"] as? String,
+                  userAgent == expectedUserAgent || userAgent.hasPrefix("\(expectedUserAgent) ")
+            else {
+                throw ServiceAPIError(code: .capabilityMissing, message: "Pinned Codex CLI version is unavailable")
+            }
             try await process.notify(method: "initialized")
             return process
         } catch {
@@ -515,6 +522,7 @@ public actor CodexDeviceAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuth
     private func launchRPC() async throws -> CodexManagedAuthRPCProcess {
         try await CodexManagedAuthRPCProcess.launch(
             executable: executable,
+            expectedVersion: expectedVersion,
             home: managedHome,
             processPort: processPort,
             processStore: processStore,
@@ -637,11 +645,6 @@ public actor CodexDeviceAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuth
             guard expectedVersion == CodexCLIContract.pinnedVersion,
                   FileManager.default.isExecutableFile(atPath: executable)
             else { throw ServiceAPIError(code: .capabilityMissing, message: "Pinned Codex CLI is unavailable") }
-            let output = try await boundedVersionProbe()
-            let firstLine = output.split(whereSeparator: \.isNewline).first.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard firstLine == "codex-cli \(CodexCLIContract.pinnedVersion)" else {
-                throw ServiceAPIError(code: .capabilityMissing, message: "Pinned Codex CLI version is unavailable")
-            }
             let process = try await launchRPC()
             await process.stop()
             startable = true
@@ -650,36 +653,6 @@ public actor CodexDeviceAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuth
         }
         cachedAvailability = (now(), startable)
         return startable
-    }
-
-    private func boundedVersionProbe() async throws -> String {
-        let captured = try await processPort.launchCaptured(
-            executable: executable,
-            arguments: ["--version"],
-            environment: try managedHome.environment(),
-            workingDirectory: managedHome.workingDirectory,
-            helperToken: UUID().uuidString,
-            outputDirectory: outputDirectory
-        )
-        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-        do {
-            while ContinuousClock.now < deadline {
-                let streams = try await processPort.capturedStreams(captured, maximumBytes: 4_096)
-                if !streams.running {
-                    let status = try await processPort.finalizeCapturedProcess(captured)
-                    guard status == 0 else {
-                        throw ServiceAPIError(code: .dependencyUnavailable, message: "Codex version probe failed")
-                    }
-                    return String(decoding: streams.stdout, as: UTF8.self)
-                }
-                try await Task.sleep(for: .milliseconds(20))
-            }
-            await processPort.cancelCapturedProcess(captured)
-            throw ServiceAPIError(code: .dependencyUnavailable, message: "Codex version probe timed out")
-        } catch {
-            await processPort.cancelCapturedProcess(captured)
-            throw error
-        }
     }
 
     private func cancelLogin(_ flow: Flow) async {

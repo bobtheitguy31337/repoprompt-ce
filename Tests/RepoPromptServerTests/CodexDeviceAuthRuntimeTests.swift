@@ -191,6 +191,8 @@ private final class Fixture: @unchecked Sendable {
             result = {}
             if method == "account/login/start":
                 result = {"type":"chatgptDeviceCode", "loginId":"device-login", "userCode":"ABCD-EFGH", "verificationUrl":"https://auth.openai.com/codex/device"}
+            elif method == "initialize":
+                result = {"userAgent":"repoprompt-server/" + VERSION + " (fixture)"}
             elif method == "account/read":
                 if COMPLETE.exists() and not auth_file.exists():
                     codex_home.mkdir(parents=True, exist_ok=True)

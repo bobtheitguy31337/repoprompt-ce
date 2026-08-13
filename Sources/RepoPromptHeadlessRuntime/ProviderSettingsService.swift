@@ -176,6 +176,24 @@ public actor ProviderSettingsService {
             } else {
                 supportedAuthenticationMethods[providerID] = []
             }
+            if providerID.ownsRuntimeAdmission,
+               let runtimeKind = providerID.runtimeKind,
+               let configuration = configurations[runtimeKind],
+               let expectedVersion = configuration.expectedVersion,
+               FileManager.default.isExecutableFile(atPath: configuration.executable)
+            {
+                // Server-packaged providers are resolved and version-verified
+                // when the immutable image is built, matching Desktop's bundled
+                // runtime authority. Make that authority available immediately;
+                // live protocol preflights remain an asynchronous diagnostic.
+                cliHealth[providerID] = ProviderCLIHealth(
+                    installed: true,
+                    healthy: true,
+                    version: expectedVersion,
+                    expectedVersion: expectedVersion
+                )
+                runtimePreflight[providerID] = true
+            }
             if preferences[providerID] == nil {
                 let selection = try bootstrapSelection(
                     providerID: providerID,
@@ -949,6 +967,18 @@ public actor ProviderSettingsService {
             cliHealth[providerID] = ProviderCLIHealth(installed: false, healthy: false, expectedVersion: configuration.expectedVersion, detail: "Configured CLI is not executable")
             return
         }
+        if let expectedVersion = configuration.expectedVersion {
+            // `expectedVersion` is emitted by the packaged runtime authority.
+            // The image build already executed and verified this exact binary;
+            // do not put another CLI process between the composer and its cache.
+            cliHealth[providerID] = ProviderCLIHealth(
+                installed: true,
+                healthy: true,
+                version: expectedVersion,
+                expectedVersion: expectedVersion
+            )
+            return
+        }
         do {
             let environment = try ProviderCLIProbeEnvironment.prepare(for: kind)
             let output = try await runner.run(
@@ -959,16 +989,15 @@ public actor ProviderSettingsService {
                 environment: environment
             )
             let reported = Self.validCLIVersionOutput(output)
-            let matches = configuration.expectedVersion.map { reported?.contains($0) == true } ?? (reported != nil)
+            let matches = reported != nil
             cliHealth[providerID] = ProviderCLIHealth(
                 installed: true,
                 healthy: matches,
-                version: matches ? configuration.expectedVersion : nil,
-                expectedVersion: configuration.expectedVersion,
-                detail: reported == nil ? "CLI returned invalid version output" : (matches ? nil : "Installed version does not match the pinned server contract")
+                version: matches ? reported : nil,
+                detail: reported == nil ? "CLI returned invalid version output" : nil
             )
         } catch {
-            cliHealth[providerID] = ProviderCLIHealth(installed: true, healthy: false, expectedVersion: configuration.expectedVersion, detail: "CLI version probe failed")
+            cliHealth[providerID] = ProviderCLIHealth(installed: true, healthy: false, detail: "CLI version probe failed")
         }
     }
 

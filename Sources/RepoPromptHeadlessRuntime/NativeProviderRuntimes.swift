@@ -77,6 +77,20 @@ private struct NativeProviderProcessSupport {
     func preflight(supportsResume: Bool, supportsSteering: Bool, protocolName: String) async -> ProviderCapability {
         let base = capability(supportsResume: supportsResume, supportsSteering: supportsSteering)
         guard base.enabled else { return base }
+        if configuration.expectedVersion != nil {
+            // Bundled/provider-image runtimes have already been resolved and
+            // version-verified by their package authority. The native runtime's
+            // protocol-specific preflight below is the meaningful live check.
+            return .init(
+                kind: configuration.kind,
+                enabled: true,
+                executable: configuration.executable,
+                supportsResume: supportsResume,
+                supportsSteering: supportsSteering,
+                version: configuration.expectedVersion,
+                protocolVersion: configuration.protocolVersion ?? protocolName
+            )
+        }
         do {
             let runner = LocalWorkspaceCommandRunner()
             let environment = try ProviderCLIProbeEnvironment.prepare(for: configuration.kind)
@@ -88,10 +102,7 @@ private struct NativeProviderProcessSupport {
                 environment: environment
             )
             let reported = output.split(whereSeparator: \.isNewline).first.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let expected = configuration.expectedVersion, reported?.contains(expected) != true {
-                return .init(kind: configuration.kind, enabled: false, executable: configuration.executable, supportsResume: supportsResume, supportsSteering: supportsSteering, version: reported, protocolVersion: configuration.protocolVersion, reasonUnavailable: "provider version does not match the pinned image contract")
-            }
-            return .init(kind: configuration.kind, enabled: true, executable: configuration.executable, supportsResume: supportsResume, supportsSteering: supportsSteering, version: reported ?? configuration.expectedVersion, protocolVersion: configuration.protocolVersion ?? protocolName)
+            return .init(kind: configuration.kind, enabled: true, executable: configuration.executable, supportsResume: supportsResume, supportsSteering: supportsSteering, version: reported, protocolVersion: configuration.protocolVersion ?? protocolName)
         } catch {
             return .init(kind: configuration.kind, enabled: false, executable: configuration.executable, supportsResume: supportsResume, supportsSteering: supportsSteering, version: configuration.expectedVersion, protocolVersion: configuration.protocolVersion, reasonUnavailable: "provider preflight failed: \(protocolName) executable probe")
         }
