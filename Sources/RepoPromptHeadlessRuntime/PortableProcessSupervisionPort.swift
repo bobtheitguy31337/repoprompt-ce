@@ -281,14 +281,13 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
                 .appendingPathComponent("repoprompt-provider-launch", isDirectory: true)
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
             try Self.prepareOutputDirectory(controlDirectory.path)
-            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/setsid")
             process.arguments = [
-                "-c",
-                Self.linuxProviderWrapperScript,
-                "repoprompt-provider-wrapper",
-                "/usr/bin/setsid",
+                "--wait",
                 "/bin/sh",
+                "-c",
                 Self.linuxProviderAnchorScript,
+                "repoprompt-provider-anchor",
                 controlDirectory.path,
                 executable,
             ] + arguments
@@ -357,26 +356,12 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
     }
 
     #if os(Linux)
-        /// Foundation launches its child as a process-group leader. Invoking
-        /// `setsid --wait` directly therefore makes `setsid` fork, leaving the
-        /// Foundation-owned PID as a wrapper and the provider in an untracked
-        /// session. A stable anchor avoids that split-brain identity: the
-        /// Foundation wrapper starts an isolated shell, the shell reports its
-        /// PID before launching the provider, and the provider inherits the
-        /// anchor's session/process group and any delegated cgroup.
-        private nonisolated static let linuxProviderWrapperScript = """
-        set -eu
-        setsid_path=$1
-        shell_path=$2
-        anchor_script=$3
-        control_dir=$4
-        shift 4
-        exec 3<&0
-        "$setsid_path" "$shell_path" -c "$anchor_script" repoprompt-provider-anchor "$control_dir" "$@" <&3 &
-        anchor_pid=$!
-        wait "$anchor_pid"
-        """
-
+        /// Foundation launches `setsid` as a process-group leader, so setsid
+        /// forks an isolated child and waits for it. The isolated child is a
+        /// stable shell anchor: it reports its PID, waits until containment is
+        /// recorded, then runs the provider in the foreground. Foreground
+        /// execution preserves the provider's bidirectional standard input;
+        /// the anchor and provider also share one verified process group.
         private nonisolated static let linuxProviderAnchorScript = """
         set -eu
         control_dir=$1
@@ -389,11 +374,8 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
             [ "$attempts" -lt 500 ] || exit 125
             sleep 0.01
         done
-        exec 3<&0
         set +e
-        "$@" <&3 3<&- &
-        provider_pid=$!
-        wait "$provider_pid"
+        "$@"
         status=$?
         exit "$status"
         """
