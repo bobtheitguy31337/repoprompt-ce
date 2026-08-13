@@ -20,6 +20,7 @@ private struct ImmediateClock: RuntimeClock {
 
 private actor FakeProcessPort: ProcessSupervisionPort {
     private let leader: ProcessIdentity
+    private let inspectedLeader: ProcessIdentity
     private let children: [ProcessIdentity]
     private let lateChildren: [ProcessIdentity]
     private var observedSignals: [Int32] = []
@@ -28,8 +29,9 @@ private actor FakeProcessPort: ProcessSupervisionPort {
     private var reconstructed: [(ProcessIdentity, String)] = []
     private var descendantScans = 0
 
-    init(leader: ProcessIdentity, children: [ProcessIdentity], lateChildren: [ProcessIdentity] = []) {
+    init(leader: ProcessIdentity, children: [ProcessIdentity], lateChildren: [ProcessIdentity] = [], inspectedLeader: ProcessIdentity? = nil) {
         self.leader = leader
+        self.inspectedLeader = inspectedLeader ?? leader
         self.children = children
         self.lateChildren = lateChildren
     }
@@ -39,7 +41,7 @@ private actor FakeProcessPort: ProcessSupervisionPort {
     }
 
     func inspect(pid: Int32) async throws -> ProcessIdentity? {
-        ([leader] + children).first { $0.pid == pid }
+        ([inspectedLeader] + children).first { $0.pid == pid }
     }
 
     func descendants(of pid: Int32) async throws -> [ProcessIdentity] {
@@ -668,6 +670,21 @@ final class ProviderSupervisorTests: XCTestCase {
         let result = await port.result()
         XCTAssertEqual(result.signals, [15, 9])
         XCTAssertEqual(result.reaped.sorted(), [200, 201])
+    }
+
+    func testCancellationAcceptsReparentedOrExecedSameProcessInstance() async throws {
+        let leader = ProcessIdentity(pid: 205, parentPID: 1, processGroupID: 205, sessionID: 205, startTimeTicks: 20, bootID: "boot", executablePath: "/bin/sh", helperTokenDigest: "token")
+        let observed = ProcessIdentity(pid: 205, parentPID: 99, processGroupID: 205, sessionID: 205, startTimeTicks: 20, bootID: "boot", executablePath: "/provider", helperTokenDigest: "token")
+        let port = FakeProcessPort(leader: leader, children: [], inspectedLeader: observed)
+        let supervisor = ProviderProcessSupervisor(processPort: port, clock: ImmediateClock())
+        let runID = UUID()
+        try await supervisor.register(runID: runID, leader: leader)
+
+        try await supervisor.cancel(runID: runID)
+
+        let result = await port.result()
+        XCTAssertEqual(result.signals, [15, 9])
+        XCTAssertEqual(result.reaped, [205])
     }
 
     func testCancellationSignalsVerifiedDescendantThatEscapedLeaderProcessGroup() async throws {

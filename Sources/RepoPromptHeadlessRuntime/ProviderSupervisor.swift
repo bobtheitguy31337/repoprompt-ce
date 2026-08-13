@@ -60,10 +60,16 @@ public actor ProviderProcessSupervisor {
     public func recoverPersistedFamilies(graceScans: Int = 100) async throws {
         guard let store else { return }
         for persisted in try await store.activeProcessFamilies() {
-            let leader = ProcessIdentity(persisted.leader)
+            let persistedLeader = ProcessIdentity(persisted.leader)
             do {
-                try await processPort.reconstruct(leader: leader, containmentMode: persisted.containmentMode)
+                try await processPort.reconstruct(leader: persistedLeader, containmentMode: persisted.containmentMode)
             } catch {
+                try await store.updateProcessFamilyState(runID: persisted.runID, state: "identity-mismatch")
+                continue
+            }
+            guard let leader = try await processPort.inspect(pid: persistedLeader.pid),
+                  leader.representsSameProcessInstance(as: persistedLeader)
+            else {
                 try await store.updateProcessFamilyState(runID: persisted.runID, state: "identity-mismatch")
                 continue
             }
@@ -73,8 +79,10 @@ public actor ProviderProcessSupervisor {
     }
 
     public func cancel(runID: UUID, termSignal: Int32 = 15, killSignal: Int32 = 9, graceScans: Int = 100) async throws {
-        guard let recorded = families[runID], let leader = recorded.first else { return }
-        guard let current = try await processPort.inspect(pid: leader.pid), current == leader else {
+        guard let recorded = families[runID], let recordedLeader = recorded.first else { return }
+        guard let leader = try await processPort.inspect(pid: recordedLeader.pid),
+              leader.representsSameProcessInstance(as: recordedLeader)
+        else {
             families[runID] = nil
             try await store?.updateProcessFamilyState(runID: runID, state: "identity-mismatch")
             return
@@ -98,8 +106,12 @@ public actor ProviderProcessSupervisor {
             }
         }
         var survivors: [ProcessIdentity] = []
-        for member in discovered where try await processPort.inspect(pid: member.pid) == member {
-            survivors.append(member)
+        for member in discovered {
+            if let observed = try await processPort.inspect(pid: member.pid),
+               observed.representsSameProcessInstance(as: member)
+            {
+                survivors.append(observed)
+            }
         }
         let containedKill = try await processPort.terminateContainedFamily(leader: leader)
         if !survivors.isEmpty, !containedKill { try await signalGroups(killSignal, members: survivors) }
@@ -128,7 +140,17 @@ public actor ProviderProcessSupervisor {
     }
 }
 
-private extension ProcessIdentity {
+extension ProcessIdentity {
+    /// Parentage and executable paths can legitimately change when a process
+    /// is reparented or calls exec. Boot identity plus PID start time and the
+    /// private helper token identify the immutable Linux process instance.
+    func representsSameProcessInstance(as other: ProcessIdentity) -> Bool {
+        pid == other.pid &&
+            startTimeTicks == other.startTimeTicks &&
+            bootID == other.bootID &&
+            helperTokenDigest == other.helperTokenDigest
+    }
+
     var persisted: PersistedProcessIdentity {
         PersistedProcessIdentity(pid: pid, parentPID: parentPID, processGroupID: processGroupID, sessionID: sessionID, startTimeTicks: startTimeTicks, bootID: bootID, executablePath: executablePath, helperTokenDigest: helperTokenDigest)
     }

@@ -452,7 +452,9 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
     }
 
     public func reconstruct(leader: ProcessIdentity, containmentMode: String) async throws {
-        guard let observed = try await inspectLinux(pid: leader.pid, helperTokenDigest: leader.helperTokenDigest), observed == leader else {
+        guard let observed = try await inspectLinux(pid: leader.pid, helperTokenDigest: leader.helperTokenDigest),
+              observed.representsSameProcessInstance(as: leader)
+        else {
             throw ServiceAPIError(code: .staleRevision, message: "Persisted provider process identity no longer matches")
         }
         identities[leader.pid] = observed
@@ -494,9 +496,26 @@ public actor PortableProcessSupervisionPort: ProcessSupervisionPort {
                 throw ServiceAPIError(code: .staleRevision, message: "Provider process group is not isolated from the service")
             }
         #endif
+        var hasLiveVerifiedMember = false
         for expected in verifiedMembers {
-            guard try await inspect(pid: expected.pid) == expected else { throw ServiceAPIError(code: .staleRevision, message: "Process identity changed before signaling") }
+            guard expected.processGroupID == processGroupID else {
+                throw ServiceAPIError(code: .staleRevision, message: "Verified process member does not belong to the requested group")
+            }
+            guard let observed = try await inspect(pid: expected.pid) else {
+                // A member exiting between discovery and signaling is the
+                // expected cancellation race, not evidence of PID reuse.
+                continue
+            }
+            guard observed.representsSameProcessInstance(as: expected) else {
+                throw ServiceAPIError(code: .staleRevision, message: "Process identity changed before signaling")
+            }
+            // A live member may move into a newly isolated process group after
+            // discovery. Do not authorize its former group with stale data;
+            // the supervisor's next scan will target its current group.
+            guard observed.processGroupID == processGroupID else { continue }
+            hasLiveVerifiedMember = true
         }
+        guard hasLiveVerifiedMember else { return }
         guard systemKill(-processGroupID, signal) == 0 || errno == ESRCH else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Unable to signal provider process group") }
     }
 
