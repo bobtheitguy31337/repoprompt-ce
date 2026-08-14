@@ -96,6 +96,9 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
         let controllerLock = context.mcpControlled
             ? ComposerLockWire(locked: true, reasonCode: "mcp_controlled", reasonText: "The active MCP controller owns this setting.")
             : activeLock
+        let permissionLock = context.mcpControlled
+            ? ComposerLockWire(locked: true, reasonCode: "mcp_controlled", reasonText: "The active MCP controller owns this setting.")
+            : .init()
         let workflowWire = workflows.map {
             ComposerWorkflowOptionWire(id: $0.id, displayName: $0.displayName, description: $0.description, guidance: $0.guidance, providerIDs: $0.providerIDs, enabled: true)
         }
@@ -106,7 +109,7 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
             suggestions: !suggestions.isEmpty,
             steering: groups.contains { $0.models.contains { $0.capabilities.steering } }
         )
-        let locks = ComposerLockSnapshotWire(model: controllerLock, effort: controllerLock, workflow: controllerLock, tools: controllerLock, permissions: controllerLock, attachments: activeLock, send: .init())
+        let locks = ComposerLockSnapshotWire(model: controllerLock, effort: controllerLock, workflow: controllerLock, tools: controllerLock, permissions: permissionLock, attachments: activeLock, send: .init())
         let empty = AgentEmptyStateWire(
             heading: emptyState.heading,
             featuredWorkflowIDs: emptyState.featuredWorkflowIDs,

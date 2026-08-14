@@ -123,6 +123,7 @@ public struct SubagentPermissionResolver: Sendable {
     ) -> DirectProviderRuntimeDefaults {
         var values = settings
         values["codex.approvalPolicy"] = mode == .defaultPermission ? "untrusted" : "on-request"
+        values["codex.approvalsReviewer"] = mode == .autoReview ? "auto_review" : "user"
         let executionMode: String = switch mode {
         case .readOnly: "readOnly"
         case .defaultPermission, .autoReview: "workspaceWrite"

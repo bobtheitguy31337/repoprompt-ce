@@ -6,6 +6,38 @@ import RepoPromptServiceProtocol
 import XCTest
 
 final class DirectProviderRuntimeTests: XCTestCase {
+    func testCodexAutoReviewSendsDesktopApprovalsReviewer() {
+        let autoReview = CodexAppServerProviderRuntime.codexPolicy(
+            .init(mode: .workspaceWrite, providerSettings: [
+                "provider.permissionId": "codex.autoReview",
+                "codex.approvalsReviewer": "auto_review",
+            ]),
+            workingDirectory: "/workspace"
+        )
+        XCTAssertEqual(autoReview.approvalPolicy, "on-request")
+        XCTAssertEqual(autoReview.sandbox, "workspace-write")
+        XCTAssertEqual(autoReview.approvalsReviewer, "auto_review")
+
+        let inferred = CodexAppServerProviderRuntime.codexPolicy(
+            .init(mode: .workspaceWrite, providerSettings: ["provider.permissionId": "codex.autoReview"]),
+            workingDirectory: "/workspace"
+        )
+        XCTAssertEqual(inferred.approvalsReviewer, "auto_review")
+
+        let requireApproval = CodexAppServerProviderRuntime.codexPolicy(
+            .init(mode: .workspaceWrite, providerSettings: ["provider.permissionId": "codex.defaultPermission"]),
+            workingDirectory: "/workspace"
+        )
+        XCTAssertEqual(requireApproval.approvalsReviewer, "user")
+    }
+
+    func testSafeManagedCodexSubagentsUseAutoReviewReviewer() async {
+        let resolved = await SubagentPermissionResolver(settings: nil, directDefaults: nil).resolve(providerID: .codex)
+        XCTAssertEqual(resolved.mode, "workspaceWrite")
+        XCTAssertEqual(resolved.providerSettings["codex.approvalsReviewer"], "auto_review")
+        XCTAssertEqual(resolved.providerSettings["codex.approvalPolicy"], "on-request")
+    }
+
     func testPublicAddressPolicyRejectsPrivateReservedMetadataAndTranslationRanges() {
         let publicAddresses = ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "2001:4860:4860::8888"]
         let prohibitedAddresses = [

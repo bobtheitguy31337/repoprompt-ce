@@ -249,7 +249,7 @@ final class AgentComposerCatalogTests: XCTestCase {
         XCTAssertEqual(expected.providers[0].models[0].descriptor.providerRawValue, "provider/codex-xhigh")
         XCTAssertEqual(expected.providers[0].models[0].descriptor(selectingEffortID: "low").providerRawValue, "provider/codex-low")
         XCTAssertTrue(expected.providers.flatMap(\.toolControls).allSatisfy(Self.isActiveRunLocked))
-        XCTAssertTrue(expected.providers.compactMap(\.permissionControl).allSatisfy { !$0.mutable && $0.lockReasonCode == "active_run" })
+        XCTAssertTrue(expected.providers.compactMap(\.permissionControl).allSatisfy { $0.mutable && $0.lockReasonCode == nil })
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
@@ -264,6 +264,10 @@ final class AgentComposerCatalogTests: XCTestCase {
         XCTAssertEqual(actual.selected?.effortID, expected.selection?.effortID)
         XCTAssertEqual(actual.selected?.permissionID, expected.selection?.permissionID)
         XCTAssertEqual(actual.selected?.toolValues, expected.selection?.toolValues.mapValues(Self.wireValue))
+        XCTAssertTrue(actual.locks.tools.locked)
+        XCTAssertEqual(actual.locks.tools.reasonCode, "active_run")
+        XCTAssertFalse(actual.locks.permissions.locked)
+        XCTAssertNil(actual.locks.permissions.reasonCode)
 
         let unavailable = AgentCatalogAuthority.resolve(
             providers: states,
@@ -322,6 +326,12 @@ final class AgentComposerCatalogTests: XCTestCase {
         XCTAssertEqual(compiled.executionPolicy.providerSettings["provider.serviceTier"], "fast")
         XCTAssertNil(compiled.executionPolicy.providerSettings["codex.enabledMCPServers"])
         XCTAssertEqual(compiled.normalizedToolValues["codex.mcpServers"], .choices(["repoprompt"]))
+        XCTAssertEqual(compiled.executionPolicy.providerSettings["provider.permissionId"], "codex.defaultPermission")
+        XCTAssertEqual(compiled.executionPolicy.providerSettings["codex.approvalsReviewer"], "user")
+        let autoReview = try adapter.compile(.init(providerID: .codex, model: model, effortID: "high", permissionID: "codex.autoReview", toolValues: ["codex.mcpServers": .choices([])]))
+        XCTAssertEqual(autoReview.executionPolicy.mode, .workspaceWrite)
+        XCTAssertEqual(autoReview.executionPolicy.providerSettings["provider.permissionId"], "codex.autoReview")
+        XCTAssertEqual(autoReview.executionPolicy.providerSettings["codex.approvalsReviewer"], "auto_review")
         XCTAssertThrowsError(try adapter.compile(.init(providerID: .codex, model: model, toolValues: ["codex.unknown": .boolean(true)])))
     }
 

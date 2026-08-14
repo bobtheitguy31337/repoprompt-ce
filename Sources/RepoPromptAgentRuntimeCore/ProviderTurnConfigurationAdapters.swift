@@ -180,7 +180,8 @@ public struct CodexTurnConfigurationAdapter: ProviderTurnConfigurationAdapter {
             "codex.goalsEnabled": String(ProviderComposerStableControls.boolean(settings["codex.goals"], fallback: true)),
             "codex.reasoningSummariesEnabled": String(ProviderComposerStableControls.boolean(settings["codex.reasoningSummaries"], fallback: false)),
             "codex.memoriesEnabled": String(ProviderComposerStableControls.boolean(settings["codex.memories"], fallback: false)),
-            "provider.permissionId": permission
+            "provider.permissionId": permission,
+            "codex.approvalsReviewer": permission == "codex.autoReview" ? "auto_review" : "user"
         ]
         if let effort { native["provider.reasoningEffort"] = effort }
         if let serviceTier = input.model.serviceTier { native["provider.serviceTier"] = serviceTier }

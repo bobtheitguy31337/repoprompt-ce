@@ -151,6 +151,12 @@ public struct AgentCatalogAuthorityContext: Hashable, Sendable {
     public var lockReasonCode: String? {
         externallyControlled ? "mcp_controlled" : (activeRun ? "active_run" : nil)
     }
+
+    /// Desktop keeps sandbox/permission level editable during an active run.
+    /// Only an external MCP controller freezes it.
+    public var permissionLockReasonCode: String? {
+        externallyControlled ? "mcp_controlled" : nil
+    }
 }
 
 public struct AgentCatalogResolvedModel: Hashable, Sendable {
@@ -249,7 +255,7 @@ public enum AgentCatalogAuthority {
                 displayName: state.displayName,
                 models: models,
                 toolControls: state.toolControls.map { locked($0, reason: context.lockReasonCode) },
-                permissionControl: state.permissionControl.map { locked($0, reason: context.lockReasonCode) }
+                permissionControl: state.permissionControl.map { locked($0, reason: context.permissionLockReasonCode) }
             )
         }
 

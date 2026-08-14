@@ -624,7 +624,14 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             await onEvent(.providerIdentity(threadID))
             var turnInput: [[String: Any]] = [["type": "text", "text": turnPrompt]]
             turnInput += request.structuredInput?.nativeImages.map { ["type": "localImage", "path": $0.filePath] } ?? []
-            var turnParams: [String: Any] = ["threadId": threadID, "input": turnInput, "cwd": request.workingDirectory, "approvalPolicy": policy.approvalPolicy, "sandboxPolicy": policy.sandboxPolicy]
+            var turnParams: [String: Any] = [
+                "threadId": threadID,
+                "input": turnInput,
+                "cwd": request.workingDirectory,
+                "approvalPolicy": policy.approvalPolicy,
+                "sandboxPolicy": policy.sandboxPolicy,
+                "approvalsReviewer": policy.approvalsReviewer,
+            ]
             if let model = request.model { turnParams["model"] = model }
             if let effort = request.policy.providerSettings["provider.reasoningEffort"] { turnParams["effort"] = effort }
             if let tier = request.policy.providerSettings["provider.serviceTier"] { turnParams["serviceTier"] = tier }
@@ -720,29 +727,36 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
         return config
     }
 
-    private nonisolated static func codexPolicy(_ policy: ProviderExecutionPolicy, workingDirectory: String) -> (approvalPolicy: String, sandbox: String, sandboxPolicy: [String: Any]) {
+    nonisolated static func codexPolicy(_ policy: ProviderExecutionPolicy, workingDirectory: String) -> (approvalPolicy: String, sandbox: String, sandboxPolicy: [String: Any], approvalsReviewer: String) {
+        let approvalsReviewer: String = {
+            if let configured = policy.providerSettings["codex.approvalsReviewer"], ["user", "auto_review"].contains(configured) {
+                return configured
+            }
+            return policy.providerSettings["provider.permissionId"] == "codex.autoReview" ? "auto_review" : "user"
+        }()
         switch policy.mode {
         case .readOnly:
-            return ("on-request", "read-only", ["type": "readOnly"])
+            return ("on-request", "read-only", ["type": "readOnly"], approvalsReviewer)
         case .workspaceWrite:
             let configured = policy.providerSettings["codex.approvalPolicy"]
             let approval = configured.flatMap { ["on-request", "untrusted", "never"].contains($0) ? $0 : nil } ?? "on-request"
             let roots = policy.writableRoots.isEmpty ? [workingDirectory] : policy.writableRoots
-            return (approval, "workspace-write", ["type": "workspaceWrite", "writableRoots": roots])
+            return (approval, "workspace-write", ["type": "workspaceWrite", "writableRoots": roots], approvalsReviewer)
         case .fullAccess:
-            return ("never", "danger-full-access", ["type": "dangerFullAccess"])
+            return ("never", "danger-full-access", ["type": "dangerFullAccess"], approvalsReviewer)
         }
     }
 
     private nonisolated static func codexThreadParameters(
         _ request: ProviderExecutionRequest,
-        policy: (approvalPolicy: String, sandbox: String, sandboxPolicy: [String: Any]),
+        policy: (approvalPolicy: String, sandbox: String, sandboxPolicy: [String: Any], approvalsReviewer: String),
         threadID: String?
     ) throws -> Data {
         var params: [String: Any] = [
             "cwd": request.workingDirectory,
             "approvalPolicy": policy.approvalPolicy,
             "sandbox": policy.sandbox,
+            "approvalsReviewer": policy.approvalsReviewer,
         ]
         let config = codexConfig(request.policy.providerSettings)
         if !config.isEmpty { params["config"] = config }
