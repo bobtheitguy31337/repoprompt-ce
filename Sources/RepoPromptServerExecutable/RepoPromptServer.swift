@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptHeadlessRuntime
+import RepoPromptMCPAdapter
 import RepoPromptServiceHTTP
 import RepoPromptServicePersistence
 
@@ -7,6 +8,10 @@ import RepoPromptServicePersistence
 struct RepoPromptServer {
     static func main() async throws {
         do {
+            if CommandLine.arguments.dropFirst().first == "mcp-stdio" {
+                try await HeadlessMCPStdioBridge.run()
+                return
+            }
             if CommandLine.arguments.dropFirst().first == "import-json" {
                 try await importJSON(arguments: Array(CommandLine.arguments.dropFirst(2)))
                 return

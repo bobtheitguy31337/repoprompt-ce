@@ -3226,6 +3226,10 @@ public actor RepoPromptHeadlessAuthority {
             }
             var providerSettings = permissions.providerSettings
             if let acceptedSubmission { providerSettings.merge(acceptedSubmission.executionPolicy.providerSettings) { _, accepted in accepted } }
+            providerSettings[CodexRepoPromptMCPConfig.sessionIDSettingsKey] = sessionID.uuidString
+            if FileManager.default.isExecutableFile(atPath: CodexRepoPromptMCPConfig.command()) {
+                providerSettings[CodexRepoPromptMCPConfig.provisionedSettingsKey] = "true"
+            }
             let resumeFallbackPrompt: String?
             if run.providerSessionID == nil {
                 resumeFallbackPrompt = nil

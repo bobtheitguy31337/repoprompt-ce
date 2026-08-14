@@ -3,6 +3,7 @@ import Hummingbird
 import HummingbirdTLS
 import RepoPromptAgentRuntimeCore
 import RepoPromptHeadlessRuntime
+import RepoPromptMCPAdapter
 import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 import RepoPromptWorkspaceRuntimeCore
@@ -558,6 +559,20 @@ public enum RepoPromptServerRunner {
             )
         )
         await durabilityOperations.start()
+        let mcpAdapter = RepoPromptMCPAdapter(authority: authority)
+        let mcpSocketURL = URL(
+            fileURLWithPath: CodexRepoPromptMCPConfig.socketPath(),
+            isDirectory: false
+        )
+        let mcpSocketServer = HeadlessMCPSocketServer(socketURL: mcpSocketURL, adapter: mcpAdapter)
+        if FileManager.default.fileExists(atPath: mcpSocketURL.deletingLastPathComponent().path) {
+            do {
+                try await mcpSocketServer.start()
+            } catch {
+                await durabilityOperations.stop()
+                throw error
+            }
+        }
 
         var serviceError: Error?
         do {
@@ -566,6 +581,7 @@ public enum RepoPromptServerRunner {
                 group.addTask { try await healthApplication.runService() }
                 _ = try await group.next()
                 let drain = await drainController.drain(timeout: 15)
+                await mcpSocketServer.stop()
                 try await authority.quiesce()
                 await durabilityOperations.stop()
                 _ = await durabilityOperations.runOnce()
@@ -577,6 +593,7 @@ public enum RepoPromptServerRunner {
         } catch {
             serviceError = error
             _ = await drainController.drain(timeout: 15)
+            await mcpSocketServer.stop()
             try? await authority.quiesce()
             await durabilityOperations.stop()
             _ = await durabilityOperations.runOnce()

@@ -111,7 +111,7 @@ private struct NativeProviderProcessSupport {
     }
 
     func makeSession(runID: UUID, arguments: [String], workingDirectory: String, model: String? = nil, policy: ProviderExecutionPolicy = .init(), includeCredentials: Bool = true, launchValidation: @escaping @Sendable () throws -> Void = {}) async throws -> NativeJSONLineProcess {
-        let preparedHome = try await prepareProviderHome(runID: runID, includeCredentials: includeCredentials)
+        let preparedHome = try await prepareProviderHome(runID: runID, includeCredentials: includeCredentials, policy: policy)
         var environment = providerEnvironment(home: preparedHome.url, baseEnvironment: preparedHome.baseEnvironment, workingDirectory: workingDirectory, policy: policy)
         let injected = includeCredentials ? try await credentialEnvironment.environment(for: configuration.kind, model: model, policy: policy) : [:]
         let reserved = Set(["HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "CODEX_HOME", "CODEX_SQLITE_HOME", "CLAUDE_CONFIG_DIR", "PATH", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD"])
@@ -197,16 +197,16 @@ private struct NativeProviderProcessSupport {
         return environment
     }
 
-    private func prepareProviderHome(runID: UUID, includeCredentials: Bool) async throws -> PreparedHome {
+    private func prepareProviderHome(runID: UUID, includeCredentials: Bool, policy: ProviderExecutionPolicy) async throws -> PreparedHome {
         // Desktop durable authority (`AppDomainRuntimeComposition`) gives every
         // provider run its own `ProviderHomes/<runID>` and copies credentials
         // from the managed Codex auth directory. Sharing the live auth home
         // across parent and child Codex processes is a server-only shortcut
         // and races SQLite/config under concurrent `agent_run` spawns.
-        return try await prepareEphemeralHome(runID: runID, includeCredentials: includeCredentials)
+        return try await prepareEphemeralHome(runID: runID, includeCredentials: includeCredentials, policy: policy)
     }
 
-    private func prepareEphemeralHome(runID: UUID, includeCredentials: Bool) async throws -> PreparedHome {
+    private func prepareEphemeralHome(runID: UUID, includeCredentials: Bool, policy: ProviderExecutionPolicy) async throws -> PreparedHome {
         let root = URL(fileURLWithPath: ephemeralHomeRoot, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let home = root.appendingPathComponent(runID.uuidString, isDirectory: true)
@@ -264,6 +264,20 @@ private struct NativeProviderProcessSupport {
                 try? FileManager.default.removeItem(at: home)
                 for record in records {
                     _ = try? await processStore?.transitionOwnedResource(resourceID: record.resourceID, expectedStates: [.preparing], to: .failed, observedBytes: nil, contentDigest: nil, cleanupError: "credential_copy_failed")
+                }
+                throw error
+            }
+        }
+        if configuration.kind == .codex {
+            do {
+                try CodexRepoPromptMCPConfig.writeIfNeeded(
+                    codexHome: home.appendingPathComponent(".codex", isDirectory: true),
+                    policy: policy
+                )
+            } catch {
+                try? FileManager.default.removeItem(at: home)
+                for record in records {
+                    _ = try? await processStore?.transitionOwnedResource(resourceID: record.resourceID, expectedStates: [.preparing], to: .failed, observedBytes: nil, contentDigest: nil, cleanupError: "mcp_config_write_failed")
                 }
                 throw error
             }
@@ -562,7 +576,7 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
     }
 
     func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
-        let process = try await support.makeSession(runID: request.runID, arguments: Self.appServerArguments, workingDirectory: request.workingDirectory, launchValidation: { try request.validateLaunch() })
+        let process = try await support.makeSession(runID: request.runID, arguments: Self.appServerArguments, workingDirectory: request.workingDirectory, policy: request.policy, launchValidation: { try request.validateLaunch() })
         sessions[request.runID] = process
         defer { sessions[request.runID] = nil
             threadIDs[request.runID] = nil
@@ -687,14 +701,17 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             "features.code_mode.direct_only_tool_namespaces": ["mcp__RepoPromptCE"]
         ]
         if !bash { config["features.unified_exec"] = false }
+        if CodexRepoPromptMCPConfig.isProvisioned(settings) {
+            config["mcp_servers.RepoPromptCE.enabled"] = true
+        }
         if let encoded = settings["codex.enabledMCPServers"],
            let data = encoded.data(using: .utf8),
            let names = try? JSONDecoder().decode([String].self, from: data)
         {
             for configuredName in names {
-                // The Linux service's isolated Codex home is auth-only. Until a server-owned
-                // RepoPrompt MCP transport is provisioned there, emitting either the stable
-                // portal ID or native display name makes Codex reject thread/start outright.
+                // Enabling RepoPromptCE without a command/args block in the isolated
+                // Codex home makes Codex reject thread/start. The server writes that
+                // Desktop-shaped block only when `repoprompt.mcpProvisioned` is set.
                 guard configuredName != "repoprompt", configuredName != "RepoPromptCE" else { continue }
                 guard configuredName.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-")).contains($0) }) else { continue }
                 config["mcp_servers.\(configuredName).enabled"] = true

@@ -1111,6 +1111,16 @@ final class NativeProviderRuntimeLifecycleTests: XCTestCase {
         XCTAssertEqual(config["mcp_servers.external-tools.enabled"] as? Bool, true)
     }
 
+    func testCodexConfigEnablesProvisionedRepoPromptTransport() {
+        let config = CodexAppServerProviderRuntime.codexConfig([
+            CodexRepoPromptMCPConfig.provisionedSettingsKey: "true",
+            "codex.enabledMCPServers": "[\"RepoPromptCE\",\"external-tools\"]"
+        ])
+        XCTAssertEqual(config["mcp_servers.RepoPromptCE.enabled"] as? Bool, true)
+        XCTAssertEqual(config["mcp_servers.external-tools.enabled"] as? Bool, true)
+        XCTAssertNil(config["mcp_servers.repoprompt.enabled"])
+    }
+
     func testCodexTurnStartedIsLifecycleOnlyAndPhaseRevisionAdvances() throws {
         let frame = Data(#"{"method":"turn/started","params":{}}"#.utf8)
         let normalized = try CodexAppServerProviderRuntime.normalize(frame)
