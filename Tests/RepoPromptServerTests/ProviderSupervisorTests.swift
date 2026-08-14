@@ -273,7 +273,7 @@ final class ProviderSupervisorTests: XCTestCase {
         try await store.close()
     }
 
-    func testManagedCodexRuntimeUsesDesktopStylePersistentHome() async throws {
+    func testManagedCodexAuthIsCopiedIntoIsolatedPerRunHome() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let executable = directory.appendingPathComponent("provider")
         let managed = directory.appendingPathComponent("managed-codex", isDirectory: true)
@@ -282,6 +282,7 @@ final class ProviderSupervisorTests: XCTestCase {
         let cacheHome = managed.appendingPathComponent("cache", isDirectory: true)
         let codexHome = managed.appendingPathComponent("home", isDirectory: true)
         let sqliteHome = managed.appendingPathComponent("sqlite", isDirectory: true)
+        let ephemeralHomes = directory.appendingPathComponent("ephemeral-homes", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         for path in [processHome, configHome, cacheHome, codexHome, sqliteHome] {
             try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
@@ -292,29 +293,36 @@ final class ProviderSupervisorTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let source = PersistentProviderRuntimeSource(environment: [
-            "HOME": processHome.path,
-            "XDG_CONFIG_HOME": configHome.path,
-            "XDG_CACHE_HOME": cacheHome.path,
-            "CODEX_HOME": codexHome.path,
-            "CODEX_SQLITE_HOME": sqliteHome.path,
-            "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
-        ])
+        let runID = UUID()
+        let source = PersistentProviderRuntimeSource(
+            environment: [
+                "HOME": processHome.path,
+                "XDG_CONFIG_HOME": configHome.path,
+                "XDG_CACHE_HOME": cacheHome.path,
+                "CODEX_HOME": codexHome.path,
+                "CODEX_SQLITE_HOME": sqliteHome.path,
+                "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
+            ],
+            sourceDirectory: codexHome.path
+        )
         let adapter = ProviderCLIAdapter(
             configurations: [.init(kind: .codex, executable: executable.path, expectedVersion: "1.0")],
             processPort: try PortableProcessSupervisionPort(),
             processStore: store,
             outputDirectory: directory.appendingPathComponent("output").path,
-            ephemeralHomeRoot: directory.appendingPathComponent("ephemeral-homes").path,
+            ephemeralHomeRoot: ephemeralHomes.path,
             credentialSource: source
         )
 
-        let result = try await adapter.complete(kind: .codex, model: nil, prompt: "prompt", workingDirectory: directory.path, runID: UUID())
+        let result = try await adapter.complete(kind: .codex, model: nil, prompt: "prompt", workingDirectory: directory.path, runID: runID)
 
-        XCTAssertEqual(result.trimmingCharacters(in: .whitespacesAndNewlines), codexHome.path)
+        let isolatedCodexHome = ephemeralHomes.appendingPathComponent(runID.uuidString).appendingPathComponent(".codex")
+        XCTAssertEqual(result.trimmingCharacters(in: .whitespacesAndNewlines), isolatedCodexHome.path)
         XCTAssertTrue(FileManager.default.fileExists(atPath: codexHome.appendingPathComponent("conversation-state").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: isolatedCodexHome.path))
         let resources = try await store.ownedResources(states: nil)
-        XCTAssertFalse(resources.contains { $0.kind == .providerHome })
+        XCTAssertTrue(resources.contains { $0.runID == runID && $0.kind == .providerHome })
+        XCTAssertTrue(resources.contains { $0.runID == runID && $0.kind == .providerCredentialCopy })
         try await store.close()
     }
 
@@ -1126,8 +1134,14 @@ private actor ProviderEventRecorder {
 
 private struct PersistentProviderRuntimeSource: ProviderCredentialSourceProviding {
     let environment: [String: String]
+    let sourceDirectory: String?
 
-    func sourceDirectory(for _: ProviderKind) async throws -> String? { nil }
+    init(environment: [String: String], sourceDirectory: String? = nil) {
+        self.environment = environment
+        self.sourceDirectory = sourceDirectory
+    }
+
+    func sourceDirectory(for _: ProviderKind) async throws -> String? { sourceDirectory }
 
     func persistentRuntimeEnvironment(for kind: ProviderKind) async throws -> [String: String]? {
         kind == .codex ? environment : nil

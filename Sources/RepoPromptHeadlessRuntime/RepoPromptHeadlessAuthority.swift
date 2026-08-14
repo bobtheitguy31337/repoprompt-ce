@@ -3146,9 +3146,8 @@ public actor RepoPromptHeadlessAuthority {
 
     private func cancelProviderRun(command: SessionCommand, sessionID: UUID, session: SessionAuthority, expectedRunID: UUID?, generation: Int64, actor: ExternalActor, idempotency: IdempotencyInput) async throws -> CommandReceipt {
         guard let binding = await session.activeBinding(), binding.generation == generation, expectedRunID == nil || expectedRunID == binding.runID else { throw await ServiceAPIError(code: .staleRevision, message: "Run identity is stale", currentRevision: (session.snapshot()).runGeneration) }
-        let rootSessionID = await (session.snapshot()).rootSessionID
-        cancellationBarriers.insert(rootSessionID)
-        try await cancelDescendants(rootSessionID: rootSessionID, excluding: sessionID, actor: actor)
+        // Session-local cancel matches Desktop `cancelAgentRun` / `agent_run cancel`.
+        // Tree-wide fencing and descendant teardown belong only to `quiesce()`.
         if let presentation = try await store.runPresentation(sessionID: sessionID), presentation.runID == binding.runID {
             let cancelling = try presentation.transitioning(to: .cancelling, statusCode: "cancel_requested")
             try await store.upsertRunPresentation(cancelling)

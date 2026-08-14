@@ -198,24 +198,11 @@ private struct NativeProviderProcessSupport {
     }
 
     private func prepareProviderHome(runID: UUID, includeCredentials: Bool) async throws -> PreparedHome {
-        if includeCredentials,
-           let environment = try await credentialSource.persistentRuntimeEnvironment(for: configuration.kind)
-        {
-            let required = ["HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "CODEX_HOME", "CODEX_SQLITE_HOME"]
-            guard required.allSatisfy({ key in
-                guard let value = environment[key] else { return false }
-                return value.hasPrefix("/") && FileManager.default.fileExists(atPath: value)
-            }), let processHome = environment["HOME"]
-            else {
-                throw ServiceAPIError(code: .dependencyUnavailable, message: "Managed provider runtime home is unavailable")
-            }
-            return PreparedHome(
-                url: URL(fileURLWithPath: processHome, isDirectory: true),
-                resources: [],
-                baseEnvironment: environment,
-                disposable: false
-            )
-        }
+        // Desktop durable authority (`AppDomainRuntimeComposition`) gives every
+        // provider run its own `ProviderHomes/<runID>` and copies credentials
+        // from the managed Codex auth directory. Sharing the live auth home
+        // across parent and child Codex processes is a server-only shortcut
+        // and races SQLite/config under concurrent `agent_run` spawns.
         return try await prepareEphemeralHome(runID: runID, includeCredentials: includeCredentials)
     }
 

@@ -446,14 +446,16 @@ final class AuthorityTests: XCTestCase {
         try await store.close()
     }
 
-    func testRootCancellationClosesDescendantsAndFencesNewChildren() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    func testRootCancellationDoesNotCancelDescendantsOrFenceNewChildren() async throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .resolvingSymlinksInPath()
+            .appendingPathComponent(".test-root-cancel-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let runner = DelayedProviderRunner()
-        await runner.setDelay(.seconds(10))
-        let provider = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: "/usr/bin/true")], runner: runner)
+        let runtime = SteeringProviderRuntime()
+        await runtime.holdNextRun()
+        let provider = ProviderCLIAdapter(runtimes: [runtime])
         let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
         let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-tree-cancel", requestDigest: "p-tree-cancel")
@@ -468,19 +470,52 @@ final class AuthorityTests: XCTestCase {
 
         _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh), sessionID: rootSession.sessionID, externalActor: actor, idempotencyKey: "resume-tree", requestDigest: "resume-tree")
         _ = try await authority.execute(command: .cancelSession(expectedRunID: nil, expectedGeneration: 1), sessionID: rootSession.sessionID, externalActor: actor, idempotencyKey: "cancel-tree", requestDigest: "cancel-tree")
-        let canceledChild = try await authority.sessionSnapshot(sessionID: child.sessionID)
+        let survivingChild = try await authority.sessionSnapshot(sessionID: child.sessionID)
         let canceledRoot = try await authority.sessionSnapshot(sessionID: rootSession.sessionID)
-        let canceledAgents = try await authority.agentSnapshots(rootSessionID: rootSession.sessionID)
-        XCTAssertEqual(canceledChild.state, .canceled)
+        let agents = try await authority.agentSnapshots(rootSessionID: rootSession.sessionID)
         XCTAssertEqual(canceledRoot.state, .canceled)
-        XCTAssertEqual(canceledAgents.first(where: { $0.sessionID == child.sessionID })?.state, .canceled)
+        XCTAssertEqual(survivingChild.state, .idle)
+        XCTAssertEqual(agents.first(where: { $0.sessionID == child.sessionID })?.state, .idle)
 
-        do {
-            _ = try await authority.spawnChildSession(parentSessionID: rootSession.sessionID, initialPrompt: "late")
-            XCTFail("expected root cancellation barrier")
-        } catch let error as ServiceAPIError {
-            XCTAssertEqual(error.code, .quiescing)
-        }
+        let late = try await authority.spawnChildSession(parentSessionID: rootSession.sessionID, initialPrompt: "late")
+        XCTAssertEqual(late.parentSessionID, rootSession.sessionID)
+        XCTAssertEqual(late.state, .idle)
+        try await authority.quiesce()
+        try await store.close()
+    }
+
+    func testChildCancellationDoesNotCancelParentOrSiblings() async throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .resolvingSymlinksInPath()
+            .appendingPathComponent(".test-child-cancel-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let runtime = SteeringProviderRuntime()
+        await runtime.holdNextRun()
+        let provider = ProviderCLIAdapter(runtimes: [runtime])
+        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-child-cancel", requestDigest: "p-child-cancel")
+        let rootSession = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "root"), externalActor: actor, idempotencyKey: "s-child-cancel", requestDigest: "s-child-cancel")
+        let childA = try await authority.spawnChildSession(parentSessionID: rootSession.sessionID, initialPrompt: "child-a", role: "explore", label: "probe-a")
+        let childB = try await authority.spawnChildSession(parentSessionID: rootSession.sessionID, initialPrompt: "child-b", role: "explore", label: "probe-b")
+
+        _ = try await authority.startChildAgentRun(sessionID: childA.sessionID)
+        try await Task.sleep(for: .milliseconds(50))
+        _ = try await authority.cancelChildAgentRun(sessionID: childA.sessionID)
+
+        let canceledChild = try await authority.sessionSnapshot(sessionID: childA.sessionID)
+        let survivingSibling = try await authority.sessionSnapshot(sessionID: childB.sessionID)
+        let survivingParent = try await authority.sessionSnapshot(sessionID: rootSession.sessionID)
+        XCTAssertEqual(canceledChild.state, .canceled)
+        XCTAssertEqual(survivingSibling.state, .idle)
+        XCTAssertEqual(survivingParent.state, .idle)
+
+        let late = try await authority.spawnChildSession(parentSessionID: rootSession.sessionID, initialPrompt: "child-c")
+        XCTAssertEqual(late.parentSessionID, rootSession.sessionID)
+        XCTAssertEqual(late.state, .idle)
+        try await authority.quiesce()
         try await store.close()
     }
 
