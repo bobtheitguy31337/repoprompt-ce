@@ -58,6 +58,16 @@ enum RepoPromptPortalSessionProjection {
         return normalized.count > prefix.count ? "\(prefix)…" : prefix
     }
 
+    static func snapshotTitles(sessions: [SessionSnapshot], agents: [AgentSnapshot]) -> [String: String] {
+        let labels = agents.reduce(into: [UUID: String]()) { result, agent in
+            guard let label = agent.label?.trimmingCharacters(in: .whitespacesAndNewlines), !label.isEmpty else { return }
+            result[agent.sessionID] = label
+        }
+        return Dictionary(uniqueKeysWithValues: sessions.map { session in
+            (session.sessionID.uuidString, labels[session.sessionID] ?? title(for: session))
+        })
+    }
+
     static func transcriptPage(
         session: SessionSnapshot,
         limit: Int,

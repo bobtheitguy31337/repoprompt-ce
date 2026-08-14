@@ -1310,6 +1310,10 @@ public actor RepoPromptHeadlessAuthority {
         return try await store.agents(rootSessionID: rootSessionID)
     }
 
+    public func agentSnapshots() async throws -> [AgentSnapshot] {
+        try await store.agents()
+    }
+
     public func execute(command: SessionCommand, sessionID: UUID, externalActor: ExternalActor, idempotencyKey: String, requestDigest: String, authorizationDecision: GoblinAuthorizationDecision? = nil) async throws -> CommandReceipt {
         try ensureWritable()
         let idempotency = IdempotencyInput(actorID: externalActor.goblinUserID, operation: command.operation, key: idempotencyKey, requestDigest: requestDigest)

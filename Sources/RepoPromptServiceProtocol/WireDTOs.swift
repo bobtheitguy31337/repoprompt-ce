@@ -210,20 +210,22 @@ public struct AuthoritativeWireSnapshot: Codable, Sendable {
     public let storeID: UUID
     public let projects: [ProjectWireSnapshot]
     public let sessions: [SessionSnapshot]
+    public let sessionTitles: [String: String]?
     public let cursor: ServiceCursor
 
-    public init(_ value: AuthoritativeSnapshot) {
+    public init(_ value: AuthoritativeSnapshot, sessionTitles: [String: String]? = nil) {
         schemaVersion = value.schemaVersion
         storeID = value.storeID
         projects = value.projects.map(ProjectWireSnapshot.init)
         sessions = value.sessions
+        self.sessionTitles = sessionTitles
         cursor = value.cursor
     }
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion
         case storeID = "storeId"
-        case projects, sessions, cursor
+        case projects, sessions, sessionTitles, cursor
     }
 }
 

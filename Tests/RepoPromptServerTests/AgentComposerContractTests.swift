@@ -520,6 +520,61 @@ final class AgentTurnIntentCompilerTests: XCTestCase {
         XCTAssertTrue(result.canonicalUserTurn.taggedFiles.isEmpty)
     }
 
+    func testSnapshotTitlesPreferAgentLabelsAndFallBackToTheFirstUserPrompt() {
+        let actor = ExternalActor(goblinUserID: "user", username: "alice", displayName: "Alice")
+        let sessionID = UUID()
+        let session = SessionSnapshot(
+            sessionID: sessionID,
+            projectID: UUID(),
+            parentSessionID: nil,
+            rootSessionID: sessionID,
+            creator: actor,
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            visibility: .privateSession,
+            state: .completed,
+            runGeneration: 1,
+            turnEpoch: 1,
+            revision: 2,
+            transcript: [
+                .init(entryID: UUID(), sessionSequence: 1, kind: .human, content: "  Build   compact session cards  ", actor: actor, timestamp: Date())
+            ],
+            interactions: [],
+            cursor: .init(storeID: UUID(), globalSequence: 1)
+        )
+        let agent = AgentSnapshot(
+            agentID: sessionID,
+            sessionID: sessionID,
+            rootSessionID: sessionID,
+            parentAgentID: nil,
+            role: "root",
+            label: "Polish agent session cards",
+            state: .completed,
+            revision: 2
+        )
+
+        XCTAssertEqual(
+            RepoPromptPortalSessionProjection.snapshotTitles(sessions: [session], agents: [agent]),
+            [sessionID.uuidString: "Polish agent session cards"]
+        )
+        XCTAssertEqual(
+            RepoPromptPortalSessionProjection.snapshotTitles(sessions: [session], agents: []),
+            [sessionID.uuidString: "Build compact session cards"]
+        )
+        let storeID = UUID()
+        let snapshot = AuthoritativeSnapshot(
+            storeID: storeID,
+            projects: [],
+            sessions: [session],
+            cursor: .init(storeID: storeID, globalSequence: 1)
+        )
+        let encoded = try? JSONEncoder.serviceEncoder.encode(
+            AuthoritativeWireSnapshot(snapshot, sessionTitles: [sessionID.uuidString: "Polish agent session cards"])
+        )
+        XCTAssertNotNil(encoded)
+        XCTAssertTrue(encoded.map { String(decoding: $0, as: UTF8.self).contains("sessionTitles") } == true)
+    }
+
     func testTextOnlyAdapterRejectsAttachmentBeforeAcceptance() async throws {
         let attachmentID = UUID()
         let wire = ComposerAttachmentWire(attachmentID: attachmentID, displayName: "x.png", mediaType: "image/png", byteSize: 24, digest: "d", pixelWidth: 1, pixelHeight: 1, lifecycle: .staged)

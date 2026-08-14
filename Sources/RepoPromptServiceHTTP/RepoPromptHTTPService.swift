@@ -1133,7 +1133,10 @@ public struct RepoPromptHTTPService: Sendable {
             })
         } }
         router.get("/internal/v1/snapshot") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinSync], operation: "snapshot")
-            return try await HTTPResponses.json(AuthoritativeWireSnapshot(authority.authoritativeSnapshot()))
+            let snapshot = try await authority.authoritativeSnapshot()
+            let agents = try await authority.agentSnapshots()
+            let titles = RepoPromptPortalSessionProjection.snapshotTitles(sessions: snapshot.sessions, agents: agents)
+            return try HTTPResponses.json(AuthoritativeWireSnapshot(snapshot, sessionTitles: titles))
         } }
         router.post("/internal/v1/admin/checkpoint") { request, context in await respond(request) { let data = try await bodyData(request)
             _ = try await authenticate(request, context: context, body: data, roles: [.operatorRole], operation: "checkpoint")
