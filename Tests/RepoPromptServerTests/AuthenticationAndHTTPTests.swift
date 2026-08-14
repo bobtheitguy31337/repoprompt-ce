@@ -416,6 +416,58 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         try await store.close()
     }
 
+    func testNestedSessionsDoNotFailReadinessCapacity() async throws {
+        let recovered = try await recoveredRunningSessions(rootCount: 1, childrenPerRoot: 3)
+        defer { removeSQLiteFiles(recovered.database) }
+        let readiness = RepoPromptReadinessService(
+            authority: recovered.authority,
+            store: recovered.store,
+            minimumFreeBytes: 0,
+            minimumFreeNodes: 0,
+            maximumActiveSessions: 2,
+            cacheDuration: 0
+        )
+        let snapshot = await readiness.snapshot(forceRefresh: true)
+        XCTAssertTrue(snapshot.ready)
+        XCTAssertEqual(snapshot.activeSessionCount, 4)
+        XCTAssertEqual(snapshot.checks.first { $0.name == "session-capacity" }?.detail, "1/2")
+        XCTAssertEqual(snapshot.checks.first { $0.name == "session-capacity" }?.ready, true)
+        let service = RepoPromptHTTPService(authority: recovered.authority, store: recovered.store, authenticator: InternalRequestAuthenticator(keys: [], store: recovered.store), eventSigningKey: responseSigningKey, readiness: readiness)
+        let app = Application(router: service.healthRouter())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/health/ready", method: .get) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
+        try await recovered.store.close()
+    }
+
+    func testExhaustedRootCapacityDoesNotFailHealthReady() async throws {
+        let recovered = try await recoveredRunningSessions(rootCount: 2, childrenPerRoot: 0)
+        defer { removeSQLiteFiles(recovered.database) }
+        let readiness = RepoPromptReadinessService(
+            authority: recovered.authority,
+            store: recovered.store,
+            minimumFreeBytes: 0,
+            minimumFreeNodes: 0,
+            maximumActiveSessions: 2,
+            cacheDuration: 0
+        )
+        let snapshot = await readiness.snapshot(forceRefresh: true)
+        XCTAssertTrue(snapshot.ready)
+        XCTAssertEqual(snapshot.activeSessionCount, 2)
+        XCTAssertEqual(snapshot.checks.first { $0.name == "session-capacity" }?.detail, "2/2")
+        XCTAssertEqual(snapshot.checks.first { $0.name == "session-capacity" }?.ready, false)
+        let service = RepoPromptHTTPService(authority: recovered.authority, store: recovered.store, authenticator: InternalRequestAuthenticator(keys: [], store: recovered.store), eventSigningKey: responseSigningKey, readiness: readiness)
+        let app = Application(router: service.healthRouter())
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/health/ready", method: .get) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
+        try await recovered.store.close()
+    }
+
     func testDegradedProjectIsDiagnosticWithoutFailingUnrelatedReadiness() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -550,6 +602,74 @@ final class AuthenticationAndHTTPTests: XCTestCase {
             }
         }
         try await store.close()
+    }
+
+    private func recoveredRunningSessions(
+        rootCount: Int,
+        childrenPerRoot: Int
+    ) async throws -> (database: URL, store: SQLiteServiceStore, authority: RepoPromptHeadlessAuthority) {
+        let database = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).sqlite")
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        var store = try await SQLiteServiceStore.open(storage: .file(database.path))
+        let projectCursor = try await store.nextCursor()
+        let projectID = UUID()
+        let project = ProjectSnapshot(
+            projectID: projectID,
+            name: "P",
+            creator: actor,
+            state: .active,
+            roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)],
+            revision: 1,
+            cursor: projectCursor
+        )
+        _ = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: nil)
+        for _ in 0 ..< rootCount {
+            let rootID = UUID()
+            try await persistRunningSession(store: store, sessionID: rootID, projectID: projectID, parentSessionID: nil, rootSessionID: rootID, actor: actor)
+            for _ in 0 ..< childrenPerRoot {
+                try await persistRunningSession(store: store, sessionID: UUID(), projectID: projectID, parentSessionID: rootID, rootSessionID: rootID, actor: actor)
+            }
+        }
+        try await store.close(clean: true)
+        store = try await SQLiteServiceStore.open(storage: .file(database.path))
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        try await authority.recover()
+        return (database, store, authority)
+    }
+
+    private func persistRunningSession(
+        store: SQLiteServiceStore,
+        sessionID: UUID,
+        projectID: UUID,
+        parentSessionID: UUID?,
+        rootSessionID: UUID,
+        actor: ExternalActor
+    ) async throws {
+        let cursor = try await store.nextCursor()
+        let session = SessionSnapshot(
+            sessionID: sessionID,
+            projectID: projectID,
+            parentSessionID: parentSessionID,
+            rootSessionID: rootSessionID,
+            creator: actor,
+            provider: .codex,
+            model: nil,
+            visibility: .privateSession,
+            state: .running,
+            runGeneration: 1,
+            turnEpoch: 1,
+            revision: 2,
+            transcript: [],
+            interactions: [],
+            cursor: cursor
+        )
+        _ = try await store.persistSession(session, eventType: .sessionResumed, actor: actor, correlationID: UUID(), idempotency: nil)
+    }
+
+    private func removeSQLiteFiles(_ database: URL) {
+        try? FileManager.default.removeItem(at: database)
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: database.path + "-wal"))
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: database.path + "-shm"))
     }
 
     private func signedHeaders(method: String, path: String, key: InternalSigningKey, instant: Date, nonce: String) -> HTTPFields {

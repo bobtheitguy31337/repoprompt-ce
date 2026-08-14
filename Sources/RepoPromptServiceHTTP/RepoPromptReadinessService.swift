@@ -150,11 +150,15 @@ public actor RepoPromptReadinessService {
         }
         let activeStates: Set<SessionLifecycleState> = [.preparing, .running, .waiting]
         let activeSessionCount = sessions.count(where: { activeStates.contains($0.state) })
-        let capacityReady = activeSessionCount < maximumActiveSessions
-        checks.append(.init(name: "session-capacity", ready: capacityReady, detail: "\(activeSessionCount)/\(maximumActiveSessions)"))
+        let activeRootCount = sessions.count(where: { $0.parentSessionID == nil && activeStates.contains($0.state) })
+        // Nested children share the parent's admission slot. Capacity is telemetry,
+        // not process liveness: Docker /health/ready must stay true while nested
+        // agents run, matching Desktop remaining usable with open subagent tabs.
+        let capacityReady = activeRootCount < maximumActiveSessions
+        checks.append(.init(name: "session-capacity", ready: capacityReady, detail: "\(activeRootCount)/\(maximumActiveSessions)"))
         let projects = await authority.projectSnapshots()
         let degraded = projects.filter { $0.state == .degraded }.map(\.projectID).sorted { $0.uuidString < $1.uuidString }
-        let ready = checks.allSatisfy(\.ready)
+        let ready = checks.filter { $0.name != "session-capacity" }.allSatisfy(\.ready)
         let result = RepoPromptReadinessSnapshot(
             ready: ready,
             checks: checks,
