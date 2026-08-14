@@ -30,7 +30,7 @@ enum PortablePOSIX {
         #endif
     }
 
-    static func shutdownDescriptor(_ fd: Int32, how: Int32) {
+    private static func shutdownDescriptor(_ fd: Int32, how: Int32) {
         #if canImport(Darwin)
             _ = Darwin.shutdown(fd, how)
         #else
@@ -38,11 +38,19 @@ enum PortablePOSIX {
         #endif
     }
 
+    static func shutdownReadWrite(_ fd: Int32) {
+        shutdownDescriptor(fd, how: shutdownHowReadWrite)
+    }
+
+    static func shutdownWrite(_ fd: Int32) {
+        shutdownDescriptor(fd, how: shutdownHowWrite)
+    }
+
     static func unixStreamSocket() -> Int32 {
         #if canImport(Darwin)
             Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         #else
-            Glibc.socket(AF_UNIX, SOCK_STREAM, 0)
+            Glibc.socket(AF_UNIX, Int32(SOCK_STREAM.rawValue), 0)
         #endif
     }
 
@@ -156,6 +164,22 @@ enum PortablePOSIX {
             _ = Darwin.unlink(path)
         #else
             _ = Glibc.unlink(path)
+        #endif
+    }
+
+    private static var shutdownHowReadWrite: Int32 {
+        #if canImport(Darwin)
+            SHUT_RDWR
+        #else
+            Int32(SHUT_RDWR)
+        #endif
+    }
+
+    private static var shutdownHowWrite: Int32 {
+        #if canImport(Darwin)
+            SHUT_WR
+        #else
+            Int32(SHUT_WR)
         #endif
     }
 }

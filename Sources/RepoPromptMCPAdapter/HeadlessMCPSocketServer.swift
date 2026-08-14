@@ -96,7 +96,7 @@ public actor HeadlessMCPSocketServer {
         let listener = listenFD
         listenFD = -1
         if listener >= 0 {
-            PortablePOSIX.shutdownDescriptor(listener, how: SHUT_RDWR)
+            PortablePOSIX.shutdownReadWrite(listener)
             PortablePOSIX.closeDescriptor(listener)
         }
         PortablePOSIX.unlinkPath(socketURL.path)

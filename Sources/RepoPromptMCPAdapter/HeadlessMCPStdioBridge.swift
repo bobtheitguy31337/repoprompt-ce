@@ -59,9 +59,9 @@ public enum HeadlessMCPStdioBridge {
             while let completed = try await group.next() {
                 switch completed {
                 case .upstream:
-                    PortablePOSIX.shutdownDescriptor(fd, how: SHUT_WR)
+                    PortablePOSIX.shutdownWrite(fd)
                 case .downstream:
-                    PortablePOSIX.shutdownDescriptor(fd, how: SHUT_RDWR)
+                    PortablePOSIX.shutdownReadWrite(fd)
                     group.cancelAll()
                     return
                 }
