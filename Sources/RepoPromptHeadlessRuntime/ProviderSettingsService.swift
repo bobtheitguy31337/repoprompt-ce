@@ -218,6 +218,15 @@ public actor ProviderSettingsService {
     }
 
     public func catalog(refreshCLI: Bool = false, refreshRuntime: Bool = false) async throws -> ProviderSettingsCatalogResponse {
+        if let codex = connections[.codex],
+           codex.record.authenticationMethod == .deviceCodeBeta,
+           codex.record.testState == .unavailable
+        {
+            // Portal reads must be able to recover a managed login that an
+            // earlier transient probe left degraded. The refresh remains
+            // single-flight, TTL-bounded, and off the response path.
+            requestProviderStatusRefresh(providerID: .codex)
+        }
         if refreshCLI || refreshRuntime {
             for providerID in ProviderSettingsID.allCases where providerID.ownsRuntimeAdmission && !providerID.isDirectAPI {
                 guard let kind = providerID.runtimeKind,
@@ -693,6 +702,16 @@ public actor ProviderSettingsService {
             return
         }
         guard let current, current.record.authenticationMethod == .deviceCodeBeta else { return }
+        if case .unavailable = state,
+           current.record.state == .connected,
+           current.record.testState == .valid
+        {
+            // A transport, provider, or refresh outage is not evidence that
+            // the durable server-managed login was revoked. Preserve the last
+            // verified state; an explicit unauthenticated reply still
+            // invalidates it through the branch below.
+            return
+        }
         let projection: (ProviderConnectionState, ProviderCredentialTestState, String?, String?) = switch state {
         case let .authenticated(accountLabel):
             (.connected, .valid, try safeLabel(accountLabel) ?? current.record.accountLabel, "ChatGPT account authenticated by the server")
@@ -904,7 +923,10 @@ public actor ProviderSettingsService {
         guard !connectedRecoveryStarted else { return }
         connectedRecoveryStarted = true
         let connectedProviders = Set(connections.compactMap { providerID, stored -> ProviderSettingsID? in
-            guard stored.record.state == .connected,
+            let isRecoverableManagedCodex = providerID == .codex
+                && stored.record.authenticationMethod == .deviceCodeBeta
+                && stored.record.testState == .unavailable
+            guard (stored.record.state == .connected || isRecoverableManagedCodex),
                   stored.record.expiresAt.map({ $0 > Date() }) ?? true
             else { return nil }
             return providerID.runtimeSettingsOwner

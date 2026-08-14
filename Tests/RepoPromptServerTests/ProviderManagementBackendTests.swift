@@ -650,6 +650,110 @@ final class ProviderManagementBackendTests: XCTestCase {
         XCTAssertEqual(logoutCount, 1)
     }
 
+    func testTransientManagedCodexProbePreservesLastVerifiedConnection() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let configuration = ProviderCLIConfiguration(
+            kind: .codex,
+            executable: "/usr/bin/true",
+            expectedVersion: "test",
+            protocolVersion: "app-server-v2"
+        )
+        let managed = CompletingManagedAuthDriver(state: .authenticated(accountLabel: "owner@example.com"))
+        let now = Date()
+        let connection = ProviderConnectionRecord(
+            connectionID: UUID(),
+            providerID: .codex,
+            authenticationMethod: .deviceCodeBeta,
+            state: .connected,
+            accountLabel: "owner@example.com",
+            lastTestedAt: now,
+            testState: .valid,
+            detail: "ChatGPT account authenticated by the server",
+            keyHelperConfigured: false,
+            workloadIdentityConfigured: false,
+            createdAt: now,
+            updatedAt: now,
+            revision: 1
+        )
+        _ = try await store.upsertProviderConnection(
+            .init(record: connection, credentialReference: nil),
+            expectedRevision: 0
+        )
+        let service = ProviderSettingsService(
+            store: store,
+            adapter: ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.codex]),
+            configurations: [configuration],
+            initiallyEnabled: [.codex],
+            managedAuthentication: managed
+        )
+        try await service.bootstrap()
+        await managed.setAuthenticationState(.unavailable)
+
+        let snapshot = try await service.testConnection(
+            providerID: .codex,
+            attribution: .init(actorID: "admin-1", actorLabel: "alice", channel: "test")
+        )
+
+        XCTAssertEqual(snapshot.connection?.state, .connected)
+        XCTAssertEqual(snapshot.connection?.testState, .valid)
+        XCTAssertEqual(snapshot.connection?.detail, "ChatGPT account authenticated by the server")
+        XCTAssertTrue(snapshot.authentication.authenticated)
+    }
+
+    func testStartupRecoveryRechecksLegacyUnavailableManagedCodexConnection() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let configuration = ProviderCLIConfiguration(
+            kind: .codex,
+            executable: "/usr/bin/true",
+            expectedVersion: "test",
+            protocolVersion: "app-server-v2"
+        )
+        let managed = CompletingManagedAuthDriver(state: .authenticated(accountLabel: "owner@example.com"))
+        let now = Date()
+        let connection = ProviderConnectionRecord(
+            connectionID: UUID(),
+            providerID: .codex,
+            authenticationMethod: .deviceCodeBeta,
+            state: .attention,
+            accountLabel: "owner@example.com",
+            lastTestedAt: now,
+            testState: .unavailable,
+            detail: "Codex authentication status is temporarily unavailable",
+            keyHelperConfigured: false,
+            workloadIdentityConfigured: false,
+            createdAt: now,
+            updatedAt: now,
+            revision: 1
+        )
+        _ = try await store.upsertProviderConnection(
+            .init(record: connection, credentialReference: nil),
+            expectedRevision: 0
+        )
+        let service = ProviderSettingsService(
+            store: store,
+            adapter: ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.codex]),
+            configurations: [configuration],
+            initiallyEnabled: [.codex],
+            managedAuthentication: managed
+        )
+        try await service.bootstrap()
+
+        await service.startConnectedProviderRecovery()
+        var recovered = false
+        for _ in 0 ..< 50 {
+            let codex = try await store.providerConnection(providerID: .codex)
+            if codex?.record.state == .connected, codex?.record.testState == .valid {
+                recovered = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+
+        XCTAssertTrue(recovered)
+    }
+
     func testTransientAuthFlowIsOwnerFencedAndCancelRemovesState() async throws {
         let driver = FakeAuthFlowDriver()
         let coordinator = TransientProviderAuthFlowCoordinator(driver: driver)
@@ -807,9 +911,17 @@ private actor UnauthenticatedClaudeRunner: WorkspaceCommandRunning {
 }
 
 private actor CompletingManagedAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuthenticationDriving {
-    private var state: ProviderManagedAuthenticationState = .notAuthenticated
+    private var state: ProviderManagedAuthenticationState
     private var statuses: [UUID: ProviderAuthTransactionStatus] = [:]
     private var logoutCalls = 0
+
+    init(state: ProviderManagedAuthenticationState = .notAuthenticated) {
+        self.state = state
+    }
+
+    func setAuthenticationState(_ state: ProviderManagedAuthenticationState) {
+        self.state = state
+    }
 
     func authFlowDescriptor(providerID: ProviderSettingsID, forceRefresh _: Bool) async -> ProviderAuthFlowDescriptor? {
         guard providerID == .codex else { return nil }
