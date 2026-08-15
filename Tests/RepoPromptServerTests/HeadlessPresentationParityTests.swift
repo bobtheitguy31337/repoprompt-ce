@@ -96,10 +96,21 @@ final class HeadlessPresentationParityTests: XCTestCase {
         XCTAssertEqual(HeadlessAskUser.timeoutSeconds(from: arguments), 45)
         XCTAssertFalse(HeadlessAskUser.isAskUserPayload(Data(#"{"prompt":"Choose a branch","choices":["sandbox"]}"#.utf8)))
 
-        let desktop = Data(#"{"answers":{"scope":{"answers":["Composer"],"selected_options":["Composer"],"custom_response":null,"skipped":false}},"timed_out":false,"skipped":false,"elapsed_seconds":3}"#.utf8)
+        let desktop = Data(#"{"title":"Need a couple of decisions","questions":[{"id":"scope","question":"What first?"}],"answers":{"scope":{"answers":["Composer"],"selected_options":["Composer"],"custom_response":null,"skipped":false}},"timed_out":false,"skipped":false,"elapsed_seconds":3}"#.utf8)
         let preserved = try JSONSerialization.jsonObject(with: HeadlessAskUser.desktopResponse(from: desktop)) as? [String: Any]
         XCTAssertEqual(preserved?["timed_out"] as? Bool, false)
         XCTAssertNotNil((preserved?["answers"] as? [String: Any])?["scope"])
+        XCTAssertNil(preserved?["questions"])
+        let presented = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: HeadlessAskUser.presentationPayload(
+                    request: arguments,
+                    answer: Data(#"{"answers":{"scope":{"answers":["Composer"],"selected_options":["Composer"],"custom_response":null,"skipped":false}},"timed_out":false,"skipped":false,"elapsed_seconds":3}"#.utf8)
+                )
+            ) as? [String: Any]
+        )
+        XCTAssertNotNil(presented["questions"])
+        XCTAssertEqual(HeadlessAskUser.resolutionLabel(from: HeadlessAskUser.presentationPayload(request: arguments, answer: desktop)), "answered")
 
         let legacy = HeadlessAskUser.desktopResponse(
             from: Data(#"{"answers":[{"questionId":"scope","text":"Composer"}]}"#.utf8),

@@ -25,22 +25,48 @@ enum HeadlessAskUser {
     }
 
     static func desktopResponse(from answer: Data, timedOut: Bool = false, elapsedSeconds: Int = 0) -> Data {
-        if !timedOut, let object = jsonObject(answer), looksLikeDesktopResponse(object) {
-            return (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? answer
-        }
         if timedOut {
-            return encode([
-                "answers": [String: Any](),
-                "timed_out": true,
-                "skipped": false,
-                "elapsed_seconds": max(0, elapsedSeconds),
-            ])
+            return encode(strippedDesktopResponse([:], timedOut: true, elapsedSeconds: elapsedSeconds))
+        }
+        if let object = jsonObject(answer), looksLikeDesktopResponse(object) {
+            return encode(strippedDesktopResponse(object, timedOut: false, elapsedSeconds: elapsedSeconds))
         }
         return encode(normalizedResponse(from: jsonObject(answer), elapsedSeconds: elapsedSeconds))
     }
 
+    static func presentationPayload(request: Data, answer: Data, timedOut: Bool = false, elapsedSeconds: Int = 0) -> Data {
+        var merged = jsonObject(request) ?? [:]
+        let response = jsonObject(desktopResponse(from: answer, timedOut: timedOut, elapsedSeconds: elapsedSeconds)) ?? [:]
+        merged["authorityOperation"] = authorityOperation
+        merged["answers"] = response["answers"] ?? [String: Any]()
+        merged["timed_out"] = response["timed_out"] ?? false
+        merged["skipped"] = response["skipped"] ?? false
+        merged["elapsed_seconds"] = response["elapsed_seconds"] ?? max(0, elapsedSeconds)
+        return encode(merged)
+    }
+
+    static func presentationPrompt(from payload: Data) -> String {
+        String(data: payload, encoding: .utf8).map { String($0.prefix(8_192)) } ?? "The agent needs your response."
+    }
+
+    static func resolutionLabel(from payload: Data) -> String {
+        guard let object = jsonObject(payload) else { return "answered" }
+        if object["timed_out"] as? Bool == true { return "timed_out" }
+        if object["skipped"] as? Bool == true { return "skipped" }
+        return "answered"
+    }
+
     private static func looksLikeDesktopResponse(_ object: [String: Any]) -> Bool {
         object["answers"] is [String: Any] && (object["timed_out"] != nil || object["timedOut"] != nil)
+    }
+
+    private static func strippedDesktopResponse(_ object: [String: Any], timedOut: Bool, elapsedSeconds: Int) -> [String: Any] {
+        [
+            "answers": object["answers"] ?? [String: Any](),
+            "timed_out": timedOut || (object["timed_out"] as? Bool ?? object["timedOut"] as? Bool ?? false),
+            "skipped": object["skipped"] as? Bool ?? false,
+            "elapsed_seconds": object["elapsed_seconds"] ?? object["elapsedSeconds"] ?? max(0, elapsedSeconds),
+        ]
     }
 
     private static func normalizedResponse(from object: [String: Any]?, elapsedSeconds: Int) -> [String: Any] {

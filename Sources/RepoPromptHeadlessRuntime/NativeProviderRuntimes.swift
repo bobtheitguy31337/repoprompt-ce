@@ -664,6 +664,10 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
     }
 
     func steer(runID: UUID, text: String, targetTurnEpoch _: Int64) async throws {
+        for _ in 0 ..< 200 {
+            if sessions[runID] != nil, threadIDs[runID] != nil, turnIDs[runID] != nil { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
         guard let process = sessions[runID], let threadID = threadIDs[runID], let turnID = turnIDs[runID] else { throw ServiceAPIError(code: .notFound, message: "Codex turn is not active") }
         _ = try await process.beginRequest(method: "turn/steer", params: ["threadId": threadID, "expectedTurnId": turnID, "input": [["type": "text", "text": text]]])
     }

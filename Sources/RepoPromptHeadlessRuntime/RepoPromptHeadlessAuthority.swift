@@ -2073,7 +2073,7 @@ public actor RepoPromptHeadlessAuthority {
         if let expiresAt = current.expiresAt, expiresAt <= clock.now() { throw ServiceAPIError(code: .interactionSettled, message: "Interaction expired") }
         if isLocallyResolvedAskUser(current.payload) {
             let resolvedPayload = HeadlessAskUser.isAskUserPayload(current.payload)
-                ? HeadlessAskUser.desktopResponse(from: payload)
+                ? HeadlessAskUser.presentationPayload(request: current.payload, answer: payload)
                 : payload
             let resolved = InteractionSnapshot(
                 interactionID: current.interactionID,
