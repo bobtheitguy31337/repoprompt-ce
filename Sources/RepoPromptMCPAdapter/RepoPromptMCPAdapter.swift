@@ -373,8 +373,8 @@ private actor AuthorityToolBackend {
         let maximumEntries = min(max(arguments["maximum_entries"]?.intValue ?? 5000, 1), 10000)
         if let rawPath = arguments["path"]?.stringValue {
             let path = try await resolve(rawPath, allowMissingLeaf: false)
-            return try await value(authority.projectTree(
-                projectID: project.projectID,
+            return try await value(authority.sessionProjectTree(
+                sessionID: binding.sessionID,
                 request: ProjectTreeRequest(
                     rootID: path.root.rootID,
                     logicalPath: path.logicalPath,
@@ -385,8 +385,8 @@ private actor AuthorityToolBackend {
         }
         var entries: [ProjectTreeEntry] = []
         for root in project.roots {
-            entries += try await authority.projectTree(
-                projectID: project.projectID,
+            entries += try await authority.sessionProjectTree(
+                sessionID: binding.sessionID,
                 request: ProjectTreeRequest(
                     rootID: root.rootID,
                     maximumDepth: maximumDepth,
@@ -403,8 +403,8 @@ private actor AuthorityToolBackend {
             throw ServiceAPIError(code: .invalidRequest, message: "read_file requires path")
         }
         let path = try await resolve(rawPath, allowMissingLeaf: false)
-        let snapshot = try await authority.projectFile(
-            projectID: session().projectID,
+        let snapshot = try await authority.sessionProjectFile(
+            sessionID: binding.sessionID,
             request: ProjectFileRequest(
                 rootID: path.root.rootID,
                 logicalPath: path.logicalPath,
@@ -431,8 +431,8 @@ private actor AuthorityToolBackend {
         var hits: [ProjectSearchHit] = []
         let limit = min(max(arguments["max_results"]?.intValue ?? 200, 1), 1000)
         for (root, logicalPath) in roots {
-            hits += try await authority.projectSearch(
-                projectID: project.projectID,
+            hits += try await authority.sessionProjectSearch(
+                sessionID: binding.sessionID,
                 request: ProjectSearchRequest(
                     rootID: root.rootID,
                     query: query,
@@ -456,11 +456,10 @@ private actor AuthorityToolBackend {
             }
         }
         var maps: [ProjectCodeMapSnapshot] = []
-        let projectID = try await session().projectID
         for rawPath in paths.prefix(256) {
             let path = try await resolve(rawPath, allowMissingLeaf: false)
-            try await maps.append(authority.projectCodeMap(
-                projectID: projectID,
+            try await maps.append(authority.sessionProjectCodeMap(
+                sessionID: binding.sessionID,
                 request: ProjectCodeMapRequest(rootID: path.root.rootID, logicalPath: path.logicalPath)
             ))
         }
@@ -690,7 +689,6 @@ private actor AuthorityToolBackend {
 
     private func git(_ arguments: [String: Value]) async throws -> Value {
         let operation = arguments["op"]?.stringValue ?? "status"
-        let project = try await project()
         let root = try await root(arguments["root_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
         let command: [String]
         switch operation {
@@ -698,8 +696,8 @@ private actor AuthorityToolBackend {
         case "log": command = ["log", "--oneline", "-n", String(min(max(arguments["count"]?.intValue ?? 20, 1), 200))]
         case "show": command = ["show", "--stat", arguments["ref"]?.stringValue ?? "HEAD"]
         case "diff":
-            let diff = try await authority.projectDiff(
-                projectID: project.projectID,
+            let diff = try await authority.sessionProjectDiff(
+                sessionID: binding.sessionID,
                 request: ProjectDiffRequest(
                     rootID: root.rootID,
                     comparison: arguments["compare"]?.stringValue ?? "HEAD",
@@ -712,8 +710,8 @@ private actor AuthorityToolBackend {
         }
         return try await .object([
             "op": .string(operation),
-            "output": .string(authority.projectGit(
-                projectID: project.projectID,
+            "output": .string(authority.sessionProjectGit(
+                sessionID: binding.sessionID,
                 rootID: root.rootID,
                 arguments: command
             ))
@@ -797,6 +795,11 @@ private actor AuthorityToolBackend {
                 role: arguments["model_id"]?.stringValue ?? defaultRole,
                 label: arguments["session_name"]?.stringValue
             )
+            // Desktop copies the parent's worktree bindings onto the child
+            // session before provider start. Linux keeps a single root-owned
+            // binding and exposes it through `effectiveWorktreeBindings` /
+            // `authoritySessionSnapshot.worktrees`, so MCP path resolution and
+            // session-scoped file tools inherit the same workspace.
             _ = try await authority.startChildAgentRun(sessionID: child.sessionID)
             return try await value(authority.sessionSnapshot(sessionID: child.sessionID))
         case "poll":
@@ -927,8 +930,11 @@ private actor AuthorityToolBackend {
 
     private func resolve(_ rawPath: String, allowMissingLeaf: Bool) async throws -> BoundPath {
         let project = try await project()
-        let worktrees = try await authority.worktreeSnapshots(projectID: project.projectID)
-        let bindings = Dictionary(uniqueKeysWithValues: worktrees.filter { $0.sessionID == binding.sessionID }.map {
+        // Desktop copies parent worktree bindings onto the child session.
+        // Linux stores one active binding on the root and exposes it to
+        // children through `authoritySessionSnapshot.worktrees`.
+        let worktrees = try await authority.authoritySessionSnapshot(sessionID: binding.sessionID).worktrees
+        let bindings = Dictionary(uniqueKeysWithValues: worktrees.map {
             ($0.rootID, URL(fileURLWithPath: $0.physicalPath).standardizedFileURL.resolvingSymlinksInPath())
         })
         var candidates: [BoundPath] = []
@@ -978,7 +984,9 @@ private actor AuthorityToolBackend {
         guard let root = project.roots.first(where: { $0.rootID == entry.rootID }) else {
             throw ServiceAPIError(code: .rootUnauthorized, message: "Selected root is unavailable")
         }
-        return URL(fileURLWithPath: root.canonicalPath).appendingPathComponent(entry.logicalPath).path
+        let worktrees = try await authority.authoritySessionSnapshot(sessionID: binding.sessionID).worktrees
+        let base = worktrees.first(where: { $0.rootID == entry.rootID })?.physicalPath ?? root.canonicalPath
+        return URL(fileURLWithPath: base).appendingPathComponent(entry.logicalPath).path
     }
 
     private func agentSessionID(_ arguments: [String: Value]) throws -> UUID {

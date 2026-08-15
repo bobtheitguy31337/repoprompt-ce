@@ -1460,6 +1460,52 @@ public actor RepoPromptHeadlessAuthority {
         return try await sessionToolAuthority(session: await session.snapshot()).readFile(request)
     }
 
+    public func sessionProjectTree(sessionID: UUID, request: ProjectTreeRequest) async throws -> [ProjectTreeEntry] {
+        guard let session = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
+        let advanced = try await advancedSettings()
+        return try await sessionToolAuthority(session: await session.snapshot()).tree(request, settings: advanced.settings)
+    }
+
+    public func sessionProjectSearch(sessionID: UUID, request: ProjectSearchRequest) async throws -> [ProjectSearchHit] {
+        guard let session = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
+        let advanced = try await advancedSettings()
+        return try await sessionToolAuthority(session: await session.snapshot()).search(request, settings: advanced.settings)
+    }
+
+    public func sessionProjectCodeMap(sessionID: UUID, request: ProjectCodeMapRequest) async throws -> ProjectCodeMapSnapshot {
+        guard let session = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
+        let advanced = try await advancedSettings()
+        return try await sessionToolAuthority(session: await session.snapshot()).codeMap(request, settings: advanced.settings)
+    }
+
+    public func sessionProjectDiff(sessionID: UUID, request: ProjectDiffRequest) async throws -> ProjectDiffSnapshot {
+        guard let session = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
+        return try await sessionToolAuthority(session: await session.snapshot()).diff(request)
+    }
+
+    public func sessionProjectGit(
+        sessionID: UUID,
+        rootID: UUID,
+        arguments: [String],
+        maximumBytes: Int = 2_097_152
+    ) async throws -> String {
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        let project = try await projects.authority(projectID: session.projectID)
+        let root = try await project.root(rootID: rootID)
+        let forbidden = Set(["push", "fetch", "pull", "clone", "remote", "credential"])
+        guard let operation = arguments.first, !forbidden.contains(operation.lowercased()) else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Network or credential Git operations are unavailable")
+        }
+        let bindings = try await effectiveWorktreeBindings(session: session)
+        let workingDirectory = bindings.first(where: { $0.rootID == rootID })?.physicalPath ?? root.snapshot.canonicalPath
+        return try await commandRunner.run(
+            executable: "/usr/bin/git",
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            maximumBytes: maximumBytes
+        )
+    }
+
     public func projectCodeMap(projectID: UUID, request: ProjectCodeMapRequest) async throws -> ProjectCodeMapSnapshot {
         guard let tool = tools[projectID] else { throw ServiceAPIError(code: .notFound, message: "Project not found") }
         let advanced = try await advancedSettings()
