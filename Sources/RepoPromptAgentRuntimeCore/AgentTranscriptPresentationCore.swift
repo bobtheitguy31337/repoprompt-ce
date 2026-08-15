@@ -131,6 +131,38 @@ public enum AgentTranscriptPresentationCore {
         return .init(turnID: id, blocks: [block], legacyStandalone: true)
     }
 
+    /// Desktop `CodexAgentModeCoordinator.latestReasoningSummaryTitle`: the latest
+    /// complete `**title**` line, used as the live run status when it reads as work.
+    public static func latestReasoningStatusTitle(from markdown: String, maxTitleLength: Int = 80) -> String? {
+        var latestTitle: String?
+        for line in markdown.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("**"), trimmed.hasSuffix("**"), trimmed.count > 4 else { continue }
+            let title = String(trimmed.dropFirst(2).dropLast(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty, title.count <= maxTitleLength else { continue }
+            latestTitle = title
+        }
+        return latestTitle
+    }
+
+    /// Desktop `shouldUseReasoningSummaryAsStatus`: keep noun-like headings out of the status line.
+    public static func shouldUseReasoningSummaryAsStatus(_ title: String) -> Bool {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 60 else { return false }
+        guard let firstWord = trimmed.split(whereSeparator: \.isWhitespace).first else { return false }
+        let normalizedFirstWord = firstWord
+            .trimmingCharacters(in: CharacterSet(charactersIn: ":.,!?()[]{}\"'“”‘’"))
+            .lowercased()
+        return normalizedFirstWord.hasSuffix("ing")
+    }
+
+    public static func reasoningStatusText(from markdown: String) -> String? {
+        guard let title = latestReasoningStatusTitle(from: markdown),
+              shouldUseReasoningSummaryAsStatus(title)
+        else { return nil }
+        return title
+    }
+
     public static func normalizedToolName(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let aliases = [

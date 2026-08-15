@@ -3073,14 +3073,16 @@ public actor RepoPromptHeadlessAuthority {
         let run = ProviderRunSnapshot(runID: binding.runID, sessionID: sessionID, provider: executionProvider, providerSessionID: resumeIdentity, state: "running", generation: binding.generation, turnEpoch: binding.turnEpoch, startReason: acceptedSubmission == nil ? (resumeIdentity == nil ? "fresh" : "resume") : "accepted-turn", startedAt: startedAt)
         try await store.persistRun(run)
         if try await store.runPresentation(sessionID: sessionID)?.runID != binding.runID {
-            try await store.upsertRunPresentation(.init(sessionID: sessionID, runID: binding.runID, generation: binding.generation, turnEpoch: binding.turnEpoch, phase: .preparing, phaseRevision: 1, runningStatusCode: "provider_preparing", runStartedAt: run.startedAt))
+            try await store.upsertRunPresentation(.init(sessionID: sessionID, runID: binding.runID, generation: binding.generation, turnEpoch: binding.turnEpoch, phase: .thinking, phaseRevision: 1, runningStatusCode: HeadlessRunStatusCopy.thinkingCode, runningStatusText: HeadlessRunStatusCopy.thinking, runStartedAt: run.startedAt))
+        } else {
+            try await transitionRunPresentation(
+                sessionID: sessionID,
+                runID: binding.runID,
+                phase: .thinking,
+                statusCode: HeadlessRunStatusCopy.thinkingCode,
+                statusText: HeadlessRunStatusCopy.thinking
+            )
         }
-        try await transitionRunPresentation(
-            sessionID: sessionID,
-            runID: binding.runID,
-            phase: .thinking,
-            statusCode: "provider_launching"
-        )
         await providerAdapter.prepareRun(kind: executionProvider, runID: binding.runID)
         let prompt = acceptedSubmission?.providerInput.prompt
             ?? providerPrompt
@@ -3410,19 +3412,20 @@ public actor RepoPromptHeadlessAuthority {
                 }
             case let .reasoning(text):
                 if !text.isEmpty {
-                    try await transitionRunPresentation(sessionID: sessionID, runID: run.runID, phase: .thinking, statusCode: "provider_reasoning")
                     try await recordSemanticActivity(runID: run.runID, channel: "reasoning", kind: .reasoning, content: text, replace: false)
+                    try await applyReasoningStatus(sessionID: sessionID, runID: run.runID, channel: "reasoning")
                     try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .reasoning, content: text, mutation: .appendToActiveEntry, eventType: .transcriptProgress)
                 }
             case let .reasoningItemDelta(providerItemID, text):
                 if !text.isEmpty {
-                    try await transitionRunPresentation(sessionID: sessionID, runID: run.runID, phase: .thinking, statusCode: "provider_reasoning")
                     try await recordSemanticActivity(runID: run.runID, channel: "reasoning:\(providerItemID)", kind: .reasoning, content: text, replace: false)
+                    try await applyReasoningStatus(sessionID: sessionID, runID: run.runID, channel: "reasoning:\(providerItemID)")
                     try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .reasoning, content: text, mutation: .appendToActiveEntry, eventType: .transcriptProgress, channel: providerItemID)
                 }
             case let .progress(text):
                 if !text.isEmpty {
-                    try await transitionRunPresentation(sessionID: sessionID, runID: run.runID, phase: .working, statusCode: "provider_working")
+                    let preserved = HeadlessRunStatusCopy.preservedOrThinking(current: try await store.runPresentation(sessionID: sessionID))
+                    try await transitionRunPresentation(sessionID: sessionID, runID: run.runID, phase: .working, statusCode: preserved.code, statusText: preserved.text)
                     try await recordSemanticActivity(runID: run.runID, channel: "progress:\(CanonicalSigning.bodyDigest(Data(text.utf8)))", kind: .progress, content: text, replace: true)
                     try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .progress, content: text, mutation: .appendEntry, eventType: .transcriptProgress)
                 }
@@ -3430,7 +3433,8 @@ public actor RepoPromptHeadlessAuthority {
                 try await transitionRunPresentation(sessionID: sessionID, runID: run.runID, phase: phase, statusCode: statusCode, statusText: statusText)
             case let .toolStarted(providerToolID, name, arguments):
                 guard let snapshot = try? await sessionSnapshot(sessionID: sessionID) else { return }
-                try await transitionRunPresentation(sessionID: sessionID, runID: run.runID, phase: .working, statusCode: "tool_running", statusText: AgentTranscriptPresentationCore.normalizedToolName(name))
+                let preserved = HeadlessRunStatusCopy.preservedOrThinking(current: try await store.runPresentation(sessionID: sessionID))
+                try await transitionRunPresentation(sessionID: sessionID, runID: run.runID, phase: .working, statusCode: preserved.code, statusText: preserved.text)
                 let invocation = ToolInvocationSnapshot(invocationID: ids.next(), toolName: name, state: "running", argumentDigest: CanonicalSigning.bodyDigest(arguments ?? Data()))
                 providerToolInvocations[binding.runID, default: [:]][providerToolID] = invocation
                 try await recordSemanticTool(runID: run.runID, activityID: invocation.invocationID, executionID: providerToolID, name: name, status: .running, displayArguments: arguments.map { String(decoding: $0, as: UTF8.self) }, displayResult: nil, argumentDigest: invocation.argumentDigest, resultDigest: nil)
@@ -3452,7 +3456,13 @@ public actor RepoPromptHeadlessAuthority {
                 let envelope = try await store.persistToolInvocation(invocation, session: snapshot, actor: nil, correlationID: invocation.invocationID, eventType: failed ? .toolFailed : .toolCompleted)
                 await eventHub.publish(envelope)
             case let .interactionRequested(providerRequestID, kind, prompt, choices):
-                try await transitionRunPresentation(sessionID: sessionID, runID: run.runID, phase: .waiting, statusCode: "interaction_waiting")
+                try await transitionRunPresentation(
+                    sessionID: sessionID,
+                    runID: run.runID,
+                    phase: .waiting,
+                    statusCode: "interaction_waiting",
+                    statusText: HeadlessRunStatusCopy.interaction(kind: kind, provider: run.provider)
+                )
                 let payload = try JSONEncoder.serviceEncoder.encode(ProviderInteractionPayload(providerRequestID: providerRequestID, prompt: prompt, choices: choices))
                 _ = try await requestInteraction(sessionID: sessionID, kind: kind == .question ? .question : .approval, payload: payload)
             case .interactionCancelled:
@@ -3466,11 +3476,40 @@ public actor RepoPromptHeadlessAuthority {
         }
     }
 
+    private func applyReasoningStatus(sessionID: UUID, runID: UUID, channel: String) async throws {
+        let activityID = Self.stableSemanticUUID(runID: runID, channel: channel)
+        let content = try await store.semanticActivity(activityID: activityID)?.content ?? ""
+        if let title = AgentTranscriptPresentationCore.reasoningStatusText(from: content) {
+            try await transitionRunPresentation(
+                sessionID: sessionID,
+                runID: runID,
+                phase: .thinking,
+                statusCode: HeadlessRunStatusCopy.reasoningTitleCode,
+                statusText: title
+            )
+            return
+        }
+        let preserved = HeadlessRunStatusCopy.preservedOrThinking(current: try await store.runPresentation(sessionID: sessionID))
+        try await transitionRunPresentation(
+            sessionID: sessionID,
+            runID: runID,
+            phase: .thinking,
+            statusCode: preserved.code,
+            statusText: preserved.text
+        )
+    }
+
     private func transitionRunPresentation(sessionID: UUID, runID: UUID, phase: RunPresentationPhase, statusCode: String?, statusText: String? = nil) async throws {
         guard let run = try await store.latestRun(sessionID: sessionID), run.runID == runID else { return }
         let current = try await store.runPresentation(sessionID: sessionID)
-            ?? RunPresentationSnapshot(sessionID: sessionID, runID: runID, generation: run.generation, turnEpoch: run.turnEpoch, phase: .preparing, phaseRevision: 1, runningStatusCode: "provider_preparing", runStartedAt: run.startedAt)
+            ?? RunPresentationSnapshot(sessionID: sessionID, runID: runID, generation: run.generation, turnEpoch: run.turnEpoch, phase: .preparing, phaseRevision: 1, runningStatusCode: HeadlessRunStatusCopy.thinkingCode, runningStatusText: HeadlessRunStatusCopy.initializing, runStartedAt: run.startedAt)
         guard current.runID == runID, current.terminalSettlementCode == nil else { return }
+        if current.phase == phase,
+           current.runningStatusCode == statusCode,
+           current.runningStatusText == statusText
+        {
+            return
+        }
         let next: RunPresentationSnapshot
         if current.phase == phase {
             next = .init(sessionID: sessionID, runID: runID, generation: current.generation, turnEpoch: current.turnEpoch, phase: phase, phaseRevision: current.phaseRevision + 1, runningStatusCode: statusCode, runningStatusText: statusText, runStartedAt: current.runStartedAt, priorActivePhase: current.priorActivePhase)

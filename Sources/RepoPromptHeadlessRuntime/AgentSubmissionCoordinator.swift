@@ -213,7 +213,7 @@ public actor AgentSubmissionCoordinator {
             }
             let previousDefaults = try await store.nextTurnDefaults(sessionID: session.sessionID)
             let nextDefaults = SessionNextTurnDefaultsRecord(sessionID: session.sessionID, revision: (previousDefaults?.revision ?? 0) + 1, configuration: effective, updatedAt: now)
-            let runPresentation = RunPresentationSnapshot(sessionID: session.sessionID, runID: identity.runID, generation: identity.generation, turnEpoch: identity.turnEpoch, phase: .preparing, phaseRevision: 1, runningStatusCode: "accepted", runStartedAt: now)
+            let runPresentation = RunPresentationSnapshot(sessionID: session.sessionID, runID: identity.runID, generation: identity.generation, turnEpoch: identity.turnEpoch, phase: .preparing, phaseRevision: 1, runningStatusCode: HeadlessRunStatusCopy.thinkingCode, runningStatusText: HeadlessRunStatusCopy.initializing, runStartedAt: now)
             let selected = AgentTurnConfigurationWire(catalogRevision: effective.catalogRevision, providerID: effective.providerID, modelID: effective.modelID, effortID: effective.effortID, workflowID: effective.workflowID, permissionID: effective.permissionID, toolValues: effective.toolValues.mapValues(Self.wireValue))
             let receiptSessionSnapshot = (acceptedNewSession?.snapshot ?? receiptSession).map {
                 Self.acceptedReceiptSessionSnapshot($0, effective: effective, nextDefaults: nextDefaults, runPresentation: runPresentation)

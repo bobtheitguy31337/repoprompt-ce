@@ -797,7 +797,7 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             }
             return ([.reasoning(text)], false)
         case "turn/started", "codex/event/turn_started":
-            return ([.runStatusChanged(phase: .thinking, statusCode: "turn_started", statusText: nil)], false)
+            return ([.runStatusChanged(phase: .thinking, statusCode: HeadlessRunStatusCopy.thinkingCode, statusText: HeadlessRunStatusCopy.thinking)], false)
         case "item/started":
             let item = params["item"] as? [String: Any] ?? params
             let id = item["id"] as? String ?? UUID().uuidString
@@ -805,7 +805,7 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             let normalizedName = normalizedItemType(itemType)
             if normalizedName == "usermessage" { return ([], false) }
             if normalizedName == "agentmessage" {
-                return ([.runStatusChanged(phase: .working, statusCode: "provider_responding", statusText: nil)], false)
+                return ([.runStatusChanged(phase: .working, statusCode: HeadlessRunStatusCopy.thinkingCode, statusText: HeadlessRunStatusCopy.thinking)], false)
             }
             guard visibleToolItemTypes.contains(normalizedName) else { return ([], false) }
             let name = canonicalToolName(item: item, itemType: itemType)
@@ -1314,40 +1314,8 @@ private actor ACPProviderRuntime: AgentProviderRuntime {
         }
     }
 
-    private nonisolated static func normalize(_ data: Data) throws -> [ProviderRuntimeEvent] {
-        guard let frame = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
-        let method = frame["method"] as? String ?? ""
-        let params = frame["params"] as? [String: Any] ?? [:]
-        if frame["id"] != nil, method == "session/request_permission" {
-            let id = String(describing: frame["id"]!)
-            let tool = params["toolCall"] as? [String: Any] ?? [:]
-            let choices = (params["options"] as? [[String: Any]] ?? []).compactMap { $0["optionId"] as? String }
-            return [.interactionRequested(providerRequestID: id, kind: .approval, prompt: tool["title"] as? String ?? "Tool approval", choices: choices)]
-        }
-        guard method == "session/update", let update = params["update"] as? [String: Any] else { return [] }
-        let type = update["sessionUpdate"] as? String ?? ""
-        switch type {
-        case "agent_message_chunk":
-            return [.assistantDelta(CodexAppServerProviderRuntime.string(in: update, paths: [["content", "text"], ["text"]]) ?? "")]
-        case "agent_thought_chunk":
-            return [.reasoning(CodexAppServerProviderRuntime.string(in: update, paths: [["content", "text"], ["text"]]) ?? "")]
-        case "plan":
-            return [.progress(CodexAppServerProviderRuntime.string(in: update, paths: [["text"], ["content", "text"]]) ?? "plan updated")]
-        case "tool_call":
-            let id = update["toolCallId"] as? String ?? UUID().uuidString
-            let name = update["title"] as? String ?? update["kind"] as? String ?? "tool"
-            return [.toolStarted(providerToolID: id, name: name, arguments: try? JSONSerialization.data(withJSONObject: update["rawInput"] ?? [:]))]
-        case "tool_call_update":
-            let id = update["toolCallId"] as? String ?? "tool"
-            let status = update["status"] as? String ?? ""
-            let output = CodexAppServerProviderRuntime.string(in: update, paths: [["content", "text"], ["output"]])
-            if ["completed", "failed"].contains(status) {
-                return [.toolCompleted(providerToolID: id, name: update["title"] as? String ?? "tool", output: output, status: status == "failed" ? .failed : .success)]
-            }
-            return [.toolUpdated(providerToolID: id, output: output ?? status)]
-        default:
-            return []
-        }
+    nonisolated static func normalize(_ data: Data) throws -> [ProviderRuntimeEvent] {
+        try HeadlessACPSessionUpdateNormalizer.normalize(data)
     }
 }
 

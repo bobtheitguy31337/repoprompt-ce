@@ -1135,9 +1135,10 @@ final class NativeProviderRuntimeLifecycleTests: XCTestCase {
         let frame = Data(#"{"method":"turn/started","params":{}}"#.utf8)
         let normalized = try CodexAppServerProviderRuntime.normalize(frame)
         XCTAssertEqual(normalized.events.count, 1)
-        guard case let .runStatusChanged(phase, code, _) = normalized.events[0] else { return XCTFail("turn started must be lifecycle") }
+        guard case let .runStatusChanged(phase, code, text) = normalized.events[0] else { return XCTFail("turn started must be lifecycle") }
         XCTAssertEqual(phase, .thinking)
-        XCTAssertEqual(code, "turn_started")
+        XCTAssertEqual(code, HeadlessRunStatusCopy.thinkingCode)
+        XCTAssertEqual(text, HeadlessRunStatusCopy.thinking)
         let now = Date(), sessionID = UUID(), runID = UUID()
         let preparing = RunPresentationSnapshot(sessionID: sessionID, runID: runID, generation: 1, turnEpoch: 1, phase: .preparing, phaseRevision: 1, runStartedAt: now)
         let thinking = try preparing.transitioning(to: .thinking, statusCode: code)
@@ -1152,9 +1153,10 @@ final class NativeProviderRuntimeLifecycleTests: XCTestCase {
 
         let assistantStarted = try CodexAppServerProviderRuntime.normalize(Data(#"{"method":"item/started","params":{"item":{"id":"assistant-1","type":"agentMessage"}}}"#.utf8))
         XCTAssertEqual(assistantStarted.events.count, 1)
-        guard case let .runStatusChanged(phase, code, _) = assistantStarted.events[0] else { return XCTFail("agent message start must advance lifecycle") }
+        guard case let .runStatusChanged(phase, code, text) = assistantStarted.events[0] else { return XCTFail("agent message start must advance lifecycle") }
         XCTAssertEqual(phase, .working)
-        XCTAssertEqual(code, "provider_responding")
+        XCTAssertEqual(code, HeadlessRunStatusCopy.thinkingCode)
+        XCTAssertEqual(text, HeadlessRunStatusCopy.thinking)
 
         let assistantDelta = try CodexAppServerProviderRuntime.normalize(Data(#"{"method":"item/agentMessage/delta","params":{"itemId":"assistant-1","delta":"one coherent "}}"#.utf8))
         guard case let .assistantItemDelta(providerItemID, delta) = assistantDelta.events.first else { return XCTFail("agent message delta must retain its native item identity") }
