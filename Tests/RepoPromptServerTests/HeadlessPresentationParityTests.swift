@@ -1,6 +1,8 @@
 import Foundation
 import RepoPromptAgentRuntimeCore
 @testable import RepoPromptHeadlessRuntime
+import RepoPromptServicePersistence
+import RepoPromptServiceProtocol
 import XCTest
 
 final class HeadlessPresentationParityTests: XCTestCase {
@@ -86,5 +88,94 @@ final class HeadlessPresentationParityTests: XCTestCase {
         XCTAssertEqual(preserved.text, "Inspecting the workspace")
         let fallback = HeadlessRunStatusCopy.preservedOrThinking(current: nil)
         XCTAssertEqual(fallback.text, HeadlessRunStatusCopy.thinking)
+    }
+
+    func testAskUserPayloadDetectionAndDesktopAnswerShaping() throws {
+        let arguments = Data(#"{"title":"Need a couple of decisions","timeout_seconds":45,"questions":[{"id":"scope","question":"What first?"}]}"#.utf8)
+        XCTAssertTrue(HeadlessAskUser.isAskUserPayload(arguments))
+        XCTAssertEqual(HeadlessAskUser.timeoutSeconds(from: arguments), 45)
+        XCTAssertFalse(HeadlessAskUser.isAskUserPayload(Data(#"{"prompt":"Choose a branch","choices":["sandbox"]}"#.utf8)))
+
+        let desktop = Data(#"{"answers":{"scope":{"answers":["Composer"],"selected_options":["Composer"],"custom_response":null,"skipped":false}},"timed_out":false,"skipped":false,"elapsed_seconds":3}"#.utf8)
+        let preserved = try JSONSerialization.jsonObject(with: HeadlessAskUser.desktopResponse(from: desktop)) as? [String: Any]
+        XCTAssertEqual(preserved?["timed_out"] as? Bool, false)
+        XCTAssertNotNil((preserved?["answers"] as? [String: Any])?["scope"])
+
+        let legacy = HeadlessAskUser.desktopResponse(
+            from: Data(#"{"answers":[{"questionId":"scope","text":"Composer"}]}"#.utf8),
+            elapsedSeconds: 2
+        )
+        let normalized = try XCTUnwrap(JSONSerialization.jsonObject(with: legacy) as? [String: Any])
+        let answer = try XCTUnwrap((normalized["answers"] as? [String: Any])?["scope"] as? [String: Any])
+        XCTAssertEqual(answer["answers"] as? [String], ["Composer"])
+        XCTAssertEqual(answer["custom_response"] as? String, "Composer")
+        XCTAssertEqual(normalized["elapsed_seconds"] as? Int, 2)
+
+        let timedOut = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: HeadlessAskUser.desktopResponse(from: Data(), timedOut: true, elapsedSeconds: 9)) as? [String: Any]
+        )
+        XCTAssertEqual(timedOut["timed_out"] as? Bool, true)
+        XCTAssertEqual(timedOut["elapsed_seconds"] as? Int, 9)
+    }
+
+    func testAskUserWaitsAndResolvesLocallyWithoutProviderDelivery() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let delivery = RecordingAskUserDelivery()
+        let authority = RepoPromptHeadlessAuthority(store: store, interactionDelivery: delivery)
+        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(
+            input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "p-ask-user",
+            requestDigest: "p-ask-user"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "s-ask-user",
+            requestDigest: "s-ask-user"
+        )
+        let arguments = Data(#"{"title":"Need a couple of decisions","questions":[{"id":"scope","question":"What first?","options":[{"label":"Composer"}]}]}"#.utf8)
+        async let waited = authority.askUserAndWait(sessionID: session.sessionID, arguments: arguments, timeoutSeconds: 5)
+        var pending: InteractionSnapshot?
+        for _ in 0 ..< 50 {
+            if let current = try await authority.interactionSnapshots(sessionID: session.sessionID).first(where: { $0.state == .pending }) {
+                pending = current
+                break
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let interaction = try XCTUnwrap(pending)
+        XCTAssertTrue(HeadlessAskUser.isAskUserPayload(interaction.payload))
+        _ = try await authority.answerInteraction(
+            sessionID: session.sessionID,
+            interactionID: interaction.interactionID,
+            expectedRevision: interaction.revision,
+            payload: Data(#"{"answers":{"scope":{"answers":["Composer"],"selected_options":["Composer"],"custom_response":null,"skipped":false}},"timed_out":false,"skipped":false,"elapsed_seconds":1}"#.utf8),
+            actor: actor,
+            idempotencyKey: "answer-ask-user",
+            requestDigest: "answer-ask-user"
+        )
+        let result = try JSONSerialization.jsonObject(with: try await waited) as? [String: Any]
+        XCTAssertEqual(result?["timed_out"] as? Bool, false)
+        XCTAssertNotNil((result?["answers"] as? [String: Any])?["scope"])
+        let deliveryCount = await delivery.deliveryCount()
+        XCTAssertEqual(deliveryCount, 0)
+        try await store.close()
+    }
+}
+
+private actor RecordingAskUserDelivery: InteractionDeliveryPort {
+    private var count = 0
+
+    func deliverAnswer(session _: SessionSnapshot, interaction _: InteractionSnapshot, answer _: Data) async throws {
+        count += 1
+    }
+
+    func deliveryCount() -> Int {
+        count
     }
 }

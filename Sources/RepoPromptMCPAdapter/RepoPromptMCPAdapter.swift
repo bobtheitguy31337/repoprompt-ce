@@ -679,11 +679,13 @@ private actor AuthorityToolBackend {
 
     private func askUser(_ arguments: [String: Value]) async throws -> Value {
         let payload = try JSONEncoder().encode(arguments)
-        return try await value(authority.requestInteraction(
+        let timeout = arguments["timeout_seconds"]?.intValue ?? arguments["timeout"]?.intValue
+        let answer = try await authority.askUserAndWait(
             sessionID: binding.sessionID,
-            kind: .question,
-            payload: payload
-        ))
+            arguments: payload,
+            timeoutSeconds: timeout
+        )
+        return try JSONDecoder().decode(Value.self, from: answer)
     }
 
     private func git(_ arguments: [String: Value]) async throws -> Value {

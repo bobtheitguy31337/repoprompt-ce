@@ -2071,22 +2071,25 @@ public actor RepoPromptHeadlessAuthority {
         guard let current = try await store.interactions(sessionID: sessionID).first(where: { $0.interactionID == interactionID }) else { throw ServiceAPIError(code: .notFound, message: "Interaction not found") }
         guard current.state == .pending, current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Interaction revision is stale", currentRevision: current.revision) }
         if let expiresAt = current.expiresAt, expiresAt <= clock.now() { throw ServiceAPIError(code: .interactionSettled, message: "Interaction expired") }
-        if current.runID == nil,
-           let question = try? JSONDecoder.serviceDecoder.decode(ContextBuilderQuestionPayload.self, from: current.payload),
-           question.authorityOperation == "context_builder.ask_user"
-        {
+        if isLocallyResolvedAskUser(current.payload) {
+            let resolvedPayload = HeadlessAskUser.isAskUserPayload(current.payload)
+                ? HeadlessAskUser.desktopResponse(from: payload)
+                : payload
             let resolved = InteractionSnapshot(
                 interactionID: current.interactionID,
-                runID: nil,
+                runID: current.runID,
                 agentID: current.agentID,
                 kind: current.kind,
                 state: .resolved,
-                payload: payload,
+                payload: resolvedPayload,
                 revision: current.revision + 1,
                 expiresAt: current.expiresAt
             )
             let event = try await store.persistInteraction(resolved, session: session, actor: actor, correlationID: ids.next(), idempotency: idempotency)
             await eventHub.publish(event)
+            if let runID = resolved.runID {
+                try? await transitionRunPresentation(sessionID: sessionID, runID: runID, phase: .working, statusCode: "interaction_resolved")
+            }
             return resolved
         }
         guard let interactionDelivery else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider interaction delivery is unavailable") }
@@ -2925,6 +2928,57 @@ public actor RepoPromptHeadlessAuthority {
         return try JSONDecoder.serviceDecoder.decode(T.self, from: existing.response)
     }
 
+    public func askUserAndWait(sessionID: UUID, arguments: Data, timeoutSeconds: Int? = nil) async throws -> Data {
+        let timeout = timeoutSeconds ?? HeadlessAskUser.timeoutSeconds(from: arguments)
+        let started = clock.now()
+        let expiresAt = started.addingTimeInterval(TimeInterval(timeout))
+        let interaction = try await requestInteraction(sessionID: sessionID, kind: .question, payload: arguments, expiresAt: expiresAt)
+        do {
+            for _ in 0 ..< max(1, timeout * 10) {
+                try Task.checkCancellation()
+                guard let current = try await store.interactions(sessionID: sessionID).first(where: { $0.interactionID == interaction.interactionID }) else {
+                    throw ServiceAPIError(code: .notFound, message: "ask_user interaction disappeared")
+                }
+                switch current.state {
+                case .resolved:
+                    return HeadlessAskUser.desktopResponse(
+                        from: current.payload,
+                        elapsedSeconds: Int(clock.now().timeIntervalSince(started))
+                    )
+                case .expired:
+                    return HeadlessAskUser.desktopResponse(
+                        from: Data(),
+                        timedOut: true,
+                        elapsedSeconds: Int(clock.now().timeIntervalSince(started))
+                    )
+                case .interrupted:
+                    throw CancellationError()
+                case .pending, .deliveryIntent:
+                    break
+                }
+                if clock.now() >= expiresAt { break }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+        } catch is CancellationError {
+            try? await settleContextBuilderQuestion(interaction, sessionID: sessionID, state: .interrupted)
+            throw CancellationError()
+        }
+        try await settleContextBuilderQuestion(interaction, sessionID: sessionID, state: .expired)
+        return HeadlessAskUser.desktopResponse(
+            from: Data(),
+            timedOut: true,
+            elapsedSeconds: Int(clock.now().timeIntervalSince(started))
+        )
+    }
+
+    private func isLocallyResolvedAskUser(_ payload: Data) -> Bool {
+        if HeadlessAskUser.isAskUserPayload(payload) { return true }
+        guard let question = try? JSONDecoder.serviceDecoder.decode(ContextBuilderQuestionPayload.self, from: payload) else {
+            return false
+        }
+        return question.authorityOperation == "context_builder.ask_user"
+    }
+
     private func askContextBuilderQuestion(sessionID: UUID, prompt: String, choices: [String], timeoutSeconds: Int) async throws -> String? {
         let expiresAt = clock.now().addingTimeInterval(TimeInterval(timeoutSeconds))
         let payload = try JSONEncoder.serviceEncoder.encode(ContextBuilderQuestionPayload(prompt: prompt, choices: choices))
@@ -2975,15 +3029,37 @@ public actor RepoPromptHeadlessAuthority {
 
     private nonisolated static func contextBuilderAnswer(from payload: Data) -> String? {
         if let value = try? JSONSerialization.jsonObject(with: payload) {
-            if let string = value as? String { return string }
+            if let string = value as? String { return nonEmptyAnswer(string) }
             if let object = value as? [String: Any] {
-                if let answer = object["answer"] as? String { return answer }
-                if let custom = object["custom_response"] as? String { return custom }
-                if let answers = object["answers"] as? [String] { return answers.joined(separator: "\n") }
+                if let answer = nonEmptyAnswer(object["answer"] as? String) { return answer }
+                if let text = nonEmptyAnswer(object["text"] as? String) { return text }
+                if let custom = nonEmptyAnswer(object["custom_response"] as? String) { return custom }
+                if let answers = object["answers"] as? [String] {
+                    return nonEmptyAnswer(answers.joined(separator: "\n"))
+                }
+                if let rows = object["answers"] as? [[String: Any]] {
+                    let texts = rows.compactMap { nonEmptyAnswer($0["text"] as? String ?? $0["answer"] as? String) }
+                    if !texts.isEmpty { return texts.joined(separator: "\n") }
+                }
+                if let map = object["answers"] as? [String: Any] {
+                    let texts = map.values.compactMap { value -> String? in
+                        guard let entry = value as? [String: Any] else { return nil }
+                        if let custom = nonEmptyAnswer(entry["custom_response"] as? String) { return custom }
+                        if let answers = entry["answers"] as? [String] { return nonEmptyAnswer(answers.joined(separator: "\n")) }
+                        return nil
+                    }
+                    if !texts.isEmpty { return texts.joined(separator: "\n") }
+                }
             }
         }
         let text = String(decoding: payload, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        return text.isEmpty ? nil : text
+        return text.hasPrefix("{") ? nil : nonEmptyAnswer(text)
+    }
+
+    private nonisolated static func nonEmptyAnswer(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private func materializedContext(projectID: UUID, selection: SelectionSnapshot, include: [String]) async throws -> String {
