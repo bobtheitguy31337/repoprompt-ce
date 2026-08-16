@@ -343,6 +343,7 @@ private actor AuthorityToolBackend {
              "direct_agents.claude.permission_mode",
              "direct_agents.claude.bash_enabled",
              "direct_agents.claude.mcp_strict",
+             "direct_agents.claude.prompt_delivery",
              "direct_agents.opencode.permission_level",
              "direct_agents.cursor.permission_level",
              "subagents.policy",
@@ -354,7 +355,19 @@ private actor AuthorityToolBackend {
              "workspace.auto_approve.add_folder",
              "workspace.auto_approve.remove_folder":
             return try await workspaceAppSetting(key: key)
+        case "claude.custom.enabled",
+             "claude.kimi.model_behavior",
+             "claude.kimi.haiku_model",
+             "claude.kimi.sonnet_model",
+             "claude.kimi.opus_model":
+            return try await backendAppSetting(key: key)
         default:
+            if Self.looksLikeCredentialKey(key) {
+                throw ServiceAPIError(
+                    code: .invalidRequest,
+                    message: "CLI credentials are stored by the server connection APIs, not app_settings"
+                )
+            }
             throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
         }
     }
@@ -370,6 +383,7 @@ private actor AuthorityToolBackend {
              "direct_agents.claude.permission_mode",
              "direct_agents.claude.bash_enabled",
              "direct_agents.claude.mcp_strict",
+             "direct_agents.claude.prompt_delivery",
              "direct_agents.opencode.permission_level",
              "direct_agents.cursor.permission_level":
             return try await replacePermissionAppSetting(key: key, value: value)
@@ -383,7 +397,19 @@ private actor AuthorityToolBackend {
              "workspace.auto_approve.add_folder",
              "workspace.auto_approve.remove_folder":
             return try await replaceWorkspaceAppSetting(key: key, value: value)
+        case "claude.custom.enabled",
+             "claude.kimi.model_behavior",
+             "claude.kimi.haiku_model",
+             "claude.kimi.sonnet_model",
+             "claude.kimi.opus_model":
+            return try await replaceBackendAppSetting(key: key, value: value)
         default:
+            if Self.looksLikeCredentialKey(key) {
+                throw ServiceAPIError(
+                    code: .invalidRequest,
+                    message: "CLI credentials are stored by the server connection APIs, not app_settings"
+                )
+            }
             throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
         }
     }
@@ -406,6 +432,8 @@ private actor AuthorityToolBackend {
             value = .bool(settings.claude.bashEnabled)
         case "direct_agents.claude.mcp_strict":
             value = .bool(settings.claude.mcpStrictModeEnabled)
+        case "direct_agents.claude.prompt_delivery":
+            value = .string(settings.claude.promptDelivery.rawValue)
         case "direct_agents.opencode.permission_level":
             value = .string(settings.openCode.permissionLevel.rawValue)
         case "direct_agents.cursor.permission_level":
@@ -438,6 +466,8 @@ private actor AuthorityToolBackend {
             settings.claude.bashEnabled = try Self.boolValue(value, key: key)
         case "direct_agents.claude.mcp_strict":
             settings.claude.mcpStrictModeEnabled = try Self.boolValue(value, key: key)
+        case "direct_agents.claude.prompt_delivery":
+            settings.claude.promptDelivery = try Self.enumValue(value, as: ClaudeAgentModePromptDelivery.self, key: key)
         case "direct_agents.opencode.permission_level":
             settings.openCode.permissionLevel = try Self.enumValue(value, as: ManagedDirectPermissionLevel.self, key: key)
         case "direct_agents.cursor.permission_level":
@@ -517,6 +547,57 @@ private actor AuthorityToolBackend {
             attribution: settingsAttribution
         )
         return try await workspaceAppSetting(key: key)
+    }
+
+    private static let backendAppSettingKeys: [String: PortalDesktopSettingKey] = [
+        "claude.custom.enabled": .claudeCustomEnabled,
+        "claude.kimi.model_behavior": .claudeKimiModelBehavior,
+        "claude.kimi.haiku_model": .claudeKimiHaikuModel,
+        "claude.kimi.sonnet_model": .claudeKimiSonnetModel,
+        "claude.kimi.opus_model": .claudeKimiOpusModel
+    ]
+
+    private func backendAppSetting(key: String) async throws -> Value {
+        guard let settingKey = Self.backendAppSettingKeys[key] else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
+        }
+        let snapshot = try await authority.portalDesktopSettings()
+        let raw = snapshot.values[settingKey.rawValue] ?? settingKey.defaultValue
+        let value: Value
+        if settingKey == .claudeCustomEnabled {
+            value = .bool(raw == "true")
+        } else {
+            value = .string(raw)
+        }
+        return .object(["key": .string(key), "value": value])
+    }
+
+    private func replaceBackendAppSetting(key: String, value: Value?) async throws -> Value {
+        guard let settingKey = Self.backendAppSettingKeys[key] else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
+        }
+        let encoded: String
+        if settingKey == .claudeCustomEnabled {
+            encoded = try Self.boolValue(value, key: key) ? "true" : "false"
+        } else if let raw = value?.stringValue {
+            encoded = raw
+        } else {
+            throw ServiceAPIError(code: .invalidRequest, message: "\(key) must be a string")
+        }
+        let current = try await authority.portalDesktopSettings()
+        _ = try await authority.replacePortalDesktopSettings(
+            .init(expectedRevision: current.revision, changes: [settingKey.rawValue: encoded])
+        )
+        return try await backendAppSetting(key: key)
+    }
+
+    private static func looksLikeCredentialKey(_ key: String) -> Bool {
+        let lowered = key.lowercased()
+        let parts = lowered.split { $0 == "." || $0 == "_" || $0 == "-" }.map(String.init)
+        let forbidden = Set(["credential", "apikey", "token", "authtoken", "secret", "password"])
+        if parts.contains(where: { forbidden.contains($0) }) { return true }
+        return ["credential", "api_key", "apikey", "auth_token", "cli_token", "clitoken"]
+            .contains { lowered.contains($0) }
     }
 
     private var settingsAttribution: SettingsMutationAttribution {

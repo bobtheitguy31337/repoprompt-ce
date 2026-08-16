@@ -119,6 +119,14 @@ private struct NativeProviderProcessSupport {
             throw ServiceAPIError(code: .invalidRequest, message: "Provider credential environment attempted to override an isolated runtime key")
         }
         environment.merge(injected) { _, injected in injected }
+        if injected["ANTHROPIC_BASE_URL"] != nil {
+            if injected["ANTHROPIC_AUTH_TOKEN"] != nil {
+                environment.removeValue(forKey: "ANTHROPIC_API_KEY")
+            }
+            if injected["ANTHROPIC_API_KEY"] != nil {
+                environment.removeValue(forKey: "ANTHROPIC_AUTH_TOKEN")
+            }
+        }
         let supervisor = ProviderProcessSupervisor(processPort: processPort, store: processStore)
         do {
             return try await NativeJSONLineProcess.launch(
@@ -179,6 +187,7 @@ private struct NativeProviderProcessSupport {
             }
         }
         if configuration.kind == .claudeCompatible,
+           ClaudeCompatibleLaunchResolver.shouldApplyEffort(providerSettings: policy.providerSettings),
            let effort = policy.providerSettings["provider.reasoningEffort"],
            ["low", "medium", "high", "xhigh", "max"].contains(effort)
         {
@@ -1348,12 +1357,12 @@ private actor ACPProviderRuntime: AgentProviderRuntime {
     }
 }
 
-private actor ClaudeNativeProviderRuntime: AgentProviderRuntime {
+actor ClaudeNativeProviderRuntime: AgentProviderRuntime {
     let kind = ProviderKind.claudeCompatible
     private let support: NativeProviderProcessSupport
     private var sessions: [UUID: NativeJSONLineProcess] = [:]
 
-    init(support: NativeProviderProcessSupport) {
+    fileprivate init(support: NativeProviderProcessSupport) {
         self.support = support
     }
 
@@ -1374,31 +1383,12 @@ private actor ClaudeNativeProviderRuntime: AgentProviderRuntime {
     }
 
     func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
-        var arguments = ["-p", "--verbose", "--output-format", "stream-json", "--input-format", "stream-json", "--permission-prompt-tool", "stdio"]
-        switch request.policy.mode {
-        case .readOnly:
-            arguments += ["--permission-mode", "plan", "--disallowedTools", "Bash,Write,Edit,NotebookEdit"]
-        case .workspaceWrite:
-            let configured = request.policy.providerSettings["claude.permissionMode"] ?? "default"
-            let mode = ["default", "acceptEdits", "auto"].contains(configured) ? configured : "default"
-            arguments += ["--permission-mode", mode]
-        case .fullAccess:
-            arguments.append("--allow-dangerously-skip-permissions")
-        }
-        if request.policy.mode != .readOnly, request.policy.providerSettings["claude.bashEnabled"] == "false" {
-            arguments += ["--disallowedTools", "Bash"]
-        }
-        if request.policy.providerSettings["claude.strictMCPEnabled"] == "true" {
-            arguments.append("--strict-mcp-config")
-        }
-        if let resume = request.resumeProviderSessionID { arguments += ["--resume", resume] }
-        let effectiveModel = Self.effectiveModel(request.model, settings: request.policy.providerSettings)
-        if let effectiveModel { arguments += ["--model", effectiveModel] }
-        let process = try await support.makeSession(runID: request.runID, arguments: arguments, workingDirectory: request.workingDirectory, model: request.model, policy: request.policy, launchValidation: { try request.validateLaunch() })
+        let launch = try Self.launchPackaging(request)
+        let process = try await support.makeSession(runID: request.runID, arguments: launch.arguments, workingDirectory: request.workingDirectory, model: request.model, policy: request.policy, launchValidation: { try request.validateLaunch() })
         sessions[request.runID] = process
         defer { sessions[request.runID] = nil }
         do {
-            var content: [[String: Any]] = [["type": "text", "text": request.prompt]]
+            var content: [[String: Any]] = [["type": "text", "text": launch.userMessage]]
             for image in request.structuredInput?.nativeImages ?? [] {
                 let bytes = try Data(contentsOf: URL(fileURLWithPath: image.filePath), options: [.mappedIfSafe])
                 guard bytes.count == image.byteSize, CanonicalSigning.bodyDigest(bytes) == image.digest else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Accepted image changed before provider dispatch") }
@@ -1467,19 +1457,42 @@ private actor ClaudeNativeProviderRuntime: AgentProviderRuntime {
         try await process.sendRaw(JSONSerialization.data(withJSONObject: ["type": "control_request", "request_id": UUID().uuidString, "request": ["subtype": "interrupt", "reason": "authority control"]]))
     }
 
-    private nonisolated static func effectiveModel(_ requested: String?, settings: [String: String]) -> String? {
-        guard let backendID = settings["claude.backendID"] else { return requested }
-        if backendID == ProviderSettingsID.claudeKimi.rawValue { return nil }
-        if settings["claude.backendModelBehavior"] == ClaudeCompatibleBackendModelBehavior.noModel.rawValue { return nil }
-        guard let requested else { return "sonnet" }
-        let normalized = requested.lowercased()
-        let slots = [
-            ("claude.backendHaikuModel", "haiku"),
-            ("claude.backendSonnetModel", "sonnet"),
-            ("claude.backendOpusModel", "opus")
-        ]
-        return slots.first(where: { settings[$0.0]?.lowercased() == normalized })?.1
-            ?? (["haiku", "sonnet", "opus"].contains(normalized) ? normalized : "sonnet")
+    /// Desktop `ClaudeAgentToolPreferences.agentModePromptDelivery` consume:
+    /// `--system-prompt` replaces native, user-message XML keeps native, empty
+    /// `--system-prompt` clears native. Store-backed `claude.promptDelivery` wins
+    /// over composer toolValues.
+    nonisolated static func launchPackaging(_ request: ProviderExecutionRequest) throws -> (arguments: [String], userMessage: String) {
+        let delivery = ClaudeAgentModePromptDelivery.resolved(rawValue: request.policy.providerSettings["claude.promptDelivery"])
+        let instructions = request.policy.providerSettings["claude.agentModeInstructions"] ?? ""
+        var arguments = ["-p", "--verbose", "--output-format", "stream-json", "--input-format", "stream-json", "--permission-prompt-tool", "stdio"]
+        switch request.policy.mode {
+        case .readOnly:
+            arguments += ["--permission-mode", "plan", "--disallowedTools", "Bash,Write,Edit,NotebookEdit"]
+        case .workspaceWrite:
+            let configured = request.policy.providerSettings["claude.permissionMode"] ?? "default"
+            let mode = ["default", "acceptEdits", "auto"].contains(configured) ? configured : "default"
+            arguments += ["--permission-mode", mode]
+        case .fullAccess:
+            arguments.append("--allow-dangerously-skip-permissions")
+        }
+        if request.policy.mode != .readOnly, request.policy.providerSettings["claude.bashEnabled"] == "false" {
+            arguments += ["--disallowedTools", "Bash"]
+        }
+        if request.policy.providerSettings["claude.strictMCPEnabled"] == "true" {
+            arguments.append("--strict-mcp-config")
+        }
+        if let resume = request.resumeProviderSessionID { arguments += ["--resume", resume] }
+        let effectiveModel = try Self.effectiveModel(request.model, settings: request.policy.providerSettings)
+        if let effectiveModel { arguments += ["--model", effectiveModel] }
+        arguments = delivery.appendingSystemPrompt(to: arguments, instructions: instructions)
+        return (arguments, delivery.packagedUserMessage(request.prompt, instructions: instructions))
+    }
+
+    private nonisolated static func effectiveModel(_ requested: String?, settings: [String: String]) throws -> String? {
+        guard let backend = ClaudeCompatibleLaunchResolver.backendSettings(from: settings) else {
+            return requested
+        }
+        return try ClaudeCompatibleLaunchResolver.resolveModel(settings: backend, requestedModel: requested)
     }
 }
 

@@ -106,6 +106,12 @@ public actor VaultProviderProcessEnvironment: ProviderProcessEnvironmentProvidin
             }
             return [:]
         }
+        // Linux server readiness — not Desktop's UserDefaults configured latch
+        // (`ClaudeCodeCompatibleBackendConfigured.<id>`). Desktop sets that
+        // latch when a Keychain secret is saved. Linux keeps
+        // `connected && testState == valid` as the catalog/launch predicate.
+        // Do not invent a fake UserDefaults latch. Server-owned / dedicated
+        // accounts, isolated HOME, and vault injection stay additive.
         guard stored.record.state == .connected,
               stored.record.testState == .valid,
               stored.record.expiresAt.map({ $0 > Date() }) ?? true
@@ -133,30 +139,15 @@ public actor VaultProviderProcessEnvironment: ProviderProcessEnvironmentProvidin
         }
         if [.claudeGLM, .claudeKimi, .claudeCustom].contains(providerID) {
             guard let config = try await backendSettings?.backendSettings(for: providerID),
-                  !config.baseURL.isEmpty,
                   stored.record.authenticationMethod == config.authHeader.authenticationMethod
             else {
                 throw ServiceAPIError(code: .providerUnavailable, message: "Claude-compatible backend settings do not match the stored connection")
             }
-            var environment = [
-                "ANTHROPIC_BASE_URL": config.baseURL,
-                (config.authHeader == .anthropicAPIKey ? "ANTHROPIC_API_KEY" : "ANTHROPIC_AUTH_TOKEN"): value
-            ]
-            if config.modelBehavior == .claudeSlotMapping {
-                guard !config.haikuModel.isEmpty, !config.sonnetModel.isEmpty, !config.opusModel.isEmpty else {
-                    throw ServiceAPIError(code: .providerUnavailable, message: "Claude-compatible model slots are incomplete")
-                }
-                environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = config.haikuModel
-                environment["ANTHROPIC_DEFAULT_SONNET_MODEL"] = config.sonnetModel
-                environment["ANTHROPIC_DEFAULT_OPUS_MODEL"] = config.opusModel
-            }
-            if providerID == .claudeGLM {
-                environment["API_TIMEOUT_MS"] = "3000000"
-                if model?.contains("[1m]") == true {
-                    environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "1000000"
-                }
-            }
-            return environment
+            return try ClaudeCompatibleLaunchResolver.resolve(
+                settings: config,
+                secret: value,
+                requestedModel: model
+            ).environmentOverrides
         }
         switch (providerID, stored.record.authenticationMethod) {
         case (.codex, .apiKey), (.codex, .enterpriseAccessToken): return ["OPENAI_API_KEY": value]

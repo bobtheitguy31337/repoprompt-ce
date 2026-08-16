@@ -1576,6 +1576,19 @@ public actor RepoPromptHeadlessAuthority {
         return await serverSettings.directAgentPermissions()
     }
 
+    public func portalDesktopSettings() async throws -> PortalDesktopSettingsSnapshot {
+        try PortalDesktopSettingsSnapshot.liveRead(stored: try await store.portalDesktopSettings())
+    }
+
+    public func replacePortalDesktopSettings(
+        _ request: UpdatePortalDesktopSettingsRequest
+    ) async throws -> PortalDesktopSettingsSnapshot {
+        try ensureWritable()
+        let current = try await portalDesktopSettings()
+        let updated = try current.applying(request)
+        return try await store.upsertPortalDesktopSettings(updated, expectedRevision: current.revision)
+    }
+
     public func workspaceApprovals() async throws -> WorkspaceApprovalSettingsSnapshot {
         guard let serverSettings else {
             throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
@@ -3111,6 +3124,11 @@ public actor RepoPromptHeadlessAuthority {
         !quiescing
     }
 
+    private func liveClaudePromptDelivery() async -> ClaudeAgentModePromptDelivery {
+        let stored = try? await store.directAgentPermissionDocument()
+        return ClaudeAgentModePromptDelivery.liveRead(stored: stored?.value.claude.promptDelivery)
+    }
+
     private func runtimeProviderSettings(providerID: ProviderSettingsID?) async -> [String: String] {
         await liveDirectAgentDefaults(providerID: providerID)?.providerSettings ?? [:]
     }
@@ -3657,6 +3675,10 @@ public actor RepoPromptHeadlessAuthority {
             }
             var providerSettings = permissions.providerSettings
             if let acceptedSubmission { providerSettings.merge(acceptedSubmission.executionPolicy.providerSettings) { _, accepted in accepted } }
+            let providerKind = acceptedSubmission?.providerKind ?? initial.provider
+            if providerKind == .claudeCompatible {
+                providerSettings["claude.promptDelivery"] = await liveClaudePromptDelivery().rawValue
+            }
             providerSettings[CodexRepoPromptMCPConfig.sessionIDSettingsKey] = sessionID.uuidString
             if FileManager.default.isExecutableFile(atPath: CodexRepoPromptMCPConfig.command()) {
                 providerSettings[CodexRepoPromptMCPConfig.provisionedSettingsKey] = "true"

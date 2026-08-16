@@ -91,6 +91,13 @@ public enum ClaudeCompatibleBackendAuthHeader: String, Codable, Hashable, Sendab
         case .anthropicAuthToken: .authToken
         }
     }
+
+    public var environmentVariableName: String {
+        switch self {
+        case .anthropicAPIKey: "ANTHROPIC_API_KEY"
+        case .anthropicAuthToken: "ANTHROPIC_AUTH_TOKEN"
+        }
+    }
 }
 
 public enum ClaudeCompatibleBackendModelBehavior: String, Codable, Hashable, Sendable {
@@ -102,6 +109,7 @@ public enum ClaudeCompatibleBackendModelBehavior: String, Codable, Hashable, Sen
 /// the Linux Claude runtime. Credential material is deliberately absent.
 public struct ClaudeCompatibleBackendSettings: Codable, Hashable, Sendable {
     public let providerID: ProviderSettingsID
+    public let isEnabled: Bool
     public let displayName: String
     public let baseURL: String
     public let authHeader: ClaudeCompatibleBackendAuthHeader
@@ -110,8 +118,19 @@ public struct ClaudeCompatibleBackendSettings: Codable, Hashable, Sendable {
     public let sonnetModel: String
     public let opusModel: String
 
-    public init(providerID: ProviderSettingsID, displayName: String, baseURL: String, authHeader: ClaudeCompatibleBackendAuthHeader, modelBehavior: ClaudeCompatibleBackendModelBehavior, haikuModel: String = "", sonnetModel: String = "", opusModel: String = "") {
+    public init(
+        providerID: ProviderSettingsID,
+        isEnabled: Bool = true,
+        displayName: String,
+        baseURL: String,
+        authHeader: ClaudeCompatibleBackendAuthHeader,
+        modelBehavior: ClaudeCompatibleBackendModelBehavior,
+        haikuModel: String = "",
+        sonnetModel: String = "",
+        opusModel: String = ""
+    ) {
         self.providerID = providerID
+        self.isEnabled = isEnabled
         self.displayName = displayName
         self.baseURL = baseURL
         self.authHeader = authHeader

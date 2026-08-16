@@ -26,6 +26,73 @@ public enum ClaudeDirectPermissionMode: String, Codable, CaseIterable, Sendable 
     case fullAccess = "bypassPermissions"
 }
 
+/// Desktop UserDefaults `claudeCodeAgentModePromptDelivery`. Missing/invalid
+/// raw defaults to `nativeSystemPrompt`. Linux has no
+/// `nullBuiltInSystemPromptEnabled` legacy flag.
+public enum ClaudeAgentModePromptDelivery: String, Codable, CaseIterable, Sendable {
+    case userMessageXML
+    case userMessageXMLWithEmptySystemPrompt
+    case nativeSystemPrompt
+
+    public static let `default` = ClaudeAgentModePromptDelivery.nativeSystemPrompt
+    public static let instructionsTag = "claude_code_instructions"
+
+    public static func resolved(rawValue: String?) -> ClaudeAgentModePromptDelivery {
+        rawValue.flatMap(Self.init(rawValue:)) ?? .nativeSystemPrompt
+    }
+
+    /// Composer/toolValues are not durable. Missing store → Desktop default.
+    public static func liveRead(stored: ClaudeAgentModePromptDelivery?) -> ClaudeAgentModePromptDelivery {
+        stored ?? .nativeSystemPrompt
+    }
+
+    public var sendsRepoPromptAsUserMessage: Bool {
+        switch self {
+        case .userMessageXML, .userMessageXMLWithEmptySystemPrompt: true
+        case .nativeSystemPrompt: false
+        }
+    }
+
+    public func nativeSystemPromptOverride(instructions: String) -> String? {
+        switch self {
+        case .userMessageXML: nil
+        case .userMessageXMLWithEmptySystemPrompt: ""
+        case .nativeSystemPrompt: instructions
+        }
+    }
+
+    public static func decoratedUserMessage(_ userMessage: String, instructions: String) -> String {
+        let trimmedInstructions = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedInstructions.isEmpty else { return userMessage }
+        let instructionsBlock = """
+        <\(instructionsTag)>
+        \(trimmedInstructions)
+        </\(instructionsTag)>
+        """
+        let trimmedUserMessage = userMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedUserMessage.isEmpty else { return instructionsBlock }
+        return """
+        \(instructionsBlock)
+
+        \(userMessage)
+        """
+    }
+
+    public func packagedUserMessage(_ userMessage: String, instructions: String) -> String {
+        sendsRepoPromptAsUserMessage
+            ? Self.decoratedUserMessage(userMessage, instructions: instructions)
+            : userMessage
+    }
+
+    public func appendingSystemPrompt(to arguments: [String], instructions: String) -> [String] {
+        var arguments = arguments
+        if let override = nativeSystemPromptOverride(instructions: instructions) {
+            arguments += ["--system-prompt", override]
+        }
+        return arguments
+    }
+}
+
 public enum ManagedDirectPermissionLevel: String, Codable, CaseIterable, Sendable {
     case managedDefault
     case fullAccess
@@ -84,15 +151,18 @@ public struct DirectClaudeAgentPermissions: Codable, Hashable, Sendable {
     public var permissionMode: ClaudeDirectPermissionMode
     public var bashEnabled: Bool
     public var mcpStrictModeEnabled: Bool
+    public var promptDelivery: ClaudeAgentModePromptDelivery
 
     public init(
         permissionMode: ClaudeDirectPermissionMode = .requireApproval,
         bashEnabled: Bool = true,
-        mcpStrictModeEnabled: Bool = true
+        mcpStrictModeEnabled: Bool = true,
+        promptDelivery: ClaudeAgentModePromptDelivery = .nativeSystemPrompt
     ) {
         self.permissionMode = permissionMode
         self.bashEnabled = bashEnabled
         self.mcpStrictModeEnabled = mcpStrictModeEnabled
+        self.promptDelivery = promptDelivery
     }
 
     public init(from decoder: Decoder) throws {
@@ -100,6 +170,11 @@ public struct DirectClaudeAgentPermissions: Codable, Hashable, Sendable {
         permissionMode = try container.decodeIfPresent(ClaudeDirectPermissionMode.self, forKey: .permissionMode) ?? .requireApproval
         bashEnabled = try container.decodeIfPresent(Bool.self, forKey: .bashEnabled) ?? true
         mcpStrictModeEnabled = try container.decodeIfPresent(Bool.self, forKey: .mcpStrictModeEnabled) ?? true
+        if let raw = try container.decodeIfPresent(String.self, forKey: .promptDelivery) {
+            promptDelivery = ClaudeAgentModePromptDelivery.resolved(rawValue: raw)
+        } else {
+            promptDelivery = .nativeSystemPrompt
+        }
     }
 
     public var permissionLevel: String {
@@ -221,6 +296,7 @@ public struct DirectAgentPermissionsSettings: Codable, Hashable, Sendable {
                     "claude.permissionMode": claude.permissionMode.rawValue,
                     "claude.bashEnabled": claude.bashEnabled ? "true" : "false",
                     "claude.strictMCPEnabled": claude.mcpStrictModeEnabled ? "true" : "false",
+                    "claude.promptDelivery": claude.promptDelivery.rawValue,
                     "provider.permissionId": "claude.\(claude.permissionLevel)"
                 ]
             )

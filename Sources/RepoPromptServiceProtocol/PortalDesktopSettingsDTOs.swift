@@ -17,6 +17,44 @@ public struct PortalDesktopSettingsSnapshot: Codable, Sendable, Equatable {
         self.values = values
         self.updatedAt = updatedAt
     }
+
+    /// Overlay stored rows onto Desktop defaults. Missing documents read as revision 0.
+    public static func liveRead(stored: PortalDesktopSettingsSnapshot?) throws -> PortalDesktopSettingsSnapshot {
+        guard let stored else {
+            return .init(
+                revision: 0,
+                values: PortalDesktopSettingKey.defaultValues,
+                updatedAt: Date(timeIntervalSince1970: 0)
+            )
+        }
+        var values = PortalDesktopSettingKey.defaultValues
+        for (rawKey, value) in stored.values {
+            guard let key = PortalDesktopSettingKey(rawValue: rawKey) else { continue }
+            values[rawKey] = try key.validated(value)
+        }
+        return .init(schemaVersion: stored.schemaVersion, revision: stored.revision, values: values, updatedAt: stored.updatedAt)
+    }
+
+    public func applying(_ request: UpdatePortalDesktopSettingsRequest) throws -> PortalDesktopSettingsSnapshot {
+        guard revision == request.expectedRevision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Settings revision is stale", currentRevision: revision)
+        }
+        guard !request.changes.isEmpty, request.changes.count <= PortalDesktopSettingKey.allCases.count else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Settings changes are empty or exceed the supported bound")
+        }
+        var next = values
+        for (rawKey, value) in request.changes {
+            guard let key = PortalDesktopSettingKey(rawValue: rawKey) else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Unknown server setting")
+            }
+            guard key.isMutable else {
+                let code: ServiceErrorCode = key.mutability == .supersededByTypedSettings ? .capabilityMissing : .invalidRequest
+                throw ServiceAPIError(code: code, message: "Legacy setting is read-only; use its typed server authority")
+            }
+            next[rawKey] = try key.validated(value)
+        }
+        return .init(schemaVersion: schemaVersion, revision: revision + 1, values: next, updatedAt: Date())
+    }
 }
 
 public struct UpdatePortalDesktopSettingsRequest: Codable, Sendable, Equatable {
@@ -69,6 +107,11 @@ public enum PortalDesktopSettingKey: String, CaseIterable, Codable, Sendable {
     case claudeKimiDisplayName
     case claudeKimiBaseURL
     case claudeKimiAuthHeader
+    case claudeKimiModelBehavior
+    case claudeKimiHaikuModel
+    case claudeKimiSonnetModel
+    case claudeKimiOpusModel
+    case claudeCustomEnabled
     case claudeCustomDisplayName
     case claudeCustomBaseURL
     case claudeCustomAuthHeader
@@ -137,6 +180,11 @@ public enum PortalDesktopSettingKey: String, CaseIterable, Codable, Sendable {
              .claudeKimiDisplayName,
              .claudeKimiBaseURL,
              .claudeKimiAuthHeader,
+             .claudeKimiModelBehavior,
+             .claudeKimiHaikuModel,
+             .claudeKimiSonnetModel,
+             .claudeKimiOpusModel,
+             .claudeCustomEnabled,
              .claudeCustomDisplayName,
              .claudeCustomBaseURL,
              .claudeCustomAuthHeader,
@@ -196,6 +244,7 @@ public enum PortalDesktopSettingKey: String, CaseIterable, Codable, Sendable {
         case .restrictAgentDiscoveryToRoles,
              .codexReasoningSummariesEnabled,
              .codexMemoriesEnabled,
+             .claudeCustomEnabled,
              .contextBuilderFollowUpAnalysis,
              .contextBuilderMCPClarifyingQuestions,
              .workspaceApprovalsGlobal,
@@ -235,6 +284,9 @@ public enum PortalDesktopSettingKey: String, CaseIterable, Codable, Sendable {
         case .claudeKimiDisplayName: "CC Moonshot"
         case .claudeKimiBaseURL: "https://api.kimi.com/coding/"
         case .claudeKimiAuthHeader: "anthropicAPIKey"
+        case .claudeKimiModelBehavior: "noModel"
+        case .claudeKimiHaikuModel, .claudeKimiSonnetModel, .claudeKimiOpusModel:
+            ""
         case .claudeCustomDisplayName: "CC Custom"
         case .claudeCustomBaseURL: ""
         case .claudeCustomAuthHeader: "anthropicAPIKey"
@@ -281,6 +333,7 @@ public enum PortalDesktopSettingKey: String, CaseIterable, Codable, Sendable {
              .claudeBashEnabled,
              .claudeStrictMCPEnabled,
              .claudeToolSearchEnabled,
+             .claudeCustomEnabled,
              .includeWorkflowCleanupGuidance,
              .contextBuilderUIClarifyingQuestions,
              .contextBuilderFollowUpAnalysis,
@@ -319,7 +372,7 @@ public enum PortalDesktopSettingKey: String, CaseIterable, Codable, Sendable {
             try Self.require(value, in: ["readOnly", "workspaceWrite", "fullAccess"])
         case .claudeGLMAuthHeader, .claudeKimiAuthHeader, .claudeCustomAuthHeader:
             try Self.require(value, in: ["anthropicAPIKey", "anthropicAuthToken"])
-        case .claudeCustomModelBehavior:
+        case .claudeKimiModelBehavior, .claudeCustomModelBehavior:
             try Self.require(value, in: ["noModel", "claudeSlotMapping"])
         case .contextBuilderBudget:
             try Self.requireInteger(value, range: 8_000 ... 240_000)
@@ -357,6 +410,9 @@ public enum PortalDesktopSettingKey: String, CaseIterable, Codable, Sendable {
              .claudeGLMSonnetModel,
              .claudeGLMOpusModel,
              .claudeKimiDisplayName,
+             .claudeKimiHaikuModel,
+             .claudeKimiSonnetModel,
+             .claudeKimiOpusModel,
              .claudeCustomDisplayName,
              .claudeCustomHaikuModel,
              .claudeCustomSonnetModel,

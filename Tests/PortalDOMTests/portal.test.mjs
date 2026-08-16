@@ -383,6 +383,11 @@ function desktopSettingsFixture(overrides = {}) {
       claudeKimiDisplayName: "CC Moonshot",
       claudeKimiBaseURL: "https://api.kimi.com/coding/",
       claudeKimiAuthHeader: "anthropicAPIKey",
+      claudeKimiModelBehavior: "noModel",
+      claudeKimiHaikuModel: "",
+      claudeKimiSonnetModel: "",
+      claudeKimiOpusModel: "",
+      claudeCustomEnabled: "false",
       claudeCustomDisplayName: "CC Custom",
       claudeCustomBaseURL: "",
       claudeCustomAuthHeader: "anthropicAPIKey",
@@ -502,6 +507,7 @@ function typedSettingsFixtures(providers, bootstrap) {
           permissionMode: "default",
           bashEnabled: true,
           mcpStrictModeEnabled: true,
+          promptDelivery: "nativeSystemPrompt",
         },
         openCode: { permissionLevel: "managedDefault" },
         cursor: { permissionLevel: "managedDefault" },
@@ -984,6 +990,46 @@ async function createHarness({
       provider.effectiveEnabled = provider.preference.enabled;
       return jsonResponse(provider);
     }
+    const connectionActionMatch = call.path.match(
+      /^api\/v1\/provider-settings\/([^/]+)\/(test|disconnect|revoke)$/,
+    );
+    if (connectionActionMatch && call.method === "POST") {
+      const provider = context.providers.find(
+        (item) =>
+          item.providerID === decodeURIComponent(connectionActionMatch[1]),
+      );
+      const operation = connectionActionMatch[2];
+      if (operation === "disconnect" || operation === "revoke") {
+        provider.connection = null;
+        provider.authentication = {
+          authenticated: false,
+          state: "notConfigured",
+          method: null,
+          accountLabel: null,
+          expiresAt: null,
+          detail: "Provision credentials on the server",
+        };
+        provider.preflight = {
+          ready: false,
+          reason: "missingCredential",
+          detail: "Provider credential is not configured",
+        };
+        provider.effectiveEnabled = false;
+      } else {
+        provider.connection = {
+          ...provider.connection,
+          testState: "valid",
+          lastTestedAt: "2026-08-16T20:00:00Z",
+          detail: "Credential accepted",
+        };
+        provider.preflight = {
+          ready: true,
+          reason: "ready",
+          detail: "Provider is ready",
+        };
+      }
+      return jsonResponse(provider);
+    }
     throw new Error(`Unexpected request: ${call.method} ${call.path}`);
   };
 
@@ -1284,6 +1330,7 @@ test("overview live-reads typed Agent Models assignments", async (t) => {
   assert.match(text, /Workspace Write/);
   assert.match(text, /Safe Managed/);
   assert.match(text, /Require Approval/);
+  assert.match(text, /Replace System Prompt/);
 });
 
 test("desktop recommendation assessment explains OpenCode-only connections without inventing role assignments", async (t) => {
@@ -1481,7 +1528,9 @@ test("Agent Permissions exposes every runtime-backed desktop direct-provider con
     "RepoPrompt Only (Strict MCP)",
     "Lazy Tool Loading",
     "Sys Prompt Packaging",
+    "Replace System Prompt",
     "User Message (Keep Native)",
+    "User Message (No Native)",
     "OpenCode Direct Agent",
     "ACP Session Mode",
     "Cursor Direct Agent",
@@ -1492,7 +1541,7 @@ test("Agent Permissions exposes every runtime-backed desktop direct-provider con
   ]) {
     assert.ok(text.includes(expected), `missing ${expected}`);
   }
-  assert.equal(content.querySelectorAll("select").length, 12);
+  assert.equal(content.querySelectorAll("select").length, 13);
   assert.equal(content.querySelectorAll('input[type="checkbox"]').length, 8);
   assert.match(text, /frozen into every child session/);
 });
@@ -1641,6 +1690,7 @@ test("typed settings pages mutate revisioned server authorities", async (t) => {
   assert.equal(directPayload.settings.codex.sandboxMode, "read-only");
   assert.equal(directPayload.settings.claude.permissionMode, "default");
   assert.equal(directPayload.settings.claude.mcpStrictModeEnabled, true);
+  assert.equal(directPayload.settings.claude.promptDelivery, "nativeSystemPrompt");
 
   const policy = document.querySelector(
     'select[aria-label="Sub-agent permission policy"]',
@@ -2629,6 +2679,197 @@ test("compatible backends remain visible and save non-secret Linux runtime setti
   custom.open = true;
   assert.match(custom.textContent, /safe endpoint validator/i);
   assert.equal(custom.querySelector(".credential-form"), null);
+});
+
+test("portal live-reads and writes promptDelivery and Claude-compatible persist keys", async (t) => {
+  const harness = await createHarness();
+  t.after(() => harness.close());
+  const { calls, document, window } = harness;
+
+  const claude = document.querySelector(
+    '[data-provider-id="claudeCompatible"]',
+  );
+  claude.open = true;
+  const packaging = claude.querySelector(
+    'select[aria-label="Sys Prompt Packaging"]',
+  );
+  assert.ok(packaging);
+  assert.equal(packaging.value, "nativeSystemPrompt");
+  assert.doesNotMatch(
+    claude.textContent,
+    /currently sends RepoPrompt instructions as a user message/,
+  );
+  change(window, packaging, "userMessageXML");
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/settings/direct-agent-permissions",
+    ),
+  );
+  const deliveryPayload = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/settings/direct-agent-permissions",
+    ).body,
+  );
+  assert.equal(deliveryPayload.settings.claude.promptDelivery, "userMessageXML");
+  assert.equal(
+    harness.context.typedSettings.directAgentPermissions.settings.claude
+      .promptDelivery,
+    "userMessageXML",
+  );
+
+  const group = document.querySelector(".compatible-provider-card");
+  group.open = true;
+  const kimi = group.querySelector('[data-provider-id="claudeKimi"]');
+  kimi.open = true;
+  const kimiForm = kimi.querySelector(".compatible-backend-form");
+  const kimiBehavior = kimiForm.querySelector('[name="behavior"]');
+  assert.equal(kimiBehavior.value, "noModel");
+  kimiBehavior.value = "claudeSlotMapping";
+  kimiBehavior.dispatchEvent(new window.Event("change", { bubbles: true }));
+  kimiForm.querySelector('[name="haiku"]').value = "kimi-haiku";
+  kimiForm.querySelector('[name="sonnet"]').value = "kimi-sonnet";
+  submit(window, kimiForm);
+  await waitFor(
+    () =>
+      calls.some(
+        (call) =>
+          call.method === "PATCH" &&
+          call.path === "api/v1/desktop-settings" &&
+          JSON.parse(call.body).changes.claudeKimiHaikuModel === "kimi-haiku",
+      ),
+    "Kimi persist PATCH was not sent",
+  );
+  const kimiPatch = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/desktop-settings" &&
+        JSON.parse(call.body).changes.claudeKimiHaikuModel === "kimi-haiku",
+    ).body,
+  );
+  assert.equal(kimiPatch.changes.claudeKimiModelBehavior, "claudeSlotMapping");
+  assert.equal(kimiPatch.changes.claudeKimiSonnetModel, "kimi-sonnet");
+  assert.equal("claudeCustomHaikuModel" in kimiPatch.changes, false);
+  assert.equal("credential" in kimiPatch.changes, false);
+  await window.RepoPromptPortalTest.whenIdle();
+  await settle();
+
+  const refreshedGroup = document.querySelector(".compatible-provider-card");
+  refreshedGroup.open = true;
+  const custom = refreshedGroup.querySelector(
+    '[data-provider-id="claudeCustom"]',
+  );
+  custom.open = true;
+  const enabled = custom.querySelector(
+    'input[aria-label="Available for new sessions"]',
+  );
+  assert.equal(enabled.checked, false);
+  change(window, enabled, true);
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/desktop-settings" &&
+        JSON.parse(call.body).changes.claudeCustomEnabled === "true",
+    ),
+  );
+  assert.equal(
+    harness.context.desktopSettings.values.claudeCustomEnabled,
+    "true",
+  );
+});
+
+test("compatible backend connect test and sign-out use server connection APIs", async (t) => {
+  const providers = providerCatalog();
+  const glmIndex = providers.findIndex(
+    (provider) => provider.providerID === "claudeGLM",
+  );
+  providers[glmIndex] = providerFixture({
+    providerID: "claudeGLM",
+    displayName: "CC Zai",
+    authenticationMethods: ["authToken"],
+    authFlows: [],
+    models: [model("glm-4.5-air")],
+    preference: { enabled: true },
+  });
+  const harness = await createHarness({ providers });
+  t.after(() => harness.close());
+  const { calls, document, window } = harness;
+
+  assert.equal(scriptSource.includes("localStorage"), false);
+  assert.equal(scriptSource.includes("sessionStorage"), false);
+  assert.equal(scriptSource.includes("cliToken"), false);
+  assert.equal(scriptSource.includes("tokenStore"), false);
+
+  const group = document.querySelector(".compatible-provider-card");
+  group.open = true;
+  const glm = group.querySelector('[data-provider-id="claudeGLM"]');
+  glm.open = true;
+  const credential = glm.querySelector('input[name="credential"]');
+  assert.ok(credential);
+  credential.value = "glm-secret-token";
+  submit(window, glm.querySelector(".secret-form"));
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "POST" &&
+        call.path === "api/v1/provider-settings/claudeGLM/connect",
+    ),
+  );
+  const connectPayload = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "POST" &&
+        call.path === "api/v1/provider-settings/claudeGLM/connect",
+    ).body,
+  );
+  assert.equal(connectPayload.authenticationMethod, "authToken");
+  assert.equal(connectPayload.credential, "glm-secret-token");
+
+  await waitFor(
+    () =>
+      document
+        .querySelector('[data-provider-id="claudeGLM"]')
+        ?.textContent.includes("Test Connection"),
+    "connected GLM actions did not render",
+  );
+  document.querySelector(".compatible-provider-card").open = true;
+  const connected = document.querySelector('[data-provider-id="claudeGLM"]');
+  connected.open = true;
+  assert.equal(connected.querySelector('input[name="credential"]')?.value, "");
+  click(
+    window,
+    [...connected.querySelectorAll("button")].find(
+      (button) => button.textContent.trim() === "Test Connection",
+    ),
+  );
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "POST" &&
+        call.path === "api/v1/provider-settings/claudeGLM/test",
+    ),
+  );
+
+  click(
+    window,
+    [...connected.querySelectorAll("button")].find(
+      (button) => button.textContent.trim() === "Delete Key",
+    ),
+  );
+  assert.equal(document.getElementById("confirm-dialog").hidden, false);
+  click(window, document.getElementById("confirm-action-button"));
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "POST" &&
+        call.path === "api/v1/provider-settings/claudeGLM/disconnect",
+    ),
+  );
 });
 
 test("connected Codex disclosure shows Desktop account and runtime controls without credential forms", async (t) => {

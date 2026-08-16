@@ -17,41 +17,12 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
     }
 
     public func snapshot() async throws -> PortalDesktopSettingsSnapshot {
-        guard let stored = try await store.portalDesktopSettings() else {
-            return .init(revision: 0, values: PortalDesktopSettingKey.defaultValues, updatedAt: .init(timeIntervalSince1970: 0))
-        }
-        var values = PortalDesktopSettingKey.defaultValues
-        for (rawKey, value) in stored.values {
-            guard let key = PortalDesktopSettingKey(rawValue: rawKey) else { continue }
-            values[rawKey] = try key.validated(value)
-        }
-        return .init(revision: stored.revision, values: values, updatedAt: stored.updatedAt)
+        try PortalDesktopSettingsSnapshot.liveRead(stored: try await store.portalDesktopSettings())
     }
 
     public func update(_ request: UpdatePortalDesktopSettingsRequest) async throws -> PortalDesktopSettingsSnapshot {
         let current = try await snapshot()
-        guard current.revision == request.expectedRevision else {
-            throw ServiceAPIError(code: .staleRevision, message: "Settings revision is stale", currentRevision: current.revision)
-        }
-        guard !request.changes.isEmpty, request.changes.count <= PortalDesktopSettingKey.allCases.count else {
-            throw ServiceAPIError(code: .invalidRequest, message: "Settings changes are empty or exceed the supported bound")
-        }
-        var values = current.values
-        for (rawKey, value) in request.changes {
-            guard let key = PortalDesktopSettingKey(rawValue: rawKey) else {
-                throw ServiceAPIError(code: .invalidRequest, message: "Unknown server setting")
-            }
-            guard key.isMutable else {
-                let code: ServiceErrorCode = key.mutability == .supersededByTypedSettings ? .capabilityMissing : .invalidRequest
-                throw ServiceAPIError(code: code, message: "Legacy setting is read-only; use its typed server authority")
-            }
-            values[rawKey] = try key.validated(value)
-        }
-        let updated = PortalDesktopSettingsSnapshot(
-            revision: current.revision + 1,
-            values: values,
-            updatedAt: Date()
-        )
+        let updated = try current.applying(request)
         return try await store.upsertPortalDesktopSettings(updated, expectedRevision: current.revision)
     }
 
@@ -80,7 +51,7 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
                 "claude.bash": .boolean(typed.claude.bashEnabled),
                 "claude.mcpStrictMode": .boolean(typed.claude.mcpStrictModeEnabled),
                 "claude.toolSearch": .boolean(Self.boolean(.claudeToolSearchEnabled, values: values)),
-                "claude.promptDelivery": .choice("nativeSystemPrompt")
+                "claude.promptDelivery": .choice(typed.claude.promptDelivery.rawValue)
             ]
             permissionID = "claude.\(typed.claude.permissionLevel)"
         case .openCodeACP:
@@ -138,13 +109,15 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
             providerSettings["claude.toolSearchEnabled"] = values[PortalDesktopSettingKey.claudeToolSearchEnabled.rawValue] ?? "true"
             if providerID != .claudeCompatible {
                 let backend = try Self.backendSettings(providerID: providerID, values: values)
-                providerSettings["claude.backendID"] = providerID.rawValue
-                providerSettings["claude.backendBaseURL"] = backend.baseURL
-                providerSettings["claude.backendAuthHeader"] = backend.authHeader.rawValue
-                providerSettings["claude.backendModelBehavior"] = backend.modelBehavior.rawValue
-                providerSettings["claude.backendHaikuModel"] = backend.haikuModel
-                providerSettings["claude.backendSonnetModel"] = backend.sonnetModel
-                providerSettings["claude.backendOpusModel"] = backend.opusModel
+                if backend.isEnabled {
+                    providerSettings["claude.backendID"] = providerID.rawValue
+                    providerSettings["claude.backendBaseURL"] = backend.baseURL
+                    providerSettings["claude.backendAuthHeader"] = backend.authHeader.rawValue
+                    providerSettings["claude.backendModelBehavior"] = backend.modelBehavior.rawValue
+                    providerSettings["claude.backendHaikuModel"] = backend.haikuModel
+                    providerSettings["claude.backendSonnetModel"] = backend.sonnetModel
+                    providerSettings["claude.backendOpusModel"] = backend.opusModel
+                }
             }
             return .init(mode: projection.mode, providerSettings: providerSettings)
         case .openCodeACP, .cursorACP:
@@ -161,31 +134,63 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
     }
 
     private nonisolated static func backendSettings(providerID: ProviderSettingsID, values: [String: String]) throws -> ClaudeCompatibleBackendSettings {
-        let keys: (PortalDesktopSettingKey, PortalDesktopSettingKey, PortalDesktopSettingKey, PortalDesktopSettingKey, PortalDesktopSettingKey, PortalDesktopSettingKey, PortalDesktopSettingKey)
-        let defaultBehavior: ClaudeCompatibleBackendModelBehavior
+        let displayName: PortalDesktopSettingKey
+        let baseURL: PortalDesktopSettingKey
+        let authHeader: PortalDesktopSettingKey
+        let haiku: PortalDesktopSettingKey
+        let sonnet: PortalDesktopSettingKey
+        let opus: PortalDesktopSettingKey
+        let behavior: PortalDesktopSettingKey?
+        let fallbackBehavior: ClaudeCompatibleBackendModelBehavior
+        let isEnabled: Bool
         switch providerID {
         case .claudeGLM:
-            keys = (.claudeGLMDisplayName, .claudeGLMBaseURL, .claudeGLMAuthHeader, .claudeGLMHaikuModel, .claudeGLMSonnetModel, .claudeGLMOpusModel, .claudeCustomModelBehavior)
-            defaultBehavior = .claudeSlotMapping
+            displayName = .claudeGLMDisplayName
+            baseURL = .claudeGLMBaseURL
+            authHeader = .claudeGLMAuthHeader
+            haiku = .claudeGLMHaikuModel
+            sonnet = .claudeGLMSonnetModel
+            opus = .claudeGLMOpusModel
+            behavior = nil
+            fallbackBehavior = .claudeSlotMapping
+            isEnabled = true
         case .claudeKimi:
-            keys = (.claudeKimiDisplayName, .claudeKimiBaseURL, .claudeKimiAuthHeader, .claudeCustomHaikuModel, .claudeCustomSonnetModel, .claudeCustomOpusModel, .claudeCustomModelBehavior)
-            defaultBehavior = .noModel
+            displayName = .claudeKimiDisplayName
+            baseURL = .claudeKimiBaseURL
+            authHeader = .claudeKimiAuthHeader
+            haiku = .claudeKimiHaikuModel
+            sonnet = .claudeKimiSonnetModel
+            opus = .claudeKimiOpusModel
+            behavior = .claudeKimiModelBehavior
+            fallbackBehavior = .noModel
+            isEnabled = true
         case .claudeCustom:
-            keys = (.claudeCustomDisplayName, .claudeCustomBaseURL, .claudeCustomAuthHeader, .claudeCustomHaikuModel, .claudeCustomSonnetModel, .claudeCustomOpusModel, .claudeCustomModelBehavior)
-            defaultBehavior = ClaudeCompatibleBackendModelBehavior(rawValue: values[keys.6.rawValue] ?? "") ?? .noModel
+            displayName = .claudeCustomDisplayName
+            baseURL = .claudeCustomBaseURL
+            authHeader = .claudeCustomAuthHeader
+            haiku = .claudeCustomHaikuModel
+            sonnet = .claudeCustomSonnetModel
+            opus = .claudeCustomOpusModel
+            behavior = .claudeCustomModelBehavior
+            fallbackBehavior = .noModel
+            isEnabled = values[PortalDesktopSettingKey.claudeCustomEnabled.rawValue] == "true"
         default:
             throw ServiceAPIError(code: .invalidRequest, message: "Claude-compatible backend settings were requested for an unrelated provider")
         }
-        let auth = ClaudeCompatibleBackendAuthHeader(rawValue: values[keys.2.rawValue] ?? "") ?? .anthropicAPIKey
+        let auth = ClaudeCompatibleBackendAuthHeader(rawValue: values[authHeader.rawValue] ?? "") ?? .anthropicAPIKey
+        let modelBehavior = behavior.flatMap {
+            ClaudeCompatibleBackendModelBehavior(rawValue: values[$0.rawValue] ?? $0.defaultValue)
+        } ?? fallbackBehavior
         return .init(
             providerID: providerID,
-            displayName: values[keys.0.rawValue] ?? keys.0.defaultValue,
-            baseURL: values[keys.1.rawValue] ?? keys.1.defaultValue,
+            isEnabled: isEnabled,
+            displayName: values[displayName.rawValue] ?? displayName.defaultValue,
+            baseURL: values[baseURL.rawValue] ?? baseURL.defaultValue,
             authHeader: auth,
-            modelBehavior: defaultBehavior,
-            haikuModel: values[keys.3.rawValue] ?? keys.3.defaultValue,
-            sonnetModel: values[keys.4.rawValue] ?? keys.4.defaultValue,
-            opusModel: values[keys.5.rawValue] ?? keys.5.defaultValue
+            modelBehavior: modelBehavior,
+            haikuModel: values[haiku.rawValue] ?? haiku.defaultValue,
+            sonnetModel: values[sonnet.rawValue] ?? sonnet.defaultValue,
+            opusModel: values[opus.rawValue] ?? opus.defaultValue
         )
     }
 

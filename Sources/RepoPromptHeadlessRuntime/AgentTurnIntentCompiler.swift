@@ -265,7 +265,7 @@ public actor AgentTurnIntentCompiler {
         if !canonicalText.isEmpty, !input.userTextConsumedByWorkflow {
             sections.append(selectedMessageContext == nil ? "<user-request>\n\(canonicalText)\n</user-request>" : canonicalText)
         }
-        let prompt = package(sections: sections, providerSettings: input.providerConfiguration.executionPolicy.providerSettings)
+        let prompt = sections.joined(separator: "\n\n")
         guard prompt.utf8.count <= limits.maximumTextBytes + limits.maximumTaggedAggregateBytes + 1_048_576 else {
             throw ServiceAPIError(code: .invalidRequest, message: "Compiled provider prompt exceeds its bound")
         }
@@ -276,15 +276,6 @@ public actor AgentTurnIntentCompiler {
     private func appendSection(_ title: String, _ value: String?, to sections: inout [String]) {
         guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return }
         sections.append("<\(title.lowercased().replacingOccurrences(of: " ", with: "-"))>\n\(value)\n</\(title.lowercased().replacingOccurrences(of: " ", with: "-"))>")
-    }
-
-    private func package(sections: [String], providerSettings: [String: String]) -> String {
-        let joined = sections.joined(separator: "\n\n")
-        switch providerSettings["claude.promptDelivery"] {
-        case "argument": return "<provider-prompt-delivery mode=\"argument\">\n\(joined)\n</provider-prompt-delivery>"
-        case "stdin": return "<provider-prompt-delivery mode=\"stdin\">\n\(joined)\n</provider-prompt-delivery>"
-        default: return joined
-        }
     }
 
     private func escapeAttribute(_ value: String) -> String {

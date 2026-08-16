@@ -19,7 +19,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         try assertRoundTrip(SubagentPermissionSettings(policy: .custom, codex: .readOnly, claude: .autoApproveEdits, openCode: .fullAccess, cursor: .managedDefault))
         try assertRoundTrip(DirectAgentPermissionsSettings(
             codex: .init(sandboxMode: .readOnly, approvalPolicy: .unlessTrusted, approvalReviewer: .user, bashEnabled: false),
-            claude: .init(permissionMode: .autoApproveEdits, bashEnabled: false, mcpStrictModeEnabled: true)
+            claude: .init(permissionMode: .autoApproveEdits, bashEnabled: false, mcpStrictModeEnabled: true, promptDelivery: .userMessageXML)
         ))
         try assertRoundTrip(ContextBuilderSettingsProfile(
             budget: 100_000,
@@ -65,8 +65,10 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertTrue(empty.settings.codex.bashEnabled)
         XCTAssertEqual(empty.settings.claude.permissionMode, .requireApproval)
         XCTAssertTrue(empty.settings.claude.mcpStrictModeEnabled)
+        XCTAssertEqual(empty.settings.claude.promptDelivery, .nativeSystemPrompt)
         let defaultClaude = try await portal.runtimeDefaults(for: .claudeCompatible)
         XCTAssertEqual(defaultClaude.providerSettings["claude.strictMCPEnabled"], "true")
+        XCTAssertEqual(defaultClaude.providerSettings["claude.promptDelivery"], "nativeSystemPrompt")
 
         let projected = try await portal.runtimeDefaults(for: .codex)
         XCTAssertEqual(projected.mode, "workspaceWrite")
@@ -1767,6 +1769,97 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertEqual(subagents.settings.policy, .inheritProviderSettings)
         let readPolicy = try await invoke(["op": "get", "key": "subagents.policy"])
         XCTAssertEqual(readPolicy["value"] as? String, "inheritProviderSettings")
+    }
+
+    func testAppSettingsCLIProviderKeysWriteTheSameStoresWithoutATokenBag() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("app-settings-cli-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
+            projectCatalog: store
+        )
+        let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
+        let portal = PortalDesktopSettingsService(store: store)
+        let actor = ExternalActor(goblinUserID: "mcp-cli", username: "mcp-cli", displayName: "MCP CLI")
+        let project = try await authority.createProject(
+            input: .init(name: "CLI", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "cli-settings-project",
+            requestDigest: "cli-settings-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "cli-settings-session",
+            requestDigest: "cli-settings-session"
+        )
+        let adapter = RepoPromptMCPAdapter(authority: authority)
+        let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
+
+        func invoke(_ object: [String: Any]) async throws -> [String: Any] {
+            let data = try await adapter.invoke(
+                toolName: "app_settings",
+                argumentsJSON: try JSONSerialization.data(withJSONObject: object),
+                binding: binding
+            )
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+
+        let defaultDelivery = try await invoke(["op": "get", "key": "direct_agents.claude.prompt_delivery"])
+        XCTAssertEqual(defaultDelivery["value"] as? String, "nativeSystemPrompt")
+        let writtenDelivery = try await invoke([
+            "op": "set",
+            "key": "direct_agents.claude.prompt_delivery",
+            "value": "userMessageXML"
+        ])
+        XCTAssertEqual(writtenDelivery["value"] as? String, "userMessageXML")
+        let stored = try await authority.directAgentPermissions()
+        XCTAssertEqual(stored.settings.claude.promptDelivery, .userMessageXML)
+
+        let defaultEnabled = try await invoke(["op": "get", "key": "claude.custom.enabled"])
+        XCTAssertEqual(defaultEnabled["value"] as? Bool, false)
+        _ = try await invoke(["op": "set", "key": "claude.custom.enabled", "value": true])
+        _ = try await invoke([
+            "op": "set",
+            "key": "claude.kimi.model_behavior",
+            "value": "claudeSlotMapping"
+        ])
+        _ = try await invoke([
+            "op": "set",
+            "key": "claude.kimi.haiku_model",
+            "value": "kimi-haiku"
+        ])
+
+        let portalSnapshot = try await portal.snapshot()
+        XCTAssertEqual(portalSnapshot.values[PortalDesktopSettingKey.claudeCustomEnabled.rawValue], "true")
+        XCTAssertEqual(portalSnapshot.values[PortalDesktopSettingKey.claudeKimiModelBehavior.rawValue], "claudeSlotMapping")
+        XCTAssertEqual(portalSnapshot.values[PortalDesktopSettingKey.claudeKimiHaikuModel.rawValue], "kimi-haiku")
+        let kimiSettings = try await portal.backendSettings(for: .claudeKimi)
+        let kimi = try XCTUnwrap(kimiSettings)
+        XCTAssertEqual(kimi.modelBehavior, .claudeSlotMapping)
+        XCTAssertEqual(kimi.haikuModel, "kimi-haiku")
+        let customSettings = try await portal.backendSettings(for: .claudeCustom)
+        let custom = try XCTUnwrap(customSettings)
+        XCTAssertTrue(custom.isEnabled)
+
+        do {
+            _ = try await invoke(["op": "set", "key": "cli.token", "value": "sk-secret"])
+            XCTFail("MCP must not accept a parallel CLI token store")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertTrue(error.message.contains("connection APIs"), error.message)
+        }
+        do {
+            _ = try await invoke(["op": "set", "key": "claude.credential", "value": "sk-secret"])
+            XCTFail("MCP must not accept credential-shaped keys")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertTrue(error.message.contains("connection APIs"), error.message)
+        }
     }
 
     func testAppSettingsWorkspaceApprovalKeysWriteTheTypedStoreAndAreNotAlwaysOn() async throws {

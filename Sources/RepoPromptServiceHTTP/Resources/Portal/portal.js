@@ -1815,7 +1815,7 @@
           ],
           claudeKimi: [
             "Kimi API Key",
-            "Save the key for Kimi's coding backend. Kimi manages model selection, so RepoPrompt does not pass --model.",
+            "Save the key for Kimi's coding backend. Model behavior and slot mappings live in the backend settings below.",
           ],
         };
         body.append(
@@ -1890,6 +1890,8 @@
       }
     } else if (externalCLIAuthenticationMethods[provider.providerID]) {
       body.append(externalCLIConnectPanel(provider));
+      if (provider.providerID === "claudeCompatible")
+        body.append(providerRuntimeControls(provider));
     } else {
       body.append(
         element(
@@ -2125,11 +2127,7 @@
           "Claude searches for each tool before use; this saves context but adds latency.",
           true,
         ),
-        desktopRow(
-          "Sys Prompt Packaging",
-          "Desktop also offers Replace System Prompt and User Message (No Native). The shared Claude runtime currently sends RepoPrompt instructions as a user message and keeps Claude Code's native prompt.",
-          element("span", "required-pill", "User Message (Keep Native)"),
-        ),
+        promptDeliveryPicker(),
       );
     } else {
       card.append(
@@ -2226,8 +2224,12 @@
           displayName: "claudeKimiDisplayName",
           baseURL: "claudeKimiBaseURL",
           auth: "claudeKimiAuthHeader",
+          behavior: "claudeKimiModelBehavior",
+          haiku: "claudeKimiHaikuModel",
+          sonnet: "claudeKimiSonnetModel",
+          opus: "claudeKimiOpusModel",
         },
-        behavior: "noModel",
+        behavior: settingValue("claudeKimiModelBehavior", "noModel"),
       },
       claudeCustom: {
         keys: {
@@ -2250,13 +2252,24 @@
         ? "Define an Anthropic-compatible endpoint. Credential entry is unavailable because this backend does not advertise a safe configured-host validator."
         : "These runtime settings mirror the desktop backend behavior. Provider credentials are managed in the key section above.",
     );
-    card.append(
-      desktopRow(
-        "Available for new sessions",
-        "Enable this backend in the server provider catalog.",
-        providerEnabledToggle(provider),
-      ),
-    );
+    if (custom) {
+      card.append(
+        toggleSetting(
+          "claudeCustomEnabled",
+          "Available for new sessions",
+          "Same persist flag launch resolution reads. Default off.",
+          false,
+        ),
+      );
+    } else {
+      card.append(
+        desktopRow(
+          "Available for new sessions",
+          "Enable this backend in the server provider catalog.",
+          providerEnabledToggle(provider),
+        ),
+      );
+    }
 
     const form = element("form", "compatible-backend-form");
     const primaryFields = element("div", "settings-form");
@@ -2298,6 +2311,8 @@
       field(primaryFields, "displayName", "Display name");
       field(primaryFields, "baseURL", "Base URL", "url");
       addAuthField(primaryFields);
+    }
+    if (definition.keys.behavior) {
       behaviorSelect = field(
         primaryFields,
         "behavior",
@@ -2340,16 +2355,6 @@
         behavior = behaviorSelect.value;
         slots.hidden = behavior !== "claudeSlotMapping";
       });
-
-    if (provider.providerID === "claudeKimi") {
-      primaryFields.append(
-        element(
-          "p",
-          "field-wide compatible-behavior-note",
-          "Model behavior: no --model flag. Kimi's coding backend manages model selection and does not use Claude effort levels.",
-        ),
-      );
-    }
 
     if (!custom) {
       field(advancedFields, "displayName", "Display name");
@@ -2457,6 +2462,65 @@
     input.setAttribute("aria-label", label);
     toggle.append(input, element("span"));
     return { toggle, input };
+  }
+
+  function promptDeliveryChoices() {
+    return [
+      ["nativeSystemPrompt", "Replace System Prompt"],
+      [
+        "userMessageXMLWithEmptySystemPrompt",
+        "User Message (No Native)",
+      ],
+      ["userMessageXML", "User Message (Keep Native)"],
+    ];
+  }
+
+  function livePromptDelivery() {
+    return (
+      state.typedSettings.directAgentPermissions?.settings?.claude
+        ?.promptDelivery || "nativeSystemPrompt"
+    );
+  }
+
+  function promptDeliveryPicker() {
+    const select = typedSelect(
+      "Sys Prompt Packaging",
+      promptDeliveryChoices(),
+      livePromptDelivery(),
+    );
+    select.addEventListener("change", () => savePromptDelivery(select));
+    return desktopRow(
+      "Sys Prompt Packaging",
+      "Replace Claude Code's native system prompt, wrap RepoPrompt instructions in the user message, or keep the native prompt. Writes the typed Direct Agents store.",
+      select,
+    );
+  }
+
+  async function savePromptDelivery(select) {
+    const snapshot = state.typedSettings.directAgentPermissions;
+    if (!snapshot) return;
+    const settings = snapshot.settings;
+    return mutateDomain(
+      "directAgentPermissions",
+      select,
+      () =>
+        api("api/v1/settings/direct-agent-permissions", {
+          method: "PATCH",
+          body: JSON.stringify({
+            expectedRevision: snapshot.revision,
+            settings: {
+              ...settings,
+              claude: {
+                ...settings.claude,
+                promptDelivery: select.value,
+              },
+            },
+          }),
+        }),
+      (value) => {
+        state.typedSettings.directAgentPermissions = value;
+      },
+    );
   }
 
   const workspaceApprovalOperations = [
@@ -2938,6 +3002,11 @@
         "RepoPrompt Only (Strict MCP)",
         settings.claude.mcpStrictModeEnabled,
       );
+      const claudePromptDelivery = typedSelect(
+        "Sys Prompt Packaging",
+        promptDeliveryChoices(),
+        settings.claude.promptDelivery || "nativeSystemPrompt",
+      );
       const openCodeLevel = typedSelect(
         "ACP Session Mode",
         [
@@ -3056,8 +3125,8 @@
           ),
           desktopRow(
             "Sys Prompt Packaging",
-            "Desktop also offers Replace System Prompt and User Message (No Native). The shared Claude runtime currently sends RepoPrompt instructions as a user message and keeps Claude Code's native prompt.",
-            element("span", "required-pill", "User Message (Keep Native)"),
+            "Replace Claude Code's native system prompt, wrap RepoPrompt instructions in the user message, or keep the native prompt.",
+            claudePromptDelivery,
           ),
         );
       }
@@ -3107,6 +3176,7 @@
                     permissionMode: claudeMode.value,
                     bashEnabled: claudeBash.input.checked,
                     mcpStrictModeEnabled: claudeStrict.input.checked,
+                    promptDelivery: claudePromptDelivery.value,
                   },
                   openCode: { permissionLevel: openCodeLevel.value },
                   cursor: { permissionLevel: cursorLevel.value },
@@ -5350,6 +5420,16 @@
     );
   }
 
+  function livePromptDeliveryLabel(mode) {
+    return (
+      {
+        nativeSystemPrompt: "Replace System Prompt",
+        userMessageXMLWithEmptySystemPrompt: "User Message (No Native)",
+        userMessageXML: "User Message (Keep Native)",
+      }[mode] || "Replace System Prompt"
+    );
+  }
+
   function liveManagedPermissionLabel(providerID) {
     const settings = state.typedSettings.directAgentPermissions?.settings;
     const level =
@@ -5483,9 +5563,9 @@
       [
         "Claude",
         permissionSettings
-          ? liveClaudePermissionLabel(permissionSettings.claude.permissionMode)
+          ? `${liveClaudePermissionLabel(permissionSettings.claude.permissionMode)} · ${livePromptDeliveryLabel(permissionSettings.claude.promptDelivery)}`
           : "Loading",
-        "Typed permission mode, Bash, and MCP-strict.",
+        "Typed permission mode, Bash, MCP-strict, and Sys Prompt Packaging.",
       ],
       [
         "OpenCode",

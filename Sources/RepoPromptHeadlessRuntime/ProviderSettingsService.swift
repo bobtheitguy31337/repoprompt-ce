@@ -1124,6 +1124,9 @@ public actor ProviderSettingsService {
             guard externallyProvisioned(providerID) else { return .init(ready: false, reason: .missingCredential, detail: "Provider credential is not configured") }
         }
         if connection?.expiresAt.map({ $0 <= Date() }) == true { return .init(ready: false, reason: .invalidCredential, detail: "Provider credential has expired") }
+        // Server readiness: `connected && testState == valid`. This is not
+        // Desktop's UserDefaults `ClaudeCodeCompatibleBackendConfigured.<id>`
+        // latch. Do not replace this predicate with a fake configured flag.
         if connection?.testState == .invalid { return .init(ready: false, reason: .invalidCredential, detail: "Provider rejected the configured credential") }
         if let connection, connection.testState != .valid {
             return .init(ready: false, reason: .authenticationPending, detail: connection.detail ?? "Provider credential requires validation")
