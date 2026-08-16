@@ -4,6 +4,9 @@ public enum ServerSettingsDomain: String, Codable, CaseIterable, Sendable {
     case agentModels
     case subagentPermissions
     case directAgentPermissions
+    case workspaceApprovals
+    case mcpDisabledTools
+    case mcpShowModelPresets
     case contextBuilder
     case mcpModelPresets
     case advanced

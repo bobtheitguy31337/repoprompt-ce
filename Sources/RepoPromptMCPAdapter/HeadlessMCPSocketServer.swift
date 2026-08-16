@@ -155,10 +155,12 @@ public actor HeadlessMCPSocketServer {
             logger.warning("MCP session not found", metadata: ["session": "\(handshake.sessionID)"])
             return
         }
-        let binding = RepoPromptMCPBinding(sessionID: snapshot.sessionID, actor: snapshot.creator)
-        let visibleNames = HeadlessCodexMCPToolPolicy.advertisedToolNames(
-            isRootSession: snapshot.parentSessionID == nil
+        let binding = RepoPromptMCPBinding(
+            sessionID: snapshot.sessionID,
+            actor: snapshot.creator,
+            mcpClientID: RepoPromptMCPBinding.untrustedClientID
         )
+        let isRootSession = snapshot.parentSessionID == nil
         let classification = MCPClientToolPolicyCatalog.classification(for: .agentModeCodexEngineer)
         let server = Server(
             name: "RepoPrompt CE",
@@ -168,7 +170,9 @@ public actor HeadlessMCPSocketServer {
             capabilities: .init(tools: .init(listChanged: false)),
             configuration: .init(strict: true, responseSendTimeout: .seconds(5))
         )
+        let adapter = adapter
         await server.withMethodHandler(ListTools.self) { _ in
+            let visibleNames = await adapter.advertisedToolNames(isRootSession: isRootSession)
             let tools = MCPDomainCanonicalToolDefinitions.definitions.compactMap { definition -> MCP.Tool? in
                 guard visibleNames.contains(definition.name) else { return nil }
                 let projected = definition.annotations.projected(for: classification.annotationProfile)
@@ -187,8 +191,8 @@ public actor HeadlessMCPSocketServer {
             }
             return ListTools.Result(tools: tools)
         }
-        let adapter = adapter
         await server.withMethodHandler(CallTool.self) { params in
+            let visibleNames = await adapter.advertisedToolNames(isRootSession: isRootSession)
             guard visibleNames.contains(params.name) else {
                 return Self.errorResult("Tool is unavailable for this client policy: \(params.name)")
             }

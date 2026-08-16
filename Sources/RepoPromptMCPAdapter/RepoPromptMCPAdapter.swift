@@ -8,10 +8,21 @@ import RepoPromptServiceProtocol
 public struct RepoPromptMCPBinding: Sendable {
     public let sessionID: UUID
     public let actor: ExternalActor
+    /// Desktop `currentClientIdentifier()` — MCP initialize name, not the HTTP actor.
+    public let mcpClientID: String
 
-    public init(sessionID: UUID, actor: ExternalActor) {
+    /// Goblin / chat-server Agent Mode sockets are not a Desktop MCP client.
+    /// Always Allow matches initialize `clientInfo.name`, never the HTTP actor.
+    public static let untrustedClientID = "unknown-client"
+
+    public init(
+        sessionID: UUID,
+        actor: ExternalActor,
+        mcpClientID: String = RepoPromptMCPBinding.untrustedClientID
+    ) {
         self.sessionID = sessionID
         self.actor = actor
+        self.mcpClientID = mcpClientID
     }
 }
 
@@ -43,6 +54,12 @@ public actor RepoPromptMCPAdapter {
         try await authority.events(after: cursor, limit: limit)
     }
 
+    public func advertisedToolNames(isRootSession: Bool) async -> Set<String> {
+        var names = HeadlessCodexMCPToolPolicy.advertisedToolNames(isRootSession: isRootSession)
+        names.subtract(await authority.disabledMCPToolNames())
+        return names
+    }
+
     public func invoke(
         toolName: String,
         argumentsJSON: Data,
@@ -50,6 +67,9 @@ public actor RepoPromptMCPAdapter {
     ) async throws -> Data {
         guard Self.canonicalToolNames.contains(toolName) else {
             throw ServiceAPIError(code: .capabilityMissing, message: "Unknown canonical MCP tool")
+        }
+        if await authority.disabledMCPToolNames().contains(toolName) {
+            throw ServiceAPIError(code: .invalidRequest, message: "Tool '\(toolName)' is disabled.")
         }
         let arguments = try JSONDecoder().decode([String: Value].self, from: argumentsJSON)
         let invocation = try await authority.beginToolInvocation(sessionID: binding.sessionID, toolName: toolName, argumentDigest: CanonicalSigning.bodyDigest(argumentsJSON), actor: binding.actor)
@@ -325,8 +345,15 @@ private actor AuthorityToolBackend {
              "direct_agents.claude.mcp_strict",
              "direct_agents.opencode.permission_level",
              "direct_agents.cursor.permission_level",
-             "subagents.policy":
+             "subagents.policy",
+             "mcp.show_model_presets":
             return try await permissionAppSetting(key: key)
+        case "workspace.auto_approve_all",
+             "workspace.auto_approve.create_workspace",
+             "workspace.auto_approve.delete_workspace",
+             "workspace.auto_approve.add_folder",
+             "workspace.auto_approve.remove_folder":
+            return try await workspaceAppSetting(key: key)
         default:
             throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
         }
@@ -348,6 +375,14 @@ private actor AuthorityToolBackend {
             return try await replacePermissionAppSetting(key: key, value: value)
         case "subagents.policy":
             return try await replaceSubagentPolicyAppSetting(value: value)
+        case "mcp.show_model_presets":
+            return try await replaceShowModelPresetsAppSetting(value: value)
+        case "workspace.auto_approve_all",
+             "workspace.auto_approve.create_workspace",
+             "workspace.auto_approve.delete_workspace",
+             "workspace.auto_approve.add_folder",
+             "workspace.auto_approve.remove_folder":
+            return try await replaceWorkspaceAppSetting(key: key, value: value)
         default:
             throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
         }
@@ -377,6 +412,8 @@ private actor AuthorityToolBackend {
             value = .string(settings.cursor.permissionLevel.rawValue)
         case "subagents.policy":
             value = .string(try await authority.subagentPermissions().settings.policy.rawValue)
+        case "mcp.show_model_presets":
+            value = .bool(try await authority.showModelPresets().settings.showModelPresets)
         default:
             throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
         }
@@ -432,6 +469,54 @@ private actor AuthorityToolBackend {
             attribution: settingsAttribution
         )
         return try await permissionAppSetting(key: "subagents.policy")
+    }
+
+    private func replaceShowModelPresetsAppSetting(value: Value?) async throws -> Value {
+        let current = try await authority.showModelPresets()
+        let enabled = try Self.boolValue(value, key: "mcp.show_model_presets")
+        _ = try await authority.setShowModelPresets(
+            enabled,
+            expectedRevision: current.revision,
+            attribution: settingsAttribution
+        )
+        return try await permissionAppSetting(key: "mcp.show_model_presets")
+    }
+
+    private static let workspaceAutoApproveOperationKeys: [String: WorkspaceApprovalOperation] = [
+        "workspace.auto_approve.create_workspace": .createWorkspace,
+        "workspace.auto_approve.delete_workspace": .deleteWorkspace,
+        "workspace.auto_approve.add_folder": .addFolder,
+        "workspace.auto_approve.remove_folder": .removeFolder
+    ]
+
+    private func workspaceAppSetting(key: String) async throws -> Value {
+        let settings = try await authority.workspaceApprovals().settings
+        let value: Value
+        if key == "workspace.auto_approve_all" {
+            value = .bool(settings.autoApproveAll)
+        } else if let operation = Self.workspaceAutoApproveOperationKeys[key] {
+            value = .bool(settings.autoApproveOperations.contains(operation))
+        } else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
+        }
+        return .object(["key": .string(key), "value": value])
+    }
+
+    private func replaceWorkspaceAppSetting(key: String, value: Value?) async throws -> Value {
+        let current = try await authority.workspaceApprovals()
+        var settings = current.settings
+        if key == "workspace.auto_approve_all" {
+            settings.autoApproveAll = try Self.boolValue(value, key: key)
+        } else if let operation = Self.workspaceAutoApproveOperationKeys[key] {
+            settings.setAutoApproveOperation(operation, enabled: try Self.boolValue(value, key: key))
+        } else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
+        }
+        _ = try await authority.replaceWorkspaceApprovals(
+            .init(expectedRevision: current.revision, settings: settings),
+            attribution: settingsAttribution
+        )
+        return try await workspaceAppSetting(key: key)
     }
 
     private var settingsAttribution: SettingsMutationAttribution {
@@ -563,6 +648,10 @@ private actor AuthorityToolBackend {
     }
 
     private func manageWorkspaces(_ arguments: [String: Value]) async throws -> Value {
+        let action = arguments["action"]?.stringValue ?? arguments["op"]?.stringValue ?? "list"
+        if let operation = WorkspaceApprovalOperation(mcpAction: action) {
+            try await authority.authorizeWorkspaceOperation(operation, clientID: binding.mcpClientID)
+        }
         let operation = arguments["op"]?.stringValue ?? "list"
         let projects = await authority.projectSnapshots()
         let sessions = try await authority.sessionSnapshots()

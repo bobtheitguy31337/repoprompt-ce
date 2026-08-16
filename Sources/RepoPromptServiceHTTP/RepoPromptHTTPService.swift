@@ -293,6 +293,36 @@ public struct RepoPromptHTTPService: Sendable {
             let input = try await JSONDecoder.serviceDecoder.decode(ReplaceAdvancedServerSettingsRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().replaceAdvanced(input, attribution: principal.settingsAttribution))
         } }
+        router.get("/portal/api/v1/settings/workspace-approvals") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            return try await portalJSON(requireServerSettings().workspaceApprovals())
+        } }
+        router.patch("/portal/api/v1/settings/workspace-approvals") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let input = try await JSONDecoder.serviceDecoder.decode(ReplaceWorkspaceApprovalSettingsRequest.self, from: bodyData(request))
+            return try await portalJSON(requireServerSettings().replaceWorkspaceApprovals(input, attribution: principal.settingsAttribution))
+        } }
+        router.get("/portal/api/v1/settings/mcp-disabled-tools") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            return try await portalJSON(requireServerSettings().mcpDisabledTools())
+        } }
+        router.patch("/portal/api/v1/settings/mcp-disabled-tools") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let input = try await JSONDecoder.serviceDecoder.decode(ReplaceMCPDisabledToolsSettingsRequest.self, from: bodyData(request))
+            return try await portalJSON(requireServerSettings().replaceMCPDisabledTools(input, attribution: principal.settingsAttribution))
+        } }
+        router.get("/portal/api/v1/settings/show-model-presets") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            return try await portalJSON(requireServerSettings().showModelPresets())
+        } }
+        router.patch("/portal/api/v1/settings/show-model-presets") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let input = try await JSONDecoder.serviceDecoder.decode(ReplaceMCPShowModelPresetsSettingsRequest.self, from: bodyData(request))
+            return try await portalJSON(requireServerSettings().replaceShowModelPresets(input, attribution: principal.settingsAttribution))
+        } }
         router.get("/portal/api/v1/sessions/:id/selection") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(context: context)
             let sessionID = try context.parameters.require("id", as: UUID.self)

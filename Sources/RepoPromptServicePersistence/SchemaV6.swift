@@ -1,7 +1,10 @@
 enum SchemaV6 {
     static let version = 6
-    static let digest = "repoprompt-service-schema-v6-typed-direct-agent-permissions"
+    static let digest = "repoprompt-service-schema-v6-typed-mcp-show-model-presets"
     static let compatiblePriorDigests: Set<String> = [
+        "repoprompt-service-schema-v6-typed-mcp-disabled-tools",
+        "repoprompt-service-schema-v6-typed-workspace-approvals",
+        "repoprompt-service-schema-v6-typed-direct-agent-permissions",
         "repoprompt-service-schema-v6-typed-settings-workflows-direct-providers-cas-audit",
         "repoprompt-service-schema-v6-agent-composer-semantic-acceptance",
         "repoprompt-service-schema-v6-typed-settings-agent-composer-semantic-acceptance"
@@ -11,6 +14,9 @@ enum SchemaV6 {
         "CREATE TABLE IF NOT EXISTS agent_model_profiles(scope_id TEXT PRIMARY KEY,project_id TEXT,profile_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",
         "CREATE TABLE IF NOT EXISTS subagent_permission_settings(fixed_id INTEGER PRIMARY KEY CHECK(fixed_id=1),settings_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",
         "CREATE TABLE IF NOT EXISTS direct_agent_permission_settings(fixed_id INTEGER PRIMARY KEY CHECK(fixed_id=1),settings_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS workspace_approval_settings(fixed_id INTEGER PRIMARY KEY CHECK(fixed_id=1),settings_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS mcp_disabled_tools(fixed_id INTEGER PRIMARY KEY CHECK(fixed_id=1),settings_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS mcp_show_model_presets(fixed_id INTEGER PRIMARY KEY CHECK(fixed_id=1),settings_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",
         "CREATE TABLE IF NOT EXISTS context_builder_settings(scope_id TEXT PRIMARY KEY,project_id TEXT,settings_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",
         "CREATE TABLE IF NOT EXISTS mcp_model_presets(fixed_id INTEGER PRIMARY KEY CHECK(fixed_id=1),presets_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",
         "CREATE TABLE IF NOT EXISTS advanced_server_settings(fixed_id INTEGER PRIMARY KEY CHECK(fixed_id=1),settings_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",

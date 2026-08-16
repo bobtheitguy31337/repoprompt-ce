@@ -74,6 +74,9 @@
       contextBuilder: null,
       modelPresets: null,
       advanced: null,
+      workspaceApprovals: null,
+      mcpDisabledTools: null,
+      showModelPresets: null,
       selectionPresets: null,
       workflows: null,
       selections: {},
@@ -595,6 +598,21 @@
       case "advanced":
         state.typedSettings.advanced = await api("api/v1/settings/advanced");
         break;
+      case "workspaceApprovals":
+        state.typedSettings.workspaceApprovals = await api(
+          "api/v1/settings/workspace-approvals",
+        );
+        break;
+      case "mcpDisabledTools":
+        state.typedSettings.mcpDisabledTools = await api(
+          "api/v1/settings/mcp-disabled-tools",
+        );
+        break;
+      case "showModelPresets":
+        state.typedSettings.showModelPresets = await api(
+          "api/v1/settings/show-model-presets",
+        );
+        break;
       case "selectionPresets":
         state.typedSettings.selectionPresets = projectID
           ? await api(
@@ -644,6 +662,9 @@
       loadSettingsDomain("contextBuilder"),
       loadSettingsDomain("modelPresets"),
       loadSettingsDomain("advanced"),
+      loadSettingsDomain("workspaceApprovals"),
+      loadSettingsDomain("mcpDisabledTools"),
+      loadSettingsDomain("showModelPresets"),
       loadSettingsDomain("selectionPresets"),
       loadSettingsDomain("workflows"),
       loadSettingsDomain("selection"),
@@ -2424,6 +2445,85 @@
     return { toggle, input };
   }
 
+  const workspaceApprovalOperations = [
+    ["create_workspace", "Create Workspace", "Create a desktop workspace."],
+    ["delete_workspace", "Delete Workspace", "Delete a desktop workspace."],
+    ["add_folder", "Add Folder", "Attach a folder to a desktop workspace."],
+    [
+      "remove_folder",
+      "Remove Folder",
+      "Detach a folder from a desktop workspace.",
+    ],
+  ];
+
+  function cloneWorkspaceApprovalSettings(snapshot) {
+    return {
+      autoApproveAll: !!snapshot.settings?.autoApproveAll,
+      autoApproveOperations: [
+        ...(snapshot.settings?.autoApproveOperations || []),
+      ],
+      clientPolicies: JSON.parse(
+        JSON.stringify(snapshot.settings?.clientPolicies || {}),
+      ),
+    };
+  }
+
+  function saveWorkspaceApprovals(snapshot, mutateSettings, control) {
+    const settings = cloneWorkspaceApprovalSettings(snapshot);
+    mutateSettings(settings);
+    return mutateDomain(
+      "workspaceApprovals",
+      control,
+      () =>
+        api("api/v1/settings/workspace-approvals", {
+          method: "PATCH",
+          body: JSON.stringify({
+            expectedRevision: snapshot.revision,
+            settings,
+          }),
+        }),
+      (value) => {
+        state.typedSettings.workspaceApprovals = value;
+      },
+    );
+  }
+
+  function saveMCPDisabledTools(snapshot, disabledTools, control) {
+    return mutateDomain(
+      "mcpDisabledTools",
+      control,
+      () =>
+        api("api/v1/settings/mcp-disabled-tools", {
+          method: "PATCH",
+          body: JSON.stringify({
+            expectedRevision: snapshot.revision,
+            settings: { disabledTools: [...disabledTools] },
+          }),
+        }),
+      (value) => {
+        state.typedSettings.mcpDisabledTools = value;
+      },
+    );
+  }
+
+  function saveShowModelPresets(snapshot, enabled, control) {
+    return mutateDomain(
+      "showModelPresets",
+      control,
+      () =>
+        api("api/v1/settings/show-model-presets", {
+          method: "PATCH",
+          body: JSON.stringify({
+            expectedRevision: snapshot.revision,
+            settings: { showModelPresets: enabled },
+          }),
+        }),
+      (value) => {
+        state.typedSettings.showModelPresets = value;
+      },
+    );
+  }
+
   function agentTargetValue(target) {
     if (!target) return "";
     return [
@@ -3937,6 +4037,11 @@
 
   function renderMCPServer() {
     const tools = state.bootstrap?.tools || [];
+    const snapshot = state.typedSettings.showModelPresets;
+    if (!snapshot) {
+      settingsPage("MCP Server", "Loading MCP server settings…", "server", []);
+      return;
+    }
     const status = desktopCard(
       "MCP Server",
       "RepoPrompt's MCP surface is part of the shared service lifecycle. Browser users cannot start, stop, or reconfigure the process independently.",
@@ -3948,6 +4053,13 @@
     );
     toolsLink.href = "#settings/mcp-tools";
     toolsLink.dataset.routeLink = "";
+    const presets = typedToggle(
+      "Use Oracle Model Presets for MCP",
+      !!snapshot.settings.showModelPresets,
+    );
+    presets.input.addEventListener("change", () =>
+      saveShowModelPresets(snapshot, presets.input.checked, presets.input),
+    );
     status.append(
       desktopRow(
         "Server Status",
@@ -3957,6 +4069,11 @@
           state.online ? "required-pill" : "connection-badge attention",
           state.online ? "Running" : "Unavailable",
         ),
+      ),
+      desktopRow(
+        "Use Oracle Model Presets for MCP",
+        "When off, list_models omits named presets and ask_oracle / oracle_send fail-closed on preset IDs.",
+        presets.toggle,
       ),
       desktopRow(
         "Tools",
@@ -3993,11 +4110,6 @@
           "Desktop-only",
           "Installers modify a local user's tool configuration and filesystem.",
         ],
-        [
-          "Oracle model presets",
-          "Typed server repository",
-          "Manage named chat/plan/review routes on the Model Presets page.",
-        ],
       ],
     );
     settingsPage(
@@ -4010,9 +4122,16 @@
 
   function renderMCPTools() {
     const tools = state.bootstrap?.tools || [];
+    const snapshot = state.typedSettings.mcpDisabledTools;
+    if (!snapshot) {
+      settingsPage("Tools", "Loading MCP tool availability…", "sliders", []);
+      return;
+    }
+    const disabled = new Set(snapshot.settings.disabledTools || []);
+    const enabledCount = tools.filter((tool) => !disabled.has(tool.name)).length;
     const card = desktopCard(
       "Advertised MCP Tools",
-      "The canonical tool catalog comes from the same server runtime that registers the tools. Admission remains server policy, so no browser toggles are rendered.",
+      "Enable or disable individual MCP tools advertised by this server. Disabled names are omitted from the live catalog and fail closed on invoke.",
     );
     const toolbar = element("div", "tool-catalog-toolbar");
     const searchLabel = element("label", "tool-search-field");
@@ -4047,10 +4166,17 @@
             `${humanize(tool.capability)} capability · ${humanize(tool.admissionClass)} admission`,
           ),
         );
+        const toggle = typedToggle(tool.name, !disabled.has(tool.name));
+        toggle.input.addEventListener("change", () => {
+          const next = new Set(disabled);
+          if (toggle.input.checked) next.delete(tool.name);
+          else next.add(tool.name);
+          saveMCPDisabledTools(snapshot, next, toggle.input);
+        });
         const badges = element("div", "tool-badges");
         badges.append(
           element("span", "required-pill", humanize(tool.scope)),
-          element("span", "read-only-pill", "Service-managed"),
+          toggle.toggle,
         );
         row.append(copy, badges);
         list.append(row);
@@ -4069,85 +4195,148 @@
     card.append(toolbar, list);
     settingsPage(
       "Tools",
-      "Search every MCP tool advertised by the shared RepoPrompt runtime.",
+      "Search and toggle every MCP tool advertised by the shared RepoPrompt runtime.",
       "sliders",
       [card],
       recommendation(
         "check",
-        `${tools.length} tools advertised`,
-        "This list is generated from MCPDomainToolCatalog rather than a partial browser-maintained list.",
+        `${enabledCount} of ${tools.length} enabled`,
+        "This list is generated from MCPDomainToolCatalog and writes the typed mcp.disabledTools store.",
       ),
     );
   }
 
   function renderWorkspaceApprovals() {
-    const server = informationalCard(
-      "Shared Server Authorization",
-      "The web service authenticates portal requests and applies server-side mutation policy. It does not inherit the desktop app's per-MCP-client trust database.",
-      [
-        [
-          "Portal mutations",
-          "Authenticated + CSRF-protected",
-          "Authorization is enforced by the HTTP service and project/session authority.",
-        ],
-        [
-          "MCP mutations",
-          "Server policy",
-          "Tool admission and mutation boundaries are evaluated by the shared runtime.",
-        ],
-        [
-          "Trusted desktop clients",
-          "Not applicable",
-          "There is no local macOS client identity to approve or revoke in the browser.",
-        ],
-      ],
+    const snapshot = state.typedSettings.workspaceApprovals;
+    if (!snapshot) {
+      settingsPage(
+        "Workspace Approvals",
+        "Loading workspace approvals…",
+        "shield",
+        [],
+      );
+      return;
+    }
+    const settings = snapshot.settings || {};
+    const operations = new Set(settings.autoApproveOperations || []);
+    const master = desktopCard(
+      "Global Settings",
+      "Approvals for RepoPrompt workspace operations (creating folders, deleting workspaces, etc.). CLI agent and sub-agent permissions are configured in Agent Permissions.",
     );
-    const desktop = informationalCard(
-      "Desktop Workspace Approvals",
-      "For comparison, the canonical desktop page controls automatic approval of four workspace-management operations; it is not a generic write/git/worktree permission page.",
-      [
-        [
-          "Master control",
-          "Auto-approve All Operations",
-          "Bypasses prompts for the four desktop workspace-management mutations.",
-        ],
-        [
-          "Create Workspace",
-          "Per-operation approval",
-          "Create a desktop workspace.",
-        ],
-        [
-          "Delete Workspace",
-          "Per-operation approval",
-          "Delete a desktop workspace.",
-        ],
-        [
-          "Add Folder",
-          "Per-operation approval",
-          "Attach a folder to a desktop workspace.",
-        ],
-        [
-          "Remove Folder",
-          "Per-operation approval",
-          "Detach a folder from a desktop workspace.",
-        ],
-        [
-          "Trusted clients",
-          "Revoke / reset",
-          "Desktop tracks which external MCP clients received approval.",
-        ],
-      ],
+    const autoApproveAll = typedToggle(
+      "Auto-approve All Operations",
+      !!settings.autoApproveAll,
     );
+    autoApproveAll.input.addEventListener("change", () =>
+      saveWorkspaceApprovals(
+        snapshot,
+        (next) => {
+          next.autoApproveAll = autoApproveAll.input.checked;
+        },
+        autoApproveAll.input,
+      ),
+    );
+    master.append(
+      desktopRow(
+        "Auto-approve All Operations",
+        "Skip approval prompts for all workspace operations from all clients.",
+        autoApproveAll.toggle,
+      ),
+    );
+    if (settings.autoApproveAll) {
+      master.append(
+        element(
+          "p",
+          "empty-inline",
+          "All workspace operations will be automatically approved without confirmation.",
+        ),
+      );
+    }
+    const perOp = desktopCard(
+      "Operation Permissions",
+      "Auto-approve specific operations globally. Unlisted operations stay fail-closed unless a trusted client Always Allow matches.",
+    );
+    workspaceApprovalOperations.forEach(([value, title, detail]) => {
+      const toggle = typedToggle(title, operations.has(value));
+      toggle.input.disabled = !!settings.autoApproveAll;
+      toggle.input.addEventListener("change", () =>
+        saveWorkspaceApprovals(
+          snapshot,
+          (next) => {
+            const listed = new Set(next.autoApproveOperations);
+            if (toggle.input.checked) listed.add(value);
+            else listed.delete(value);
+            next.autoApproveOperations = [...listed];
+          },
+          toggle.input,
+        ),
+      );
+      perOp.append(desktopRow(title, detail, toggle.toggle));
+    });
+    const trusted = desktopCard(
+      "Trusted Clients",
+      'Clients that received Always Allow appear here. Chat-server is not a trusted client by default.',
+    );
+    const policies = Object.values(settings.clientPolicies || {}).sort((left, right) =>
+      String(left.clientID || "").localeCompare(String(right.clientID || "")),
+    );
+    if (policies.length) {
+      const reset = element("button", "secondary-button", "Reset All");
+      reset.type = "button";
+      reset.addEventListener("click", async () => {
+        const confirmed = await confirmAction({
+          title: "Reset All Trusted Clients?",
+          message:
+            "This will remove all per-client auto-approve settings. You'll be prompted for approval on future operations.",
+          label: "Reset",
+          returnFocus: reset,
+        });
+        if (!confirmed) return;
+        saveWorkspaceApprovals(
+          snapshot,
+          (next) => {
+            next.clientPolicies = {};
+          },
+          reset,
+        );
+      });
+      trusted.append(reset);
+      policies.forEach((policy) => {
+        const allowed = [...(policy.allowedOperations || [])].join(", ") || "none";
+        const revoke = element("button", "secondary-button", "Revoke");
+        revoke.type = "button";
+        revoke.setAttribute("aria-label", `Revoke ${policy.clientID}`);
+        revoke.addEventListener("click", () =>
+          saveWorkspaceApprovals(
+            snapshot,
+            (next) => {
+              delete next.clientPolicies[policy.clientID];
+            },
+            revoke,
+          ),
+        );
+        trusted.append(
+          desktopRow(
+            policy.clientID || "unknown-client",
+            `Always Allow: ${allowed}`,
+            revoke,
+          ),
+        );
+      });
+    } else {
+      trusted.append(
+        element(
+          "p",
+          "empty-inline",
+          'No Trusted Clients. When you approve operations with "Always Allow", clients will appear here.',
+        ),
+      );
+    }
     settingsPage(
       "Workspace Approvals",
-      "Understand the shared-server authorization boundary and the distinct desktop approval map.",
+      "Control automatic approval of the four workspace-management operations. Missing settings stay fail-closed.",
       "shield",
-      [server, desktop],
-      recommendation(
-        "shield",
-        "No invented approval toggles",
-        "The previous portal controls had different semantics and were not consumed by server policy.",
-      ),
+      [master, perOp, trusted],
     );
   }
 
@@ -4157,9 +4346,12 @@
       settingsPage("Model Presets", "Loading model presets…", "model", []);
       return;
     }
+    const presetsGate = state.typedSettings.showModelPresets;
     const card = desktopCard(
       "Oracle Model Presets",
-      "This ordered revisioned collection is consumed by list_models, ask_oracle, and oracle_send. Disabled or unavailable targets fail explicitly.",
+      presetsGate?.settings?.showModelPresets
+        ? "This ordered revisioned collection is consumed by list_models, ask_oracle, and oracle_send. Disabled or unavailable targets fail explicitly."
+        : "Named presets are hidden from list_models until Use Oracle Model Presets for MCP is enabled on the MCP Server page. ask_oracle and oracle_send fail-closed on preset IDs while the gate is off.",
     );
     const form = element("form", "typed-settings-form");
     const rowsContainer = element("div", "model-preset-rows");

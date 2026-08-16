@@ -74,3 +74,39 @@ public struct ReplaceMCPModelPresetsRequest: Codable, Hashable, Sendable {
         self.presets = presets
     }
 }
+
+/// Desktop `scalarPreferences.mcp.showModelPresets`. Missing key → **false**.
+public struct MCPShowModelPresetsSettings: Codable, Hashable, Sendable {
+    public var showModelPresets: Bool
+
+    public init(showModelPresets: Bool = false) {
+        self.showModelPresets = showModelPresets
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        showModelPresets = try container.decodeIfPresent(Bool.self, forKey: .showModelPresets) ?? false
+    }
+}
+
+public struct MCPShowModelPresetsSettingsSnapshot: Codable, Hashable, Sendable {
+    public let settings: MCPShowModelPresetsSettings
+    public let revision: Int64
+    public let updatedAt: Date
+
+    public init(settings: MCPShowModelPresetsSettings, revision: Int64, updatedAt: Date) {
+        self.settings = settings
+        self.revision = revision
+        self.updatedAt = updatedAt
+    }
+}
+
+public struct ReplaceMCPShowModelPresetsSettingsRequest: Codable, Hashable, Sendable {
+    public let expectedRevision: Int64
+    public let settings: MCPShowModelPresetsSettings
+
+    public init(expectedRevision: Int64, settings: MCPShowModelPresetsSettings) {
+        self.expectedRevision = expectedRevision
+        self.settings = settings
+    }
+}

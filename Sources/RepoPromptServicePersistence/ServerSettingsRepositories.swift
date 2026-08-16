@@ -59,6 +59,66 @@ public extension SQLiteServiceStore {
         )
     }
 
+    func workspaceApprovalDocument() async throws -> StoredSettingsDocument<WorkspaceApprovalSettings>? {
+        try await readSettingsDocument(.workspaceApprovals, scopeID: "global")
+    }
+
+    @discardableResult
+    func upsertWorkspaceApprovalDocument(
+        _ document: StoredSettingsDocument<WorkspaceApprovalSettings>,
+        expectedRevision: Int64,
+        audit: ServerSettingsAuditMutation
+    ) async throws -> StoredSettingsDocument<WorkspaceApprovalSettings> {
+        try await upsertSettingsDocument(
+            document,
+            repository: .workspaceApprovals,
+            scopeID: "global",
+            projectID: nil,
+            expectedRevision: expectedRevision,
+            audit: audit
+        )
+    }
+
+    func mcpDisabledToolsDocument() async throws -> StoredSettingsDocument<MCPDisabledToolsSettings>? {
+        try await readSettingsDocument(.mcpDisabledTools, scopeID: "global")
+    }
+
+    @discardableResult
+    func upsertMCPDisabledToolsDocument(
+        _ document: StoredSettingsDocument<MCPDisabledToolsSettings>,
+        expectedRevision: Int64,
+        audit: ServerSettingsAuditMutation
+    ) async throws -> StoredSettingsDocument<MCPDisabledToolsSettings> {
+        try await upsertSettingsDocument(
+            document,
+            repository: .mcpDisabledTools,
+            scopeID: "global",
+            projectID: nil,
+            expectedRevision: expectedRevision,
+            audit: audit
+        )
+    }
+
+    func mcpShowModelPresetsDocument() async throws -> StoredSettingsDocument<MCPShowModelPresetsSettings>? {
+        try await readSettingsDocument(.mcpShowModelPresets, scopeID: "global")
+    }
+
+    @discardableResult
+    func upsertMCPShowModelPresetsDocument(
+        _ document: StoredSettingsDocument<MCPShowModelPresetsSettings>,
+        expectedRevision: Int64,
+        audit: ServerSettingsAuditMutation
+    ) async throws -> StoredSettingsDocument<MCPShowModelPresetsSettings> {
+        try await upsertSettingsDocument(
+            document,
+            repository: .mcpShowModelPresets,
+            scopeID: "global",
+            projectID: nil,
+            expectedRevision: expectedRevision,
+            audit: audit
+        )
+    }
+
     func directAgentPermissionDocument() async throws -> StoredSettingsDocument<DirectAgentPermissionsSettings>? {
         try await readSettingsDocument(.directAgentPermissions, scopeID: "global")
     }
@@ -212,6 +272,9 @@ private enum SettingsRepository {
     case agentModels
     case subagentPermissions
     case directAgentPermissions
+    case workspaceApprovals
+    case mcpDisabledTools
+    case mcpShowModelPresets
     case contextBuilder
     case mcpModelPresets
     case advanced
@@ -222,6 +285,9 @@ private enum SettingsRepository {
         case .agentModels: .agentModels
         case .subagentPermissions: .subagentPermissions
         case .directAgentPermissions: .directAgentPermissions
+        case .workspaceApprovals: .workspaceApprovals
+        case .mcpDisabledTools: .mcpDisabledTools
+        case .mcpShowModelPresets: .mcpShowModelPresets
         case .contextBuilder: .contextBuilder
         case .mcpModelPresets: .mcpModelPresets
         case .advanced: .advanced
@@ -242,6 +308,12 @@ private extension SQLiteServiceStore {
             try await connection.query("SELECT settings_json,revision,updated_at FROM subagent_permission_settings WHERE fixed_id=1").first
         case .directAgentPermissions:
             try await connection.query("SELECT settings_json,revision,updated_at FROM direct_agent_permission_settings WHERE fixed_id=1").first
+        case .workspaceApprovals:
+            try await connection.query("SELECT settings_json,revision,updated_at FROM workspace_approval_settings WHERE fixed_id=1").first
+        case .mcpDisabledTools:
+            try await connection.query("SELECT settings_json,revision,updated_at FROM mcp_disabled_tools WHERE fixed_id=1").first
+        case .mcpShowModelPresets:
+            try await connection.query("SELECT settings_json,revision,updated_at FROM mcp_show_model_presets WHERE fixed_id=1").first
         case .contextBuilder:
             try await connection.query("SELECT settings_json,revision,updated_at FROM context_builder_settings WHERE scope_id=?", [.text(scopeID)]).first
         case .mcpModelPresets:
@@ -254,7 +326,7 @@ private extension SQLiteServiceStore {
         guard let row else { return nil }
         let jsonColumn: String = switch repository {
         case .agentModels: "profile_json"
-        case .subagentPermissions, .directAgentPermissions, .contextBuilder, .advanced: "settings_json"
+        case .subagentPermissions, .directAgentPermissions, .workspaceApprovals, .mcpDisabledTools, .mcpShowModelPresets, .contextBuilder, .advanced: "settings_json"
         case .mcpModelPresets, .selectionPresets: "presets_json"
         }
         guard let json = row.column(jsonColumn)?.string else {
@@ -307,6 +379,21 @@ private extension SQLiteServiceStore {
                     "INSERT INTO direct_agent_permission_settings(fixed_id,settings_json,revision,updated_at) VALUES(1,?,?,?) ON CONFLICT(fixed_id) DO UPDATE SET settings_json=excluded.settings_json,revision=excluded.revision,updated_at=excluded.updated_at",
                     [.text(json), revision, updatedAt]
                 )
+            case .workspaceApprovals:
+                _ = try await connection.query(
+                    "INSERT INTO workspace_approval_settings(fixed_id,settings_json,revision,updated_at) VALUES(1,?,?,?) ON CONFLICT(fixed_id) DO UPDATE SET settings_json=excluded.settings_json,revision=excluded.revision,updated_at=excluded.updated_at",
+                    [.text(json), revision, updatedAt]
+                )
+            case .mcpDisabledTools:
+                _ = try await connection.query(
+                    "INSERT INTO mcp_disabled_tools(fixed_id,settings_json,revision,updated_at) VALUES(1,?,?,?) ON CONFLICT(fixed_id) DO UPDATE SET settings_json=excluded.settings_json,revision=excluded.revision,updated_at=excluded.updated_at",
+                    [.text(json), revision, updatedAt]
+                )
+            case .mcpShowModelPresets:
+                _ = try await connection.query(
+                    "INSERT INTO mcp_show_model_presets(fixed_id,settings_json,revision,updated_at) VALUES(1,?,?,?) ON CONFLICT(fixed_id) DO UPDATE SET settings_json=excluded.settings_json,revision=excluded.revision,updated_at=excluded.updated_at",
+                    [.text(json), revision, updatedAt]
+                )
             case .contextBuilder:
                 _ = try await connection.query(
                     "INSERT INTO context_builder_settings(scope_id,project_id,settings_json,revision,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(scope_id) DO UPDATE SET project_id=excluded.project_id,settings_json=excluded.settings_json,revision=excluded.revision,updated_at=excluded.updated_at",
@@ -348,6 +435,12 @@ private extension SQLiteServiceStore {
             try await connection.query("SELECT revision FROM subagent_permission_settings WHERE fixed_id=1").first
         case .directAgentPermissions:
             try await connection.query("SELECT revision FROM direct_agent_permission_settings WHERE fixed_id=1").first
+        case .workspaceApprovals:
+            try await connection.query("SELECT revision FROM workspace_approval_settings WHERE fixed_id=1").first
+        case .mcpDisabledTools:
+            try await connection.query("SELECT revision FROM mcp_disabled_tools WHERE fixed_id=1").first
+        case .mcpShowModelPresets:
+            try await connection.query("SELECT revision FROM mcp_show_model_presets WHERE fixed_id=1").first
         case .contextBuilder:
             try await connection.query("SELECT revision FROM context_builder_settings WHERE scope_id=?", [.text(scopeID)]).first
         case .mcpModelPresets:

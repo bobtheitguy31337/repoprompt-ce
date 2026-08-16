@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptServiceProtocol
 
 private extension DomainSettingValue {
     init(mcpValue: Value) throws {
@@ -30,8 +31,14 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
     private let scopeID: DomainStandaloneScopeID
     private let context: DirectHeadlessDomainContext
     private let settingsStore: DomainDirectSettingsStore
+    private let workspaceApprovals: @Sendable () async -> WorkspaceApprovalSettings
 
-    init(runtime: MCPDomainRuntime, scopeID: DomainStandaloneScopeID, context: DirectHeadlessDomainContext) {
+    init(
+        runtime: MCPDomainRuntime,
+        scopeID: DomainStandaloneScopeID,
+        context: DirectHeadlessDomainContext,
+        workspaceApprovals: @escaping @Sendable () async -> WorkspaceApprovalSettings = { .init() }
+    ) {
         self.runtime = runtime
         self.scopeID = scopeID
         self.context = context
@@ -39,6 +46,7 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             persistence: runtime.persistenceCoordinator,
             profileIdentifier: runtime.configuration.profileIdentifier
         )
+        self.workspaceApprovals = workspaceApprovals
     }
 
     func accessSettings(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
@@ -221,6 +229,15 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
         args: [String: Value],
         request: DomainPhysicalToolRequest
     ) async throws -> DomainPhysicalToolResult {
+        if let operation = WorkspaceApprovalOperation(mcpAction: action) {
+            let clientID = request.securityContext?.principal.displayName
+                ?? request.securityContext?.principal.stableKey
+                ?? "unknown-client"
+            let settings = await workspaceApprovals()
+            guard settings.shouldAutoApprove(operation: operation, clientID: clientID) else {
+                throw MCPError.invalidRequest(operation.deniedByUserMessage)
+            }
+        }
         let operationID = request.securityContext?.invocationID ?? UUID()
         if action == "create" {
             guard let name = args["name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else {

@@ -340,6 +340,146 @@ public actor ServerSettingsService {
         return .init(settings: stored.value, revision: stored.revision, updatedAt: stored.updatedAt)
     }
 
+    public func workspaceApprovals() async -> WorkspaceApprovalSettingsSnapshot {
+        guard let document = try? await store.workspaceApprovalDocument() else {
+            return .init(settings: .init(), revision: 0, updatedAt: epoch)
+        }
+        return .init(settings: document.value, revision: document.revision, updatedAt: document.updatedAt)
+    }
+
+    public func replaceWorkspaceApprovals(
+        _ request: ReplaceWorkspaceApprovalSettingsRequest,
+        attribution: SettingsMutationAttribution
+    ) async throws -> WorkspaceApprovalSettingsSnapshot {
+        let document = StoredSettingsDocument(
+            value: request.settings,
+            revision: request.expectedRevision + 1,
+            updatedAt: now()
+        )
+        let stored = try await store.upsertWorkspaceApprovalDocument(
+            document,
+            expectedRevision: request.expectedRevision,
+            audit: try audit(operation: "replaceGlobal", attribution: attribution, payload: request.settings)
+        )
+        return .init(settings: stored.value, revision: stored.revision, updatedAt: stored.updatedAt)
+    }
+
+    public func setAutoApproveOperation(
+        _ operation: WorkspaceApprovalOperation,
+        enabled: Bool,
+        expectedRevision: Int64,
+        attribution: SettingsMutationAttribution
+    ) async throws -> WorkspaceApprovalSettingsSnapshot {
+        var settings = await workspaceApprovals().settings
+        settings.setAutoApproveOperation(operation, enabled: enabled)
+        return try await replaceWorkspaceApprovals(
+            .init(expectedRevision: expectedRevision, settings: settings),
+            attribution: attribution
+        )
+    }
+
+    public func addAutoApproval(
+        clientID: String,
+        operation: WorkspaceApprovalOperation,
+        expectedRevision: Int64,
+        attribution: SettingsMutationAttribution
+    ) async throws -> WorkspaceApprovalSettingsSnapshot {
+        var settings = await workspaceApprovals().settings
+        settings.addAutoApproval(clientID: clientID, operation: operation)
+        return try await replaceWorkspaceApprovals(
+            .init(expectedRevision: expectedRevision, settings: settings),
+            attribution: attribution
+        )
+    }
+
+    public func mcpDisabledTools() async -> MCPDisabledToolsSettingsSnapshot {
+        guard let document = try? await store.mcpDisabledToolsDocument() else {
+            return .init(settings: .init(), revision: 0, updatedAt: epoch)
+        }
+        return .init(settings: document.value, revision: document.revision, updatedAt: document.updatedAt)
+    }
+
+    public func replaceMCPDisabledTools(
+        _ request: ReplaceMCPDisabledToolsSettingsRequest,
+        attribution: SettingsMutationAttribution
+    ) async throws -> MCPDisabledToolsSettingsSnapshot {
+        let document = StoredSettingsDocument(
+            value: request.settings,
+            revision: request.expectedRevision + 1,
+            updatedAt: now()
+        )
+        let stored = try await store.upsertMCPDisabledToolsDocument(
+            document,
+            expectedRevision: request.expectedRevision,
+            audit: try audit(operation: "replaceGlobal", attribution: attribution, payload: request.settings)
+        )
+        return .init(settings: stored.value, revision: stored.revision, updatedAt: stored.updatedAt)
+    }
+
+    public func setMCPToolEnabled(
+        _ name: String,
+        enabled: Bool,
+        expectedRevision: Int64,
+        attribution: SettingsMutationAttribution
+    ) async throws -> MCPDisabledToolsSettingsSnapshot {
+        var settings = await mcpDisabledTools().settings
+        settings.setToolEnabled(name, enabled: enabled)
+        return try await replaceMCPDisabledTools(
+            .init(expectedRevision: expectedRevision, settings: settings),
+            attribution: attribution
+        )
+    }
+
+    public func applyMCPToolDefaultOffDiscoveries(
+        _ names: Set<String>,
+        expectedRevision: Int64,
+        attribution: SettingsMutationAttribution
+    ) async throws -> MCPDisabledToolsSettingsSnapshot {
+        var settings = await mcpDisabledTools().settings
+        guard settings.applyDefaultOffDiscoveries(names) else {
+            return await mcpDisabledTools()
+        }
+        return try await replaceMCPDisabledTools(
+            .init(expectedRevision: expectedRevision, settings: settings),
+            attribution: attribution
+        )
+    }
+
+    public func showModelPresets() async -> MCPShowModelPresetsSettingsSnapshot {
+        guard let document = try? await store.mcpShowModelPresetsDocument() else {
+            return .init(settings: .init(), revision: 0, updatedAt: epoch)
+        }
+        return .init(settings: document.value, revision: document.revision, updatedAt: document.updatedAt)
+    }
+
+    public func replaceShowModelPresets(
+        _ request: ReplaceMCPShowModelPresetsSettingsRequest,
+        attribution: SettingsMutationAttribution
+    ) async throws -> MCPShowModelPresetsSettingsSnapshot {
+        let document = StoredSettingsDocument(
+            value: request.settings,
+            revision: request.expectedRevision + 1,
+            updatedAt: now()
+        )
+        let stored = try await store.upsertMCPShowModelPresetsDocument(
+            document,
+            expectedRevision: request.expectedRevision,
+            audit: try audit(operation: "replaceGlobal", attribution: attribution, payload: request.settings)
+        )
+        return .init(settings: stored.value, revision: stored.revision, updatedAt: stored.updatedAt)
+    }
+
+    public func setShowModelPresets(
+        _ enabled: Bool,
+        expectedRevision: Int64,
+        attribution: SettingsMutationAttribution
+    ) async throws -> MCPShowModelPresetsSettingsSnapshot {
+        return try await replaceShowModelPresets(
+            .init(expectedRevision: expectedRevision, settings: .init(showModelPresets: enabled)),
+            attribution: attribution
+        )
+    }
+
     public func replaceSubagentPermissions(
         _ request: ReplaceSubagentPermissionSettingsRequest,
         attribution: SettingsMutationAttribution
@@ -509,6 +649,12 @@ public actor ServerSettingsService {
         presetID: UUID,
         availability: MCPModelPresetAvailability
     ) async throws -> ResolvedAgentModelRoute {
+        guard await showModelPresets().settings.showModelPresets else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "MCP model presets are disabled. Enable mcp.show_model_presets to use named presets."
+            )
+        }
         let snapshot = try await modelPresets()
         guard let preset = snapshot.presets.first(where: { $0.presetID == presetID }), preset.enabled else {
             throw ServiceAPIError(code: .notFound, message: "MCP model preset is missing or disabled")
@@ -527,11 +673,13 @@ public actor ServerSettingsService {
         let profile = try await agentModels(projectID: projectID)
         let catalog = try await providerCatalog.serverSettingsProviderCatalog()
         let presets = try await modelPresets()
+        let gate = await showModelPresets()
+        let advertisedPresets = gate.settings.showModelPresets ? presets.presets.filter(\.enabled) : []
         return .init(
             providers: catalog.providers,
-            presets: presets.presets.filter(\.enabled),
+            presets: advertisedPresets,
             roleModelRestrictionApplied: false,
-            settingsRevision: max(max(profile.globalRevision, profile.projectRevision), presets.revision)
+            settingsRevision: max(max(max(profile.globalRevision, profile.projectRevision), presets.revision), gate.revision)
         )
     }
 

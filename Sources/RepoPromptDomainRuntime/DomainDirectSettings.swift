@@ -67,7 +67,7 @@ package enum DomainAppSettingsCatalog {
         DomainSettingDescriptor(key: "models.custom_planning_prompt", group: "models", valueKind: .string, defaultValue: .string(""), description: "Custom Oracle system prompt."),
         enumString("context_builder.agent", "context_builder", "claudeCode", ["claudeCode", "codexExec", "cursor", "openCode", "zaiClaudeCode", "kimiClaudeCode", "customClaudeCompatible"], "CLI agent used by Context Builder."),
         model("context_builder.model", "Model raw identifier used by Context Builder."),
-        bool("mcp.show_model_presets", "mcp", true, "Whether MCP model preset recommendations are shown."),
+        bool("mcp.show_model_presets", "mcp", false, "Whether MCP model preset recommendations are shown."),
         bool("code_maps.globally_disabled", "code_maps", false, "Whether Code Maps are globally disabled."),
         bool("agent_mode.show_built_in_workflow_cleanup_guidance", "agent_mode", true, "Whether built-in workflows include cleanup guidance."),
         bool("agent_mode.codex_goal_support_enabled", "agent_mode", true, "Whether Codex goal support is enabled."),

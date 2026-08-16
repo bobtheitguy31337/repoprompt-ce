@@ -1576,6 +1576,138 @@ public actor RepoPromptHeadlessAuthority {
         return await serverSettings.directAgentPermissions()
     }
 
+    public func workspaceApprovals() async throws -> WorkspaceApprovalSettingsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
+        }
+        return await serverSettings.workspaceApprovals()
+    }
+
+    public func replaceWorkspaceApprovals(
+        _ request: ReplaceWorkspaceApprovalSettingsRequest,
+        attribution: SettingsMutationAttribution
+    ) async throws -> WorkspaceApprovalSettingsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
+        }
+        return try await serverSettings.replaceWorkspaceApprovals(request, attribution: attribution)
+    }
+
+    public func authorizeWorkspaceOperation(
+        _ operation: WorkspaceApprovalOperation,
+        clientID: String
+    ) async throws {
+        let settings: WorkspaceApprovalSettings
+        if let serverSettings {
+            settings = await serverSettings.workspaceApprovals().settings
+        } else {
+            settings = .init()
+        }
+        guard settings.shouldAutoApprove(operation: operation, clientID: clientID) else {
+            throw ServiceAPIError(code: .invalidRequest, message: operation.deniedByUserMessage)
+        }
+    }
+
+    public func setAutoApproveOperation(
+        _ operation: WorkspaceApprovalOperation,
+        enabled: Bool,
+        expectedRevision: Int64,
+        attribution: SettingsMutationAttribution
+    ) async throws -> WorkspaceApprovalSettingsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
+        }
+        return try await serverSettings.setAutoApproveOperation(
+            operation,
+            enabled: enabled,
+            expectedRevision: expectedRevision,
+            attribution: attribution
+        )
+    }
+
+    public func addAutoApproval(
+        clientID: String,
+        operation: WorkspaceApprovalOperation,
+        expectedRevision: Int64,
+        attribution: SettingsMutationAttribution
+    ) async throws -> WorkspaceApprovalSettingsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
+        }
+        return try await serverSettings.addAutoApproval(
+            clientID: clientID,
+            operation: operation,
+            expectedRevision: expectedRevision,
+            attribution: attribution
+        )
+    }
+
+    public func mcpDisabledTools() async throws -> MCPDisabledToolsSettingsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
+        }
+        return await serverSettings.mcpDisabledTools()
+    }
+
+    public func disabledMCPToolNames() async -> Set<String> {
+        guard let serverSettings else { return [] }
+        return await serverSettings.mcpDisabledTools().settings.disabledTools
+    }
+
+    public func setMCPToolEnabled(
+        _ name: String,
+        enabled: Bool,
+        expectedRevision: Int64,
+        attribution: SettingsMutationAttribution
+    ) async throws -> MCPDisabledToolsSettingsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
+        }
+        return try await serverSettings.setMCPToolEnabled(
+            name,
+            enabled: enabled,
+            expectedRevision: expectedRevision,
+            attribution: attribution
+        )
+    }
+
+    public func applyMCPToolDefaultOffDiscoveries(
+        _ names: Set<String>,
+        expectedRevision: Int64,
+        attribution: SettingsMutationAttribution
+    ) async throws -> MCPDisabledToolsSettingsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
+        }
+        return try await serverSettings.applyMCPToolDefaultOffDiscoveries(
+            names,
+            expectedRevision: expectedRevision,
+            attribution: attribution
+        )
+    }
+
+    public func showModelPresets() async throws -> MCPShowModelPresetsSettingsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
+        }
+        return await serverSettings.showModelPresets()
+    }
+
+    public func setShowModelPresets(
+        _ enabled: Bool,
+        expectedRevision: Int64,
+        attribution: SettingsMutationAttribution
+    ) async throws -> MCPShowModelPresetsSettingsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
+        }
+        return try await serverSettings.setShowModelPresets(
+            enabled,
+            expectedRevision: expectedRevision,
+            attribution: attribution
+        )
+    }
+
     public func replaceDirectAgentPermissions(
         _ request: ReplaceDirectAgentPermissionsSettingsRequest,
         attribution: SettingsMutationAttribution

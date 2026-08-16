@@ -174,7 +174,11 @@ public enum PortalDesktopSettingKey: String, CaseIterable, Codable, Sendable {
              .contextBuilderAnalysisBudget,
              .contextBuilderMCPClarifyingQuestions,
              .contextBuilderCustomInstructions,
-             .modelPresets:
+             .modelPresets,
+             .mcpUseModelPresets,
+             .mcpDisabledTools,
+             .workspaceApprovalsGlobal,
+             .workspaceApprovalOperations:
             .supersededByTypedSettings
         default:
             .compatibilityReadOnly
@@ -195,6 +199,7 @@ public enum PortalDesktopSettingKey: String, CaseIterable, Codable, Sendable {
              .contextBuilderFollowUpAnalysis,
              .contextBuilderMCPClarifyingQuestions,
              .workspaceApprovalsGlobal,
+             .mcpUseModelPresets,
              .openAIShowServiceTierVariants,
              .openRouterUseCustomSettings,
              .removeCompletedWorktrees:
@@ -208,7 +213,6 @@ public enum PortalDesktopSettingKey: String, CaseIterable, Codable, Sendable {
              .includeWorkflowCleanupGuidance,
              .contextBuilderUIClarifyingQuestions,
              .mcpToolsEnabled,
-             .mcpUseModelPresets,
              .openRouterIncludeDefaults,
              .customProviderIncludeContentType:
             "true"

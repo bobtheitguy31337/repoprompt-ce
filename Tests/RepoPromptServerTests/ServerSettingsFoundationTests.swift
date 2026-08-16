@@ -38,6 +38,9 @@ final class ServerSettingsFoundationTests: XCTestCase {
             order: 0
         ))
         try assertRoundTrip(AdvancedServerSettings(historyIdleThresholdMinutes: 10))
+        try assertRoundTrip(WorkspaceApprovalSettings(autoApproveAll: true, autoApproveOperations: [.addFolder]))
+        try assertRoundTrip(MCPDisabledToolsSettings(disabledTools: ["manage_workspaces"]))
+        try assertRoundTrip(MCPShowModelPresetsSettings(showModelPresets: true))
         try assertRoundTrip(ProjectSelectionPreset(
             presetID: UUID(),
             projectID: UUID(),
@@ -149,6 +152,542 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertEqual(permissions.providerSettings["codex.approvalsReviewer"], "user")
         XCTAssertEqual(permissions.providerSettings["codex.bashEnabled"], "false")
         XCTAssertEqual(permissions.providerSettings["provider.permissionId"], "codex.readOnly")
+    }
+
+    func testWorkspaceAutoApproveAllDefaultsOffAndMCPMutationsLiveReadIt() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let catalog = StaticProviderCatalog(response: Self.providerCatalog())
+        let service = ServerSettingsService(store: store, providerCatalog: catalog, projectCatalog: store)
+        let empty = await service.workspaceApprovals()
+        XCTAssertEqual(empty.revision, 0)
+        XCTAssertFalse(empty.settings.autoApproveAll)
+        XCTAssertTrue(empty.settings.autoApproveOperations.isEmpty)
+
+        let missingJSON = try JSONDecoder.serviceDecoder.decode(
+            WorkspaceApprovalSettings.self,
+            from: Data("{}".utf8)
+        )
+        XCTAssertFalse(missingJSON.autoApproveAll)
+
+        let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
+        let actor = ExternalActor(goblinUserID: "mcp-client", username: "mcp", displayName: "MCP")
+        do {
+            try await authority.authorizeWorkspaceOperation(.createWorkspace, clientID: actor.goblinUserID)
+            XCTFail("default-off must not auto-approve workspace create")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertEqual(error.message, WorkspaceApprovalOperation.createWorkspace.deniedByUserMessage)
+        }
+
+        let adapter = RepoPromptMCPAdapter(authority: authority)
+        let projectRoot = FileManager.default.temporaryDirectory.appendingPathComponent("ws-approval-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: projectRoot) }
+        let project = try await authority.createProject(
+            input: .init(name: "Approvals", roots: [.init(logicalName: "root", path: projectRoot.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "ws-approval-project",
+            requestDigest: "ws-approval-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "ws-approval-session",
+            requestDigest: "ws-approval-session"
+        )
+        let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
+        do {
+            _ = try await adapter.invoke(
+                toolName: "manage_workspaces",
+                argumentsJSON: JSONSerialization.data(withJSONObject: ["action": "create", "name": "Denied"], options: [.sortedKeys]),
+                binding: binding
+            )
+            XCTFail("MCP create must live-read default-off auto-approve-all")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertEqual(error.message, WorkspaceApprovalOperation.createWorkspace.deniedByUserMessage)
+        }
+
+        let written = try await service.replaceWorkspaceApprovals(
+            .init(expectedRevision: 0, settings: .init(autoApproveAll: true)),
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(written.revision, 1)
+        XCTAssertTrue(written.settings.autoApproveAll)
+        try await authority.authorizeWorkspaceOperation(.createWorkspace, clientID: actor.goblinUserID)
+        try await authority.authorizeWorkspaceOperation(.deleteWorkspace, clientID: actor.goblinUserID)
+        try await authority.authorizeWorkspaceOperation(.addFolder, clientID: actor.goblinUserID)
+        try await authority.authorizeWorkspaceOperation(.removeFolder, clientID: actor.goblinUserID)
+        _ = try await adapter.invoke(
+            toolName: "manage_workspaces",
+            argumentsJSON: JSONSerialization.data(withJSONObject: ["action": "create", "name": "Allowed"], options: [.sortedKeys]),
+            binding: binding
+        )
+    }
+
+    func testWorkspacePerOperationApprovalsPersistAndLiveReadIndependentlyOfMasterFlag() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
+            projectCatalog: store
+        )
+        let missingJSON = try JSONDecoder.serviceDecoder.decode(
+            WorkspaceApprovalSettings.self,
+            from: Data("{}".utf8)
+        )
+        XCTAssertTrue(missingJSON.autoApproveOperations.isEmpty)
+        XCTAssertFalse(missingJSON.shouldAutoApprove(operation: .addFolder, clientID: "any"))
+
+        let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
+        let actor = ExternalActor(goblinUserID: "mcp-client", username: "mcp", displayName: "MCP")
+        let enabled = try await authority.setAutoApproveOperation(
+            .addFolder,
+            enabled: true,
+            expectedRevision: 0,
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(enabled.revision, 1)
+        XCTAssertFalse(enabled.settings.autoApproveAll)
+        XCTAssertEqual(enabled.settings.autoApproveOperations, [.addFolder])
+
+        try await authority.authorizeWorkspaceOperation(.addFolder, clientID: actor.goblinUserID)
+        do {
+            try await authority.authorizeWorkspaceOperation(.createWorkspace, clientID: actor.goblinUserID)
+            XCTFail("unlisted ops must still deny when master auto-approve is off")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertEqual(error.message, WorkspaceApprovalOperation.createWorkspace.deniedByUserMessage)
+        }
+
+        let projectRoot = FileManager.default.temporaryDirectory.appendingPathComponent("ws-per-op-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: projectRoot) }
+        let project = try await authority.createProject(
+            input: .init(name: "PerOp", roots: [.init(logicalName: "root", path: projectRoot.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "ws-per-op-project",
+            requestDigest: "ws-per-op-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "ws-per-op-session",
+            requestDigest: "ws-per-op-session"
+        )
+        let adapter = RepoPromptMCPAdapter(authority: authority)
+        let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
+        _ = try await adapter.invoke(
+            toolName: "manage_workspaces",
+            argumentsJSON: JSONSerialization.data(withJSONObject: [
+                "action": "add_folder",
+                "folder_path": projectRoot.path
+            ], options: [.sortedKeys]),
+            binding: binding
+        )
+        do {
+            _ = try await adapter.invoke(
+                toolName: "manage_workspaces",
+                argumentsJSON: JSONSerialization.data(withJSONObject: ["action": "delete"], options: [.sortedKeys]),
+                binding: binding
+            )
+            XCTFail("delete must stay denied when only add_folder is listed")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertEqual(error.message, WorkspaceApprovalOperation.deleteWorkspace.deniedByUserMessage)
+        }
+
+        let disabled = try await authority.setAutoApproveOperation(
+            .addFolder,
+            enabled: false,
+            expectedRevision: 1,
+            attribution: Self.attribution
+        )
+        XCTAssertTrue(disabled.settings.autoApproveOperations.isEmpty)
+        do {
+            try await authority.authorizeWorkspaceOperation(.addFolder, clientID: actor.goblinUserID)
+            XCTFail("clearing the per-op toggle must restore deny")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertEqual(error.message, WorkspaceApprovalOperation.addFolder.deniedByUserMessage)
+        }
+    }
+
+    func testWorkspaceTrustedClientAlwaysAllowPersistsAndFamilyMatchesIndependentlyOfMasterFlag() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
+            projectCatalog: store
+        )
+        let missingJSON = try JSONDecoder.serviceDecoder.decode(
+            WorkspaceApprovalSettings.self,
+            from: Data("{}".utf8)
+        )
+        XCTAssertTrue(missingJSON.clientPolicies.isEmpty)
+        XCTAssertFalse(missingJSON.shouldAutoApprove(operation: .createWorkspace, clientID: "claude-code"))
+
+        let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
+        let actor = ExternalActor(goblinUserID: "mcp-client", username: "mcp", displayName: "MCP")
+        let trusted = try await authority.addAutoApproval(
+            clientID: "claude-code",
+            operation: .createWorkspace,
+            expectedRevision: 0,
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(trusted.revision, 1)
+        XCTAssertFalse(trusted.settings.autoApproveAll)
+        XCTAssertTrue(trusted.settings.autoApproveOperations.isEmpty)
+        XCTAssertEqual(Set(trusted.settings.clientPolicies.keys), ["claude-code"])
+        XCTAssertEqual(trusted.settings.clientPolicies["claude-code"]?.allowedOperations, [.createWorkspace])
+
+        XCTAssertTrue(trusted.settings.shouldAutoApprove(operation: .createWorkspace, clientID: "Claude Code v2.1"))
+        XCTAssertFalse(trusted.settings.shouldAutoApprove(operation: .deleteWorkspace, clientID: "Claude Code v2.1"))
+        XCTAssertFalse(trusted.settings.shouldAutoApprove(operation: .createWorkspace, clientID: "my-custom-client"))
+        XCTAssertFalse(trusted.settings.shouldAutoApprove(operation: .createWorkspace, clientID: actor.goblinUserID))
+
+        try await authority.authorizeWorkspaceOperation(.createWorkspace, clientID: "Claude Code v2.1")
+        do {
+            try await authority.authorizeWorkspaceOperation(.deleteWorkspace, clientID: "Claude Code v2.1")
+            XCTFail("unlisted ops must still deny for a trusted client")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertEqual(error.message, WorkspaceApprovalOperation.deleteWorkspace.deniedByUserMessage)
+        }
+        do {
+            try await authority.authorizeWorkspaceOperation(.createWorkspace, clientID: actor.goblinUserID)
+            XCTFail("HTTP actor identity must not substitute for MCP client identity")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertEqual(error.message, WorkspaceApprovalOperation.createWorkspace.deniedByUserMessage)
+        }
+
+        let projectRoot = FileManager.default.temporaryDirectory.appendingPathComponent("ws-trusted-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: projectRoot) }
+        let project = try await authority.createProject(
+            input: .init(name: "Trusted", roots: [.init(logicalName: "root", path: projectRoot.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "ws-trusted-project",
+            requestDigest: "ws-trusted-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "ws-trusted-session",
+            requestDigest: "ws-trusted-session"
+        )
+        let adapter = RepoPromptMCPAdapter(authority: authority)
+        let familyBinding = RepoPromptMCPBinding(
+            sessionID: session.sessionID,
+            actor: actor,
+            mcpClientID: "Claude Code v2.1"
+        )
+        _ = try await adapter.invoke(
+            toolName: "manage_workspaces",
+            argumentsJSON: JSONSerialization.data(withJSONObject: ["action": "create", "name": "Allowed"], options: [.sortedKeys]),
+            binding: familyBinding
+        )
+        do {
+            _ = try await adapter.invoke(
+                toolName: "manage_workspaces",
+                argumentsJSON: JSONSerialization.data(withJSONObject: ["action": "delete"], options: [.sortedKeys]),
+                binding: familyBinding
+            )
+            XCTFail("delete must stay denied when only create_workspace is trusted for this client")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertEqual(error.message, WorkspaceApprovalOperation.deleteWorkspace.deniedByUserMessage)
+        }
+
+        let unknownBinding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
+        do {
+            _ = try await adapter.invoke(
+                toolName: "manage_workspaces",
+                argumentsJSON: JSONSerialization.data(withJSONObject: ["action": "create", "name": "Unknown"], options: [.sortedKeys]),
+                binding: unknownBinding
+            )
+            XCTFail("unknown MCP client must not inherit another client's Always Allow policy")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertEqual(error.message, WorkspaceApprovalOperation.createWorkspace.deniedByUserMessage)
+        }
+    }
+
+    func testChatServerGoblinDoesNotInheritTrustedClientAlwaysAllowAndUserCreateStaysUngated() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
+            projectCatalog: store
+        )
+        let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
+        let goblin = ExternalActor(
+            goblinUserID: "goblin-chat-server",
+            username: "claude-code",
+            displayName: "Claude Code v2.1"
+        )
+        _ = try await authority.addAutoApproval(
+            clientID: "claude-code",
+            operation: .createWorkspace,
+            expectedRevision: 0,
+            attribution: Self.attribution
+        )
+        let trusted = try await authority.workspaceApprovals()
+        XCTAssertTrue(
+            trusted.settings.shouldAutoApprove(
+                operation: .createWorkspace,
+                clientID: goblin.displayName
+            )
+        )
+
+        let projectRoot = FileManager.default.temporaryDirectory.appendingPathComponent("ws-goblin-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: projectRoot) }
+        let project = try await authority.createProject(
+            input: .init(name: "Goblin", roots: [.init(logicalName: "root", path: projectRoot.path, writable: true)]),
+            externalActor: goblin,
+            idempotencyKey: "ws-goblin-project",
+            requestDigest: "ws-goblin-project"
+        )
+        XCTAssertEqual(project.name, "Goblin")
+
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: goblin,
+            idempotencyKey: "ws-goblin-session",
+            requestDigest: "ws-goblin-session"
+        )
+        let adapter = RepoPromptMCPAdapter(authority: authority)
+        let baseline = HeadlessCodexMCPToolPolicy.advertisedToolNames(isRootSession: true)
+        let victim = try XCTUnwrap(baseline.sorted().first)
+        let kept = try XCTUnwrap(baseline.sorted().first { $0 != victim })
+        let goblinBinding = RepoPromptMCPBinding(
+            sessionID: session.sessionID,
+            actor: goblin,
+            mcpClientID: RepoPromptMCPBinding.untrustedClientID
+        )
+        XCTAssertEqual(goblinBinding.mcpClientID, "unknown-client")
+        XCTAssertEqual(RepoPromptMCPBinding(sessionID: session.sessionID, actor: goblin).mcpClientID, goblinBinding.mcpClientID)
+        do {
+            _ = try await adapter.invoke(
+                toolName: "manage_workspaces",
+                argumentsJSON: JSONSerialization.data(withJSONObject: ["action": "create", "name": "Denied"], options: [.sortedKeys]),
+                binding: goblinBinding
+            )
+            XCTFail("chat-server Goblin identity must not inherit Desktop Always Allow")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertEqual(error.message, WorkspaceApprovalOperation.createWorkspace.deniedByUserMessage)
+        }
+
+        _ = try await authority.setMCPToolEnabled(
+            victim,
+            enabled: false,
+            expectedRevision: 0,
+            attribution: Self.attribution
+        )
+        let advertised = await adapter.advertisedToolNames(isRootSession: true)
+        XCTAssertFalse(advertised.contains(victim))
+        XCTAssertTrue(advertised.contains(kept))
+        do {
+            _ = try await adapter.invoke(
+                toolName: victim,
+                argumentsJSON: JSONSerialization.data(withJSONObject: ["op": "list"], options: [.sortedKeys]),
+                binding: goblinBinding
+            )
+            XCTFail("disabled tools must stay omitted for the chat-server MCP binding")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertEqual(error.message, "Tool '\(victim)' is disabled.")
+        }
+    }
+
+    func testMCPDisabledToolsPersistAndLiveReadOmitsAdvertisedCatalogAndInvoke() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
+            projectCatalog: store
+        )
+        let missingJSON = try JSONDecoder.serviceDecoder.decode(
+            MCPDisabledToolsSettings.self,
+            from: Data("{}".utf8)
+        )
+        XCTAssertTrue(missingJSON.disabledTools.isEmpty)
+        XCTAssertTrue(missingJSON.isEnabled("manage_workspaces"))
+
+        let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
+        let empty = await authority.disabledMCPToolNames()
+        XCTAssertTrue(empty.isEmpty)
+
+        let discovered = try await authority.applyMCPToolDefaultOffDiscoveries(
+            ["experimental_tool"],
+            expectedRevision: 0,
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(discovered.revision, 1)
+        XCTAssertEqual(discovered.settings.disabledTools, ["experimental_tool"])
+        XCTAssertFalse(discovered.settings.isEnabled("experimental_tool"))
+        XCTAssertTrue(discovered.settings.isEnabled("manage_workspaces"))
+
+        let disabled = try await authority.setMCPToolEnabled(
+            "manage_workspaces",
+            enabled: false,
+            expectedRevision: 1,
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(disabled.settings.disabledTools, ["experimental_tool", "manage_workspaces"])
+
+        let actor = ExternalActor(goblinUserID: "mcp-tools", username: "mcp", displayName: "MCP")
+        let projectRoot = FileManager.default.temporaryDirectory.appendingPathComponent("ws-disabled-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: projectRoot) }
+        let project = try await authority.createProject(
+            input: .init(name: "DisabledTools", roots: [.init(logicalName: "root", path: projectRoot.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "ws-disabled-project",
+            requestDigest: "ws-disabled-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "ws-disabled-session",
+            requestDigest: "ws-disabled-session"
+        )
+        let adapter = RepoPromptMCPAdapter(authority: authority)
+        let baseline = HeadlessCodexMCPToolPolicy.advertisedToolNames(isRootSession: true)
+        XCTAssertFalse(baseline.isEmpty)
+        let victim = try XCTUnwrap(baseline.sorted().first)
+        let kept = try XCTUnwrap(baseline.sorted().first { $0 != victim })
+        let disabledAdvertised = try await authority.setMCPToolEnabled(
+            victim,
+            enabled: false,
+            expectedRevision: 2,
+            attribution: Self.attribution
+        )
+        XCTAssertTrue(disabledAdvertised.settings.disabledTools.contains(victim))
+        let advertised = await adapter.advertisedToolNames(isRootSession: true)
+        XCTAssertFalse(advertised.contains(victim))
+        XCTAssertTrue(advertised.contains(kept))
+
+        let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
+        do {
+            _ = try await adapter.invoke(
+                toolName: "manage_workspaces",
+                argumentsJSON: JSONSerialization.data(withJSONObject: ["action": "list"], options: [.sortedKeys]),
+                binding: binding
+            )
+            XCTFail("disabled tools must not invoke")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertEqual(error.message, "Tool 'manage_workspaces' is disabled.")
+        }
+
+        let enabled = try await authority.setMCPToolEnabled(
+            "manage_workspaces",
+            enabled: true,
+            expectedRevision: 3,
+            attribution: Self.attribution
+        )
+        XCTAssertFalse(enabled.settings.disabledTools.contains("manage_workspaces"))
+        XCTAssertTrue(enabled.settings.disabledTools.contains(victim))
+        _ = try await adapter.invoke(
+            toolName: "manage_workspaces",
+            argumentsJSON: JSONSerialization.data(withJSONObject: ["action": "list"], options: [.sortedKeys]),
+            binding: binding
+        )
+        let restoredVictim = try await authority.setMCPToolEnabled(
+            victim,
+            enabled: true,
+            expectedRevision: 4,
+            attribution: Self.attribution
+        )
+        XCTAssertFalse(restoredVictim.settings.disabledTools.contains(victim))
+        let restored = await adapter.advertisedToolNames(isRootSession: true)
+        XCTAssertTrue(restored.contains(victim))
+        XCTAssertEqual(restored, baseline)
+    }
+
+    func testMCPShowModelPresetsDefaultsOffAndListModelsLiveReadsTheGate() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
+            projectCatalog: store
+        )
+        let missingJSON = try JSONDecoder.serviceDecoder.decode(
+            MCPShowModelPresetsSettings.self,
+            from: Data("{}".utf8)
+        )
+        XCTAssertFalse(missingJSON.showModelPresets)
+
+        let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
+        let actor = ExternalActor(goblinUserID: "mcp-presets", username: "mcp", displayName: "MCP")
+        let projectRoot = FileManager.default.temporaryDirectory.appendingPathComponent("ws-presets-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: projectRoot) }
+        let project = try await authority.createProject(
+            input: .init(name: "Presets", roots: [.init(logicalName: "root", path: projectRoot.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "ws-presets-project",
+            requestDigest: "ws-presets-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "ws-presets-session",
+            requestDigest: "ws-presets-session"
+        )
+        let presetID = UUID()
+        _ = try await service.replaceModelPresets(
+            .init(expectedRevision: 0, presets: [.init(
+                presetID: presetID,
+                name: "Review",
+                target: .init(providerID: .codex, modelID: "gpt-5.6-sol"),
+                availability: [.review],
+                order: 0
+            )]),
+            attribution: Self.attribution
+        )
+        let hiddenDiscovery = try await service.modelDiscovery(projectID: project.projectID)
+        XCTAssertTrue(hiddenDiscovery.presets.isEmpty)
+
+        let adapter = RepoPromptMCPAdapter(authority: authority)
+        let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
+        func invoke(tool: String, _ object: [String: Any]) async throws -> [String: Any] {
+            let data = try await adapter.invoke(
+                toolName: tool,
+                argumentsJSON: try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+                binding: binding
+            )
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+
+        let unread = try await invoke(tool: "app_settings", ["op": "get", "key": "mcp.show_model_presets"])
+        XCTAssertEqual(unread["key"] as? String, "mcp.show_model_presets")
+        XCTAssertEqual(unread["value"] as? Bool, false)
+        let listedOff = try await invoke(tool: "oracle_utils", ["op": "models"])
+        XCTAssertEqual((listedOff["presets"] as? [[String: Any]])?.count, 0)
+
+        let written = try await invoke(tool: "app_settings", [
+            "op": "set",
+            "key": "mcp.show_model_presets",
+            "value": true
+        ])
+        XCTAssertEqual(written["value"] as? Bool, true)
+        let enabled = try await authority.showModelPresets()
+        XCTAssertTrue(enabled.settings.showModelPresets)
+        let listedOn = try await invoke(tool: "oracle_utils", ["op": "models"])
+        let advertised = try XCTUnwrap(listedOn["presets"] as? [[String: Any]])
+        XCTAssertEqual(advertised.count, 1)
+        XCTAssertEqual(advertised.first?["presetID"] as? String, presetID.uuidString)
     }
 
     func testSubagentCustomEmptyCodexDefaultsToDefaultPermissionAndInheritUsesLiveDirectAgents() async throws {
@@ -555,6 +1094,11 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertEqual(legacySnapshot.values[PortalDesktopSettingKey.contextBuilderBudget.rawValue], "120000")
         XCTAssertEqual(PortalDesktopSettingKey.contextBuilderBudget.mutability, .supersededByTypedSettings)
         XCTAssertEqual(PortalDesktopSettingKey.codexPermissionLevel.mutability, .supersededByTypedSettings)
+        XCTAssertEqual(PortalDesktopSettingKey.mcpUseModelPresets.mutability, .supersededByTypedSettings)
+        XCTAssertEqual(PortalDesktopSettingKey.mcpDisabledTools.mutability, .supersededByTypedSettings)
+        XCTAssertEqual(PortalDesktopSettingKey.workspaceApprovalsGlobal.mutability, .supersededByTypedSettings)
+        XCTAssertEqual(PortalDesktopSettingKey.workspaceApprovalOperations.mutability, .supersededByTypedSettings)
+        XCTAssertEqual(PortalDesktopSettingKey.mcpUseModelPresets.defaultValue, "false")
         XCTAssertFalse(PortalDesktopSettingKey.codexPermissionLevel.isMutable)
 
         do {
@@ -654,6 +1198,15 @@ final class ServerSettingsFoundationTests: XCTestCase {
             )]),
             attribution: Self.attribution
         )
+        let hidden = try await service.modelDiscovery(projectID: projectID)
+        XCTAssertTrue(hidden.presets.isEmpty, "mcp.show_model_presets defaults off")
+        do {
+            _ = try await service.resolveModelPreset(presetID: presetID, availability: .review)
+            XCTFail("named presets must not resolve while the advertisement gate is off")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+        }
+        _ = try await service.setShowModelPresets(true, expectedRevision: 0, attribution: Self.attribution)
         let presetRoute = try await service.resolveModelPreset(presetID: presetID, availability: .review)
         XCTAssertEqual(presetRoute.providerID, .codex)
         XCTAssertEqual(presetRoute.reasoningEffort, "high")
@@ -1216,6 +1769,104 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertEqual(readPolicy["value"] as? String, "inheritProviderSettings")
     }
 
+    func testAppSettingsWorkspaceApprovalKeysWriteTheTypedStoreAndAreNotAlwaysOn() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("app-settings-workspace-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
+            projectCatalog: store
+        )
+        let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
+        let actor = ExternalActor(goblinUserID: "mcp-workspace", username: "mcp-workspace", displayName: "MCP Workspace")
+        let project = try await authority.createProject(
+            input: .init(name: "Workspace", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "workspace-settings-project",
+            requestDigest: "workspace-settings-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "workspace-settings-session",
+            requestDigest: "workspace-settings-session"
+        )
+        let adapter = RepoPromptMCPAdapter(authority: authority)
+        let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
+
+        func invoke(_ object: [String: Any]) async throws -> [String: Any] {
+            let data = try await adapter.invoke(
+                toolName: "app_settings",
+                argumentsJSON: try JSONSerialization.data(withJSONObject: object),
+                binding: binding
+            )
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+
+        let unread = try await invoke(["op": "get", "key": "workspace.auto_approve_all"])
+        XCTAssertEqual(unread["value"] as? Bool, false)
+        let unreadCreate = try await invoke(["op": "get", "key": "workspace.auto_approve.create_workspace"])
+        XCTAssertEqual(unreadCreate["value"] as? Bool, false)
+        do {
+            _ = try await adapter.invoke(
+                toolName: "manage_workspaces",
+                argumentsJSON: JSONSerialization.data(withJSONObject: ["action": "create", "name": "Denied"], options: [.sortedKeys]),
+                binding: binding
+            )
+            XCTFail("workspace mutations must stay fail-closed until the typed store approves them")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertEqual(error.message, WorkspaceApprovalOperation.createWorkspace.deniedByUserMessage)
+        }
+
+        let master = try await invoke([
+            "op": "set",
+            "key": "workspace.auto_approve_all",
+            "value": true
+        ])
+        XCTAssertEqual(master["value"] as? Bool, true)
+        let enabled = try await authority.workspaceApprovals()
+        XCTAssertTrue(enabled.settings.autoApproveAll)
+        _ = try await adapter.invoke(
+            toolName: "manage_workspaces",
+            argumentsJSON: JSONSerialization.data(withJSONObject: ["action": "create", "name": "Allowed"], options: [.sortedKeys]),
+            binding: binding
+        )
+
+        _ = try await invoke([
+            "op": "set",
+            "key": "workspace.auto_approve_all",
+            "value": false
+        ])
+        _ = try await invoke([
+            "op": "set",
+            "key": "workspace.auto_approve.create_workspace",
+            "value": true
+        ])
+        let stored = try await authority.workspaceApprovals()
+        XCTAssertFalse(stored.settings.autoApproveAll)
+        XCTAssertEqual(stored.settings.autoApproveOperations, [.createWorkspace])
+        _ = try await adapter.invoke(
+            toolName: "manage_workspaces",
+            argumentsJSON: JSONSerialization.data(withJSONObject: ["action": "create", "name": "PerOp"], options: [.sortedKeys]),
+            binding: binding
+        )
+        do {
+            _ = try await adapter.invoke(
+                toolName: "manage_workspaces",
+                argumentsJSON: JSONSerialization.data(withJSONObject: ["action": "delete"], options: [.sortedKeys]),
+                binding: binding
+            )
+            XCTFail("unlisted workspace ops must stay fail-closed")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertEqual(error.message, WorkspaceApprovalOperation.deleteWorkspace.deniedByUserMessage)
+        }
+    }
+
     func testChildCreationEnforcesSafeInheritAndCustomWithExactProviderIdentity() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
@@ -1380,6 +2031,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             )]),
             attribution: Self.attribution
         )
+        _ = try await service.setShowModelPresets(true, expectedRevision: 0, attribution: Self.attribution)
 
         let result = try await authority.runContextBuilder(
             sessionID: session.sessionID,

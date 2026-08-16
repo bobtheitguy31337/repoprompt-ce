@@ -327,8 +327,9 @@ actor DirectHeadlessMCPService {
                 )
         })
         await server.withMethodHandler(ListTools.self) { _ in
+            let disabled = await prepared.authority.disabledMCPToolNames()
             let tools = MCPDomainCanonicalToolDefinitions.definitions.compactMap { definition -> MCP.Tool? in
-                guard visibleNames.contains(definition.name) else { return nil }
+                guard visibleNames.contains(definition.name), !disabled.contains(definition.name) else { return nil }
                 let projected = definition.annotations.projected(
                     for: classification.annotationProfile
                 )
@@ -349,7 +350,8 @@ actor DirectHeadlessMCPService {
         }
 
         await server.withMethodHandler(CallTool.self) { params in
-            guard visibleNames.contains(params.name) else {
+            let disabled = await prepared.authority.disabledMCPToolNames()
+            guard visibleNames.contains(params.name), !disabled.contains(params.name) else {
                 return Self.errorResult("Tool is unavailable for this client policy: \(params.name)")
             }
             do {

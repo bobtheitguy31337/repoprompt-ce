@@ -408,7 +408,7 @@ function desktopSettingsFixture(overrides = {}) {
       contextBuilderMCPClarifyingQuestions: "false",
       contextBuilderCustomInstructions: "",
       mcpToolsEnabled: "true",
-      mcpUseModelPresets: "true",
+      mcpUseModelPresets: "false",
       mcpDisabledTools: "[]",
       workspaceApprovalsGlobal: "false",
       workspaceApprovalOperations: "[]",
@@ -547,6 +547,32 @@ function typedSettingsFixtures(providers, bootstrap) {
       },
       revision: 0,
       scannerPolicyGeneration: 0,
+      updatedAt: "1970-01-01T00:00:00Z",
+    },
+    workspaceApprovals: {
+      settings: {
+        autoApproveAll: false,
+        autoApproveOperations: [],
+        clientPolicies: {
+          "cursor-family": {
+            clientID: "cursor-family",
+            allowedOperations: ["create_workspace"],
+            createdAt: "1970-01-01T00:00:00Z",
+            lastUsedAt: null,
+          },
+        },
+      },
+      revision: 0,
+      updatedAt: "1970-01-01T00:00:00Z",
+    },
+    mcpDisabledTools: {
+      settings: { disabledTools: [] },
+      revision: 0,
+      updatedAt: "1970-01-01T00:00:00Z",
+    },
+    showModelPresets: {
+      settings: { showModelPresets: false },
+      revision: 0,
       updatedAt: "1970-01-01T00:00:00Z",
     },
     selectionPresets: {
@@ -822,6 +848,39 @@ async function createHarness({
         };
       }
       return jsonResponse(context.typedSettings.advanced);
+    }
+    if (call.path === "api/v1/settings/workspace-approvals") {
+      if (call.method === "PATCH") {
+        const payload = JSON.parse(call.body);
+        context.typedSettings.workspaceApprovals = {
+          ...context.typedSettings.workspaceApprovals,
+          settings: payload.settings,
+          revision: context.typedSettings.workspaceApprovals.revision + 1,
+        };
+      }
+      return jsonResponse(context.typedSettings.workspaceApprovals);
+    }
+    if (call.path === "api/v1/settings/mcp-disabled-tools") {
+      if (call.method === "PATCH") {
+        const payload = JSON.parse(call.body);
+        context.typedSettings.mcpDisabledTools = {
+          ...context.typedSettings.mcpDisabledTools,
+          settings: payload.settings,
+          revision: context.typedSettings.mcpDisabledTools.revision + 1,
+        };
+      }
+      return jsonResponse(context.typedSettings.mcpDisabledTools);
+    }
+    if (call.path === "api/v1/settings/show-model-presets") {
+      if (call.method === "PATCH") {
+        const payload = JSON.parse(call.body);
+        context.typedSettings.showModelPresets = {
+          ...context.typedSettings.showModelPresets,
+          settings: payload.settings,
+          revision: context.typedSettings.showModelPresets.revision + 1,
+        };
+      }
+      return jsonResponse(context.typedSettings.showModelPresets);
     }
     if (/^api\/v1\/projects\/[^/]+\/selection-presets$/.test(call.path)) {
       return jsonResponse(context.typedSettings.selectionPresets);
@@ -1275,10 +1334,10 @@ test("desktop recommendation assessment explains OpenCode-only connections witho
   assert.ok(assignedRoutes.every((value) => !value.startsWith("openCodeACP|")));
 });
 
-test("MCP Tools renders and searches the complete canonical server catalog without fake toggles", async (t) => {
+test("MCP Tools renders and searches the complete canonical server catalog with live-read toggles", async (t) => {
   const harness = await createHarness({ hash: "#settings/mcp-tools" });
   t.after(() => harness.close());
-  const { document, window } = harness;
+  const { calls, document, window } = harness;
 
   assert.equal(document.querySelectorAll(".tool-catalog-row").length, 27);
   const text = document.getElementById("settings-content").textContent;
@@ -1292,14 +1351,109 @@ test("MCP Tools renders and searches the complete canonical server catalog witho
     assert.match(text, new RegExp(name));
   }
   assert.equal(
-    document.querySelector('.tool-catalog-list input[type="checkbox"]'),
-    null,
+    document.querySelectorAll('.tool-catalog-list input[type="checkbox"]')
+      .length,
+    27,
   );
+  const fileActions = document.querySelector(
+    'input[aria-label="file_actions"]',
+  );
+  change(window, fileActions, false);
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/settings/mcp-disabled-tools",
+    ),
+  );
+  const payload = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/settings/mcp-disabled-tools",
+    ).body,
+  );
+  assert.deepEqual(Object.keys(payload).sort(), [
+    "expectedRevision",
+    "settings",
+  ]);
+  assert.deepEqual(payload.settings.disabledTools, ["file_actions"]);
+
   const search = document.querySelector('input[aria-label="Search MCP tools"]');
   search.value = "oracle";
   search.dispatchEvent(new window.Event("input", { bubbles: true }));
   assert.equal(document.querySelectorAll(".tool-catalog-row").length, 4);
   assert.match(document.querySelector(".tool-count").textContent, /4 of 27/);
+});
+
+test("Workspace Approvals and MCP Server live-read the typed MCP workspace authority", async (t) => {
+  const harness = await createHarness({ hash: "#settings/workspace-approvals" });
+  t.after(() => harness.close());
+  const { calls, document, window } = harness;
+  const text = document.getElementById("settings-content").textContent;
+
+  assert.match(text, /Auto-approve All Operations/);
+  assert.match(text, /Create Workspace/);
+  assert.match(text, /Trusted Clients/);
+  assert.match(text, /cursor-family/);
+  assert.doesNotMatch(text, /Not applicable/);
+  assert.doesNotMatch(text, /write operations/);
+  assert.equal(
+    document.querySelectorAll('input[type="checkbox"]').length,
+    5,
+  );
+
+  const master = document.querySelector(
+    'input[aria-label="Auto-approve All Operations"]',
+  );
+  change(window, master, true);
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/settings/workspace-approvals",
+    ),
+  );
+  const workspacePayload = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/settings/workspace-approvals",
+    ).body,
+  );
+  assert.equal(workspacePayload.settings.autoApproveAll, true);
+  assert.deepEqual(workspacePayload.settings.autoApproveOperations, []);
+  assert.equal(
+    workspacePayload.settings.clientPolicies["cursor-family"].clientID,
+    "cursor-family",
+  );
+
+  window.location.hash = "#settings/mcp-server";
+  window.dispatchEvent(new window.HashChangeEvent("hashchange"));
+  await settle();
+  const presets = document.querySelector(
+    'input[aria-label="Use Oracle Model Presets for MCP"]',
+  );
+  assert.equal(presets.checked, false);
+  change(window, presets, true);
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/settings/show-model-presets",
+    ),
+  );
+  const presetsPayload = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/settings/show-model-presets",
+    ).body,
+  );
+  assert.deepEqual(presetsPayload, {
+    expectedRevision: 0,
+    settings: { showModelPresets: true },
+  });
 });
 
 test("Agent Permissions exposes every runtime-backed desktop direct-provider control", async (t) => {
@@ -1353,7 +1507,6 @@ test("unsupported desktop authorities are explicit and do not expose inert contr
   const { document, window } = harness;
 
   const cases = [
-    ["workspace-approvals", /Auto-approve All Operations/, /write operations/],
     ["manage-workspaces", /Operator-provisioned here/, /Open Folder/],
     ["openrouter", /Deployment-disabled/, /API key/],
     ["custom-api", /pinned-address egress/, /Preferred Model/],
