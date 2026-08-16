@@ -999,6 +999,22 @@ test("filtered Desktop settings hierarchy deep-links, searches, and excludes des
   );
   assert.match(
     document.getElementById("settings-content").textContent,
+    /agent_manage list_agents/,
+  );
+  assert.doesNotMatch(
+    document.getElementById("settings-content").textContent,
+    /Filters list_models discovery/,
+  );
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /Unassigned \(fail-closed\)/,
+  );
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /Unassigned \(tracks recommendation\)/,
+  );
+  assert.match(
+    document.getElementById("settings-content").textContent,
     /Use global settings/,
   );
 
@@ -1165,6 +1181,16 @@ test("connected CLI recommendation Check Now opens a live desktop-style assessme
   assert.match(text, /profile 202_608/);
   assert.match(text, /Provider Defaults/);
   assert.match(text, /Save Agent Routes/);
+});
+
+test("overview live-reads typed Agent Models assignments", async (t) => {
+  const harness = await createHarness({ hash: "#settings/overview" });
+  t.after(() => harness.close());
+  const text = harness.document.getElementById("settings-content").textContent;
+  assert.match(text, /Live routing/);
+  assert.match(text, /Unconfigured/);
+  assert.match(text, /Tracks recommendation/);
+  assert.match(text, /Fail-closed when unassigned/);
 });
 
 test("desktop recommendation assessment explains OpenCode-only connections without inventing role assignments", async (t) => {
@@ -1358,7 +1384,6 @@ test("typed settings pages mutate revisioned server authorities", async (t) => {
   );
   oracleRoute.value =
     [...oracleRoute.options].find((option) => option.value)?.value || "";
-  document.querySelector('input[aria-label="Pin Oracle route"]').checked = true;
   submit(window, oracleRoute.closest("form"));
   await waitFor(
     () =>
@@ -1380,7 +1405,7 @@ test("typed settings pages mutate revisioned server authorities", async (t) => {
     "providerID",
     "reasoningEffort",
   ]);
-  assert.equal(savedAgentModelsPayload.profile.oracle.pinned, true);
+  assert.equal(savedAgentModelsPayload.profile.oracle.pinned, false);
 
   window.location.hash = "#settings/agent-permissions";
   window.dispatchEvent(new window.HashChangeEvent("hashchange"));

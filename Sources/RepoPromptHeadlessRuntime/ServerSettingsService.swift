@@ -159,6 +159,15 @@ public actor ServerSettingsService {
     ) async throws -> ResolvedAgentModelRoute? {
         let snapshot = try await agentModels(projectID: projectID)
         let catalog = try await providerCatalog.serverSettingsProviderCatalog()
+        if target == .oracle {
+            return try resolveOracleTarget(assigned: snapshot.effectiveProfile[.oracle], catalog: catalog)
+        }
+        if target == .contextBuilder {
+            return try resolveContextBuilderTarget(profile: snapshot.effectiveProfile, catalog: catalog)
+        }
+        if target.isSubagentRole {
+            return try resolveRoleTarget(target: target, assigned: snapshot.effectiveProfile[target], catalog: catalog)
+        }
         guard let assigned = snapshot.effectiveProfile[target] else { return nil }
         if let route = runtimeRoute(assigned, target: target, catalog: catalog, usedRecommendationFallback: false) {
             return route
@@ -174,6 +183,126 @@ public actor ServerSettingsService {
             return nil
         }
         return runtimeRoute(recommended, target: target, catalog: catalog, usedRecommendationFallback: true)
+    }
+
+    func resolveOracleTarget(
+        assigned: AgentModelTarget?,
+        catalog: ProviderSettingsCatalogResponse
+    ) throws -> ResolvedAgentModelRoute {
+        guard let assigned else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "MCP Oracle model is not configured. Select an Oracle model in the Models settings before using ask_oracle."
+            )
+        }
+        let trimmedModel = assigned.modelID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmedModel.isEmpty else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "MCP Oracle model raw value is invalid. Select a valid Oracle model in the Models settings before using ask_oracle."
+            )
+        }
+        guard let route = runtimeRoute(assigned, target: .oracle, catalog: catalog, usedRecommendationFallback: false) else {
+            throw ServiceAPIError(
+                code: .dependencyUnavailable,
+                message: "MCP oracle model '\(trimmedModel)' is not available.",
+                retryable: true
+            )
+        }
+        return route
+    }
+
+    func resolveContextBuilderTarget(
+        profile: AgentModelsProfile,
+        catalog: ProviderSettingsCatalogResponse
+    ) throws -> ResolvedAgentModelRoute {
+        guard var assigned = profile.contextBuilder else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "Context Builder provider is not configured. Select a Context Builder agent and model in the Models settings before running Context Builder."
+            )
+        }
+        let remembered = profile.contextBuilderModelsByAgent?[assigned.providerID.rawValue]
+        let trimmedModel = assigned.modelID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if trimmedModel.isEmpty, let remembered, !remembered.isEmpty {
+            assigned = AgentModelTarget(
+                providerID: assigned.providerID,
+                modelID: remembered,
+                reasoningEffort: assigned.reasoningEffort,
+                pinned: assigned.pinned
+            )
+        }
+        let resolvedModel = assigned.modelID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !resolvedModel.isEmpty else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "Context Builder model is invalid. Select a valid Context Builder model in the Models settings before running Context Builder."
+            )
+        }
+        guard let route = runtimeRoute(assigned, target: .contextBuilder, catalog: catalog, usedRecommendationFallback: false) else {
+            throw ServiceAPIError(
+                code: .dependencyUnavailable,
+                message: "The target workspace Context Builder provider is not available. Verify its Models settings and provider credentials.",
+                retryable: true
+            )
+        }
+        return route
+    }
+
+    func resolveRoleTarget(
+        target: AgentRoutingTarget,
+        assigned: AgentModelTarget?,
+        catalog: ProviderSettingsCatalogResponse
+    ) throws -> ResolvedAgentModelRoute {
+        if let assigned, let route = runtimeRoute(assigned, target: target, catalog: catalog, usedRecommendationFallback: false) {
+            return route
+        }
+        guard let recommended = recommendationTarget(target: target, catalog: catalog, requireEffective: true),
+              let route = runtimeRoute(recommended, target: target, catalog: catalog, usedRecommendationFallback: true)
+        else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "No available agent/model for task label '\(target.rawValue)'."
+            )
+        }
+        return route
+    }
+
+    public func createSessionInput(from request: GoblinCreateSessionRequest) async throws -> CreateSessionInput {
+        if request.hasExplicitProviderRoute {
+            return try request.explicitCreateSessionInput()
+        }
+        let target = request.routingTarget ?? .pair
+        guard target.isSubagentRole else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "Session start routingTarget must be a role (explore, engineer, pair, or design)"
+            )
+        }
+        guard let route = try await resolveAgentTarget(projectID: request.projectID, target: target) else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "No available agent/model for task label '\(target.rawValue)'."
+            )
+        }
+        var settings = request.initialProviderSettings ?? [:]
+        settings["provider.settingsID"] = route.providerID.rawValue
+        if let effort = route.reasoningEffort {
+            settings["provider.reasoningEffort"] = effort
+        }
+        return CreateSessionInput(
+            projectID: request.projectID,
+            parentSessionID: request.parentSessionID,
+            provider: route.provider,
+            providerSettingsID: route.providerID,
+            model: route.modelID,
+            visibility: request.visibility,
+            initialPrompt: request.initialPrompt,
+            selectedMessageContext: request.selectedMessageContext,
+            startImmediately: request.startImmediately ?? false,
+            initialPermissionMode: request.initialPermissionMode,
+            initialProviderSettings: settings
+        )
     }
 
     public func providerCatalogSnapshot() async throws -> ProviderSettingsCatalogResponse {
@@ -374,45 +503,37 @@ public actor ServerSettingsService {
         let profile = try await agentModels(projectID: projectID)
         let catalog = try await providerCatalog.serverSettingsProviderCatalog()
         let presets = try await modelPresets()
-        guard profile.effectiveProfile.restrictDiscoveryToRoleModels else {
-            return .init(
-                providers: catalog.providers,
-                presets: presets.presets.filter(\.enabled),
-                roleModelRestrictionApplied: false,
-                settingsRevision: max(max(profile.globalRevision, profile.projectRevision), presets.revision)
+        return .init(
+            providers: catalog.providers,
+            presets: presets.presets.filter(\.enabled),
+            roleModelRestrictionApplied: false,
+            settingsRevision: max(max(profile.globalRevision, profile.projectRevision), presets.revision)
+        )
+    }
+
+    public func agentDiscovery(projectID: UUID, rolesOnly: Bool = false) async throws -> MCPAgentDiscoverySnapshot {
+        let snapshot = try await agentModels(projectID: projectID)
+        let catalog = try await providerCatalog.serverSettingsProviderCatalog()
+        let restrict = snapshot.effectiveProfile.restrictDiscoveryToRoleModels
+        let omitAgentCatalog = rolesOnly || restrict
+        let taskLabels = AgentRoutingTarget.allCases.compactMap { target -> MCPAgentTaskLabel? in
+            guard target.isSubagentRole else { return nil }
+            return taskLabel(
+                target: target,
+                assigned: snapshot.effectiveProfile[target],
+                catalog: catalog
             )
         }
-        var allowed = Set<String>()
-        for target in AgentRoutingTarget.allCases {
-            if let route = try await resolveAgentTarget(projectID: projectID, target: target), let model = route.modelID {
-                allowed.insert("\(route.providerID.rawValue)\u{0}\(model)")
-            }
-        }
-        let filtered = catalog.providers.compactMap { provider -> ProviderSettingsSnapshot? in
-            let models = provider.models.filter { allowed.contains("\(provider.providerID.rawValue)\u{0}\($0.id)") }
-            guard !models.isEmpty else { return nil }
-            return ProviderSettingsSnapshot(
-                providerID: provider.providerID,
-                displayName: provider.displayName,
-                category: provider.category,
-                summary: provider.summary,
-                deploymentAllowed: provider.deploymentAllowed,
-                runtimePreflightVerified: provider.runtimePreflightVerified,
-                effectiveEnabled: provider.effectiveEnabled,
-                preference: provider.preference,
-                cli: provider.cli,
-                authentication: provider.authentication,
-                connection: provider.connection,
-                preflight: provider.preflight,
-                capabilities: provider.capabilities,
-                models: models
-            )
+        let agents: [MCPDiscoveredAgent]?
+        if omitAgentCatalog {
+            agents = nil
+        } else {
+            agents = catalog.providers.compactMap { discoveredAgent(from: $0) }
         }
         return .init(
-            providers: filtered,
-            presets: presets.presets.filter(\.enabled),
-            roleModelRestrictionApplied: true,
-            settingsRevision: max(max(profile.globalRevision, profile.projectRevision), presets.revision)
+            taskLabels: taskLabels,
+            agents: agents,
+            roleModelRestrictionApplied: restrict
         )
     }
 
@@ -547,25 +668,41 @@ private extension ServerSettingsService {
             }
             return AgentModelTarget(providerID: value.providerID, modelID: modelID, reasoningEffort: effort, pinned: value.pinned)
         }
+        let normalizedContextBuilder = try target(profile.contextBuilder)
+        var modelsByAgent = profile.contextBuilderModelsByAgent ?? [:]
+        if let normalizedContextBuilder, let modelID = normalizedContextBuilder.modelID {
+            modelsByAgent[normalizedContextBuilder.providerID.rawValue] = modelID
+        }
+        var normalizedMap: [String: String] = [:]
+        for (agent, model) in modelsByAgent {
+            guard let modelID = try normalizedText(model, maximumBytes: 256) else { continue }
+            normalizedMap[agent] = modelID
+        }
         return try AgentModelsProfile(
             oracle: target(profile.oracle),
-            contextBuilder: target(profile.contextBuilder),
+            contextBuilder: normalizedContextBuilder,
             explore: target(profile.explore),
             engineer: target(profile.engineer),
             pair: target(profile.pair),
             design: target(profile.design),
-            restrictDiscoveryToRoleModels: profile.restrictDiscoveryToRoleModels
+            restrictDiscoveryToRoleModels: profile.restrictDiscoveryToRoleModels,
+            contextBuilderModelsByAgent: normalizedMap.isEmpty ? nil : normalizedMap
         )
     }
 
     func applying(_ recommendations: [AgentModelRecommendationRow], to profile: AgentModelsProfile) -> AgentModelsProfile {
-        recommendations.reduce(profile) { result, row in
+        var next = profile
+        for role in [AgentRoutingTarget.explore, .engineer, .pair, .design] {
+            next = next.replacing(role, with: nil)
+        }
+        for row in recommendations {
             guard row.availability == .exact,
                   let target = row.recommendedTarget,
-                  result[row.target]?.pinned != true
-            else { return result }
-            return result.replacing(row.target, with: target)
+                  row.target == .oracle || row.target == .contextBuilder
+            else { continue }
+            next = next.replacing(row.target, with: target)
         }
+        return next
     }
 
     func recommendationRows(catalog: ProviderSettingsCatalogResponse) -> [AgentModelRecommendationRow] {
@@ -614,6 +751,82 @@ private extension ServerSettingsService {
             (.pair, [codex("high"), claude("opus", nil), cursor(true)]),
             (.design, [claude("opus", nil), cursor(true), codex("medium")])
         ]
+    }
+
+    func taskLabel(
+        target: AgentRoutingTarget,
+        assigned: AgentModelTarget?,
+        catalog: ProviderSettingsCatalogResponse
+    ) -> MCPAgentTaskLabel? {
+        let recommended = recommendationTarget(target: target, catalog: catalog, requireEffective: false)
+        let assignedRoute = assigned.flatMap { runtimeRoute($0, target: target, catalog: catalog, usedRecommendationFallback: false) }
+        let effective: ResolvedAgentModelRoute
+        if let assignedRoute {
+            effective = assignedRoute
+        } else if let recommended,
+                  let route = runtimeRoute(recommended, target: target, catalog: catalog, usedRecommendationFallback: true)
+        {
+            effective = route
+        } else {
+            return nil
+        }
+        let recommendedRoute = recommended.flatMap {
+            runtimeRoute($0, target: target, catalog: catalog, usedRecommendationFallback: true)
+        }
+        let recommendedID = recommendedRoute.map(compoundModelID) ?? compoundModelID(effective)
+        return MCPAgentTaskLabel(
+            label: target.rawValue,
+            description: roleDescription(target),
+            modelID: compoundModelID(effective),
+            name: displayName(for: effective, catalog: catalog),
+            recommendedModelID: recommendedID,
+            recommendedName: recommendedRoute.map { displayName(for: $0, catalog: catalog) } ?? displayName(for: effective, catalog: catalog),
+            hasCustomOverride: assigned != nil && assignedRoute != nil && (assigned?.providerID != recommended?.providerID || assigned?.modelID != recommended?.modelID),
+            overrideUnavailable: assigned != nil && assignedRoute == nil
+        )
+    }
+
+    func discoveredAgent(from provider: ProviderSettingsSnapshot) -> MCPDiscoveredAgent? {
+        guard provider.deploymentAllowed,
+              provider.effectiveEnabled,
+              provider.providerID.runtimeKind != nil,
+              !provider.models.isEmpty
+        else { return nil }
+        let models = provider.models.map { model in
+            MCPDiscoveredAgentModel(
+                modelID: "\(provider.providerID.rawValue):\(model.id)",
+                name: model.displayName,
+                reasoningEffort: model.reasoningEfforts.first
+            )
+        }
+        let defaultModel = provider.preference.defaultModel ?? provider.models.first?.id
+        return MCPDiscoveredAgent(
+            name: provider.displayName,
+            available: true,
+            capabilities: [],
+            models: models,
+            defaultModelID: defaultModel.map { "\(provider.providerID.rawValue):\($0)" }
+        )
+    }
+
+    func compoundModelID(_ route: ResolvedAgentModelRoute) -> String {
+        "\(route.providerID.rawValue):\(route.modelID ?? "")"
+    }
+
+    func displayName(for route: ResolvedAgentModelRoute, catalog: ProviderSettingsCatalogResponse) -> String {
+        let provider = catalog.providers.first(where: { $0.providerID == route.providerID })
+        let modelName = provider?.models.first(where: { $0.id == route.modelID })?.displayName ?? route.modelID ?? route.providerID.rawValue
+        return "\(provider?.displayName ?? route.providerID.rawValue) \(modelName)"
+    }
+
+    func roleDescription(_ target: AgentRoutingTarget) -> String {
+        switch target {
+        case .explore: "Fast exploration and codebase mapping"
+        case .engineer: "Balanced engineering work"
+        case .pair: "Interactive pair programming with highest-tier models"
+        case .design: "Architecture, design discussions, and creative problem solving"
+        case .oracle, .contextBuilder: target.rawValue
+        }
     }
 
     func recommendationTarget(

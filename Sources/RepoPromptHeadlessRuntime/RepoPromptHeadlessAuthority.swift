@@ -1206,14 +1206,24 @@ public actor RepoPromptHeadlessAuthority {
         let parent = await parentAuthority.snapshot()
         guard !cancellationBarriers.contains(parent.rootSessionID) else { throw ServiceAPIError(code: .quiescing, message: "Root session is canceling; new children are fenced") }
         let explicitProviderID = providerSettingsID ?? provider.flatMap { ProviderSettingsID.defaultSettingsID(for: $0) }
-        let routed: ResolvedAgentModelRoute? = if provider == nil, providerSettingsID == nil, model == nil, let target = AgentRoutingTarget(rawValue: role) {
-            try await serverSettings?.resolveAgentTarget(projectID: parent.projectID, target: target)
+        let trimmedModel = model?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasExplicitRoute = provider != nil || providerSettingsID != nil || !(trimmedModel?.isEmpty ?? true)
+        let roleTarget = AgentRoutingTarget(rawValue: role)
+        let routed: ResolvedAgentModelRoute?
+        if !hasExplicitRoute, let roleTarget, roleTarget.isSubagentRole, let serverSettings {
+            guard let resolved = try await serverSettings.resolveAgentTarget(projectID: parent.projectID, target: roleTarget) else {
+                throw ServiceAPIError(
+                    code: .invalidRequest,
+                    message: "No available agent/model for task label '\(roleTarget.rawValue)'."
+                )
+            }
+            routed = resolved
         } else {
-            nil
+            routed = nil
         }
         let resolvedProvider = provider ?? explicitProviderID?.runtimeKind ?? routed?.provider ?? parent.provider
         let resolvedProviderID = explicitProviderID ?? routed?.providerID ?? parent.providerSettingsID ?? ProviderSettingsID.defaultSettingsID(for: resolvedProvider)
-        let resolvedModel = model ?? routed?.modelID ?? parent.model
+        let resolvedModel = (trimmedModel?.isEmpty == false ? trimmedModel : nil) ?? routed?.modelID ?? parent.model
         var routeSettings: [String: String] = [:]
         if let effort = routed?.reasoningEffort { routeSettings["provider.reasoningEffort"] = effort }
         let child = try await createAuthoritySession(
@@ -1523,6 +1533,35 @@ public actor RepoPromptHeadlessAuthority {
             )
         }
         return try await serverSettings.modelDiscovery(projectID: session.projectID)
+    }
+
+    public func globalAgentModels() async throws -> AgentModelsSettingsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
+        }
+        return try await serverSettings.agentModels()
+    }
+
+    public func replaceGlobalAgentModels(
+        _ request: ReplaceGlobalAgentModelsRequest,
+        attribution: SettingsMutationAttribution
+    ) async throws -> AgentModelsSettingsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
+        }
+        return try await serverSettings.replaceGlobalAgentModels(request, attribution: attribution)
+    }
+
+    public func agentDiscovery(sessionID: UUID, rolesOnly: Bool = false) async throws -> MCPAgentDiscoverySnapshot {
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        guard let serverSettings else {
+            return MCPAgentDiscoverySnapshot(
+                taskLabels: [],
+                agents: rolesOnly ? nil : [],
+                roleModelRestrictionApplied: false
+            )
+        }
+        return try await serverSettings.agentDiscovery(projectID: session.projectID, rolesOnly: rolesOnly)
     }
 
     public func advancedSettings() async throws -> AdvancedServerSettingsSnapshot {
@@ -2442,8 +2481,16 @@ public actor RepoPromptHeadlessAuthority {
             )
             renderedInstructions = input.instructions
         }
-        let contextBuilderRoute = try await serverSettings?.resolveAgentTarget(projectID: session.projectID, target: .contextBuilder)
-        let contextBuilderProviderID = contextBuilderRoute?.providerID ?? session.providerSettingsID
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Context Builder settings authority is not configured")
+        }
+        guard let contextBuilderRoute = try await serverSettings.resolveAgentTarget(projectID: session.projectID, target: .contextBuilder) else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "Context Builder provider is not configured. Select a Context Builder agent and model in the Models settings before running Context Builder."
+            )
+        }
+        let contextBuilderProviderID = contextBuilderRoute.providerID
         let contextBuilderProviderSettings = await runtimeProviderSettings(providerID: contextBuilderProviderID)
         let advanced = try await advancedSettings()
         let current = try await selectionSnapshot(sessionID: sessionID)
@@ -2498,11 +2545,11 @@ public actor RepoPromptHeadlessAuthority {
             tokenBudget: effectiveSettings.budget,
             responseType: input.responseType,
             allowClarifyingQuestions: effectiveSettings.allowClarifyingQuestions,
-            provider: contextBuilderRoute?.provider ?? session.provider,
+            provider: contextBuilderRoute.provider,
             providerSettingsID: contextBuilderProviderID,
             providerSettings: contextBuilderProviderSettings,
-            model: contextBuilderRoute?.modelID ?? session.model,
-            reasoningEffort: contextBuilderRoute?.reasoningEffort,
+            model: contextBuilderRoute.modelID,
+            reasoningEffort: contextBuilderRoute.reasoningEffort,
             runID: runID
         ))
         let proposalData = try JSONEncoder.serviceEncoder.encode(proposal)
@@ -2520,8 +2567,13 @@ public actor RepoPromptHeadlessAuthority {
             guard let oracleRuntime else {
                 throw ServiceAPIError(code: .dependencyUnavailable, message: "Context Builder follow-up analysis requires the Oracle runtime")
             }
-            let oracleRoute = try await serverSettings?.resolveAgentTarget(projectID: session.projectID, target: .oracle)
-            let oracleProviderID = oracleRoute?.providerID ?? session.providerSettingsID
+            guard let oracleRoute = try await serverSettings.resolveAgentTarget(projectID: session.projectID, target: .oracle) else {
+                throw ServiceAPIError(
+                    code: .invalidRequest,
+                    message: "MCP Oracle model is not configured. Select an Oracle model in the Models settings before using ask_oracle."
+                )
+            }
+            let oracleProviderID = oracleRoute.providerID
             let oracleProviderSettings = await runtimeProviderSettings(providerID: oracleProviderID)
             let proposedSelection = SelectionSnapshot(
                 sessionID: sessionID,
@@ -2537,11 +2589,11 @@ public actor RepoPromptHeadlessAuthority {
                 selectedContext: proposedContext,
                 priorTurns: [],
                 providerSessionID: nil,
-                provider: oracleRoute?.provider ?? session.provider,
+                provider: oracleRoute.provider,
                 providerSettingsID: oracleProviderID,
                 providerSettings: oracleProviderSettings,
-                model: oracleRoute?.modelID ?? session.model,
-                reasoningEffort: oracleRoute?.reasoningEffort,
+                model: oracleRoute.modelID,
+                reasoningEffort: oracleRoute.reasoningEffort,
                 tokenBudget: effectiveSettings.followUpBudget,
                 workingDirectory: workingDirectory,
                 runID: ids.next()
@@ -2586,11 +2638,11 @@ public actor RepoPromptHeadlessAuthority {
                 chatID: chatID,
                 sessionID: sessionID,
                 providerSessionID: proposal.providerSessionID,
-                providerSettingsID: contextBuilderRoute?.providerID ?? session.providerSettingsID,
+                providerSettingsID: contextBuilderRoute.providerID,
                 providerSettings: contextBuilderProviderSettings,
-                provider: contextBuilderRoute?.provider ?? session.provider,
-                model: contextBuilderRoute?.modelID ?? session.model,
-                reasoningEffort: contextBuilderRoute?.reasoningEffort,
+                provider: contextBuilderRoute.provider,
+                model: contextBuilderRoute.modelID,
+                reasoningEffort: contextBuilderRoute.reasoningEffort,
                 turns: [.init(prompt: renderedInstructions, response: response, timestamp: clock.now())],
                 revision: 1
             ))
@@ -2650,17 +2702,26 @@ public actor RepoPromptHeadlessAuthority {
                 }
                 oracleRoute = try await serverSettings.resolveModelPreset(presetID: presetID, availability: availability)
             } else {
-                oracleRoute = try await serverSettings?.resolveAgentTarget(projectID: session.projectID, target: .oracle)
+                guard let serverSettings else {
+                    throw ServiceAPIError(code: .dependencyUnavailable, message: "Oracle settings authority is not configured")
+                }
+                oracleRoute = try await serverSettings.resolveAgentTarget(projectID: session.projectID, target: .oracle)
+            }
+            guard let oracleRoute else {
+                throw ServiceAPIError(
+                    code: .invalidRequest,
+                    message: "MCP Oracle model is not configured. Select an Oracle model in the Models settings before using ask_oracle."
+                )
             }
             priorChat = OracleChatState(
                 chatID: chatID,
                 sessionID: sessionID,
                 providerSessionID: nil,
-                providerSettingsID: oracleRoute?.providerID ?? session.providerSettingsID,
-                providerSettings: await runtimeProviderSettings(providerID: oracleRoute?.providerID ?? session.providerSettingsID),
-                provider: oracleRoute?.provider ?? session.provider,
-                model: oracleRoute?.modelID ?? session.model,
-                reasoningEffort: oracleRoute?.reasoningEffort,
+                providerSettingsID: oracleRoute.providerID,
+                providerSettings: await runtimeProviderSettings(providerID: oracleRoute.providerID),
+                provider: oracleRoute.provider,
+                model: oracleRoute.modelID,
+                reasoningEffort: oracleRoute.reasoningEffort,
                 turns: [],
                 revision: 0
             )

@@ -2679,11 +2679,10 @@
       : snapshot.globalProfile;
     const routes = desktopCard(
       projectOverride ? "Project Agent Routes" : "Global Agent Routes",
-      "These six assignments are resolved before runtime launch. Pinned unavailable targets fail explicitly; unpinned targets may use an exact server recommendation fallback.",
+      "Oracle and Context Builder fail closed when unassigned. Explore, engineer, pair, and design stay unassigned to track recommendations; an explicit pick is stored even when it matches a recommendation.",
     );
     const form = element("form", "typed-settings-form");
     const targetControls = {};
-    const choices = agentTargetChoices();
     [
       "oracle",
       "contextBuilder",
@@ -2693,23 +2692,24 @@
       "design",
     ].forEach((targetName) => {
       const row = element("div", "typed-route-row");
+      const failClosed =
+        targetName === "oracle" || targetName === "contextBuilder";
       const select = typedSelect(
         `${humanize(targetName)} route`,
-        choices,
+        [
+          [
+            "",
+            failClosed
+              ? "Unassigned (fail-closed)"
+              : "Unassigned (tracks recommendation)",
+          ],
+          ...agentTargetChoices().slice(1),
+        ],
         agentTargetValue(profile[targetName]),
       );
-      const pinned = typedToggle(
-        `Pin ${humanize(targetName)} route`,
-        profile[targetName]?.pinned === true,
-      );
-      row.append(
-        element("strong", "", humanize(targetName)),
-        select,
-        element("span", "compact-toggle-label", "Pinned"),
-        pinned.toggle,
-      );
+      row.append(element("strong", "", humanize(targetName)), select);
       form.append(row);
-      targetControls[targetName] = { select, pinned: pinned.input };
+      targetControls[targetName] = { select };
     });
     const restrict = typedToggle(
       "Hide non-role models from MCP agents",
@@ -2718,7 +2718,7 @@
     form.append(
       desktopRow(
         "Hide non-role models from MCP agents",
-        "Filters list_models discovery to configured role targets while preserving enabled model presets.",
+        "Hides the extra per-agent catalog on agent_manage list_agents. Task labels stay visible. Manually supplied compound IDs are still accepted.",
         restrict.toggle,
       ),
     );
@@ -2731,10 +2731,7 @@
         restrictDiscoveryToRoleModels: restrict.input.checked,
       };
       Object.entries(targetControls).forEach(([name, controls]) => {
-        nextProfile[name] = agentTargetFromValue(
-          controls.select.value,
-          controls.pinned.checked,
-        );
+        nextProfile[name] = agentTargetFromValue(controls.select.value);
       });
       mutateDomain(
         "agentModels",
@@ -4852,6 +4849,40 @@
     );
   }
 
+  function liveRouteAssignment(target) {
+    return state.typedSettings.agentModels?.effectiveProfile?.[target] || null;
+  }
+
+  function liveRouteStatus(target) {
+    const assigned = liveRouteAssignment(target);
+    if (!assigned) {
+      return target === "oracle" || target === "contextBuilder"
+        ? "Unconfigured"
+        : "Tracks recommendation";
+    }
+    const provider = orderedProviders().find(
+      (candidate) => candidate.providerID === assigned.providerID,
+    );
+    return `${provider?.displayName || assigned.providerID}${assigned.modelID ? ` · ${assigned.modelID}` : ""}${assigned.reasoningEffort ? ` · ${humanize(assigned.reasoningEffort)}` : ""}`;
+  }
+
+  function liveRouteDetail(target) {
+    if (target === "oracle" || target === "contextBuilder") {
+      return "Fail-closed when unassigned. Live-read from the typed Agent Models store.";
+    }
+    return "Empty tracks the recommendation. An explicit pick stays stored.";
+  }
+
+  function liveAgentModelsStatus() {
+    const snapshot = state.typedSettings.agentModels;
+    if (!snapshot) return "Loading";
+    const profile = snapshot.effectiveProfile || {};
+    if (profile.oracle || profile.contextBuilder) return liveRouteStatus("oracle");
+    return orderedProviders().some(isConnectedProvider)
+      ? "Recommendations ready"
+      : "Connect a CLI provider";
+  }
+
   function renderOverview() {
     const content = document.getElementById("settings-content");
     disposeSensitiveInputs(content);
@@ -4894,7 +4925,7 @@
       "Agent Models",
       "Typed global/project routes plus server profile 202_608 recommendations.",
       "agent-models",
-      connected.length ? "Recommendations ready" : "Connect a CLI provider",
+      liveAgentModelsStatus(),
     );
     routeRow(
       "CLI Providers",
@@ -4921,6 +4952,27 @@
       "Editable",
     );
     content.append(routes);
+    const liveRoutes = desktopCard(
+      "Live routing",
+      "Effective Oracle, Context Builder, and role defaults from the typed Agent Models store.",
+    );
+    [
+      ["oracle", "Oracle"],
+      ["contextBuilder", "Context Builder"],
+      ["explore", "Explore"],
+      ["engineer", "Engineer"],
+      ["pair", "Pair"],
+      ["design", "Design"],
+    ].forEach(([target, title]) => {
+      liveRoutes.append(
+        desktopRow(
+          title,
+          liveRouteDetail(target),
+          element("span", "read-only-value", liveRouteStatus(target)),
+        ),
+      );
+    });
+    content.append(liveRoutes);
 
     const providerCard = desktopCard(
       "CLI Provider Status",

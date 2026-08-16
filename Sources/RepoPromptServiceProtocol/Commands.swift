@@ -424,6 +424,96 @@ public struct CreateSessionInput: Codable, Sendable {
     }
 }
 
+/// Goblin `POST /internal/v1/sessions` body. Explicit provider/model stays a
+/// composer/legacy path. Omitted provider resolves `routingTarget` (default Pair).
+public struct GoblinCreateSessionRequest: Codable, Sendable {
+    public let projectID: UUID
+    public let parentSessionID: UUID?
+    public let routingTarget: AgentRoutingTarget?
+    public let provider: ProviderKind?
+    public let providerSettingsID: ProviderSettingsID?
+    public let model: String?
+    public let visibility: Visibility
+    public let initialPrompt: String?
+    public let selectedMessageContext: SelectedMessageContext?
+    public let startImmediately: Bool?
+    public let initialPermissionMode: String?
+    public let initialProviderSettings: [String: String]?
+
+    public init(
+        projectID: UUID,
+        parentSessionID: UUID? = nil,
+        routingTarget: AgentRoutingTarget? = nil,
+        provider: ProviderKind? = nil,
+        providerSettingsID: ProviderSettingsID? = nil,
+        model: String? = nil,
+        visibility: Visibility,
+        initialPrompt: String? = nil,
+        selectedMessageContext: SelectedMessageContext? = nil,
+        startImmediately: Bool? = nil,
+        initialPermissionMode: String? = nil,
+        initialProviderSettings: [String: String]? = nil
+    ) {
+        self.projectID = projectID
+        self.parentSessionID = parentSessionID
+        self.routingTarget = routingTarget
+        self.provider = provider
+        self.providerSettingsID = providerSettingsID
+        self.model = model
+        self.visibility = visibility
+        self.initialPrompt = initialPrompt
+        self.selectedMessageContext = selectedMessageContext
+        self.startImmediately = startImmediately
+        self.initialPermissionMode = initialPermissionMode
+        self.initialProviderSettings = initialProviderSettings
+    }
+
+    public var hasExplicitProviderRoute: Bool {
+        if provider != nil || providerSettingsID != nil { return true }
+        let trimmed = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return !trimmed.isEmpty
+    }
+
+    public func explicitCreateSessionInput() throws -> CreateSessionInput {
+        let provider: ProviderKind
+        if let explicit = self.provider {
+            provider = explicit
+        } else if let settingsID = providerSettingsID, let kind = settingsID.runtimeKind {
+            provider = kind
+        } else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Session start with an explicit model requires a provider")
+        }
+        return CreateSessionInput(
+            projectID: projectID,
+            parentSessionID: parentSessionID,
+            provider: provider,
+            providerSettingsID: providerSettingsID,
+            model: model,
+            visibility: visibility,
+            initialPrompt: initialPrompt,
+            selectedMessageContext: selectedMessageContext,
+            startImmediately: startImmediately ?? false,
+            initialPermissionMode: initialPermissionMode,
+            initialProviderSettings: initialProviderSettings
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case projectID = "projectId"
+        case parentSessionID = "parentSessionId"
+        case routingTarget
+        case provider
+        case providerSettingsID = "providerSettingsId"
+        case model
+        case visibility
+        case initialPrompt
+        case selectedMessageContext
+        case startImmediately
+        case initialPermissionMode
+        case initialProviderSettings
+    }
+}
+
 public enum ProviderResumeMode: String, Codable, CaseIterable, Sendable {
     case fresh, resume, auto
 }

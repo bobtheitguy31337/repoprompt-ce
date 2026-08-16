@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptHeadlessRuntime
+import RepoPromptMCPAdapter
 @testable import RepoPromptServiceHTTP
 @testable import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
@@ -9,7 +10,12 @@ import XCTest
 final class ServerSettingsFoundationTests: XCTestCase {
     func testTypedSettingsRoundTripThroughServiceCoders() throws {
         let target = AgentModelTarget(providerID: .codex, modelID: "gpt-5.6-sol", reasoningEffort: "high", pinned: true)
-        try assertRoundTrip(AgentModelsProfile(oracle: target, engineer: target, restrictDiscoveryToRoleModels: true))
+        try assertRoundTrip(AgentModelsProfile(
+            oracle: target,
+            engineer: target,
+            restrictDiscoveryToRoleModels: true,
+            contextBuilderModelsByAgent: [ProviderSettingsID.codex.rawValue: "gpt-5.6-sol"]
+        ))
         try assertRoundTrip(SubagentPermissionSettings(policy: .custom, codex: .readOnly, claude: .autoApproveEdits, openCode: .fullAccess, cursor: .managedDefault))
         try assertRoundTrip(ContextBuilderSettingsProfile(
             budget: 100_000,
@@ -411,19 +417,37 @@ final class ServerSettingsFoundationTests: XCTestCase {
             providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
             projectCatalog: StaticProjectCatalog(roots: [projectID: [rootID]])
         )
-        let unassigned = try await service.resolveAgentTarget(projectID: projectID, target: .oracle)
-        XCTAssertNil(unassigned)
-        _ = try await service.applyGlobalAgentModelRecommendations(
+        do {
+            _ = try await service.resolveAgentTarget(projectID: projectID, target: .oracle)
+            XCTFail("unconfigured Oracle must fail-closed")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertTrue(error.message.contains("not configured"))
+        }
+        do {
+            _ = try await service.resolveAgentTarget(projectID: projectID, target: .contextBuilder)
+            XCTFail("unconfigured Context Builder must fail-closed")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertTrue(error.message.contains("not configured"))
+        }
+        let applied = try await service.applyGlobalAgentModelRecommendations(
             .init(expectedRevision: 0),
             attribution: Self.attribution
         )
+        XCTAssertNotNil(applied.effectiveProfile.oracle)
+        XCTAssertNotNil(applied.effectiveProfile.contextBuilder)
+        XCTAssertNil(applied.effectiveProfile.explore)
+        XCTAssertNil(applied.effectiveProfile.engineer)
+        XCTAssertNil(applied.effectiveProfile.pair)
+        XCTAssertNil(applied.effectiveProfile.design)
 
         for target in AgentRoutingTarget.allCases {
             let resolved = try await service.resolveAgentTarget(projectID: projectID, target: target)
             let route = try XCTUnwrap(resolved)
             XCTAssertEqual(route.routingTarget, target)
             XCTAssertNotEqual(route.providerID, .openCodeACP)
-            XCTAssertFalse(route.usedRecommendationFallback)
+            XCTAssertEqual(route.usedRecommendationFallback, target.isSubagentRole)
         }
 
         _ = try await service.replaceGlobalContextBuilder(
@@ -472,6 +496,424 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertEqual(presetRoute.reasoningEffort, "high")
         let discovery = try await service.modelDiscovery(projectID: projectID)
         XCTAssertEqual(discovery.presets.map(\.presetID), [presetID])
+    }
+
+    func testContextBuilderRemembersPerAgentModelAndFailClosesWhenUnconfigured() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let projectID = UUID()
+        let rootID = UUID()
+        try await persistProject(projectID: projectID, rootID: rootID, store: store)
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
+            projectCatalog: StaticProjectCatalog(roots: [projectID: [rootID]])
+        )
+
+        let codex = AgentModelTarget(providerID: .codex, modelID: "gpt-5.6-sol", reasoningEffort: "high")
+        let first = try await service.replaceGlobalAgentModels(
+            .init(expectedRevision: 0, profile: .init(contextBuilder: codex)),
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(first.effectiveProfile.contextBuilderModelsByAgent?[ProviderSettingsID.codex.rawValue], "gpt-5.6-sol")
+
+        let claude = AgentModelTarget(providerID: .claudeCompatible, modelID: "claude-opus-5")
+        let switched = try await service.replaceGlobalAgentModels(
+            .init(
+                expectedRevision: first.globalRevision,
+                profile: first.effectiveProfile.replacing(.contextBuilder, with: claude)
+            ),
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(switched.effectiveProfile.contextBuilder?.providerID, .claudeCompatible)
+        XCTAssertEqual(switched.effectiveProfile.contextBuilderModelsByAgent?[ProviderSettingsID.codex.rawValue], "gpt-5.6-sol")
+        XCTAssertEqual(switched.effectiveProfile.contextBuilderModelsByAgent?[ProviderSettingsID.claudeCompatible.rawValue], "claude-opus-5")
+
+        let restored = try await service.replaceGlobalAgentModels(
+            .init(
+                expectedRevision: switched.globalRevision,
+                profile: switched.effectiveProfile.replacing(
+                    .contextBuilder,
+                    with: AgentModelTarget(providerID: .codex)
+                )
+            ),
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(restored.effectiveProfile.contextBuilder?.providerID, .codex)
+        XCTAssertEqual(restored.effectiveProfile.contextBuilder?.modelID, "gpt-5.6-sol")
+        let route = try await service.resolveAgentTarget(projectID: projectID, target: .contextBuilder)
+        XCTAssertEqual(try XCTUnwrap(route).modelID, "gpt-5.6-sol")
+        XCTAssertFalse(try XCTUnwrap(route).usedRecommendationFallback)
+
+        let cleared = try await service.replaceGlobalAgentModels(
+            .init(
+                expectedRevision: restored.globalRevision,
+                profile: restored.effectiveProfile.replacing(.contextBuilder, with: nil)
+            ),
+            attribution: Self.attribution
+        )
+        do {
+            _ = try await service.resolveAgentTarget(projectID: projectID, target: .contextBuilder)
+            XCTFail("cleared Context Builder must fail-closed")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+        }
+        XCTAssertEqual(cleared.effectiveProfile.contextBuilderModelsByAgent?[ProviderSettingsID.codex.rawValue], "gpt-5.6-sol")
+    }
+
+    func testRoleDefaultsTrackRecommendationsStickWhenAssignedAndFailClosedWhenEmpty() async throws {
+        let omitted = try MCPAgentStartTarget.resolve(modelID: nil, defaultRole: "pair")
+        XCTAssertEqual(omitted.role, "pair")
+        XCTAssertNil(omitted.provider)
+        XCTAssertNil(omitted.model)
+
+        let explore = try MCPAgentStartTarget.resolve(modelID: "explore", defaultRole: "pair")
+        XCTAssertEqual(explore.role, "explore")
+
+        let compound = try MCPAgentStartTarget.resolve(modelID: "claudeCode:sonnet", defaultRole: "pair")
+        XCTAssertEqual(compound.role, "child")
+        XCTAssertEqual(compound.providerSettingsID, .claudeCompatible)
+        XCTAssertEqual(compound.model, "sonnet")
+
+        let native = try MCPAgentStartTarget.resolve(modelID: "codex:gpt-5.6-sol", defaultRole: "pair")
+        XCTAssertEqual(native.role, "child")
+        XCTAssertEqual(native.providerSettingsID, .codex)
+        XCTAssertEqual(native.model, "gpt-5.6-sol")
+
+        do {
+            _ = try MCPAgentStartTarget.resolve(modelID: "not-a-role", defaultRole: "pair")
+            XCTFail("unknown model_id without a colon must fail-closed")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+        }
+
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let catalog = StaticProviderCatalog(response: Self.providerCatalog())
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: catalog,
+            projectCatalog: store
+        )
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("role-defaults-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
+        let actor = ExternalActor(goblinUserID: "roles", username: "roles", displayName: "Roles")
+        let project = try await authority.createProject(
+            input: .init(name: "Roles", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "roles-project",
+            requestDigest: "roles-project"
+        )
+        let projectID = project.projectID
+
+        let unassignedPairRoute = try await service.resolveAgentTarget(projectID: projectID, target: .pair)
+        let unassignedPair = try XCTUnwrap(unassignedPairRoute)
+        XCTAssertEqual(unassignedPair.providerID, .codex)
+        XCTAssertEqual(unassignedPair.modelID, "gpt-5.6-sol")
+        XCTAssertEqual(unassignedPair.reasoningEffort, "high")
+        XCTAssertTrue(unassignedPair.usedRecommendationFallback)
+
+        let unassignedExploreRoute = try await service.resolveAgentTarget(projectID: projectID, target: .explore)
+        let unassignedExplore = try XCTUnwrap(unassignedExploreRoute)
+        XCTAssertEqual(unassignedExplore.providerID, .codex)
+        XCTAssertEqual(unassignedExplore.reasoningEffort, "low")
+        XCTAssertTrue(unassignedExplore.usedRecommendationFallback)
+        let parent = try await authority.createSession(
+            input: .init(
+                projectID: project.projectID,
+                provider: .claudeCompatible,
+                model: "claude-opus-5",
+                visibility: .privateSession
+            ),
+            externalActor: actor,
+            idempotencyKey: "roles-parent",
+            requestDigest: "roles-parent"
+        )
+
+        let pairChild = try await authority.spawnChildSession(
+            parentSessionID: parent.sessionID,
+            initialPrompt: "pair",
+            role: "pair"
+        )
+        XCTAssertEqual(pairChild.provider, .codex)
+        XCTAssertEqual(pairChild.providerSettingsID, .codex)
+        XCTAssertEqual(pairChild.model, "gpt-5.6-sol")
+        XCTAssertNotEqual(pairChild.model, parent.model)
+
+        let explicit = try await authority.spawnChildSession(
+            parentSessionID: parent.sessionID,
+            providerSettingsID: .claudeGLM,
+            initialPrompt: "explicit"
+        )
+        XCTAssertEqual(explicit.providerSettingsID, .claudeGLM)
+        XCTAssertEqual(explicit.provider, .claudeCompatible)
+
+        let matchingRecommendation = AgentModelTarget(providerID: .codex, modelID: "gpt-5.6-sol", reasoningEffort: "high")
+        let assigned = try await service.replaceGlobalAgentModels(
+            .init(expectedRevision: 0, profile: .init(pair: matchingRecommendation)),
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(assigned.effectiveProfile.pair, matchingRecommendation)
+        let stickyPairRoute = try await service.resolveAgentTarget(projectID: projectID, target: .pair)
+        let stickyPair = try XCTUnwrap(stickyPairRoute)
+        XCTAssertEqual(stickyPair.providerID, .codex)
+        XCTAssertEqual(stickyPair.modelID, "gpt-5.6-sol")
+        XCTAssertFalse(stickyPair.usedRecommendationFallback)
+
+        let cursorPin = AgentModelTarget(providerID: .cursorACP, modelID: "auto")
+        let pinned = try await service.replaceGlobalAgentModels(
+            .init(
+                expectedRevision: assigned.globalRevision,
+                profile: assigned.effectiveProfile.replacing(.pair, with: cursorPin)
+            ),
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(pinned.effectiveProfile.pair, cursorPin)
+
+        let degraded = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: .init(providers: Self.providerCatalog().providers.filter { $0.providerID != .cursorACP })),
+            projectCatalog: store
+        )
+        let fallbackRoute = try await degraded.resolveAgentTarget(projectID: projectID, target: .pair)
+        let fallback = try XCTUnwrap(fallbackRoute)
+        XCTAssertEqual(fallback.providerID, .codex)
+        XCTAssertEqual(fallback.modelID, "gpt-5.6-sol")
+        XCTAssertTrue(fallback.usedRecommendationFallback)
+        let persistedPin = try await degraded.agentModels(projectID: projectID)
+        XCTAssertEqual(persistedPin.effectiveProfile.pair, cursorPin)
+
+        let empty = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: .init(providers: [])),
+            projectCatalog: store
+        )
+        do {
+            _ = try await empty.resolveAgentTarget(projectID: projectID, target: .pair)
+            XCTFail("empty catalog must fail-closed for role defaults")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+            XCTAssertTrue(error.message.contains("No available agent/model for task label 'pair'"))
+        }
+    }
+
+    func testGoblinSessionStartWithoutProviderResolvesPairRoute() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let projectID = UUID()
+        let rootID = UUID()
+        try await persistProject(projectID: projectID, rootID: rootID, store: store)
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
+            projectCatalog: StaticProjectCatalog(roots: [projectID: [rootID]])
+        )
+        let omitted = try JSONDecoder.serviceDecoder.decode(
+            GoblinCreateSessionRequest.self,
+            from: Data("""
+            {"projectId":"\(projectID.uuidString)","visibility":"private","initialPrompt":"Inspect"}
+            """.utf8)
+        )
+        XCTAssertFalse(omitted.hasExplicitProviderRoute)
+        let resolved = try await service.createSessionInput(from: omitted)
+        XCTAssertEqual(resolved.provider, .codex)
+        XCTAssertEqual(resolved.providerSettingsID, .codex)
+        XCTAssertEqual(resolved.model, "gpt-5.6-sol")
+        XCTAssertEqual(resolved.initialProviderSettings?["provider.reasoningEffort"], "high")
+
+        let explore = try await service.createSessionInput(
+            from: .init(projectID: projectID, routingTarget: .explore, visibility: .privateSession, initialPrompt: "Explore")
+        )
+        XCTAssertEqual(explore.provider, .codex)
+        XCTAssertEqual(explore.initialProviderSettings?["provider.reasoningEffort"], "low")
+
+        do {
+            _ = try await service.createSessionInput(
+                from: .init(projectID: projectID, routingTarget: .oracle, visibility: .privateSession)
+            )
+            XCTFail("oracle is not a session start role")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+        }
+
+        let explicit = try JSONDecoder.serviceDecoder.decode(
+            GoblinCreateSessionRequest.self,
+            from: Data("""
+            {"projectId":"\(projectID.uuidString)","provider":"codex","visibility":"private"}
+            """.utf8)
+        )
+        XCTAssertTrue(explicit.hasExplicitProviderRoute)
+        let explicitInput = try explicit.explicitCreateSessionInput()
+        XCTAssertEqual(explicitInput.provider, .codex)
+        XCTAssertNil(explicitInput.model)
+    }
+
+    func testApplyRecommendationsWritesStickyOracleAndContextBuilderAndClearsRoleOverrides() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let projectID = UUID()
+        let rootID = UUID()
+        try await persistProject(projectID: projectID, rootID: rootID, store: store)
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
+            projectCatalog: StaticProjectCatalog(roots: [projectID: [rootID]])
+        )
+
+        let seeded = try await service.replaceGlobalAgentModels(
+            .init(
+                expectedRevision: 0,
+                profile: .init(
+                    oracle: .init(providerID: .claudeCompatible, modelID: "claude-opus-5", pinned: true),
+                    pair: .init(providerID: .cursorACP, modelID: "auto"),
+                    restrictDiscoveryToRoleModels: true
+                )
+            ),
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(seeded.effectiveProfile.oracle?.providerID, .claudeCompatible)
+        XCTAssertEqual(seeded.effectiveProfile.pair?.providerID, .cursorACP)
+
+        let applied = try await service.applyGlobalAgentModelRecommendations(
+            .init(expectedRevision: seeded.globalRevision),
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(applied.effectiveProfile.oracle?.providerID, .codex)
+        XCTAssertEqual(applied.effectiveProfile.oracle?.modelID, "gpt-5.6-sol")
+        XCTAssertEqual(applied.effectiveProfile.contextBuilder?.providerID, .codex)
+        XCTAssertNil(applied.effectiveProfile.explore)
+        XCTAssertNil(applied.effectiveProfile.engineer)
+        XCTAssertNil(applied.effectiveProfile.pair)
+        XCTAssertNil(applied.effectiveProfile.design)
+        XCTAssertTrue(applied.effectiveProfile.restrictDiscoveryToRoleModels)
+
+        let oracleRoute = try await service.resolveAgentTarget(projectID: projectID, target: .oracle)
+        let oracle = try XCTUnwrap(oracleRoute)
+        XCTAssertEqual(oracle.providerID, .codex)
+        XCTAssertFalse(oracle.usedRecommendationFallback)
+
+        let contextBuilderRoute = try await service.resolveAgentTarget(projectID: projectID, target: .contextBuilder)
+        let contextBuilder = try XCTUnwrap(contextBuilderRoute)
+        XCTAssertEqual(contextBuilder.providerID, .codex)
+        XCTAssertFalse(contextBuilder.usedRecommendationFallback)
+
+        let pairRoute = try await service.resolveAgentTarget(projectID: projectID, target: .pair)
+        let pair = try XCTUnwrap(pairRoute)
+        XCTAssertEqual(pair.providerID, .codex)
+        XCTAssertTrue(pair.usedRecommendationFallback)
+    }
+
+    func testRestrictDiscoveryHidesListAgentsCatalogAndLeavesListModelsUnfiltered() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let projectID = UUID()
+        let rootID = UUID()
+        try await persistProject(projectID: projectID, rootID: rootID, store: store)
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
+            projectCatalog: StaticProjectCatalog(roots: [projectID: [rootID]])
+        )
+
+        let open = try await service.agentDiscovery(projectID: projectID)
+        XCTAssertFalse(open.roleModelRestrictionApplied)
+        XCTAssertEqual(Set(open.taskLabels.map(\.label)), ["explore", "engineer", "pair", "design"])
+        XCTAssertFalse(try XCTUnwrap(open.agents).isEmpty)
+        XCTAssertTrue(try XCTUnwrap(open.agents).contains { agent in
+            agent.models.contains { $0.modelID.hasPrefix("codex:") }
+        })
+
+        let rolesOnly = try await service.agentDiscovery(projectID: projectID, rolesOnly: true)
+        XCTAssertNil(rolesOnly.agents)
+        XCTAssertFalse(rolesOnly.taskLabels.isEmpty)
+
+        let restricted = try await service.replaceGlobalAgentModels(
+            .init(
+                expectedRevision: 0,
+                profile: .init(
+                    pair: .init(providerID: .cursorACP, modelID: "auto"),
+                    restrictDiscoveryToRoleModels: true
+                )
+            ),
+            attribution: Self.attribution
+        )
+        XCTAssertTrue(restricted.effectiveProfile.restrictDiscoveryToRoleModels)
+
+        let hidden = try await service.agentDiscovery(projectID: projectID)
+        XCTAssertTrue(hidden.roleModelRestrictionApplied)
+        XCTAssertNil(hidden.agents)
+        XCTAssertEqual(Set(hidden.taskLabels.map(\.label)), ["explore", "engineer", "pair", "design"])
+        let pairLabel = try XCTUnwrap(hidden.taskLabels.first(where: { $0.label == "pair" }))
+        XCTAssertEqual(pairLabel.modelID, "cursorACP:auto")
+        XCTAssertTrue(pairLabel.hasCustomOverride)
+        XCTAssertFalse(pairLabel.overrideUnavailable)
+
+        let models = try await service.modelDiscovery(projectID: projectID)
+        XCTAssertFalse(models.roleModelRestrictionApplied)
+        XCTAssertEqual(Set(models.providers.map(\.providerID)), Set(Self.providerCatalog().providers.map(\.providerID)))
+        XCTAssertGreaterThan(models.providers.reduce(0) { $0 + $1.models.count }, 1)
+    }
+
+    func testAppSettingsRoutingKeysWriteTheTypedAgentModelsStore() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("app-settings-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
+            projectCatalog: store
+        )
+        let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
+        let actor = ExternalActor(goblinUserID: "mcp-settings", username: "mcp-settings", displayName: "MCP Settings")
+        let project = try await authority.createProject(
+            input: .init(name: "Settings", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "settings-project",
+            requestDigest: "settings-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "settings-session",
+            requestDigest: "settings-session"
+        )
+        let adapter = RepoPromptMCPAdapter(authority: authority)
+        let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
+
+        func invoke(_ object: [String: Any]) async throws -> [String: Any] {
+            let data = try await adapter.invoke(
+                toolName: "app_settings",
+                argumentsJSON: try JSONSerialization.data(withJSONObject: object),
+                binding: binding
+            )
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+
+        let empty = try await invoke(["op": "get", "key": "models.planning_model"])
+        XCTAssertEqual(empty["key"] as? String, "models.planning_model")
+        XCTAssertTrue(empty["value"] is NSNull)
+
+        let written = try await invoke([
+            "op": "set",
+            "key": "models.planning_model",
+            "value": "codex:gpt-5.6-sol"
+        ])
+        XCTAssertEqual(written["value"] as? String, "codex:gpt-5.6-sol")
+        let stored = try await authority.globalAgentModels()
+        XCTAssertEqual(stored.effectiveProfile.oracle?.providerID, .codex)
+        XCTAssertEqual(stored.effectiveProfile.oracle?.modelID, "gpt-5.6-sol")
+
+        _ = try await invoke(["op": "set", "key": "context_builder.agent", "value": "claudeCode"])
+        _ = try await invoke(["op": "set", "key": "context_builder.model", "value": "claude-opus-5"])
+        let builder = try await authority.globalAgentModels().effectiveProfile.contextBuilder
+        XCTAssertEqual(builder?.providerID, .claudeCompatible)
+        XCTAssertEqual(builder?.modelID, "claude-opus-5")
+        let readBuilder = try await invoke(["op": "get", "key": "context_builder.model"])
+        XCTAssertEqual(readBuilder["value"] as? String, "claude-opus-5")
     }
 
     func testChildCreationEnforcesSafeInheritAndCustomWithExactProviderIdentity() async throws {

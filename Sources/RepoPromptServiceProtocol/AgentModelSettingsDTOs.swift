@@ -7,6 +7,13 @@ public enum AgentRoutingTarget: String, Codable, CaseIterable, Sendable {
     case engineer
     case pair
     case design
+
+    public var isSubagentRole: Bool {
+        switch self {
+        case .explore, .engineer, .pair, .design: true
+        case .oracle, .contextBuilder: false
+        }
+    }
 }
 
 public struct ResolvedAgentModelRoute: Codable, Hashable, Sendable {
@@ -56,6 +63,7 @@ public struct AgentModelsProfile: Codable, Hashable, Sendable {
     public let pair: AgentModelTarget?
     public let design: AgentModelTarget?
     public let restrictDiscoveryToRoleModels: Bool
+    public let contextBuilderModelsByAgent: [String: String]?
 
     public init(
         oracle: AgentModelTarget? = nil,
@@ -64,7 +72,8 @@ public struct AgentModelsProfile: Codable, Hashable, Sendable {
         engineer: AgentModelTarget? = nil,
         pair: AgentModelTarget? = nil,
         design: AgentModelTarget? = nil,
-        restrictDiscoveryToRoleModels: Bool = false
+        restrictDiscoveryToRoleModels: Bool = false,
+        contextBuilderModelsByAgent: [String: String]? = nil
     ) {
         self.oracle = oracle
         self.contextBuilder = contextBuilder
@@ -73,6 +82,7 @@ public struct AgentModelsProfile: Codable, Hashable, Sendable {
         self.pair = pair
         self.design = design
         self.restrictDiscoveryToRoleModels = restrictDiscoveryToRoleModels
+        self.contextBuilderModelsByAgent = Self.normalizedContextBuilderModelsByAgent(contextBuilderModelsByAgent)
     }
 
     public subscript(target: AgentRoutingTarget) -> AgentModelTarget? {
@@ -87,15 +97,50 @@ public struct AgentModelsProfile: Codable, Hashable, Sendable {
     }
 
     public func replacing(_ target: AgentRoutingTarget, with value: AgentModelTarget?) -> AgentModelsProfile {
-        AgentModelsProfile(
+        var modelsByAgent = contextBuilderModelsByAgent ?? [:]
+        let nextContextBuilder: AgentModelTarget?
+        if target == .contextBuilder {
+            if let value {
+                let remembered = modelsByAgent[value.providerID.rawValue]
+                let trimmedModel = value.modelID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let resolvedModel = trimmedModel.isEmpty ? remembered : trimmedModel
+                if let resolvedModel, !resolvedModel.isEmpty {
+                    modelsByAgent[value.providerID.rawValue] = resolvedModel
+                }
+                nextContextBuilder = AgentModelTarget(
+                    providerID: value.providerID,
+                    modelID: resolvedModel,
+                    reasoningEffort: value.reasoningEffort,
+                    pinned: value.pinned
+                )
+            } else {
+                nextContextBuilder = nil
+            }
+        } else {
+            nextContextBuilder = contextBuilder
+        }
+        return AgentModelsProfile(
             oracle: target == .oracle ? value : oracle,
-            contextBuilder: target == .contextBuilder ? value : contextBuilder,
+            contextBuilder: nextContextBuilder,
             explore: target == .explore ? value : explore,
             engineer: target == .engineer ? value : engineer,
             pair: target == .pair ? value : pair,
             design: target == .design ? value : design,
-            restrictDiscoveryToRoleModels: restrictDiscoveryToRoleModels
+            restrictDiscoveryToRoleModels: restrictDiscoveryToRoleModels,
+            contextBuilderModelsByAgent: modelsByAgent.isEmpty ? nil : modelsByAgent
         )
+    }
+
+    static func normalizedContextBuilderModelsByAgent(_ models: [String: String]?) -> [String: String]? {
+        guard let models else { return nil }
+        var normalized: [String: String] = [:]
+        for (rawAgent, rawModel) in models {
+            let agent = rawAgent.trimmingCharacters(in: .whitespacesAndNewlines)
+            let model = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !agent.isEmpty, !model.isEmpty else { continue }
+            normalized[agent] = model
+        }
+        return normalized.isEmpty ? nil : normalized
     }
 
     public static let `default` = AgentModelsProfile()
@@ -210,5 +255,119 @@ public struct ApplyAgentModelRecommendationsRequest: Codable, Hashable, Sendable
 
     public init(expectedRevision: Int64) {
         self.expectedRevision = expectedRevision
+    }
+}
+
+public struct MCPAgentTaskLabel: Codable, Hashable, Sendable {
+    public let label: String
+    public let description: String
+    public let modelID: String
+    public let name: String
+    public let recommendedModelID: String
+    public let recommendedName: String
+    public let hasCustomOverride: Bool
+    public let overrideUnavailable: Bool
+
+    public init(
+        label: String,
+        description: String,
+        modelID: String,
+        name: String,
+        recommendedModelID: String,
+        recommendedName: String,
+        hasCustomOverride: Bool,
+        overrideUnavailable: Bool
+    ) {
+        self.label = label
+        self.description = description
+        self.modelID = modelID
+        self.name = name
+        self.recommendedModelID = recommendedModelID
+        self.recommendedName = recommendedName
+        self.hasCustomOverride = hasCustomOverride
+        self.overrideUnavailable = overrideUnavailable
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case label, description, name
+        case modelID = "model_id"
+        case recommendedModelID = "recommended_model_id"
+        case recommendedName = "recommended_name"
+        case hasCustomOverride = "has_custom_override"
+        case overrideUnavailable = "override_unavailable"
+    }
+}
+
+public struct MCPDiscoveredAgentModel: Codable, Hashable, Sendable {
+    public let modelID: String
+    public let name: String
+    public let reasoningEffort: String?
+
+    public init(modelID: String, name: String, reasoningEffort: String? = nil) {
+        self.modelID = modelID
+        self.name = name
+        self.reasoningEffort = reasoningEffort
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case modelID = "model_id"
+        case reasoningEffort = "reasoning_effort"
+    }
+}
+
+public struct MCPDiscoveredAgent: Codable, Hashable, Sendable {
+    public let name: String
+    public let available: Bool
+    public let capabilities: [String]
+    public let models: [MCPDiscoveredAgentModel]
+    public let defaultModelID: String?
+
+    public init(
+        name: String,
+        available: Bool,
+        capabilities: [String],
+        models: [MCPDiscoveredAgentModel],
+        defaultModelID: String?
+    ) {
+        self.name = name
+        self.available = available
+        self.capabilities = capabilities
+        self.models = models
+        self.defaultModelID = defaultModelID
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name, available, capabilities, models
+        case defaultModelID = "default_model_id"
+    }
+}
+
+public struct MCPAgentDiscoverySnapshot: Codable, Hashable, Sendable {
+    public let taskLabels: [MCPAgentTaskLabel]
+    public let agents: [MCPDiscoveredAgent]?
+    public let roleModelRestrictionApplied: Bool
+
+    public init(
+        taskLabels: [MCPAgentTaskLabel],
+        agents: [MCPDiscoveredAgent]?,
+        roleModelRestrictionApplied: Bool
+    ) {
+        self.taskLabels = taskLabels
+        self.agents = agents
+        self.roleModelRestrictionApplied = roleModelRestrictionApplied
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case agents
+        case taskLabels = "task_labels"
+        case roleModelRestrictionApplied = "role_model_restriction_applied"
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(taskLabels, forKey: .taskLabels)
+        try container.encodeIfPresent(agents, forKey: .agents)
+        try container.encode(roleModelRestrictionApplied, forKey: .roleModelRestrictionApplied)
     }
 }

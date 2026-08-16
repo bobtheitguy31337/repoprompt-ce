@@ -289,13 +289,117 @@ private actor AuthorityToolBackend {
     }
 
     private func appSettings(_ arguments: [String: Value]) async throws -> Value {
+        let operation = arguments["op"]?.stringValue ?? "list"
+        switch operation {
+        case "get":
+            if let key = arguments["key"]?.stringValue {
+                return try await routingAppSetting(key: key)
+            }
+        case "set":
+            if let key = arguments["key"]?.stringValue {
+                return try await replaceRoutingAppSetting(key: key, value: arguments["value"])
+            }
+            throw ServiceAPIError(code: .invalidRequest, message: "app_settings set requires key")
+        default:
+            break
+        }
         let capabilities = try await authority.capabilities()
-        let providers = await authority.providerCapabilities(preflight: arguments["op"]?.stringValue == "list")
+        let providers = await authority.providerCapabilities(preflight: operation == "list")
         return try value(SettingsResult(
-            operation: arguments["op"]?.stringValue ?? "list",
+            operation: operation,
             capabilities: capabilities,
             providers: providers
         ))
+    }
+
+    private func routingAppSetting(key: String) async throws -> Value {
+        let snapshot = try await authority.globalAgentModels()
+        let profile = snapshot.effectiveProfile
+        switch key {
+        case "models.planning_model":
+            return .object([
+                "key": .string(key),
+                "value": profile.oracle.flatMap(Self.compoundID).map(Value.string) ?? .null
+            ])
+        case "context_builder.agent":
+            return .object([
+                "key": .string(key),
+                "value": profile.contextBuilder.map { .string($0.providerID.rawValue) } ?? .null
+            ])
+        case "context_builder.model":
+            return .object([
+                "key": .string(key),
+                "value": profile.contextBuilder?.modelID.map(Value.string) ?? .null
+            ])
+        default:
+            throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
+        }
+    }
+
+    private func replaceRoutingAppSetting(key: String, value: Value?) async throws -> Value {
+        let current = try await authority.globalAgentModels()
+        var profile = current.globalProfile
+        switch key {
+        case "models.planning_model":
+            profile = profile.replacing(.oracle, with: try Self.agentTarget(fromCompoundOrModel: value?.stringValue))
+        case "context_builder.agent":
+            guard let raw = value?.stringValue, let providerID = Self.providerSettingsID(fromAppSettings: raw) else {
+                throw ServiceAPIError(code: .invalidRequest, message: "context_builder.agent must be a known CLI agent")
+            }
+            profile = profile.replacing(.contextBuilder, with: AgentModelTarget(providerID: providerID, modelID: profile.contextBuilder?.modelID))
+        case "context_builder.model":
+            guard let currentBuilder = profile.contextBuilder else {
+                throw ServiceAPIError(code: .invalidRequest, message: "context_builder.agent must be configured before setting context_builder.model")
+            }
+            profile = profile.replacing(
+                .contextBuilder,
+                with: AgentModelTarget(providerID: currentBuilder.providerID, modelID: value?.stringValue)
+            )
+        default:
+            throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
+        }
+        _ = try await authority.replaceGlobalAgentModels(
+            .init(expectedRevision: current.globalRevision, profile: profile),
+            attribution: SettingsMutationAttribution(
+                actorID: binding.actor.goblinUserID,
+                actorLabel: binding.actor.displayName,
+                channel: "mcp"
+            )
+        )
+        return try await routingAppSetting(key: key)
+    }
+
+    private static func compoundID(_ target: AgentModelTarget) -> String? {
+        guard let modelID = target.modelID, !modelID.isEmpty else { return nil }
+        return "\(target.providerID.rawValue):\(modelID)"
+    }
+
+    private static func agentTarget(fromCompoundOrModel raw: String?) throws -> AgentModelTarget? {
+        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.contains(":") {
+            let start = try MCPAgentStartTarget.resolve(modelID: trimmed, defaultRole: "pair")
+            guard let providerID = start.providerSettingsID, let model = start.model else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Invalid models.planning_model '\(trimmed)'")
+            }
+            return AgentModelTarget(providerID: providerID, modelID: model)
+        }
+        throw ServiceAPIError(
+            code: .invalidRequest,
+            message: "models.planning_model must be a compound agent:model ID"
+        )
+    }
+
+    private static func providerSettingsID(fromAppSettings raw: String) -> ProviderSettingsID? {
+        ProviderSettingsID(rawValue: raw) ?? {
+            switch raw {
+            case "codexExec": .codex
+            case "claudeCode": .claudeCompatible
+            case "openCode": .openCodeACP
+            case "cursor": .cursorACP
+            default: nil
+            }
+        }()
     }
 
     private func bindContext() async throws -> Value {
@@ -784,15 +888,20 @@ private actor AuthorityToolBackend {
             guard let message = arguments["message"]?.stringValue, !message.isEmpty else {
                 throw ServiceAPIError(code: .invalidRequest, message: "Agent start requires message")
             }
-            let provider = arguments["provider"]?.stringValue.flatMap(ProviderKind.init(rawValue:))
-            let providerSettingsID = arguments["provider_settings_id"]?.stringValue.flatMap(ProviderSettingsID.init(rawValue:))
+            let start = try MCPAgentStartTarget.resolve(
+                modelID: arguments["model_id"]?.stringValue,
+                defaultRole: defaultRole,
+                provider: arguments["provider"]?.stringValue.flatMap(ProviderKind.init(rawValue:)),
+                providerSettingsID: arguments["provider_settings_id"]?.stringValue.flatMap(ProviderSettingsID.init(rawValue:)),
+                model: arguments["model"]?.stringValue
+            )
             let child = try await authority.spawnChildSession(
                 parentSessionID: binding.sessionID,
-                provider: provider,
-                providerSettingsID: providerSettingsID,
-                model: arguments["model"]?.stringValue,
+                provider: start.provider,
+                providerSettingsID: start.providerSettingsID,
+                model: start.model,
                 initialPrompt: message,
-                role: arguments["model_id"]?.stringValue ?? defaultRole,
+                role: start.role,
                 label: arguments["session_name"]?.stringValue
             )
             // Desktop copies the parent's worktree bindings onto the child
@@ -821,7 +930,12 @@ private actor AuthorityToolBackend {
     private func agentManage(_ arguments: [String: Value]) async throws -> Value {
         let operation = arguments["op"]?.stringValue ?? "list_agents"
         switch operation {
-        case "list_agents", "list", "list_sessions":
+        case "list_agents":
+            return try await value(authority.agentDiscovery(
+                sessionID: binding.sessionID,
+                rolesOnly: arguments["roles_only"]?.boolValue ?? false
+            ))
+        case "list", "list_sessions":
             let root = try await session().rootSessionID
             return try await value(authority.agentSnapshots(rootSessionID: root))
         case "cancel":
@@ -1018,6 +1132,61 @@ private actor AuthorityToolBackend {
     private func value(_ encodable: some Encodable) throws -> Value {
         let data = try JSONEncoder.serviceEncoder.encode(encodable)
         return try JSONDecoder().decode(Value.self, from: data)
+    }
+}
+
+public struct MCPAgentStartTarget: Sendable {
+    public let role: String
+    public let provider: ProviderKind?
+    public let providerSettingsID: ProviderSettingsID?
+    public let model: String?
+
+    public static func resolve(
+        modelID: String?,
+        defaultRole: String,
+        provider: ProviderKind? = nil,
+        providerSettingsID: ProviderSettingsID? = nil,
+        model: String? = nil
+    ) throws -> MCPAgentStartTarget {
+        let trimmed = modelID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if trimmed.isEmpty {
+            return .init(role: defaultRole, provider: provider, providerSettingsID: providerSettingsID, model: model)
+        }
+        if let role = AgentRoutingTarget(rawValue: trimmed.lowercased()), role.isSubagentRole {
+            return .init(role: role.rawValue, provider: provider, providerSettingsID: providerSettingsID, model: model)
+        }
+        if trimmed.contains(":") {
+            let parts = trimmed.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+            let agentRaw = String(parts[0])
+            let modelRaw = parts.count == 2 ? String(parts[1]) : ""
+            guard !modelRaw.isEmpty else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Invalid model_id '\(trimmed)'. Use a task label (explore, engineer, pair, design) or a compound ID from agent_manage op=list_agents.")
+            }
+            let mappedID = ProviderSettingsID(rawValue: agentRaw) ?? desktopProviderSettingsID(agentRaw)
+            guard let mappedID else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Unknown model_id '\(trimmed)'. Use a task label (explore, engineer, pair, design) or a compound ID from agent_manage op=list_agents.")
+            }
+            return .init(
+                role: "child",
+                provider: provider,
+                providerSettingsID: providerSettingsID ?? mappedID,
+                model: model ?? modelRaw
+            )
+        }
+        throw ServiceAPIError(
+            code: .invalidRequest,
+            message: "Unknown model_id '\(trimmed)'. Use a task label (explore, engineer, pair, design) or a compound ID from agent_manage op=list_agents."
+        )
+    }
+
+    private static func desktopProviderSettingsID(_ raw: String) -> ProviderSettingsID? {
+        switch raw {
+        case "codexExec": .codex
+        case "claudeCode": .claudeCompatible
+        case "openCode": .openCodeACP
+        case "cursor": .cursorACP
+        default: nil
+        }
     }
 }
 

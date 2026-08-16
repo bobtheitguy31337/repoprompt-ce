@@ -877,7 +877,13 @@ public struct RepoPromptHTTPService: Sendable {
                 try await requireSubmissionDispatchQueue().enqueue(accepted, actor: actor, requestDigest: requestDigest)
                 return try HTTPResponses.privateJSON(accepted.receipt, status: .accepted)
             }
-            let input = try JSONDecoder.serviceDecoder.decode(CreateSessionInput.self, from: data)
+            let requestBody = try JSONDecoder.serviceDecoder.decode(GoblinCreateSessionRequest.self, from: data)
+            let input: CreateSessionInput
+            if requestBody.hasExplicitProviderRoute {
+                input = try requestBody.explicitCreateSessionInput()
+            } else {
+                input = try await requireServerSettings().createSessionInput(from: requestBody)
+            }
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "startSession", projectID: input.projectID)
             guard input.parentSessionID == nil else { throw ServiceAPIError(code: .invalidRequest, message: "Public session creation cannot specify parentSessionID; child agents are created by agent_manage") }
             let snapshot = try await authority.createSession(input: input, externalActor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest)
