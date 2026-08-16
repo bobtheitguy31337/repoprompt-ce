@@ -1,5 +1,10 @@
 import Foundation
 
+public enum WorkflowRepositoryDefaults {
+    /// Desktop `AgentWorkflowStore.hiddenBuiltInIDs` default `{build}`.
+    public static let hiddenBuiltInID = "rp-build"
+}
+
 public enum ServerWorkflowSource: String, Codable, CaseIterable, Sendable {
     case builtin
     case custom

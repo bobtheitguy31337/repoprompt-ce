@@ -475,14 +475,30 @@ public struct WorkflowSnapshot: Codable, Hashable, Sendable {
     public let definition: String
     public let contentDigest: String
     public let enabled: Bool
+    public let visible: Bool
+    public let featuredOrder: Int?
+    public let rowRevision: Int64
 
-    public init(workflowID: String, source: String, name: String, definition: String, contentDigest: String, enabled: Bool) {
+    public init(
+        workflowID: String,
+        source: String,
+        name: String,
+        definition: String,
+        contentDigest: String,
+        enabled: Bool,
+        visible: Bool = true,
+        featuredOrder: Int? = nil,
+        rowRevision: Int64 = 1
+    ) {
         self.workflowID = workflowID
         self.source = source
         self.name = name
         self.definition = definition
         self.contentDigest = contentDigest
         self.enabled = enabled
+        self.visible = visible
+        self.featuredOrder = featuredOrder
+        self.rowRevision = rowRevision
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -492,6 +508,22 @@ public struct WorkflowSnapshot: Codable, Hashable, Sendable {
         case definition
         case contentDigest
         case enabled
+        case visible
+        case featuredOrder
+        case rowRevision
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        workflowID = try container.decode(String.self, forKey: .workflowID)
+        source = try container.decode(String.self, forKey: .source)
+        name = try container.decode(String.self, forKey: .name)
+        definition = try container.decode(String.self, forKey: .definition)
+        contentDigest = try container.decode(String.self, forKey: .contentDigest)
+        enabled = try container.decode(Bool.self, forKey: .enabled)
+        visible = try container.decodeIfPresent(Bool.self, forKey: .visible) ?? true
+        featuredOrder = try container.decodeIfPresent(Int.self, forKey: .featuredOrder)
+        rowRevision = try container.decodeIfPresent(Int64.self, forKey: .rowRevision) ?? 1
     }
 }
 

@@ -141,12 +141,13 @@ final class CanonicalWorkspaceRuntimeTests: XCTestCase {
         XCTAssertTrue(execution.prompt.contains("<turn><user>First</user><assistant>Earlier</assistant></turn>"))
     }
 
-    func testBuiltinCatalogIsExactVersionedNineWorkflowSnapshot() throws {
+    func testBuiltinCatalogIsExactVersionedEightWorkflowSnapshot() throws {
         let workflows = try BuiltinWorkflowCatalog().workflows()
-        XCTAssertEqual(workflows.map(\.workflowID), ["rp-investigate", "rp-build", "rp-reminder", "rp-oracle-export", "rp-review", "rp-refactor", "rp-orchestrate", "rp-optimize", "rp-deep-plan"])
-        XCTAssertEqual(workflows.map(\.name), ["Investigate", "Plan & Build", "Reminder", "ChatGPT Export", "Review", "Refactor", "Orchestrate", "Optimize", "Deep Plan"])
+        XCTAssertEqual(workflows.map(\.workflowID), ["rp-investigate", "rp-build", "rp-oracle-export", "rp-review", "rp-refactor", "rp-orchestrate", "rp-optimize", "rp-deep-plan"])
+        XCTAssertEqual(workflows.map(\.name), ["Investigate", "Plan & Build", "ChatGPT Export", "Review", "Refactor", "Orchestrate", "Optimize", "Deep Plan"])
         XCTAssertFalse(workflows.map(\.name).contains { $0.hasPrefix("rp-") })
-        XCTAssertEqual(Set(workflows.map(\.contentDigest)).count, 9)
+        XCTAssertFalse(workflows.contains { $0.workflowID == "rp-reminder" })
+        XCTAssertEqual(Set(workflows.map(\.contentDigest)).count, 8)
         for workflow in workflows {
             XCTAssertEqual(workflow.source, "builtin")
             XCTAssertTrue(workflow.definition.contains("name: \"\(workflow.workflowID)\""), workflow.workflowID)

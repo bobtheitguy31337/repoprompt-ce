@@ -17,9 +17,10 @@ public extension SQLiteServiceStore {
                 _ = try await connection.query("DELETE FROM workflows WHERE workflow_id=? AND source='builtin'", [.text(workflowID)])
             }
             for workflow in builtins {
+                let defaultVisible = workflow.workflowID == WorkflowRepositoryDefaults.hiddenBuiltInID ? 0 : 1
                 _ = try await connection.query(
-                    "INSERT OR IGNORE INTO workflow_repository_metadata(workflow_id,visible,featured_order,row_revision,updated_at) VALUES(?,1,NULL,1,?)",
-                    [.text(workflow.workflowID), .float(now.timeIntervalSince1970)]
+                    "INSERT OR IGNORE INTO workflow_repository_metadata(workflow_id,visible,featured_order,row_revision,updated_at) VALUES(?,?,NULL,1,?)",
+                    [.text(workflow.workflowID), .integer(defaultVisible), .float(now.timeIntervalSince1970)]
                 )
             }
             return ()
@@ -110,8 +111,8 @@ public extension SQLiteServiceStore {
                 )
             }
             _ = try await connection.query(
-                "INSERT INTO workflow_repository_state(fixed_id,collection_revision,include_session_cleanup_guidance,updated_at) VALUES(1,?,?,?) ON CONFLICT(fixed_id) DO UPDATE SET collection_revision=excluded.collection_revision,include_session_cleanup_guidance=excluded.include_session_cleanup_guidance,updated_at=excluded.updated_at",
-                [.integer(Int(snapshot.revision)), .integer(snapshot.includeSessionCleanupGuidance ? 1 : 0), .float(snapshot.updatedAt.timeIntervalSince1970)]
+                "INSERT INTO workflow_repository_state(fixed_id,collection_revision,include_session_cleanup_guidance,updated_at) VALUES(1,?,1,?) ON CONFLICT(fixed_id) DO UPDATE SET collection_revision=excluded.collection_revision,updated_at=excluded.updated_at",
+                [.integer(Int(snapshot.revision)), .float(snapshot.updatedAt.timeIntervalSince1970)]
             )
             _ = try await connection.query(
                 "INSERT INTO settings_audit(audit_id,domain,scope_id,prior_revision,new_revision,operation,actor_id,actor_label,channel,payload_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -129,7 +130,42 @@ public extension SQLiteServiceStore {
                     .float(snapshot.updatedAt.timeIntervalSince1970)
                 ]
             )
-            return snapshot
+            return try await workflowRepositorySnapshot()
+        }
+    }
+
+    @discardableResult
+    func replaceWorkflowCleanupGuidance(
+        _ includeSessionCleanupGuidance: Bool,
+        audit: ServerSettingsAuditMutation
+    ) async throws -> ServerWorkflowRepositorySnapshot {
+        try validateWorkflowAudit(audit)
+        return try await transaction {
+            let now = Date()
+            let observed = Int64(try await connection.query(
+                "SELECT collection_revision FROM workflow_repository_state WHERE fixed_id=1"
+            ).first?.column("collection_revision")?.integer ?? 0)
+            _ = try await connection.query(
+                "INSERT INTO workflow_repository_state(fixed_id,collection_revision,include_session_cleanup_guidance,updated_at) VALUES(1,0,?,?) ON CONFLICT(fixed_id) DO UPDATE SET include_session_cleanup_guidance=excluded.include_session_cleanup_guidance,updated_at=excluded.updated_at",
+                [.integer(includeSessionCleanupGuidance ? 1 : 0), .float(now.timeIntervalSince1970)]
+            )
+            _ = try await connection.query(
+                "INSERT INTO settings_audit(audit_id,domain,scope_id,prior_revision,new_revision,operation,actor_id,actor_label,channel,payload_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    .text(UUID().uuidString),
+                    .text(ServerSettingsDomain.workflowRepository.rawValue),
+                    .text("global"),
+                    .integer(Int(observed)),
+                    .integer(Int(observed)),
+                    .text(audit.operation),
+                    .text(audit.attribution.actorID),
+                    .text(audit.attribution.actorLabel),
+                    .text(audit.attribution.channel),
+                    .text(audit.payloadDigest),
+                    .float(now.timeIntervalSince1970)
+                ]
+            )
+            return try await workflowRepositorySnapshot()
         }
     }
 }

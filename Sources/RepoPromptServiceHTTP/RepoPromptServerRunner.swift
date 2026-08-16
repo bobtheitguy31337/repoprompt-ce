@@ -470,9 +470,7 @@ public enum RepoPromptServerRunner {
             directProviderDefaults: portalDesktopSettings
         )
         try await authority.recover()
-        let composerWorkflows = try await authority.workflowSnapshots().filter(\.enabled).map {
-            AgentComposerWorkflowDescriptor(id: $0.workflowID, displayName: $0.name, description: $0.source, guidance: $0.definition)
-        }
+        let composerWorkflows: [AgentComposerWorkflowDescriptor] = []
         let composerSuggestions: [ComposerSuggestionDescriptor] = [
             .init(kind: .nativeCommand, id: "compact", insertionText: "/compact", displayName: "Compact context", detailText: "Ask Codex to compact the current context.", providerIDs: [.codex], expansion: "/compact")
         ]
@@ -481,7 +479,7 @@ public enum RepoPromptServerRunner {
             store: store,
             workflows: composerWorkflows,
             suggestions: composerSuggestions,
-            emptyState: .init(featuredWorkflowIDs: Array(composerWorkflows.prefix(4).map(\.id)), tips: ["Tag a file to add its current contents to only this turn.", "Choose a concrete model before sending.", "Use Shift+Return to add a new line."]),
+            emptyState: .init(featuredWorkflowIDs: [], tips: ["Tag a file to add its current contents to only this turn.", "Choose a concrete model before sending.", "Use Shift+Return to add a new line."]),
             providerProfileLoader: { providerID in
                 try await portalDesktopSettings.composerCatalogProfile(for: providerID)
             }

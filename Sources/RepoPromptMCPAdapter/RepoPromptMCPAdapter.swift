@@ -1177,6 +1177,12 @@ private actor AuthorityToolBackend {
         case "list", "list_sessions":
             let root = try await session().rootSessionID
             return try await value(authority.agentSnapshots(rootSessionID: root))
+        case "list_workflows":
+            let repository = try await authority.workflowRepositorySnapshot()
+            return try value(MCPWorkflowListResult(
+                workflows: try await authority.workflowSnapshots(),
+                revision: repository.revision
+            ))
         case "cancel":
             let sessionID = try agentSessionID(arguments)
             _ = try await authority.cancelChildAgentRun(sessionID: sessionID)
@@ -1372,6 +1378,11 @@ private actor AuthorityToolBackend {
         let data = try JSONEncoder.serviceEncoder.encode(encodable)
         return try JSONDecoder().decode(Value.self, from: data)
     }
+}
+
+private struct MCPWorkflowListResult: Encodable, Sendable {
+    let workflows: [WorkflowSnapshot]
+    let revision: Int64
 }
 
 public struct MCPAgentStartTarget: Sendable {

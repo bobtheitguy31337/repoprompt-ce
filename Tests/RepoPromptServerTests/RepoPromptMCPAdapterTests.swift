@@ -113,6 +113,67 @@ final class RepoPromptMCPAdapterTests: XCTestCase {
         try await store.close()
     }
 
+    func testListWorkflowsLiveReadsFeaturedOrderAndOmitsHiddenBuiltIns() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try "catalog".write(to: root.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        try await authority.recover()
+        let initial = try await authority.workflowRepositorySnapshot()
+        let featured = try await authority.reorderWorkflows(
+            .init(expectedRevision: initial.revision, featuredWorkflowIDs: ["rp-review", "rp-orchestrate"]),
+            attribution: .init(actorID: "certificate:mcp-workflows", actorLabel: "MCP Workflows", channel: "test")
+        )
+
+        let actor = ExternalActor(goblinUserID: "mcp-workflows", username: "mcp-workflows", displayName: "MCP Workflows")
+        let project = try await authority.createProject(
+            input: .init(name: "Workflows", roots: [
+                .init(logicalName: "source", path: root.path, writable: true)
+            ]),
+            externalActor: actor,
+            idempotencyKey: "workflow-project",
+            requestDigest: "workflow-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(
+                projectID: project.projectID,
+                provider: .codex,
+                visibility: .privateSession
+            ),
+            externalActor: actor,
+            idempotencyKey: "workflow-session",
+            requestDigest: "workflow-session"
+        )
+        let adapter = RepoPromptMCPAdapter(authority: authority)
+        let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
+        let data = try await adapter.invoke(
+            toolName: "agent_manage",
+            argumentsJSON: json(["op": "list_workflows"]),
+            binding: binding
+        )
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(payload["revision"] as? Int, Int(featured.revision))
+        let workflows = try XCTUnwrap(payload["workflows"] as? [[String: Any]])
+        let ids = workflows.compactMap { $0["workflowId"] as? String }
+        XCTAssertFalse(ids.contains("rp-build"))
+        XCTAssertFalse(ids.contains("rp-reminder"))
+        XCTAssertTrue(ids.contains("rp-review"))
+        XCTAssertTrue(ids.contains("rp-orchestrate"))
+        let review = try XCTUnwrap(workflows.first { $0["workflowId"] as? String == "rp-review" })
+        XCTAssertEqual(review["visible"] as? Bool, true)
+        XCTAssertEqual(review["featuredOrder"] as? Int, 0)
+        XCTAssertEqual(review["name"] as? String, "Review")
+        let orchestrate = try XCTUnwrap(workflows.first { $0["workflowId"] as? String == "rp-orchestrate" })
+        XCTAssertEqual(orchestrate["featuredOrder"] as? Int, 1)
+        let hidden = try await authority.workflowSnapshot(workflowID: "rp-build")
+        XCTAssertFalse(hidden.visible)
+        XCTAssertNil(hidden.featuredOrder)
+        try await store.close()
+    }
+
     func testOracleUsesProviderNativeContinuationIdentity() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let artifacts = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

@@ -140,8 +140,9 @@ public struct AgentTurnCompilationInput: Sendable {
     public let providerPromptWrapper: String?
     public let workflowGuidance: String?
     public let goalGuidance: String?
+    public let userTextConsumedByWorkflow: Bool
 
-    public init(projectID: UUID, sessionID: UUID?, identity: CanonicalTurnIdentity, content: AgentTurnContentWire, selectedMessageContext: SelectedMessageContext? = nil, effectiveConfiguration: EffectiveTurnConfigurationRecord, providerConfiguration: CompiledProviderTurnConfiguration, attachmentManifest: AgentTurnAttachmentManifest = .init(), continuationContext: String? = nil, providerPromptWrapper: String? = nil, workflowGuidance: String? = nil, goalGuidance: String? = nil) {
+    public init(projectID: UUID, sessionID: UUID?, identity: CanonicalTurnIdentity, content: AgentTurnContentWire, selectedMessageContext: SelectedMessageContext? = nil, effectiveConfiguration: EffectiveTurnConfigurationRecord, providerConfiguration: CompiledProviderTurnConfiguration, attachmentManifest: AgentTurnAttachmentManifest = .init(), continuationContext: String? = nil, providerPromptWrapper: String? = nil, workflowGuidance: String? = nil, goalGuidance: String? = nil, userTextConsumedByWorkflow: Bool = false) {
         self.projectID = projectID
         self.sessionID = sessionID
         self.identity = identity
@@ -154,6 +155,7 @@ public struct AgentTurnCompilationInput: Sendable {
         self.providerPromptWrapper = providerPromptWrapper
         self.workflowGuidance = workflowGuidance
         self.goalGuidance = goalGuidance
+        self.userTextConsumedByWorkflow = userTextConsumedByWorkflow
     }
 }
 
@@ -260,7 +262,7 @@ public actor AgentTurnIntentCompiler {
         for file in resolvedFiles {
             sections.append("<tagged-file label=\"\(escapeAttribute(file.logicalLabel))\">\n\(file.content)\n</tagged-file>")
         }
-        if !canonicalText.isEmpty {
+        if !canonicalText.isEmpty, !input.userTextConsumedByWorkflow {
             sections.append(selectedMessageContext == nil ? "<user-request>\n\(canonicalText)\n</user-request>" : canonicalText)
         }
         let prompt = package(sections: sections, providerSettings: input.providerConfiguration.executionPolicy.providerSettings)

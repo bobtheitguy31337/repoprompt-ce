@@ -99,9 +99,7 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
         let permissionLock = context.mcpControlled
             ? ComposerLockWire(locked: true, reasonCode: "mcp_controlled", reasonText: "The active MCP controller owns this setting.")
             : .init()
-        let workflowWire = workflows.map {
-            ComposerWorkflowOptionWire(id: $0.id, displayName: $0.displayName, description: $0.description, guidance: $0.guidance, providerIDs: $0.providerIDs, enabled: true)
-        }
+        let workflowWire = try await livePickerWorkflows(keeping: selected?.workflowID)
         let contextWire = ComposerContextWire(kind: context.kind == .project ? .project : .session, projectID: context.projectID, sessionID: context.sessionID)
         let capabilities = ComposerCapabilitiesWire(
             attachments: groups.contains { $0.models.contains { $0.capabilities.nativeImages } },
@@ -112,7 +110,7 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
         let locks = ComposerLockSnapshotWire(model: controllerLock, effort: controllerLock, workflow: controllerLock, tools: controllerLock, permissions: permissionLock, attachments: activeLock, send: .init())
         let empty = AgentEmptyStateWire(
             heading: emptyState.heading,
-            featuredWorkflowIDs: emptyState.featuredWorkflowIDs,
+            featuredWorkflowIDs: try await liveFeaturedWorkflowIDs(),
             tips: emptyState.tips.enumerated().map { .init(id: "tip-\($0.offset + 1)", text: $0.element) }
         )
         let seed = ComposerCatalogWireSnapshot(revision: "pending", context: contextWire, providerGroups: groups, workflows: workflowWire, selected: selected, locks: locks, capabilities: capabilities, emptyState: empty, mcpControlled: context.mcpControlled)
@@ -188,6 +186,46 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
                     defaultEffortID: model.descriptor.defaultEffortID
                 )
             }
+        }
+    }
+
+    private func liveFeaturedWorkflowIDs() async throws -> [String] {
+        try await store.workflowRepositorySnapshot().workflows
+            .filter { $0.enabled && $0.visible && $0.featuredOrder != nil }
+            .sorted { ($0.featuredOrder ?? .max, $0.workflowID) < ($1.featuredOrder ?? .max, $1.workflowID) }
+            .map(\.workflowID)
+    }
+
+    private func livePickerWorkflows(keeping selectedID: String?) async throws -> [ComposerWorkflowOptionWire] {
+        let repository = try await store.workflowRepositorySnapshot()
+        let live = repository.workflows.filter { workflow in
+            guard workflow.enabled else { return false }
+            return workflow.visible || workflow.workflowID == selectedID
+        }
+        return live.sorted(by: Self.pickerOrder).map {
+            ComposerWorkflowOptionWire(
+                id: $0.workflowID,
+                displayName: $0.name,
+                description: $0.source.rawValue,
+                guidance: $0.definition,
+                providerIDs: [],
+                enabled: $0.enabled,
+                visible: $0.visible,
+                featuredOrder: $0.featuredOrder
+            )
+        }
+    }
+
+    private static func pickerOrder(_ lhs: ServerWorkflowDefinition, _ rhs: ServerWorkflowDefinition) -> Bool {
+        switch (lhs.featuredOrder, rhs.featuredOrder) {
+        case let (left?, right?):
+            return (left, lhs.workflowID) < (right, rhs.workflowID)
+        case (_?, nil):
+            return true
+        case (nil, _?):
+            return false
+        default:
+            return (lhs.name, lhs.workflowID) < (rhs.name, rhs.workflowID)
         }
     }
 

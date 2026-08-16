@@ -1371,11 +1371,11 @@ public struct RepoPromptHTTPService: Sendable {
         let projects = await authority.projectSnapshots().map(RepoPromptPortalSessionProjection.project)
         let sessions = try await authority.sessionSnapshots().map(RepoPromptPortalSessionProjection.project)
         let workflowRepository = try await authority.workflowRepositorySnapshot()
-        let workflows = workflowRepository.workflows.filter { $0.enabled && $0.visible }.map {
+        let workflows = try await authority.workflowSnapshots().map {
             PortalWorkflowSummary(
                 workflowID: $0.workflowID,
                 name: $0.name,
-                source: $0.source,
+                source: ServerWorkflowSource(rawValue: $0.source) ?? .builtin,
                 enabled: $0.enabled,
                 visible: $0.visible,
                 featuredOrder: $0.featuredOrder,

@@ -1353,11 +1353,26 @@ input:disabled {
 }
 
 .workflow-settings-list,
+.workflow-picker-list,
 .workspace-project-list,
 .provider-status-list,
 .model-config-list,
 .tool-catalog-list {
   display: grid;
+}
+
+.workflow-picker-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  gap: var(--space-8);
+}
+
+.workflow-picker-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-12);
 }
 
 .tool-catalog-toolbar {

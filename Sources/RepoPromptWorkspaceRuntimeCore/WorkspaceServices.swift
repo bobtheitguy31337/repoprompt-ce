@@ -979,8 +979,8 @@ public actor ArtifactRuntimeService {
 }
 
 public struct BuiltinWorkflowCatalog: Sendable {
-    // Mirrors the vanilla desktop AgentWorkflow labels; Reminder is server-only.
-    // IDs and prompt frontmatter remain stable rp-* command identifiers.
+    // Mirrors the vanilla desktop AgentWorkflow labels. rp-reminder stays a skill,
+    // not a catalog workflow row.
     private static let displayNames = [
         "rp-build": "Plan & Build",
         "rp-review": "Review",
@@ -989,8 +989,7 @@ public struct BuiltinWorkflowCatalog: Sendable {
         "rp-oracle-export": "ChatGPT Export",
         "rp-orchestrate": "Orchestrate",
         "rp-optimize": "Optimize",
-        "rp-deep-plan": "Deep Plan",
-        "rp-reminder": "Reminder"
+        "rp-deep-plan": "Deep Plan"
     ]
 
     public init() {}
@@ -1001,6 +1000,7 @@ public struct BuiltinWorkflowCatalog: Sendable {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Canonical workflow catalog resource is missing")
         }
         let definitions = try JSONDecoder().decode([BundledWorkflowDefinition].self, from: Data(contentsOf: url))
+            .filter { Self.displayNames[$0.id] != nil }
         let expectedIDs = Set(Self.displayNames.keys)
         guard definitions.count == expectedIDs.count, Set(definitions.map(\.id)) == expectedIDs else {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Canonical workflow catalog is incomplete or contains duplicate IDs")

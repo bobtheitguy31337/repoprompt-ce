@@ -5,6 +5,7 @@ import RepoPromptHeadlessRuntime
 @testable import RepoPromptServiceHTTP
 @testable import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
+import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 final class SettingsCatalogAuthorityTests: XCTestCase {
@@ -201,9 +202,9 @@ final class SettingsCatalogAuthorityTests: XCTestCase {
             "rp-oracle-export": "ChatGPT Export",
             "rp-orchestrate": "Orchestrate",
             "rp-optimize": "Optimize",
-            "rp-deep-plan": "Deep Plan",
-            "rp-reminder": "Reminder"
+            "rp-deep-plan": "Deep Plan"
         ])
+        XCTAssertFalse(builtinNames.keys.contains("rp-reminder"))
         XCTAssertFalse(builtinNames.values.contains { $0.hasPrefix("rp-") })
         XCTAssertEqual(initial.revision, 0)
 
@@ -271,14 +272,21 @@ final class SettingsCatalogAuthorityTests: XCTestCase {
             .init(expectedRevision: ordered.revision, includeSessionCleanupGuidance: false),
             attribution: Self.attribution
         )
+        XCTAssertEqual(cleanupOff.revision, ordered.revision)
+        XCTAssertEqual(cleanupOff.workflows.map(\.rowRevision), ordered.workflows.map(\.rowRevision))
         let rawRuntime = try await authority.workflowSnapshot(workflowID: custom.workflowID)
         XCTAssertFalse(rawRuntime.definition.contains("### Session cleanup guidance"))
+        let builtinOff = try await authority.workflowSnapshot(workflowID: "rp-review")
+        XCTAssertFalse(builtinOff.definition.contains("### Session cleanup guidance"))
         let cleanupOn = try await authority.updateWorkflowPreferences(
             .init(expectedRevision: cleanupOff.revision, includeSessionCleanupGuidance: true),
             attribution: Self.attribution
         )
-        let guidedRuntime = try await authority.workflowSnapshot(workflowID: custom.workflowID)
-        XCTAssertTrue(guidedRuntime.definition.contains("### Session cleanup guidance"))
+        XCTAssertEqual(cleanupOn.revision, ordered.revision)
+        let guidedCustom = try await authority.workflowSnapshot(workflowID: custom.workflowID)
+        XCTAssertFalse(guidedCustom.definition.contains("### Session cleanup guidance"))
+        let guidedBuiltin = try await authority.workflowSnapshot(workflowID: "rp-review")
+        XCTAssertTrue(guidedBuiltin.definition.contains("### Session cleanup guidance"))
 
         do {
             _ = try await authority.createWorkflow(
@@ -332,7 +340,8 @@ final class SettingsCatalogAuthorityTests: XCTestCase {
         XCTAssertNotNil(reloaded.workflows.first { $0.workflowID == custom.workflowID })
         XCTAssertFalse(reloaded.workflows.first { $0.workflowID == builtin.workflowID }?.visible ?? true)
         let audits = try await store.settingsAuditRecords(domain: .workflowRepository, scopeID: "global")
-        XCTAssertEqual(audits.count, Int(reloaded.revision))
+        XCTAssertEqual(audits.filter { $0.operation != "updatePreferences" }.count, Int(reloaded.revision))
+        XCTAssertEqual(audits.filter { $0.operation == "updatePreferences" }.count, 2)
         XCTAssertTrue(audits.allSatisfy { $0.payloadDigest.count == 64 })
 
         try await authority.quiesce()
@@ -485,6 +494,41 @@ final class SettingsCatalogAuthorityTests: XCTestCase {
         actorLabel: "Item 3 Test",
         channel: "portal-test"
     )
+
+    func testRecoverRemovesDemotedReminderBuiltinRow() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try await SQLiteServiceStore.open(storage: .file(directory.appendingPathComponent("workflows.sqlite").path))
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        try await authority.recover()
+
+        let leftoverDefinition = """
+        ---
+        name: "rp-reminder"
+        description: leftover builtin row
+        ---
+        """
+        let leftover = WorkflowSnapshot(
+            workflowID: "rp-reminder",
+            source: "builtin",
+            name: "Reminder",
+            definition: leftoverDefinition,
+            contentDigest: CanonicalSigning.bodyDigest(Data(leftoverDefinition.utf8)),
+            enabled: true
+        )
+        try await store.installWorkflows([leftover])
+        try await store.bootstrapWorkflowRepository(
+            builtins: try BuiltinWorkflowCatalog().workflows() + [leftover]
+        )
+        let leftoverSnapshot = try await authority.workflowRepositorySnapshot()
+        XCTAssertTrue(leftoverSnapshot.workflows.contains { $0.workflowID == "rp-reminder" })
+
+        try await authority.recover()
+        let recovered = try await authority.workflowRepositorySnapshot()
+        XCTAssertFalse(recovered.workflows.contains { $0.workflowID == "rp-reminder" })
+        XCTAssertEqual(Set(recovered.workflows.filter { $0.source == .builtin }.map(\.workflowID)).count, 8)
+    }
 
     private static let workflowMarkdown = """
     ---

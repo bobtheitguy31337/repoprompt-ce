@@ -621,7 +621,7 @@
           : null;
         break;
       case "workflows":
-        state.typedSettings.workflows = await api("api/v1/workflows");
+        applyWorkflowRepository(await api("api/v1/workflows"));
         break;
       case "selection":
         if (sessionID) {
@@ -651,6 +651,20 @@
       }
       default:
         throw new PortalError(`Unknown settings domain: ${domain}`);
+    }
+  }
+
+  function applyWorkflowRepository(value) {
+    state.typedSettings.workflows = value;
+    if (!value || !Array.isArray(value.workflows)) return;
+    state.bootstrap ||= { projects: [], sessions: [], workflows: [] };
+    state.bootstrap.workflows = value.workflows.filter(
+      (workflow) => workflow.enabled && workflow.visible,
+    );
+    state.bootstrap.workflowRepositoryRevision = value.revision;
+    if (typeof value.includeSessionCleanupGuidance === "boolean") {
+      state.bootstrap.includeSessionCleanupGuidance =
+        value.includeSessionCleanupGuidance;
     }
   }
 
@@ -3267,7 +3281,7 @@
             }),
           }),
         (value) => {
-          state.typedSettings.workflows = value;
+          applyWorkflowRepository(value);
         },
       ),
     );
@@ -3295,7 +3309,7 @@
             body: JSON.stringify({ expectedRevision: snapshot.revision }),
           }),
         (value) => {
-          state.typedSettings.workflows = value;
+          applyWorkflowRepository(value);
         },
       ),
     );
@@ -3308,6 +3322,16 @@
     const featured = snapshot.workflows
       .filter((workflow) => workflow.featuredOrder !== null)
       .sort((left, right) => left.featuredOrder - right.featuredOrder);
+    const pickerWorkflows = snapshot.workflows
+      .filter((workflow) => workflow.enabled && workflow.visible)
+      .sort((left, right) => {
+        if (left.featuredOrder !== null && right.featuredOrder !== null) {
+          return left.featuredOrder - right.featuredOrder;
+        }
+        if (left.featuredOrder !== null) return -1;
+        if (right.featuredOrder !== null) return 1;
+        return String(left.name).localeCompare(String(right.name));
+      });
     function reorderFeatured(workflowID, delta, control) {
       const ids = featured.map((workflow) => workflow.workflowID);
       const index = ids.indexOf(workflowID);
@@ -3326,9 +3350,43 @@
             }),
           }),
         (value) => {
-          state.typedSettings.workflows = value;
+          applyWorkflowRepository(value);
         },
       );
+    }
+    const picker = desktopCard(
+      "Picker Catalog",
+      "Live discovery from the server repository: enabled and visible rows, featured order first. Hidden built-ins stay in Settings only.",
+    );
+    picker.dataset.workflowPicker = "server-catalog";
+    if (!pickerWorkflows.length) {
+      picker.append(
+        element(
+          "p",
+          "scope-footnote",
+          "No enabled visible workflows are advertised.",
+        ),
+      );
+    } else {
+      const pickerList = element("ol", "workflow-picker-list");
+      pickerWorkflows.forEach((workflow) => {
+        const item = element("li", "workflow-picker-item");
+        item.dataset.workflowId = workflow.workflowID;
+        item.dataset.featuredOrder =
+          workflow.featuredOrder === null ? "" : String(workflow.featuredOrder);
+        item.append(
+          element("strong", "", workflow.name),
+          element(
+            "small",
+            "",
+            workflow.featuredOrder === null
+              ? "Visible"
+              : `Featured ${workflow.featuredOrder + 1}`,
+          ),
+        );
+        pickerList.append(item);
+      });
+      picker.append(pickerList);
     }
     const list = element("div", "workflow-settings-list");
     snapshot.workflows.forEach((workflow) => {
@@ -3376,7 +3434,7 @@
               },
             ),
           (value) => {
-            state.typedSettings.workflows = value;
+            applyWorkflowRepository(value);
           },
         ),
       );
@@ -3399,7 +3457,7 @@
               },
             ),
           (value) => {
-            state.typedSettings.workflows = value;
+            applyWorkflowRepository(value);
           },
         ),
       );
@@ -3409,6 +3467,10 @@
         workflow.featuredOrder === null ? "Feature" : "Unfeature",
       );
       feature.type = "button";
+      if (!workflow.visible && workflow.featuredOrder === null) {
+        feature.disabled = true;
+        feature.title = "Hidden workflows cannot be featured.";
+      }
       feature.addEventListener("click", () => {
         const ids = featured
           .map((item) => item.workflowID)
@@ -3426,11 +3488,14 @@
               }),
             }),
           (value) => {
-            state.typedSettings.workflows = value;
+            applyWorkflowRepository(value);
           },
         );
       });
-      actions.append(visible, clone, feature);
+      if (workflow.source === "builtin") {
+        actions.append(visible);
+      }
+      actions.append(clone, feature);
       if (workflow.featuredOrder !== null) {
         const earlier = element("button", "secondary-button", "Move Earlier");
         earlier.type = "button";
@@ -3499,7 +3564,7 @@
                 },
               ),
             (value) => {
-              state.typedSettings.workflows = value;
+              applyWorkflowRepository(value);
             },
           );
         });
@@ -3541,7 +3606,7 @@
                 },
               ),
             (value) => {
-              state.typedSettings.workflows = value;
+              applyWorkflowRepository(value);
             },
           );
         });
@@ -3608,7 +3673,7 @@
             }),
           }),
         (value) => {
-          state.typedSettings.workflows = value;
+          applyWorkflowRepository(value);
         },
       );
     });
@@ -3617,7 +3682,7 @@
       "Agent Workflows",
       "Manage the server-native workflow repository and its runtime visibility.",
       "workflow",
-      [preferences, catalog, create],
+      [preferences, picker, catalog, create],
     );
   }
 

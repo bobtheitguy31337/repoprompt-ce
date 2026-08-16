@@ -166,9 +166,23 @@ public actor AgentSubmissionCoordinator {
 
         do {
             let context = ComposerCatalogContext(kind: catalogContextKind, projectID: session.projectID, sessionID: catalogContextKind == .session ? session.sessionID : nil, actorID: actor.goblinUserID, activeRun: false, mcpControlled: mcpControlled)
-            let (effective, providerConfiguration, _, workflowGuidance) = try await catalog.validate(submission.configuration, context: context, acceptedAt: now)
+            let (effective, providerConfiguration, _, catalogWorkflowGuidance) = try await catalog.validate(submission.configuration, context: context, acceptedAt: now)
             guard session.provider == providerConfiguration.runtimeKind else {
                 throw ServiceAPIError(code: .capabilityMissing, message: "Session provider does not match the accepted configuration")
+            }
+            var workflowGuidance = catalogWorkflowGuidance
+            var userTextConsumedByWorkflow = false
+            if let workflowID = effective.workflowID {
+                let repository = try await store.workflowRepositorySnapshot()
+                if let workflow = repository.workflows.first(where: { $0.workflowID == workflowID && $0.enabled }) {
+                    workflowGuidance = WorkflowCatalogConsume.wrap(
+                        template: workflow.definition,
+                        userText: submission.content.text,
+                        source: workflow.source,
+                        includeBuiltinCleanup: repository.includeSessionCleanupGuidance
+                    )
+                    userTextConsumedByWorkflow = true
+                }
             }
             let manifest = try await attachments.prepareAcceptance(
                 attachmentIDs: submission.content.attachmentIDs,
@@ -189,7 +203,8 @@ public actor AgentSubmissionCoordinator {
                 effectiveConfiguration: effective,
                 providerConfiguration: providerConfiguration,
                 attachmentManifest: manifest,
-                workflowGuidance: workflowGuidance
+                workflowGuidance: workflowGuidance,
+                userTextConsumedByWorkflow: userTextConsumedByWorkflow
             ))
             let preparedIntent = StoredPreparedIntent(canonicalUserTurn: compilation.canonicalUserTurn, providerKind: providerConfiguration.runtimeKind, providerModel: providerConfiguration.providerRawModelValue, executionPolicy: providerConfiguration.executionPolicy)
             let canonicalJSON = try JSONEncoder.serviceEncoder.encode(compilation.canonicalUserTurn)

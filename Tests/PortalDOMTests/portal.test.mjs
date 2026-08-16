@@ -1983,7 +1983,6 @@ test("workflow settings retain rp IDs while showing only desktop built-in names"
     ["rp-orchestrate", "Orchestrate"],
     ["rp-optimize", "Optimize"],
     ["rp-deep-plan", "Deep Plan"],
-    ["rp-reminder", "Reminder"],
   ];
   const bootstrap = bootstrapFixture({
     workflows: builtins.map(([workflowID, name], featuredOrder) => ({
@@ -2036,6 +2035,128 @@ test("workflow settings retain rp IDs while showing only desktop built-in names"
     document.getElementById("settings-save-status").textContent,
     "Saved",
   );
+});
+
+test("workflow picker live-reads server featured order and visibility", async (t) => {
+  const bootstrap = bootstrapFixture({
+    workflows: [
+      {
+        workflowID: "rp-build",
+        name: "Plan & Build",
+        source: "builtin",
+        enabled: true,
+        visible: false,
+        featuredOrder: null,
+        rowRevision: 1,
+      },
+      {
+        workflowID: "rp-investigate",
+        name: "Investigate",
+        source: "builtin",
+        enabled: true,
+        visible: true,
+        featuredOrder: null,
+        rowRevision: 1,
+      },
+      {
+        workflowID: "rp-review",
+        name: "Review",
+        source: "builtin",
+        enabled: true,
+        visible: true,
+        featuredOrder: 0,
+        rowRevision: 1,
+      },
+      {
+        workflowID: "rp-orchestrate",
+        name: "Orchestrate",
+        source: "builtin",
+        enabled: true,
+        visible: true,
+        featuredOrder: 1,
+        rowRevision: 1,
+      },
+      {
+        workflowID: "custom-one",
+        name: "Team Review",
+        source: "custom",
+        enabled: true,
+        visible: true,
+        featuredOrder: null,
+        rowRevision: 1,
+      },
+    ],
+  });
+  const harness = await createHarness({
+    hash: "#settings/agent-workflows",
+    bootstrap,
+  });
+  t.after(() => harness.close());
+  const { document } = harness;
+  const picker = document.querySelector('[data-workflow-picker="server-catalog"]');
+  assert.ok(picker);
+  const pickerIDs = [
+    ...picker.querySelectorAll(".workflow-picker-item"),
+  ].map((node) => node.dataset.workflowId);
+  assert.deepEqual(pickerIDs, [
+    "rp-review",
+    "rp-orchestrate",
+    "rp-investigate",
+    "custom-one",
+  ]);
+  assert.equal(
+    picker.querySelector('[data-workflow-id="rp-review"] small').textContent,
+    "Featured 1",
+  );
+  assert.equal(
+    picker.querySelector('[data-workflow-id="rp-orchestrate"] small')
+      .textContent,
+    "Featured 2",
+  );
+  assert.equal(
+    picker.querySelector('[data-workflow-id="rp-investigate"] small')
+      .textContent,
+    "Visible",
+  );
+  assert.equal(picker.querySelector('[data-workflow-id="rp-build"]'), null);
+
+  const catalogRows = [
+    ...document.querySelectorAll(".workflow-editor-row"),
+  ];
+  const rowByName = (name) =>
+    catalogRows.find(
+      (row) => row.querySelector("strong")?.textContent === name,
+    );
+  const buildRow = rowByName("Plan & Build");
+  const customRow = rowByName("Team Review");
+  assert.ok(buildRow);
+  assert.ok(customRow);
+  assert.equal(
+    buildRow.querySelector(".connection-badge")?.textContent,
+    "Hidden",
+  );
+  assert.match(
+    buildRow.querySelector(".workflow-editor-summary small")?.textContent || "",
+    /revision 1$/,
+  );
+  assert.doesNotMatch(buildRow.textContent, /featured/i);
+  assert.equal(
+    [...buildRow.querySelectorAll("button")].some(
+      (button) => button.textContent === "Show",
+    ),
+    true,
+  );
+  assert.equal(
+    [...customRow.querySelectorAll("button")].some(
+      (button) => button.textContent === "Hide" || button.textContent === "Show",
+    ),
+    false,
+  );
+  const featureBuild = [...buildRow.querySelectorAll("button")].find(
+    (button) => button.textContent === "Feature",
+  );
+  assert.ok(featureBuild);
+  assert.equal(featureBuild.disabled, true);
 });
 
 test("model presets, workflows, and named selection presets render real management controls", async (t) => {

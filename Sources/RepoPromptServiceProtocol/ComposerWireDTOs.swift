@@ -192,14 +192,43 @@ public struct ComposerWorkflowOptionWire: Codable, Hashable, Sendable {
     public let guidance: String?
     public let providerIDs: [ProviderSettingsID]
     public let enabled: Bool
+    public let visible: Bool
+    public let featuredOrder: Int?
 
-    public init(id: String, displayName: String, description: String? = nil, guidance: String? = nil, providerIDs: [ProviderSettingsID] = [], enabled: Bool = true) {
+    public init(
+        id: String,
+        displayName: String,
+        description: String? = nil,
+        guidance: String? = nil,
+        providerIDs: [ProviderSettingsID] = [],
+        enabled: Bool = true,
+        visible: Bool = true,
+        featuredOrder: Int? = nil
+    ) {
         self.id = id
         self.displayName = displayName
         self.description = description
         self.guidance = guidance
         self.providerIDs = providerIDs
         self.enabled = enabled
+        self.visible = visible
+        self.featuredOrder = featuredOrder
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, displayName, description, guidance, providerIDs, enabled, visible, featuredOrder
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        description = try container.decodeIfPresent(String.self, forKey: .description)
+        guidance = try container.decodeIfPresent(String.self, forKey: .guidance)
+        providerIDs = try container.decodeIfPresent([ProviderSettingsID].self, forKey: .providerIDs) ?? []
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        visible = try container.decodeIfPresent(Bool.self, forKey: .visible) ?? true
+        featuredOrder = try container.decodeIfPresent(Int.self, forKey: .featuredOrder)
     }
 }
 

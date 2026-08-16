@@ -85,6 +85,166 @@ final class AgentComposerCatalogTests: XCTestCase {
         XCTAssertFalse(group.toolControls.isEmpty)
     }
 
+    func testComposerEmptyStateLiveReadsFeaturedOrderInsteadOfBootFrozenPrefix() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        try await authority.recover()
+        let initial = try await authority.workflowRepositorySnapshot()
+        XCTAssertTrue(initial.workflows.allSatisfy { $0.featuredOrder == nil })
+        _ = try await authority.reorderWorkflows(
+            .init(expectedRevision: initial.revision, featuredWorkflowIDs: ["rp-review", "rp-orchestrate", "rp-deep-plan"]),
+            attribution: .init(actorID: "certificate:featured-order-test", actorLabel: "Featured Order Test", channel: "test")
+        )
+
+        let runner = StructuredStartProviderRunner()
+        let configuration = ProviderCLIConfiguration(kind: .codex, executable: "/usr/bin/swift", expectedVersion: "6.2")
+        let settings = ProviderSettingsService(
+            store: store,
+            adapter: ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.codex], runner: runner),
+            configurations: [configuration],
+            initiallyEnabled: [.codex],
+            runner: runner
+        )
+        try await settings.bootstrap()
+        let catalog = AgentComposerCatalogService(
+            providerSettings: settings,
+            store: store,
+            workflows: [
+                .init(id: "boot-a", displayName: "A"),
+                .init(id: "boot-b", displayName: "B"),
+                .init(id: "boot-c", displayName: "C"),
+                .init(id: "boot-d", displayName: "D"),
+                .init(id: "boot-e", displayName: "E"),
+            ],
+            emptyState: .init(featuredWorkflowIDs: ["boot-a", "boot-b", "boot-c", "boot-d"], tips: [])
+        )
+        let snapshot = try await catalog.snapshot(context: .init(kind: .project, projectID: UUID(), actorID: "featured-reader"))
+        XCTAssertEqual(snapshot.emptyState.featuredWorkflowIDs, ["rp-review", "rp-orchestrate", "rp-deep-plan"])
+        XCTAssertEqual(
+            snapshot.workflows.filter { $0.featuredOrder != nil }.map(\.id),
+            ["rp-review", "rp-orchestrate", "rp-deep-plan"]
+        )
+        XCTAssertEqual(snapshot.workflows.first { $0.id == "rp-review" }?.featuredOrder, 0)
+        XCTAssertFalse(snapshot.workflows.contains { $0.id == "rp-build" })
+        XCTAssertFalse(snapshot.workflows.contains { $0.id.hasPrefix("boot-") })
+    }
+
+    func testBuiltInVisibilityDefaultsHideBuildUnfeaturesAndKeepsSelectedLookup() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        try await authority.recover()
+        let initial = try await authority.workflowRepositorySnapshot()
+        let build = try XCTUnwrap(initial.workflows.first { $0.workflowID == "rp-build" })
+        XCTAssertFalse(build.visible)
+        XCTAssertTrue(
+            initial.workflows
+                .filter { $0.source == .builtin && $0.workflowID != "rp-build" }
+                .allSatisfy(\.visible)
+        )
+        let discoveredAfterBoot = try await authority.workflowSnapshots()
+        XCTAssertFalse(discoveredAfterBoot.contains { $0.workflowID == "rp-build" })
+        _ = try await authority.workflowSnapshot(workflowID: "rp-build")
+
+        do {
+            _ = try await authority.reorderWorkflows(
+                .init(expectedRevision: initial.revision, featuredWorkflowIDs: ["rp-build"]),
+                attribution: .init(actorID: "certificate:visibility-test", actorLabel: "Visibility Test", channel: "test")
+            )
+            XCTFail("expected hidden built-in to be rejected from featured order")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+        }
+
+        let featured = try await authority.reorderWorkflows(
+            .init(expectedRevision: initial.revision, featuredWorkflowIDs: ["rp-review"]),
+            attribution: .init(actorID: "certificate:visibility-test", actorLabel: "Visibility Test", channel: "test")
+        )
+        let review = try XCTUnwrap(featured.workflows.first { $0.workflowID == "rp-review" })
+        XCTAssertEqual(review.featuredOrder, 0)
+        let hidden = try await authority.setWorkflowVisibility(
+            workflowID: "rp-review",
+            request: .init(expectedRevision: featured.revision, expectedRowRevision: review.rowRevision, visible: false),
+            attribution: .init(actorID: "certificate:visibility-test", actorLabel: "Visibility Test", channel: "test")
+        )
+        XCTAssertNil(hidden.workflows.first { $0.workflowID == "rp-review" }?.featuredOrder)
+        let discoveredAfterHide = try await authority.workflowSnapshots()
+        XCTAssertFalse(discoveredAfterHide.contains { $0.workflowID == "rp-review" })
+        _ = try await authority.workflowSnapshot(workflowID: "rp-review")
+
+        let created = try await authority.createWorkflow(
+            .init(expectedRevision: hidden.revision, name: "Custom Visible", definition: """
+            ---
+            name: custom-visible
+            description: Custom
+            ---
+
+            # Custom
+            """),
+            attribution: .init(actorID: "certificate:visibility-test", actorLabel: "Visibility Test", channel: "test")
+        )
+        let custom = try XCTUnwrap(created.workflows.first { $0.source == .custom })
+        XCTAssertTrue(custom.visible)
+        do {
+            _ = try await authority.setWorkflowVisibility(
+                workflowID: custom.workflowID,
+                request: .init(expectedRevision: created.revision, expectedRowRevision: custom.rowRevision, visible: false),
+                attribution: .init(actorID: "certificate:visibility-test", actorLabel: "Visibility Test", channel: "test")
+            )
+            XCTFail("expected custom hide to be rejected")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .invalidRequest)
+        }
+
+        let runner = StructuredStartProviderRunner()
+        let configuration = ProviderCLIConfiguration(kind: .codex, executable: "/usr/bin/swift", expectedVersion: "6.2")
+        let settings = ProviderSettingsService(
+            store: store,
+            adapter: ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.codex], runner: runner),
+            configurations: [configuration],
+            initiallyEnabled: [.codex],
+            runner: runner
+        )
+        try await settings.bootstrap()
+        let catalog = AgentComposerCatalogService(providerSettings: settings, store: store)
+        let snapshot = try await catalog.snapshot(context: .init(kind: .project, projectID: UUID(), actorID: "visibility-reader"))
+        XCTAssertFalse(snapshot.workflows.contains { $0.id == "rp-build" })
+        XCTAssertFalse(snapshot.workflows.contains { $0.id == "rp-review" })
+        XCTAssertTrue(snapshot.workflows.contains { $0.id == "rp-orchestrate" })
+        XCTAssertTrue(snapshot.emptyState.featuredWorkflowIDs.isEmpty)
+    }
+
+    func testCustomWorkflowWrapsArgumentsAndOmitsCleanup() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        try await authority.recover()
+        let initial = try await authority.workflowRepositorySnapshot()
+        let created = try await authority.createWorkflow(
+            .init(expectedRevision: initial.revision, name: "Custom Review", definition: """
+            ---
+            name: custom-review
+            description: Review selected context
+            ---
+
+            Review: $ARGUMENTS
+            """),
+            attribution: .init(actorID: "certificate:wrap-test", actorLabel: "Wrap Test", channel: "test")
+        )
+        let custom = try XCTUnwrap(created.workflows.first { $0.source == .custom })
+        let wrapped = try await authority.wrapWorkflowUserText(workflowID: custom.workflowID, userText: "auth bug")
+        XCTAssertTrue(wrapped.contains("Review: auth bug"))
+        XCTAssertFalse(wrapped.contains("$ARGUMENTS"))
+        XCTAssertFalse(wrapped.contains("### Session cleanup guidance"))
+        XCTAssertFalse(wrapped.contains("---\nname: custom-review"))
+
+        let builtin = try await authority.wrapWorkflowUserText(workflowID: "rp-review", userText: "auth bug")
+        XCTAssertTrue(builtin.contains("auth bug"))
+        XCTAssertFalse(builtin.contains("$ARGUMENTS"))
+        XCTAssertTrue(builtin.contains("### Session cleanup guidance"))
+    }
+
     func testDurableProviderCatalogRemainsVisibleDuringTransientRuntimeFailure() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

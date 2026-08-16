@@ -41,8 +41,7 @@ public actor WorkflowRepository {
     public func workflow(workflowID: String) async throws -> WorkflowSnapshot {
         let repository = try await snapshot()
         guard let workflow = repository.workflows.first(where: { $0.workflowID == workflowID }),
-              workflow.enabled,
-              workflow.visible
+              workflow.enabled
         else {
             throw ServiceAPIError(code: .notFound, message: "Workflow not found")
         }
@@ -67,7 +66,7 @@ public actor WorkflowRepository {
             definition: normalized.definition,
             contentDigest: digest(normalized.definition),
             enabled: request.enabled,
-            visible: request.visible,
+            visible: true,
             featuredOrder: featuredOrder,
             rowRevision: 1
         )
@@ -105,7 +104,7 @@ public actor WorkflowRepository {
             definition: normalized.definition,
             contentDigest: digest(normalized.definition),
             enabled: request.enabled,
-            visible: request.visible,
+            visible: true,
             featuredOrder: featuredOrder,
             rowRevision: existing.rowRevision + 1
         )
@@ -182,6 +181,9 @@ public actor WorkflowRepository {
         guard let existing = current.workflows.first(where: { $0.workflowID == workflowID }) else {
             throw ServiceAPIError(code: .notFound, message: "Workflow not found")
         }
+        guard existing.source == .builtin else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Only built-in workflows can be hidden")
+        }
         try fenceRow(existing, expected: request.expectedRowRevision)
         let updated = ServerWorkflowDefinition(
             workflowID: existing.workflowID,
@@ -191,7 +193,7 @@ public actor WorkflowRepository {
             contentDigest: existing.contentDigest,
             enabled: existing.enabled,
             visible: request.visible,
-            featuredOrder: existing.featuredOrder,
+            featuredOrder: request.visible ? existing.featuredOrder : nil,
             rowRevision: existing.rowRevision + 1
         )
         return try await persist(
@@ -209,7 +211,9 @@ public actor WorkflowRepository {
     ) async throws -> ServerWorkflowRepositorySnapshot {
         let current = try await fencedSnapshot(expectedRevision: request.expectedRevision)
         guard Set(request.featuredWorkflowIDs).count == request.featuredWorkflowIDs.count,
-              request.featuredWorkflowIDs.allSatisfy({ id in current.workflows.contains { $0.workflowID == id } })
+              request.featuredWorkflowIDs.allSatisfy({ id in
+                  current.workflows.contains { $0.workflowID == id && $0.visible }
+              })
         else {
             throw ServiceAPIError(code: .invalidRequest, message: "Featured workflow order is invalid")
         }
@@ -242,13 +246,14 @@ public actor WorkflowRepository {
         _ request: UpdateServerWorkflowPreferencesRequest,
         attribution: SettingsMutationAttribution
     ) async throws -> ServerWorkflowRepositorySnapshot {
-        let current = try await fencedSnapshot(expectedRevision: request.expectedRevision)
-        return try await persist(
-            current: current,
-            workflows: current.workflows,
-            includeCleanup: request.includeSessionCleanupGuidance,
-            operation: "updatePreferences",
-            attribution: attribution
+        let payload = try JSONEncoder.serviceEncoder.encode(request)
+        return try await store.replaceWorkflowCleanupGuidance(
+            request.includeSessionCleanupGuidance,
+            audit: .init(
+                operation: "updatePreferences",
+                attribution: attribution,
+                payloadDigest: CanonicalSigning.bodyDigest(payload)
+            )
         )
     }
 
@@ -270,7 +275,7 @@ public actor WorkflowRepository {
                 definition: workflow.definition,
                 contentDigest: workflow.contentDigest,
                 enabled: true,
-                visible: existing?.visible ?? true,
+                visible: existing?.visible ?? (workflow.workflowID != WorkflowRepositoryDefaults.hiddenBuiltInID),
                 featuredOrder: existing?.featuredOrder,
                 rowRevision: changed ? (existing?.rowRevision ?? 0) + 1 : existing?.rowRevision ?? 1
             )
@@ -304,25 +309,83 @@ public actor WorkflowRepository {
             attribution: attribution
         )
     }
+
+    public func wrapUserText(workflowID: String, userText: String) async throws -> String {
+        let repository = try await snapshot()
+        guard let workflow = repository.workflows.first(where: { $0.workflowID == workflowID }),
+              workflow.enabled
+        else {
+            throw ServiceAPIError(code: .notFound, message: "Workflow not found")
+        }
+        return WorkflowCatalogConsume.wrap(
+            template: workflow.definition,
+            userText: userText,
+            source: workflow.source,
+            includeBuiltinCleanup: repository.includeSessionCleanupGuidance
+        )
+    }
 }
 
-private extension WorkflowRepository {
-    static let cleanupGuidance = """
+public enum WorkflowCatalogConsume {
+    public static let builtinCleanupGuidance = """
 
     ---
     ### Session cleanup guidance
     After recording completed delegated work, remove disposable finished agent sessions with the authenticated session-cleanup operation. Never remove active, blocked, or still-needed sessions.
     """
 
+    public static func stripYAMLFrontmatter(_ text: String) -> String {
+        var body = text
+        if body.hasPrefix("---") {
+            let searchRange = body.index(body.startIndex, offsetBy: 3) ..< body.endIndex
+            if let closingRange = body.range(of: "\n---", range: searchRange) {
+                body = String(body[closingRange.upperBound...])
+                    .trimmingCharacters(in: .newlines)
+            }
+        }
+        return body
+    }
+
+    public static func wrap(
+        template: String,
+        userText: String,
+        source: ServerWorkflowSource,
+        includeBuiltinCleanup: Bool
+    ) -> String {
+        var body = stripYAMLFrontmatter(template).replacingOccurrences(of: "$ARGUMENTS", with: userText)
+        if includeBuiltinCleanup, source == .builtin {
+            body += builtinCleanupGuidance
+        }
+        return body
+    }
+
+    public static func renderedDefinition(
+        _ definition: String,
+        source: ServerWorkflowSource,
+        includeBuiltinCleanup: Bool
+    ) -> String {
+        guard includeBuiltinCleanup, source == .builtin else { return definition }
+        return definition + builtinCleanupGuidance
+    }
+}
+
+private extension WorkflowRepository {
     func runtimeSnapshot(_ workflow: ServerWorkflowDefinition, includeSessionCleanupGuidance: Bool) -> WorkflowSnapshot {
-        let definition = includeSessionCleanupGuidance ? workflow.definition + Self.cleanupGuidance : workflow.definition
+        let definition = WorkflowCatalogConsume.renderedDefinition(
+            workflow.definition,
+            source: workflow.source,
+            includeBuiltinCleanup: includeSessionCleanupGuidance
+        )
         return WorkflowSnapshot(
             workflowID: workflow.workflowID,
             source: workflow.source.rawValue,
             name: workflow.name,
             definition: definition,
             contentDigest: digest(definition),
-            enabled: workflow.enabled
+            enabled: workflow.enabled,
+            visible: workflow.visible,
+            featuredOrder: workflow.featuredOrder,
+            rowRevision: workflow.rowRevision
         )
     }
 

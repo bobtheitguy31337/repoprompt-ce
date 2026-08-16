@@ -1823,6 +1823,10 @@ public actor RepoPromptHeadlessAuthority {
         try await workflowRepository.workflow(workflowID: workflowID)
     }
 
+    public func wrapWorkflowUserText(workflowID: String, userText: String) async throws -> String {
+        try await workflowRepository.wrapUserText(workflowID: workflowID, userText: userText)
+    }
+
     public func createWorkflow(_ request: CreateServerWorkflowRequest, attribution: SettingsMutationAttribution) async throws -> ServerWorkflowRepositorySnapshot {
         try ensureWritable()
         return try await workflowRepository.create(request, attribution: attribution)
