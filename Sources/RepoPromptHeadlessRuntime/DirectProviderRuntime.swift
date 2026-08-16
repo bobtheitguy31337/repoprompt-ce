@@ -479,12 +479,14 @@ public actor DirectAPIProviderRuntime: AgentProviderRuntime {
         let path: String
         if providerID == .anthropicAPI {
             path = "\(endpoint.basePath)/messages"
-            payload = [
+            var body: [String: Any] = [
                 "model": model,
                 "max_tokens": configuration.maximumOutputTokens,
                 "stream": true,
                 "messages": [["role": "user", "content": prompt]]
             ]
+            Self.attachTemperature(from: settings, to: &body)
+            payload = body
         } else {
             path = providerID == .customOpenAICompatible
                 ? (endpoint.basePath.hasSuffix("/v1") ? "\(endpoint.basePath)/chat/completions" : "\(endpoint.basePath)/v1/chat/completions")
@@ -504,6 +506,7 @@ public actor DirectAPIProviderRuntime: AgentProviderRuntime {
             if let effort = settings["provider.reasoningEffort"] {
                 body["reasoning_effort"] = effort
             }
+            Self.attachTemperature(from: settings, to: &body)
             payload = body
         }
         return .init(
@@ -515,6 +518,12 @@ public actor DirectAPIProviderRuntime: AgentProviderRuntime {
             maximumResponseBodyBytes: min(8 * 1024 * 1024, max(64 * 1024, configuration.maximumOutputTokens * 32)),
             totalTimeout: .seconds(120)
         )
+    }
+
+    /// Desktop `effectiveTemperature`: attach only a non-zero global when the enable flag left it in the bag.
+    static func attachTemperature(from settings: [String: String], to body: inout [String: Any]) {
+        guard let raw = settings["models.temperature"], let temperature = Double(raw), temperature != 0 else { return }
+        body["temperature"] = temperature
     }
 
     static func parseOutput(

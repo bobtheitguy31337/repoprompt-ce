@@ -2852,11 +2852,29 @@
       "Hide non-role models from MCP agents",
       profile.restrictDiscoveryToRoleModels === true,
     );
+    const syncCompose = typedToggle(
+      "Sync chat model with Oracle",
+      profile.syncChatModelWithOracle === true,
+    );
+    const composeModel = document.createElement("input");
+    composeModel.type = "text";
+    composeModel.value = profile.preferredComposeModelRaw || "";
+    composeModel.setAttribute("aria-label", "Preferred compose model");
     form.append(
       desktopRow(
         "Hide non-role models from MCP agents",
         "Hides the extra per-agent catalog on agent_manage list_agents. Task labels stay visible. Manually supplied compound IDs are still accepted.",
         restrict.toggle,
+      ),
+      desktopRow(
+        "Sync chat model with Oracle",
+        "When on, the compose/chat model live-reads the Oracle model.",
+        syncCompose.toggle,
+      ),
+      desktopRow(
+        "Preferred compose model",
+        "Raw compose/chat model identifier. Empty tracks Oracle when sync is on.",
+        composeModel,
       ),
     );
     const save = element("button", "primary-button", "Save Agent Routes");
@@ -2865,7 +2883,10 @@
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       const nextProfile = {
+        ...profile,
         restrictDiscoveryToRoleModels: restrict.input.checked,
+        preferredComposeModelRaw: composeModel.value.trim() || null,
+        syncChatModelWithOracle: syncCompose.input.checked,
       };
       Object.entries(targetControls).forEach(([name, controls]) => {
         nextProfile[name] = agentTargetFromValue(controls.select.value);
@@ -4112,6 +4133,94 @@
         history,
       ),
     );
+    const packaging = desktopCard(
+      "Prompt Packaging",
+      "Live-read by materialized context, Oracle/copy packaging, and MCP app_settings. There is no separate Copy Prompt Order page.",
+    );
+    const fileEdit = typedSelect(
+      "File edit format",
+      [
+        ["Diff", "Diff"],
+        ["Whole", "Whole"],
+        ["None", "None"],
+      ],
+      settings.fileEditFormat || "Diff",
+    );
+    const pathDisplay = typedSelect(
+      "File path display",
+      [
+        ["Full", "Full"],
+        ["Relative", "Relative"],
+      ],
+      settings.filePathDisplayOption || "Full",
+    );
+    const temperatureEnabled = typedToggle(
+      "Set model temperature",
+      settings.setModelTemperature !== false,
+    );
+    const temperature = document.createElement("input");
+    temperature.type = "number";
+    temperature.min = "0";
+    temperature.max = "2";
+    temperature.step = "0.1";
+    temperature.value = String(settings.modelTemperature ?? 0);
+    temperature.setAttribute("aria-label", "Model temperature");
+    const planning = document.createElement("textarea");
+    planning.rows = 4;
+    planning.value = settings.customPlanningPrompt || "";
+    planning.setAttribute("aria-label", "Custom planning prompt");
+    const sectionOrder = document.createElement("input");
+    sectionOrder.type = "text";
+    sectionOrder.value =
+      settings.promptSectionsOrder ||
+      '["fileMap","fileContents","gitDiff","metaPrompts","userInstructions"]';
+    sectionOrder.setAttribute("aria-label", "Prompt sections order");
+    const duplicate = typedToggle(
+      "Duplicate user instructions at top",
+      settings.duplicateUserInstructionsAtTop === true,
+    );
+    const datetime = typedToggle(
+      "Include datetime in user instructions",
+      settings.includeDatetimeInUserInstructions === true,
+    );
+    packaging.append(
+      desktopRow(
+        "File edit format",
+        "Diff, Whole, or None. Missing or invalid raw live-reads Diff.",
+        fileEdit,
+      ),
+      desktopRow(
+        "File path display",
+        "Full uses the root path; Relative uses the logical path.",
+        pathDisplay,
+      ),
+      desktopRow(
+        "Set model temperature",
+        "Off, or a stored 0.0, omits temperature from provider payloads.",
+        temperatureEnabled.toggle,
+      ),
+      desktopRow("Model temperature", "0–2. Live-read when the enable flag is on.", temperature),
+      desktopRow(
+        "Custom planning prompt",
+        "Empty live-reads the built-in Architect fallback.",
+        planning,
+      ),
+      desktopRow(
+        "Prompt sections order",
+        "JSON array of each section once. Incomplete values live-read the Desktop default.",
+        sectionOrder,
+      ),
+      desktopRow(
+        "Duplicate user instructions at top",
+        "Prepends user instructions and still emits them in section order.",
+        duplicate.toggle,
+      ),
+      desktopRow(
+        "Include datetime in user instructions",
+        'Adds date="yyyy-MM-dd\'T\'HH:mm" when packaging user instructions.',
+        datetime.toggle,
+      ),
+    );
     const save = element("button", "primary-button", "Save Advanced Settings");
     save.type = "button";
     save.addEventListener("click", () => {
@@ -4127,6 +4236,15 @@
         );
         return;
       }
+      const modelTemperature = Number(temperature.value);
+      if (
+        !Number.isFinite(modelTemperature) ||
+        modelTemperature < 0 ||
+        modelTemperature > 2
+      ) {
+        toast("Model temperature must be a number from 0 through 2.", true);
+        return;
+      }
       mutateDomain(
         "advanced",
         save,
@@ -4136,6 +4254,7 @@
             body: JSON.stringify({
               expectedRevision: snapshot.revision,
               settings: {
+                ...settings,
                 ...Object.fromEntries(
                   Object.entries(toggles).map(([key, toggle]) => [
                     key,
@@ -4143,6 +4262,14 @@
                   ]),
                 ),
                 historyIdleThresholdMinutes,
+                fileEditFormat: fileEdit.value,
+                customPlanningPrompt: planning.value,
+                modelTemperature,
+                setModelTemperature: temperatureEnabled.input.checked,
+                promptSectionsOrder: sectionOrder.value,
+                duplicateUserInstructionsAtTop: duplicate.input.checked,
+                filePathDisplayOption: pathDisplay.value,
+                includeDatetimeInUserInstructions: datetime.input.checked,
               },
             }),
           }),
@@ -4151,22 +4278,24 @@
         },
       );
     });
-    card.append(save);
+    packaging.append(save);
     const boundary = informationalCard(
       "Desktop Utility Boundaries",
       "These local desktop integrations have no safe or useful server-setting equivalent and remain input-free.",
       [
-        ["Prompt packaging", "Desktop Copy / built-in Chat only"],
         ["Keyboard shortcut link", "Intentionally omitted"],
         ["repoprompt:// URL opener", "macOS-only"],
-        ["Saved prompt import/export/reset", "Desktop store only"],
+        [
+          "Saved prompt import/export/reset",
+          "File-panel utilities; the catalog persists on the server store",
+        ],
       ],
     );
     settingsPage(
       "Advanced",
       "Configure only canonical settings consumed by shared-server runtime operations.",
       "sliders",
-      [card, boundary],
+      [card, packaging, boundary],
     );
   }
 

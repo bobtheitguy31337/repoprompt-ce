@@ -85,6 +85,51 @@ final class AgentComposerCatalogTests: XCTestCase {
         XCTAssertFalse(group.toolControls.isEmpty)
     }
 
+    func testComposerSelectionLiveReadsPreferredComposeModelFromAgentModelsStore() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        _ = try await store.upsertProviderSettings(
+            ProviderSettingsPreference(providerID: .codex, enabled: true, revision: 1),
+            expectedRevision: 0
+        )
+        let instant = Date(timeIntervalSince1970: 1_786_400_000)
+        let connection = ProviderConnectionRecord(
+            connectionID: UUID(),
+            providerID: .codex,
+            authenticationMethod: .deviceCodeBeta,
+            state: .attention,
+            accountLabel: "sandbox",
+            lastTestedAt: instant,
+            testState: .unavailable,
+            detail: "Authentication status is temporarily unavailable",
+            keyHelperConfigured: false,
+            workloadIdentityConfigured: false,
+            createdAt: instant,
+            updatedAt: instant,
+            revision: 1
+        )
+        _ = try await store.upsertProviderConnection(.init(record: connection, credentialReference: nil), expectedRevision: 0)
+        let runner = StructuredStartProviderRunner()
+        let configuration = ProviderCLIConfiguration(kind: .codex, executable: "/usr/bin/swift", expectedVersion: "6.2")
+        let settings = ProviderSettingsService(
+            store: store,
+            adapter: ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.codex], runner: runner),
+            configurations: [configuration],
+            initiallyEnabled: [.codex],
+            runner: runner
+        )
+        try await settings.bootstrap()
+
+        let snapshot = try await AgentComposerCatalogService(
+            providerSettings: settings,
+            store: store,
+            composeModelLoader: { "gpt-5.6-sol-fast" }
+        ).snapshot(context: .init(kind: .project, projectID: UUID(), actorID: "compose-reader"))
+
+        XCTAssertEqual(snapshot.selected?.providerID, .codex)
+        XCTAssertEqual(snapshot.selected?.modelID, "gpt-5.6-sol-fast")
+    }
+
     func testComposerEmptyStateLiveReadsFeaturedOrderInsteadOfBootFrozenPrefix() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }

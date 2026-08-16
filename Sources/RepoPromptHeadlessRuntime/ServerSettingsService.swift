@@ -736,6 +736,9 @@ public actor ServerSettingsService {
         guard (0 ... 60).contains(request.settings.historyIdleThresholdMinutes) else {
             throw ServiceAPIError(code: .invalidRequest, message: "History idle threshold is outside its supported range")
         }
+        guard (0 ... 2).contains(request.settings.modelTemperature) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Model temperature is outside its supported range")
+        }
         let document = StoredSettingsDocument(value: request.settings, revision: request.expectedRevision + 1, updatedAt: now())
         let stored = try await store.upsertAdvancedServerSettingsDocument(
             document,
@@ -858,7 +861,9 @@ private extension ServerSettingsService {
             pair: target(profile.pair),
             design: target(profile.design),
             restrictDiscoveryToRoleModels: profile.restrictDiscoveryToRoleModels,
-            contextBuilderModelsByAgent: normalizedMap.isEmpty ? nil : normalizedMap
+            contextBuilderModelsByAgent: normalizedMap.isEmpty ? nil : normalizedMap,
+            preferredComposeModelRaw: profile.preferredComposeModelRaw,
+            syncChatModelWithOracle: profile.syncChatModelWithOracle
         )
     }
 
@@ -873,6 +878,9 @@ private extension ServerSettingsService {
                   row.target == .oracle || row.target == .contextBuilder
             else { continue }
             next = next.replacing(row.target, with: target)
+        }
+        if let oracleModel = next.oracle?.modelID {
+            next = next.replacingComposeModel(oracleModel)
         }
         return next
     }

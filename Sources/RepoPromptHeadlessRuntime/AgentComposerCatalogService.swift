@@ -37,6 +37,7 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
     private let emptyState: AgentEmptyStateDescriptor
     private let providerProfileLoader: (@Sendable (ProviderSettingsID) async throws -> AgentCatalogProviderProfile)?
     private let providerStateLoader: (@Sendable (Date) async throws -> [AgentCatalogProviderState])?
+    private let composeModelLoader: (@Sendable () async throws -> String?)?
     private let now: @Sendable () -> Date
 
     public init(
@@ -55,6 +56,7 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
         ),
         providerProfileLoader: (@Sendable (ProviderSettingsID) async throws -> AgentCatalogProviderProfile)? = nil,
         providerStateLoader: (@Sendable (Date) async throws -> [AgentCatalogProviderState])? = nil,
+        composeModelLoader: (@Sendable () async throws -> String?)? = nil,
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.providerSettings = providerSettings
@@ -65,6 +67,7 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
         self.emptyState = emptyState
         self.providerProfileLoader = providerProfileLoader
         self.providerStateLoader = providerStateLoader
+        self.composeModelLoader = composeModelLoader
         self.now = now
     }
 
@@ -247,9 +250,10 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
         }
         if let providerStateLoader {
             let instant = now()
+            let states = try await providerStateLoader(instant)
             return AgentCatalogAuthority.resolve(
-                providers: try await providerStateLoader(instant),
-                storedSelection: storedSelection,
+                providers: states,
+                storedSelection: try await resolvedStoredSelection(storedSelection, in: states),
                 context: .init(now: instant, activeRun: context.activeRun, externallyControlled: context.mcpControlled)
             )
         }
@@ -317,9 +321,32 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
         }
         return AgentCatalogAuthority.resolve(
             providers: states,
-            storedSelection: storedSelection,
+            storedSelection: try await resolvedStoredSelection(storedSelection, in: states),
             context: .init(now: instant, activeRun: context.activeRun, externallyControlled: context.mcpControlled)
         )
+    }
+
+    private func resolvedStoredSelection(
+        _ storedSelection: AgentCatalogStoredSelection?,
+        in states: [AgentCatalogProviderState]
+    ) async throws -> AgentCatalogStoredSelection? {
+        if let storedSelection { return storedSelection }
+        return Self.composeStoreSelection(try await composeModelLoader?(), in: states)
+    }
+
+    private static func composeStoreSelection(_ raw: String?, in states: [AgentCatalogProviderState]) -> AgentCatalogStoredSelection? {
+        let needle = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        guard !needle.isEmpty else { return nil }
+        for state in states {
+            for source in state.modelSources {
+                if let model = source.models.first(where: {
+                    $0.modelID.lowercased() == needle || $0.rawValue.lowercased() == needle
+                }) {
+                    return .init(providerID: state.providerID, modelID: model.modelID)
+                }
+            }
+        }
+        return nil
     }
 
     private static func candidate(_ entry: ProviderModelCatalogEntry) -> AgentCatalogModelCandidate {

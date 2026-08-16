@@ -64,6 +64,8 @@ public struct AgentModelsProfile: Codable, Hashable, Sendable {
     public let design: AgentModelTarget?
     public let restrictDiscoveryToRoleModels: Bool
     public let contextBuilderModelsByAgent: [String: String]?
+    public let preferredComposeModelRaw: String?
+    public let syncChatModelWithOracle: Bool?
 
     public init(
         oracle: AgentModelTarget? = nil,
@@ -73,7 +75,9 @@ public struct AgentModelsProfile: Codable, Hashable, Sendable {
         pair: AgentModelTarget? = nil,
         design: AgentModelTarget? = nil,
         restrictDiscoveryToRoleModels: Bool = false,
-        contextBuilderModelsByAgent: [String: String]? = nil
+        contextBuilderModelsByAgent: [String: String]? = nil,
+        preferredComposeModelRaw: String? = nil,
+        syncChatModelWithOracle: Bool? = nil
     ) {
         self.oracle = oracle
         self.contextBuilder = contextBuilder
@@ -83,6 +87,8 @@ public struct AgentModelsProfile: Codable, Hashable, Sendable {
         self.design = design
         self.restrictDiscoveryToRoleModels = restrictDiscoveryToRoleModels
         self.contextBuilderModelsByAgent = Self.normalizedContextBuilderModelsByAgent(contextBuilderModelsByAgent)
+        self.preferredComposeModelRaw = Self.normalizedComposeModelRaw(preferredComposeModelRaw)
+        self.syncChatModelWithOracle = syncChatModelWithOracle
     }
 
     public subscript(target: AgentRoutingTarget) -> AgentModelTarget? {
@@ -127,8 +133,88 @@ public struct AgentModelsProfile: Codable, Hashable, Sendable {
             pair: target == .pair ? value : pair,
             design: target == .design ? value : design,
             restrictDiscoveryToRoleModels: restrictDiscoveryToRoleModels,
-            contextBuilderModelsByAgent: modelsByAgent.isEmpty ? nil : modelsByAgent
+            contextBuilderModelsByAgent: modelsByAgent.isEmpty ? nil : modelsByAgent,
+            preferredComposeModelRaw: preferredComposeModelRaw,
+            syncChatModelWithOracle: syncChatModelWithOracle
+        ).honoringComposeSync(oracleChanged: target == .oracle)
+    }
+
+    public func resolvedSyncChatModelWithOracle() -> Bool {
+        if let syncChatModelWithOracle { return syncChatModelWithOracle }
+        let planning = normalizedPlanningModelID
+        let compose = Self.normalizedComposeModelRaw(preferredComposeModelRaw)
+        return planning != nil && planning == compose
+    }
+
+    public func resolvedComposeModelRaw() -> String? {
+        if resolvedSyncChatModelWithOracle(), let planning = normalizedPlanningModelID {
+            return planning
+        }
+        return Self.normalizedComposeModelRaw(preferredComposeModelRaw)
+    }
+
+    public func replacingComposeModel(_ raw: String?) -> AgentModelsProfile {
+        let compose = Self.normalizedComposeModelRaw(raw)
+        let planning = normalizedPlanningModelID
+        let nextSync: Bool?
+        if resolvedSyncChatModelWithOracle(), compose != planning {
+            nextSync = false
+        } else {
+            nextSync = syncChatModelWithOracle
+        }
+        return AgentModelsProfile(
+            oracle: oracle,
+            contextBuilder: contextBuilder,
+            explore: explore,
+            engineer: engineer,
+            pair: pair,
+            design: design,
+            restrictDiscoveryToRoleModels: restrictDiscoveryToRoleModels,
+            contextBuilderModelsByAgent: contextBuilderModelsByAgent,
+            preferredComposeModelRaw: compose,
+            syncChatModelWithOracle: nextSync
         )
+    }
+
+    public func replacingSyncChatModelWithOracle(_ enabled: Bool) -> AgentModelsProfile {
+        let compose = enabled ? normalizedPlanningModelID : Self.normalizedComposeModelRaw(preferredComposeModelRaw)
+        return AgentModelsProfile(
+            oracle: oracle,
+            contextBuilder: contextBuilder,
+            explore: explore,
+            engineer: engineer,
+            pair: pair,
+            design: design,
+            restrictDiscoveryToRoleModels: restrictDiscoveryToRoleModels,
+            contextBuilderModelsByAgent: contextBuilderModelsByAgent,
+            preferredComposeModelRaw: compose,
+            syncChatModelWithOracle: enabled
+        )
+    }
+
+    private var normalizedPlanningModelID: String? {
+        Self.normalizedComposeModelRaw(oracle?.modelID)
+    }
+
+    private func honoringComposeSync(oracleChanged: Bool) -> AgentModelsProfile {
+        guard oracleChanged, resolvedSyncChatModelWithOracle() else { return self }
+        return AgentModelsProfile(
+            oracle: oracle,
+            contextBuilder: contextBuilder,
+            explore: explore,
+            engineer: engineer,
+            pair: pair,
+            design: design,
+            restrictDiscoveryToRoleModels: restrictDiscoveryToRoleModels,
+            contextBuilderModelsByAgent: contextBuilderModelsByAgent,
+            preferredComposeModelRaw: normalizedPlanningModelID,
+            syncChatModelWithOracle: syncChatModelWithOracle ?? true
+        )
+    }
+
+    static func normalizedComposeModelRaw(_ raw: String?) -> String? {
+        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     static func normalizedContextBuilderModelsByAgent(_ models: [String: String]?) -> [String: String]? {

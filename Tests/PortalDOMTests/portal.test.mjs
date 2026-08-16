@@ -472,6 +472,8 @@ function typedSettingsFixtures(providers, bootstrap) {
     pair: null,
     design: null,
     restrictDiscoveryToRoleModels: false,
+    preferredComposeModelRaw: null,
+    syncChatModelWithOracle: false,
   };
   const contextProfile = {
     budget: 160000,
@@ -550,6 +552,14 @@ function typedSettingsFixtures(providers, bootstrap) {
         showEmptyFolders: true,
         codeMapsEnabled: true,
         historyIdleThresholdMinutes: 5,
+        fileEditFormat: "Diff",
+        customPlanningPrompt: "",
+        modelTemperature: 0,
+        setModelTemperature: true,
+        promptSectionsOrder: "",
+        duplicateUserInstructionsAtTop: false,
+        filePathDisplayOption: "Full",
+        includeDatetimeInUserInstructions: false,
       },
       revision: 0,
       scannerPolicyGeneration: 0,
@@ -1614,7 +1624,9 @@ test("typed settings pages mutate revisioned server authorities", async (t) => {
     "explore",
     "oracle",
     "pair",
+    "preferredComposeModelRaw",
     "restrictDiscoveryToRoleModels",
+    "syncChatModelWithOracle",
   ]);
   assert.equal(agentModelsPayload.mode, "projectOverride");
   await settle();
@@ -1740,6 +1752,14 @@ test("typed settings pages mutate revisioned server authorities", async (t) => {
     document.getElementById("settings-content").textContent,
     /scanner policy generation 0/,
   );
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /Prompt Packaging/,
+  );
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /File path display/,
+  );
   const historyThreshold = document.querySelector(
     'input[aria-label="Default history idle threshold"]',
   );
@@ -1770,13 +1790,24 @@ test("typed settings pages mutate revisioned server authorities", async (t) => {
   ]);
   assert.deepEqual(Object.keys(advancedPayload.settings).sort(), [
     "codeMapsEnabled",
+    "customPlanningPrompt",
+    "duplicateUserInstructionsAtTop",
+    "fileEditFormat",
+    "filePathDisplayOption",
     "followSymbolicLinks",
     "historyIdleThresholdMinutes",
+    "includeDatetimeInUserInstructions",
+    "modelTemperature",
+    "promptSectionsOrder",
     "respectCursorIgnore",
     "respectNestedIgnoreFiles",
     "respectRepoIgnore",
+    "setModelTemperature",
     "showEmptyFolders",
   ]);
+  assert.equal(advancedPayload.settings.fileEditFormat, "Diff");
+  assert.equal(advancedPayload.settings.filePathDisplayOption, "Full");
+  assert.equal(advancedPayload.settings.setModelTemperature, true);
   assert.equal(advancedPayload.settings.historyIdleThresholdMinutes, 5);
 });
 

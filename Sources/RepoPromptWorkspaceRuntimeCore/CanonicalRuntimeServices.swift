@@ -462,8 +462,9 @@ public struct OracleRuntimeRequest: Sendable {
     public let tokenBudget: Int?
     public let workingDirectory: String
     public let runID: UUID
+    public let planningSystemPrompt: String?
 
-    public init(sessionID: UUID, prompt: String, mode: String, selectedContext: String, priorTurns: [OracleChatTurn], providerSessionID: String?, provider: ProviderKind, providerSettingsID: ProviderSettingsID? = nil, providerSettings: [String: String] = [:], model: String?, reasoningEffort: String? = nil, tokenBudget: Int? = nil, workingDirectory: String, runID: UUID) {
+    public init(sessionID: UUID, prompt: String, mode: String, selectedContext: String, priorTurns: [OracleChatTurn], providerSessionID: String?, provider: ProviderKind, providerSettingsID: ProviderSettingsID? = nil, providerSettings: [String: String] = [:], model: String?, reasoningEffort: String? = nil, tokenBudget: Int? = nil, workingDirectory: String, runID: UUID, planningSystemPrompt: String? = nil) {
         self.sessionID = sessionID
         self.prompt = prompt
         self.mode = mode
@@ -478,6 +479,7 @@ public struct OracleRuntimeRequest: Sendable {
         self.tokenBudget = tokenBudget
         self.workingDirectory = workingDirectory
         self.runID = runID
+        self.planningSystemPrompt = planningSystemPrompt
     }
 }
 
@@ -516,8 +518,15 @@ public struct ProviderOracleRuntimeService: OracleRuntimeService, Sendable {
         let history = request.providerSessionID == nil
             ? request.priorTurns.suffix(50).map { "<turn><user>\($0.prompt)</user><assistant>\($0.response)</assistant></turn>" }.joined(separator: "\n")
             : ""
+        let systemPrompt: String
+        if mode == "plan" {
+            let planning = request.planningSystemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            systemPrompt = planning.isEmpty ? AdvancedServerSettings.architectFallback : planning
+        } else {
+            systemPrompt = "You are RepoPrompt Oracle, a repository reasoning service. Answer only from the frozen, root-authorized context below. State uncertainty and missing context explicitly. Do not claim access to unselected files."
+        }
         let prompt = """
-        You are RepoPrompt Oracle, a repository reasoning service. Answer only from the frozen, root-authorized context below. State uncertainty and missing context explicitly. Do not claim access to unselected files.
+        \(systemPrompt)
         <mode>\(mode == "selected" ? "chat" : mode)</mode>
         <prior_conversation>
         \(history.isEmpty ? "(new chat)" : history)

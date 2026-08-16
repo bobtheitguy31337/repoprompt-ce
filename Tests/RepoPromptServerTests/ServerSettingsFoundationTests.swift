@@ -1697,6 +1697,78 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertEqual(readBuilder["value"] as? String, "claude-opus-5")
     }
 
+    func testAppSettingsPackagingKeysWriteTheSameAdvancedAndComposeStores() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("app-settings-packaging-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
+            projectCatalog: store
+        )
+        let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
+        let actor = ExternalActor(goblinUserID: "mcp-packaging", username: "mcp-packaging", displayName: "MCP Packaging")
+        let project = try await authority.createProject(
+            input: .init(name: "Packaging", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "packaging-project",
+            requestDigest: "packaging-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "packaging-session",
+            requestDigest: "packaging-session"
+        )
+        let adapter = RepoPromptMCPAdapter(authority: authority)
+        let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
+
+        func invoke(_ object: [String: Any]) async throws -> [String: Any] {
+            let data = try await adapter.invoke(
+                toolName: "app_settings",
+                argumentsJSON: try JSONSerialization.data(withJSONObject: object),
+                binding: binding
+            )
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+
+        _ = try await invoke(["op": "set", "key": "models.file_edit_format", "value": "Whole"])
+        _ = try await invoke(["op": "set", "key": "models.temperature", "value": 0.7])
+        _ = try await invoke(["op": "set", "key": "models.temperature_enabled", "value": true])
+        _ = try await invoke(["op": "set", "key": "models.custom_planning_prompt", "value": "Custom plan"])
+        _ = try await invoke(["op": "set", "key": "prompt_packaging.duplicate_user_instructions_at_top", "value": true])
+        _ = try await invoke(["op": "set", "key": "prompt_packaging.file_path_display_option", "value": "Relative"])
+        _ = try await invoke(["op": "set", "key": "prompt_packaging.include_datetime_in_user_instructions", "value": true])
+        _ = try await invoke([
+            "op": "set",
+            "key": "prompt_packaging.prompt_sections_order",
+            "value": PromptSection.defaultOrderJSON
+        ])
+        _ = try await invoke(["op": "set", "key": "models.preferred_compose_model", "value": "gpt-5.6-sol"])
+        _ = try await invoke(["op": "set", "key": "models.sync_chat_model_with_oracle", "value": false])
+
+        let advanced = try await authority.advancedSettings().settings
+        XCTAssertEqual(advanced.resolvedFileEditFormat(), .whole)
+        XCTAssertEqual(advanced.modelTemperature, 0.7)
+        XCTAssertTrue(advanced.setModelTemperature)
+        XCTAssertEqual(advanced.customPlanningPrompt, "Custom plan")
+        XCTAssertTrue(advanced.duplicateUserInstructionsAtTop)
+        XCTAssertEqual(advanced.resolvedFilePathDisplay(), .relative)
+        XCTAssertTrue(advanced.includeDatetimeInUserInstructions)
+        XCTAssertEqual(advanced.resolvedPromptSectionOrder(), PromptSection.defaultOrder)
+
+        let compose = try await authority.globalAgentModels().effectiveProfile
+        XCTAssertEqual(compose.preferredComposeModelRaw, "gpt-5.6-sol")
+        XCTAssertEqual(compose.syncChatModelWithOracle, false)
+
+        let pathDisplay = try await invoke(["op": "get", "key": "prompt_packaging.file_path_display_option"])
+        XCTAssertEqual(pathDisplay["value"] as? String, "Relative")
+        let composeRead = try await invoke(["op": "get", "key": "models.preferred_compose_model"])
+        XCTAssertEqual(composeRead["value"] as? String, "gpt-5.6-sol")
+    }
+
     func testAppSettingsPermissionKeysWriteTheTypedPermissionStore() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }

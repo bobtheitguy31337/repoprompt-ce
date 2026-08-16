@@ -334,7 +334,7 @@ private actor AuthorityToolBackend {
 
     private func typedAppSetting(key: String) async throws -> Value {
         switch key {
-        case "models.planning_model", "context_builder.agent", "context_builder.model":
+        case "models.planning_model", "models.preferred_compose_model", "models.sync_chat_model_with_oracle", "models.custom_planning_prompt", "models.file_edit_format", "models.temperature", "models.temperature_enabled", "prompt_packaging.prompt_sections_order", "prompt_packaging.duplicate_user_instructions_at_top", "prompt_packaging.file_path_display_option", "prompt_packaging.include_datetime_in_user_instructions", "context_builder.agent", "context_builder.model":
             return try await routingAppSetting(key: key)
         case "direct_agents.codex.sandbox",
              "direct_agents.codex.approval_policy",
@@ -374,7 +374,7 @@ private actor AuthorityToolBackend {
 
     private func replaceTypedAppSetting(key: String, value: Value?) async throws -> Value {
         switch key {
-        case "models.planning_model", "context_builder.agent", "context_builder.model":
+        case "models.planning_model", "models.preferred_compose_model", "models.sync_chat_model_with_oracle", "models.custom_planning_prompt", "models.file_edit_format", "models.temperature", "models.temperature_enabled", "prompt_packaging.prompt_sections_order", "prompt_packaging.duplicate_user_instructions_at_top", "prompt_packaging.file_path_display_option", "prompt_packaging.include_datetime_in_user_instructions", "context_builder.agent", "context_builder.model":
             return try await replaceRoutingAppSetting(key: key, value: value)
         case "direct_agents.codex.sandbox",
              "direct_agents.codex.approval_policy",
@@ -617,6 +617,38 @@ private actor AuthorityToolBackend {
         throw ServiceAPIError(code: .invalidRequest, message: "\(key) must be a Boolean")
     }
 
+    private static func temperatureValue(_ value: Value?, key: String) throws -> Double {
+        let parsed: Double?
+        if let number = value?.doubleValue {
+            parsed = number
+        } else if let integer = value?.intValue {
+            parsed = Double(integer)
+        } else if let raw = value?.stringValue {
+            parsed = Double(raw)
+        } else {
+            parsed = nil
+        }
+        guard let temperature = parsed, (0 ... 2).contains(temperature) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "\(key) must be a number between 0 and 2")
+        }
+        return temperature
+    }
+
+    private static func promptSectionsOrderValue(_ value: Value?, key: String) throws -> String {
+        guard let raw = value?.stringValue,
+              let data = raw.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([PromptSection].self, from: data),
+              decoded.count == PromptSection.allCases.count,
+              Set(decoded) == Set(PromptSection.allCases)
+        else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "\(key) must be a JSON array of each PromptSection once"
+            )
+        }
+        return PromptSection.encode(decoded)
+    }
+
     private static func enumValue<ValueType: RawRepresentable>(
         _ value: Value?,
         as type: ValueType.Type,
@@ -636,6 +668,64 @@ private actor AuthorityToolBackend {
             return .object([
                 "key": .string(key),
                 "value": profile.oracle.flatMap(Self.compoundID).map(Value.string) ?? .null
+            ])
+        case "models.preferred_compose_model":
+            return .object([
+                "key": .string(key),
+                "value": profile.resolvedComposeModelRaw().map(Value.string) ?? .null
+            ])
+        case "models.sync_chat_model_with_oracle":
+            return .object([
+                "key": .string(key),
+                "value": .bool(profile.resolvedSyncChatModelWithOracle())
+            ])
+        case "models.custom_planning_prompt":
+            let settings = try await authority.advancedSettings().settings
+            return .object([
+                "key": .string(key),
+                "value": .string(settings.customPlanningPrompt)
+            ])
+        case "models.file_edit_format":
+            let settings = try await authority.advancedSettings().settings
+            return .object([
+                "key": .string(key),
+                "value": .string(settings.resolvedFileEditFormat().rawValue)
+            ])
+        case "models.temperature":
+            let settings = try await authority.advancedSettings().settings
+            return .object([
+                "key": .string(key),
+                "value": .double(settings.modelTemperature)
+            ])
+        case "models.temperature_enabled":
+            let settings = try await authority.advancedSettings().settings
+            return .object([
+                "key": .string(key),
+                "value": .bool(settings.setModelTemperature)
+            ])
+        case "prompt_packaging.prompt_sections_order":
+            let settings = try await authority.advancedSettings().settings
+            return .object([
+                "key": .string(key),
+                "value": .string(PromptSection.encode(settings.resolvedPromptSectionOrder()))
+            ])
+        case "prompt_packaging.duplicate_user_instructions_at_top":
+            let settings = try await authority.advancedSettings().settings
+            return .object([
+                "key": .string(key),
+                "value": .bool(settings.duplicateUserInstructionsAtTop)
+            ])
+        case "prompt_packaging.file_path_display_option":
+            let settings = try await authority.advancedSettings().settings
+            return .object([
+                "key": .string(key),
+                "value": .string(settings.resolvedFilePathDisplay().rawValue)
+            ])
+        case "prompt_packaging.include_datetime_in_user_instructions":
+            let settings = try await authority.advancedSettings().settings
+            return .object([
+                "key": .string(key),
+                "value": .bool(settings.includeDatetimeInUserInstructions)
             ])
         case "context_builder.agent":
             return .object([
@@ -658,6 +748,108 @@ private actor AuthorityToolBackend {
         switch key {
         case "models.planning_model":
             profile = profile.replacing(.oracle, with: try Self.agentTarget(fromCompoundOrModel: value?.stringValue))
+        case "models.preferred_compose_model":
+            profile = profile.replacingComposeModel(value?.stringValue)
+        case "models.sync_chat_model_with_oracle":
+            profile = profile.replacingSyncChatModelWithOracle(try Self.boolValue(value, key: key))
+        case "models.custom_planning_prompt":
+            let currentAdvanced = try await authority.advancedSettings()
+            let next = currentAdvanced.settings.replacing(customPlanningPrompt: value?.stringValue ?? "")
+            _ = try await authority.replaceAdvancedSettings(
+                .init(expectedRevision: currentAdvanced.revision, settings: next),
+                attribution: SettingsMutationAttribution(
+                    actorID: binding.actor.goblinUserID,
+                    actorLabel: binding.actor.displayName,
+                    channel: "mcp"
+                )
+            )
+            return try await routingAppSetting(key: key)
+        case "models.file_edit_format":
+            let currentAdvanced = try await authority.advancedSettings()
+            let next = currentAdvanced.settings.replacing(fileEditFormat: value?.stringValue ?? AdvancedServerSettings.FileEditFormat.defaultRaw)
+            _ = try await authority.replaceAdvancedSettings(
+                .init(expectedRevision: currentAdvanced.revision, settings: next),
+                attribution: SettingsMutationAttribution(
+                    actorID: binding.actor.goblinUserID,
+                    actorLabel: binding.actor.displayName,
+                    channel: "mcp"
+                )
+            )
+            return try await routingAppSetting(key: key)
+        case "models.temperature":
+            let currentAdvanced = try await authority.advancedSettings()
+            let next = currentAdvanced.settings.replacing(modelTemperature: try Self.temperatureValue(value, key: key))
+            _ = try await authority.replaceAdvancedSettings(
+                .init(expectedRevision: currentAdvanced.revision, settings: next),
+                attribution: SettingsMutationAttribution(
+                    actorID: binding.actor.goblinUserID,
+                    actorLabel: binding.actor.displayName,
+                    channel: "mcp"
+                )
+            )
+            return try await routingAppSetting(key: key)
+        case "models.temperature_enabled":
+            let currentAdvanced = try await authority.advancedSettings()
+            let next = currentAdvanced.settings.replacing(setModelTemperature: try Self.boolValue(value, key: key))
+            _ = try await authority.replaceAdvancedSettings(
+                .init(expectedRevision: currentAdvanced.revision, settings: next),
+                attribution: SettingsMutationAttribution(
+                    actorID: binding.actor.goblinUserID,
+                    actorLabel: binding.actor.displayName,
+                    channel: "mcp"
+                )
+            )
+            return try await routingAppSetting(key: key)
+        case "prompt_packaging.prompt_sections_order":
+            let currentAdvanced = try await authority.advancedSettings()
+            let next = currentAdvanced.settings.replacing(promptSectionsOrder: try Self.promptSectionsOrderValue(value, key: key))
+            _ = try await authority.replaceAdvancedSettings(
+                .init(expectedRevision: currentAdvanced.revision, settings: next),
+                attribution: SettingsMutationAttribution(
+                    actorID: binding.actor.goblinUserID,
+                    actorLabel: binding.actor.displayName,
+                    channel: "mcp"
+                )
+            )
+            return try await routingAppSetting(key: key)
+        case "prompt_packaging.duplicate_user_instructions_at_top":
+            let currentAdvanced = try await authority.advancedSettings()
+            let next = currentAdvanced.settings.replacing(duplicateUserInstructionsAtTop: try Self.boolValue(value, key: key))
+            _ = try await authority.replaceAdvancedSettings(
+                .init(expectedRevision: currentAdvanced.revision, settings: next),
+                attribution: SettingsMutationAttribution(
+                    actorID: binding.actor.goblinUserID,
+                    actorLabel: binding.actor.displayName,
+                    channel: "mcp"
+                )
+            )
+            return try await routingAppSetting(key: key)
+        case "prompt_packaging.file_path_display_option":
+            let currentAdvanced = try await authority.advancedSettings()
+            let next = currentAdvanced.settings.replacing(
+                filePathDisplayOption: try Self.enumValue(value, as: AdvancedServerSettings.FilePathDisplay.self, key: key).rawValue
+            )
+            _ = try await authority.replaceAdvancedSettings(
+                .init(expectedRevision: currentAdvanced.revision, settings: next),
+                attribution: SettingsMutationAttribution(
+                    actorID: binding.actor.goblinUserID,
+                    actorLabel: binding.actor.displayName,
+                    channel: "mcp"
+                )
+            )
+            return try await routingAppSetting(key: key)
+        case "prompt_packaging.include_datetime_in_user_instructions":
+            let currentAdvanced = try await authority.advancedSettings()
+            let next = currentAdvanced.settings.replacing(includeDatetimeInUserInstructions: try Self.boolValue(value, key: key))
+            _ = try await authority.replaceAdvancedSettings(
+                .init(expectedRevision: currentAdvanced.revision, settings: next),
+                attribution: SettingsMutationAttribution(
+                    actorID: binding.actor.goblinUserID,
+                    actorLabel: binding.actor.displayName,
+                    channel: "mcp"
+                )
+            )
+            return try await routingAppSetting(key: key)
         case "context_builder.agent":
             guard let raw = value?.stringValue, let providerID = Self.providerSettingsID(fromAppSettings: raw) else {
                 throw ServiceAPIError(code: .invalidRequest, message: "context_builder.agent must be a known CLI agent")

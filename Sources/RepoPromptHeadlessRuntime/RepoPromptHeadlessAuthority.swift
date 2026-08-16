@@ -1765,6 +1765,16 @@ public actor RepoPromptHeadlessAuthority {
         return AdvancedServerSettingsSnapshot(settings: .default, revision: 0, updatedAt: Date(timeIntervalSince1970: 0))
     }
 
+    public func replaceAdvancedSettings(
+        _ request: ReplaceAdvancedServerSettingsRequest,
+        attribution: SettingsMutationAttribution
+    ) async throws -> AdvancedServerSettingsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Settings authority is not configured")
+        }
+        return try await serverSettings.replaceAdvanced(request, attribution: attribution)
+    }
+
     public func historyIdleThresholdMinutes(explicit: Int?) async throws -> Int {
         if let explicit { return max(0, min(explicit, 60)) }
         return try await advancedSettings().settings.historyIdleThresholdMinutes
@@ -2868,7 +2878,7 @@ public actor RepoPromptHeadlessAuthority {
         let project = try await projectSnapshot(projectID: session.projectID)
         let workingDirectory = try await executionLocation(session: session).workingDirectory
         let selection = try await selectionSnapshot(sessionID: sessionID)
-        let context = try await materializedContext(projectID: project.projectID, selection: selection, include: ["files"])
+        let context = try await materializedContext(projectID: project.projectID, selection: selection, include: ["files"], purpose: .chat)
         let chatID = input.chatID ?? ids.next()
         let priorChat: OracleChatState
         let oracleRoute: ResolvedAgentModelRoute?
@@ -2932,6 +2942,13 @@ public actor RepoPromptHeadlessAuthority {
         } else {
             oracleProviderSettings = await runtimeProviderSettings(providerID: priorChat.providerSettingsID ?? session.providerSettingsID)
         }
+        let planningSystemPrompt: String?
+        if input.contextMode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "plan" {
+            planningSystemPrompt = (try? await serverSettings?.advanced().settings.resolvedPlanningPrompt())
+                ?? AdvancedServerSettings.architectFallback
+        } else {
+            planningSystemPrompt = nil
+        }
         let execution = try await oracleRuntime.ask(.init(
             sessionID: sessionID,
             prompt: input.prompt,
@@ -2945,7 +2962,8 @@ public actor RepoPromptHeadlessAuthority {
             model: priorChat.model ?? session.model,
             reasoningEffort: priorChat.reasoningEffort,
             workingDirectory: workingDirectory,
-            runID: ids.next()
+            runID: ids.next(),
+            planningSystemPrompt: planningSystemPrompt
         ))
         let response = execution.response
         let nextChat = OracleChatState(
@@ -3130,7 +3148,17 @@ public actor RepoPromptHeadlessAuthority {
     }
 
     private func runtimeProviderSettings(providerID: ProviderSettingsID?) async -> [String: String] {
-        await liveDirectAgentDefaults(providerID: providerID)?.providerSettings ?? [:]
+        await attachingResolvedTemperature(liveDirectAgentDefaults(providerID: providerID)?.providerSettings ?? [:])
+    }
+
+    private func attachingResolvedTemperature(_ settings: [String: String]) async -> [String: String] {
+        var next = settings
+        if let temperature = (try? await advancedSettings())?.settings.resolvedAttachedTemperature() {
+            next["models.temperature"] = String(temperature)
+        } else {
+            next.removeValue(forKey: "models.temperature")
+        }
+        return next
     }
 
     private func liveDirectAgentDefaults(providerID: ProviderSettingsID?) async -> DirectProviderRuntimeDefaults? {
@@ -3433,16 +3461,28 @@ public actor RepoPromptHeadlessAuthority {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    private func materializedContext(projectID: UUID, selection: SelectionSnapshot, include: [String]) async throws -> String {
-        var sections = ["# RepoPrompt Context", "selection-revision: \(selection.revision)"]
+    private func materializedContext(projectID: UUID, selection: SelectionSnapshot, include: [String], purpose: PromptPackagingPurpose = .copy) async throws -> String {
         let session = try await sessionSnapshot(sessionID: selection.sessionID)
         guard session.projectID == projectID else { throw ServiceAPIError(code: .rootUnauthorized, message: "Selection does not belong to the project") }
         let tool = try await sessionToolAuthority(session: session)
         let advanced = try await advancedSettings()
+        let project = try await projects.authority(projectID: projectID)
+        let bindings = (try? await effectiveWorktreeBindings(session: session)) ?? []
+        var fileBlocks: [String] = []
         for entry in selection.entries {
+            let rootPath: String?
+            if let physical = bindings.first(where: { $0.rootID == entry.rootID })?.physicalPath {
+                rootPath = physical
+            } else if let root = try? await project.root(rootID: entry.rootID) {
+                rootPath = root.snapshot.canonicalPath
+            } else {
+                rootPath = nil
+            }
+            let fullPath = rootPath.map { AdvancedServerSettings.FilePathDisplay.joinedFullPath(rootPath: $0, logicalPath: entry.logicalPath) }
+            let displayPath = advanced.settings.displayedFilePath(logicalPath: entry.logicalPath, fullPath: fullPath)
             if entry.mode == .codeMap {
                 let codeMap = try await tool.codeMap(.init(rootID: entry.rootID, logicalPath: entry.logicalPath), settings: advanced.settings)
-                sections.append("## \(entry.logicalPath) [codemap:\(codeMap.status)]\n```\n\(codeMap.content)\n```")
+                fileBlocks.append("## \(displayPath) [codemap:\(codeMap.status)]\n```\n\(codeMap.content)\n```")
                 continue
             }
             let file = try await tool.readFile(.init(rootID: entry.rootID, logicalPath: entry.logicalPath, maximumBytes: 1_048_576))
@@ -3453,10 +3493,17 @@ public actor RepoPromptHeadlessAuthority {
             } else {
                 content = file.content
             }
-            sections.append("## \(entry.logicalPath)\n```\n\(content)\n```")
+            fileBlocks.append("## \(displayPath)\n```\n\(content)\n```")
         }
-        if include.contains("transcript") { sections.append("transcript: included-by-session-endpoint") }
-        return sections.joined(separator: "\n\n")
+        var packaged = advanced.settings.packagedContext(
+            selectionRevision: selection.revision,
+            snippets: fileBlocks.isEmpty ? [:] : [.fileContents: fileBlocks.joined(separator: "\n\n")],
+            purpose: purpose
+        )
+        if include.contains("transcript") {
+            packaged += "\n\ntranscript: included-by-session-endpoint"
+        }
+        return packaged
     }
 
     private func createArtifact(projectID: UUID, sessionID: UUID?, kind: String, logicalName: String, content: Data, actor: ExternalActor?) async throws -> ArtifactSnapshot {
@@ -3683,6 +3730,7 @@ public actor RepoPromptHeadlessAuthority {
             if FileManager.default.isExecutableFile(atPath: CodexRepoPromptMCPConfig.command()) {
                 providerSettings[CodexRepoPromptMCPConfig.provisionedSettingsKey] = "true"
             }
+            providerSettings = await attachingResolvedTemperature(providerSettings)
             let resumeFallbackPrompt: String?
             if run.providerSessionID == nil {
                 resumeFallbackPrompt = nil

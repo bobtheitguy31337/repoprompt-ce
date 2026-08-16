@@ -252,7 +252,8 @@ public enum RepoPromptServerRunner {
         workflows: [AgentComposerWorkflowDescriptor],
         suggestions: [ComposerSuggestionDescriptor],
         emptyState: AgentEmptyStateDescriptor,
-        providerProfileLoader: (@Sendable (ProviderSettingsID) async throws -> AgentCatalogProviderProfile)? = nil
+        providerProfileLoader: (@Sendable (ProviderSettingsID) async throws -> AgentCatalogProviderProfile)? = nil,
+        composeModelLoader: (@Sendable () async throws -> String?)? = nil
     ) -> any AgentComposerCatalogProviding {
         AgentComposerCatalogService(
             providerSettings: providerSettings,
@@ -260,7 +261,8 @@ public enum RepoPromptServerRunner {
             workflows: workflows,
             suggestions: suggestions,
             emptyState: emptyState,
-            providerProfileLoader: providerProfileLoader
+            providerProfileLoader: providerProfileLoader,
+            composeModelLoader: composeModelLoader
         )
     }
 
@@ -482,6 +484,9 @@ public enum RepoPromptServerRunner {
             emptyState: .init(featuredWorkflowIDs: [], tips: ["Tag a file to add its current contents to only this turn.", "Choose a concrete model before sending.", "Use Shift+Return to add a new line."]),
             providerProfileLoader: { providerID in
                 try await portalDesktopSettings.composerCatalogProfile(for: providerID)
+            },
+            composeModelLoader: {
+                try await serverSettings.agentModels().effectiveProfile.resolvedComposeModelRaw()
             }
         )
         let composerAttachments = try AgentComposerAttachmentStore(
