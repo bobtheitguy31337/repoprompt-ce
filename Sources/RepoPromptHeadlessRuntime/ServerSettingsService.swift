@@ -300,7 +300,7 @@ public actor ServerSettingsService {
             initialPrompt: request.initialPrompt,
             selectedMessageContext: request.selectedMessageContext,
             startImmediately: request.startImmediately ?? false,
-            initialPermissionMode: request.initialPermissionMode,
+            initialPermissionMode: route.providerID.hasTypedDirectAgentProfile ? nil : request.initialPermissionMode,
             initialProviderSettings: settings
         )
     }
@@ -314,6 +314,30 @@ public actor ServerSettingsService {
             return .init(settings: .safeManaged, revision: 0, updatedAt: epoch)
         }
         return .init(settings: document.value, revision: document.revision, updatedAt: document.updatedAt)
+    }
+
+    public func directAgentPermissions() async -> DirectAgentPermissionsSettingsSnapshot {
+        guard let document = try? await store.directAgentPermissionDocument() else {
+            return .init(settings: .default, revision: 0, updatedAt: epoch)
+        }
+        return .init(settings: document.value, revision: document.revision, updatedAt: document.updatedAt)
+    }
+
+    public func replaceDirectAgentPermissions(
+        _ request: ReplaceDirectAgentPermissionsSettingsRequest,
+        attribution: SettingsMutationAttribution
+    ) async throws -> DirectAgentPermissionsSettingsSnapshot {
+        let document = StoredSettingsDocument(
+            value: request.settings,
+            revision: request.expectedRevision + 1,
+            updatedAt: now()
+        )
+        let stored = try await store.upsertDirectAgentPermissionDocument(
+            document,
+            expectedRevision: request.expectedRevision,
+            audit: try audit(operation: "replaceGlobal", attribution: attribution, payload: request.settings)
+        )
+        return .init(settings: stored.value, revision: stored.revision, updatedAt: stored.updatedAt)
     }
 
     public func replaceSubagentPermissions(

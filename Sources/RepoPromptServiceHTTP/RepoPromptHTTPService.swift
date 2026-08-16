@@ -234,6 +234,16 @@ public struct RepoPromptHTTPService: Sendable {
             let input = try await JSONDecoder.serviceDecoder.decode(ReplaceSubagentPermissionSettingsRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().replaceSubagentPermissions(input, attribution: principal.settingsAttribution))
         } }
+        router.get("/portal/api/v1/settings/direct-agent-permissions") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(context: context)
+            return try await portalJSON(requireServerSettings().directAgentPermissions())
+        } }
+        router.patch("/portal/api/v1/settings/direct-agent-permissions") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let input = try await JSONDecoder.serviceDecoder.decode(ReplaceDirectAgentPermissionsSettingsRequest.self, from: bodyData(request))
+            return try await portalJSON(requireServerSettings().replaceDirectAgentPermissions(input, attribution: principal.settingsAttribution))
+        } }
         router.get("/portal/api/v1/settings/context-builder") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(context: context)
             return try await portalJSON(requireServerSettings().contextBuilder())

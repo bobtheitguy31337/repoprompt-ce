@@ -34,7 +34,7 @@ public struct SubagentPermissionSettings: Codable, Hashable, Sendable {
 
     public init(
         policy: SubagentPermissionPolicy = .safeManaged,
-        codex: SubagentCodexPermissionMode = .autoReview,
+        codex: SubagentCodexPermissionMode = .defaultPermission,
         claude: SubagentClaudePermissionMode = .requireApproval,
         openCode: SubagentManagedPermissionMode = .managedDefault,
         cursor: SubagentManagedPermissionMode = .managedDefault

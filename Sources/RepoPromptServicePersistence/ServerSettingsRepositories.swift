@@ -59,6 +59,26 @@ public extension SQLiteServiceStore {
         )
     }
 
+    func directAgentPermissionDocument() async throws -> StoredSettingsDocument<DirectAgentPermissionsSettings>? {
+        try await readSettingsDocument(.directAgentPermissions, scopeID: "global")
+    }
+
+    @discardableResult
+    func upsertDirectAgentPermissionDocument(
+        _ document: StoredSettingsDocument<DirectAgentPermissionsSettings>,
+        expectedRevision: Int64,
+        audit: ServerSettingsAuditMutation
+    ) async throws -> StoredSettingsDocument<DirectAgentPermissionsSettings> {
+        try await upsertSettingsDocument(
+            document,
+            repository: .directAgentPermissions,
+            scopeID: "global",
+            projectID: nil,
+            expectedRevision: expectedRevision,
+            audit: audit
+        )
+    }
+
     func contextBuilderDocument(scopeID: String) async throws -> StoredSettingsDocument<ContextBuilderScopeDocument>? {
         try await readSettingsDocument(.contextBuilder, scopeID: scopeID)
     }
@@ -191,6 +211,7 @@ public extension SQLiteServiceStore {
 private enum SettingsRepository {
     case agentModels
     case subagentPermissions
+    case directAgentPermissions
     case contextBuilder
     case mcpModelPresets
     case advanced
@@ -200,6 +221,7 @@ private enum SettingsRepository {
         switch self {
         case .agentModels: .agentModels
         case .subagentPermissions: .subagentPermissions
+        case .directAgentPermissions: .directAgentPermissions
         case .contextBuilder: .contextBuilder
         case .mcpModelPresets: .mcpModelPresets
         case .advanced: .advanced
@@ -218,6 +240,8 @@ private extension SQLiteServiceStore {
             try await connection.query("SELECT profile_json,revision,updated_at FROM agent_model_profiles WHERE scope_id=?", [.text(scopeID)]).first
         case .subagentPermissions:
             try await connection.query("SELECT settings_json,revision,updated_at FROM subagent_permission_settings WHERE fixed_id=1").first
+        case .directAgentPermissions:
+            try await connection.query("SELECT settings_json,revision,updated_at FROM direct_agent_permission_settings WHERE fixed_id=1").first
         case .contextBuilder:
             try await connection.query("SELECT settings_json,revision,updated_at FROM context_builder_settings WHERE scope_id=?", [.text(scopeID)]).first
         case .mcpModelPresets:
@@ -230,7 +254,7 @@ private extension SQLiteServiceStore {
         guard let row else { return nil }
         let jsonColumn: String = switch repository {
         case .agentModels: "profile_json"
-        case .subagentPermissions, .contextBuilder, .advanced: "settings_json"
+        case .subagentPermissions, .directAgentPermissions, .contextBuilder, .advanced: "settings_json"
         case .mcpModelPresets, .selectionPresets: "presets_json"
         }
         guard let json = row.column(jsonColumn)?.string else {
@@ -278,6 +302,11 @@ private extension SQLiteServiceStore {
                     "INSERT INTO subagent_permission_settings(fixed_id,settings_json,revision,updated_at) VALUES(1,?,?,?) ON CONFLICT(fixed_id) DO UPDATE SET settings_json=excluded.settings_json,revision=excluded.revision,updated_at=excluded.updated_at",
                     [.text(json), revision, updatedAt]
                 )
+            case .directAgentPermissions:
+                _ = try await connection.query(
+                    "INSERT INTO direct_agent_permission_settings(fixed_id,settings_json,revision,updated_at) VALUES(1,?,?,?) ON CONFLICT(fixed_id) DO UPDATE SET settings_json=excluded.settings_json,revision=excluded.revision,updated_at=excluded.updated_at",
+                    [.text(json), revision, updatedAt]
+                )
             case .contextBuilder:
                 _ = try await connection.query(
                     "INSERT INTO context_builder_settings(scope_id,project_id,settings_json,revision,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(scope_id) DO UPDATE SET project_id=excluded.project_id,settings_json=excluded.settings_json,revision=excluded.revision,updated_at=excluded.updated_at",
@@ -317,6 +346,8 @@ private extension SQLiteServiceStore {
             try await connection.query("SELECT revision FROM agent_model_profiles WHERE scope_id=?", [.text(scopeID)]).first
         case .subagentPermissions:
             try await connection.query("SELECT revision FROM subagent_permission_settings WHERE fixed_id=1").first
+        case .directAgentPermissions:
+            try await connection.query("SELECT revision FROM direct_agent_permission_settings WHERE fixed_id=1").first
         case .contextBuilder:
             try await connection.query("SELECT revision FROM context_builder_settings WHERE scope_id=?", [.text(scopeID)]).first
         case .mcpModelPresets:

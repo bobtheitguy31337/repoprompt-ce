@@ -738,16 +738,41 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             }
             return policy.providerSettings["provider.permissionId"] == "codex.autoReview" ? "auto_review" : "user"
         }()
+        let typedSandbox = policy.providerSettings["codex.sandbox"].flatMap { raw -> String? in
+            switch raw {
+            case "read-only", "readOnly": "read-only"
+            case "workspace-write", "workspaceWrite": "workspace-write"
+            case "danger-full-access", "dangerFullAccess": "danger-full-access"
+            default: nil
+            }
+        }
+        let typedApproval = policy.providerSettings["codex.approvalPolicy"].flatMap { raw -> String? in
+            switch raw {
+            case "on-request", "onRequest": "on-request"
+            case "untrusted", "unless-trusted", "unlessTrusted": "untrusted"
+            case "never": "never"
+            default: nil
+            }
+        }
+        if let typedSandbox {
+            switch typedSandbox {
+            case "read-only":
+                return (typedApproval ?? "on-request", "read-only", ["type": "readOnly"], approvalsReviewer)
+            case "danger-full-access":
+                return (typedApproval ?? "never", "danger-full-access", ["type": "dangerFullAccess"], approvalsReviewer)
+            default:
+                let roots = policy.writableRoots.isEmpty ? [workingDirectory] : policy.writableRoots
+                return (typedApproval ?? "on-request", "workspace-write", ["type": "workspaceWrite", "writableRoots": roots], approvalsReviewer)
+            }
+        }
         switch policy.mode {
         case .readOnly:
-            return ("on-request", "read-only", ["type": "readOnly"], approvalsReviewer)
+            return (typedApproval ?? "on-request", "read-only", ["type": "readOnly"], approvalsReviewer)
         case .workspaceWrite:
-            let configured = policy.providerSettings["codex.approvalPolicy"]
-            let approval = configured.flatMap { ["on-request", "untrusted", "never"].contains($0) ? $0 : nil } ?? "on-request"
             let roots = policy.writableRoots.isEmpty ? [workingDirectory] : policy.writableRoots
-            return (approval, "workspace-write", ["type": "workspaceWrite", "writableRoots": roots], approvalsReviewer)
+            return (typedApproval ?? "on-request", "workspace-write", ["type": "workspaceWrite", "writableRoots": roots], approvalsReviewer)
         case .fullAccess:
-            return ("never", "danger-full-access", ["type": "dangerFullAccess"], approvalsReviewer)
+            return (typedApproval ?? "never", "danger-full-access", ["type": "dangerFullAccess"], approvalsReviewer)
         }
     }
 

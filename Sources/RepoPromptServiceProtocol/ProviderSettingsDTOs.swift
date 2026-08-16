@@ -63,6 +63,17 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
         default: false
         }
     }
+
+    /// Desktop Direct Agents persist a typed profile for these CLI families.
+    /// `serverDefaultExecutionMode` must not replace that profile.
+    public var hasTypedDirectAgentProfile: Bool {
+        switch self {
+        case .codex, .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom, .openCodeACP, .cursorACP:
+            true
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
+            false
+        }
+    }
 }
 
 public enum ProviderSettingsCategory: String, Codable, Sendable {

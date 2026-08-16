@@ -387,6 +387,8 @@ final class SettingsCatalogAuthorityTests: XCTestCase {
             (.post, "/portal/api/v1/projects/\(projectID)/settings/agent-models/apply-recommendations"),
             (.get, "/portal/api/v1/settings/subagent-permissions"),
             (.patch, "/portal/api/v1/settings/subagent-permissions"),
+            (.get, "/portal/api/v1/settings/direct-agent-permissions"),
+            (.patch, "/portal/api/v1/settings/direct-agent-permissions"),
             (.get, "/portal/api/v1/settings/context-builder"),
             (.patch, "/portal/api/v1/settings/context-builder"),
             (.get, "/portal/api/v1/projects/\(projectID)/settings/context-builder"),

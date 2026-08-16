@@ -63,41 +63,32 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
         var toolValues: [String: AgentControlValue] = [:]
         let permissionID: String?
 
+        let typed = await liveDirectAgentPermissions(values: values)
         switch providerID {
         case .codex:
             toolValues = [
-                "codex.bash": .boolean(Self.boolean(.codexBashEnabled, values: values)),
+                "codex.bash": .boolean(typed.codex.bashEnabled),
                 "codex.search": .boolean(Self.boolean(.codexSearchEnabled, values: values)),
                 "codex.goals": .boolean(Self.boolean(.codexGoalsEnabled, values: values)),
                 "codex.reasoningSummaries": .boolean(Self.boolean(.codexReasoningSummariesEnabled, values: values)),
                 "codex.memories": .boolean(Self.boolean(.codexMemoriesEnabled, values: values)),
                 "codex.mcpServers": .choices(["repoprompt"])
             ]
-            permissionID = switch values[PortalDesktopSettingKey.codexPermissionLevel.rawValue] {
-            case "readOnly": "codex.readOnly"
-            case "defaultPermission": "codex.defaultPermission"
-            case "fullAccess": "codex.fullAccess"
-            default: "codex.autoReview"
-            }
+            permissionID = "codex.\(typed.codex.permissionLevel)"
         case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom:
             toolValues = [
-                "claude.bash": .boolean(Self.boolean(.claudeBashEnabled, values: values)),
-                "claude.mcpStrictMode": .boolean(Self.boolean(.claudeStrictMCPEnabled, values: values)),
+                "claude.bash": .boolean(typed.claude.bashEnabled),
+                "claude.mcpStrictMode": .boolean(typed.claude.mcpStrictModeEnabled),
                 "claude.toolSearch": .boolean(Self.boolean(.claudeToolSearchEnabled, values: values)),
                 "claude.promptDelivery": .choice("nativeSystemPrompt")
             ]
-            permissionID = switch values[PortalDesktopSettingKey.claudePermissionLevel.rawValue] {
-            case "autoApproveEdits": "claude.autoApproveEdits"
-            case "auto": "claude.auto"
-            case "fullAccess": "claude.fullAccess"
-            default: "claude.requireApproval"
-            }
+            permissionID = "claude.\(typed.claude.permissionLevel)"
         case .openCodeACP:
-            permissionID = values[PortalDesktopSettingKey.openCodePermissionLevel.rawValue] == "fullAccess"
+            permissionID = typed.openCode.permissionLevel == .fullAccess
                 ? "opencode.fullAccess"
                 : "opencode.managedDefault"
         case .cursorACP:
-            permissionID = values[PortalDesktopSettingKey.cursorPermissionLevel.rawValue] == "fullAccess"
+            permissionID = typed.cursor.permissionLevel == .fullAccess
                 ? "cursor.fullAccess"
                 : "cursor.managedDefault"
         case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
@@ -127,34 +118,24 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
 
     public func runtimeDefaults(for providerID: ProviderSettingsID) async throws -> RuntimeDefaults {
         let values = try await snapshot().values
+        let typed = await liveDirectAgentPermissions(values: values)
+        let projection = typed.projection(for: providerID)
         let fallbackMode = values[PortalDesktopSettingKey.serverDefaultExecutionMode.rawValue] ?? "workspaceWrite"
+        guard providerID.hasTypedDirectAgentProfile else {
+            return .init(mode: fallbackMode, providerSettings: [:])
+        }
         switch providerID {
         case .codex:
-            let permission = values[PortalDesktopSettingKey.codexPermissionLevel.rawValue] ?? "autoReview"
-            let mode = Self.executionMode(permission, fallback: fallbackMode)
-            return .init(mode: mode, providerSettings: [
-                "codex.approvalPolicy": permission == "defaultPermission" ? "untrusted" : "on-request",
-                "codex.bashEnabled": values[PortalDesktopSettingKey.codexBashEnabled.rawValue] ?? "true",
-                "codex.searchEnabled": values[PortalDesktopSettingKey.codexSearchEnabled.rawValue] ?? "true",
-                "codex.goalsEnabled": values[PortalDesktopSettingKey.codexGoalsEnabled.rawValue] ?? "true",
-                "codex.reasoningSummariesEnabled": values[PortalDesktopSettingKey.codexReasoningSummariesEnabled.rawValue] ?? "false",
-                "codex.memoriesEnabled": values[PortalDesktopSettingKey.codexMemoriesEnabled.rawValue] ?? "false",
-                "codex.enabledMCPServers": values[PortalDesktopSettingKey.codexEnabledMCPServers.rawValue] ?? "[\"RepoPromptCE\"]"
-            ])
+            var providerSettings = projection.providerSettings
+            providerSettings["codex.searchEnabled"] = values[PortalDesktopSettingKey.codexSearchEnabled.rawValue] ?? "true"
+            providerSettings["codex.goalsEnabled"] = values[PortalDesktopSettingKey.codexGoalsEnabled.rawValue] ?? "true"
+            providerSettings["codex.reasoningSummariesEnabled"] = values[PortalDesktopSettingKey.codexReasoningSummariesEnabled.rawValue] ?? "false"
+            providerSettings["codex.memoriesEnabled"] = values[PortalDesktopSettingKey.codexMemoriesEnabled.rawValue] ?? "false"
+            providerSettings["codex.enabledMCPServers"] = values[PortalDesktopSettingKey.codexEnabledMCPServers.rawValue] ?? "[\"RepoPromptCE\"]"
+            return .init(mode: projection.mode, providerSettings: providerSettings)
         case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom:
-            let permission = values[PortalDesktopSettingKey.claudePermissionLevel.rawValue] ?? "requireApproval"
-            let mode = permission == "fullAccess" ? "fullAccess" : (permission == "requireApproval" ? "workspaceWrite" : fallbackMode)
-            let claudeMode: String = switch permission {
-            case "autoApproveEdits": "acceptEdits"
-            case "auto": "auto"
-            default: "default"
-            }
-            var providerSettings = [
-                "claude.permissionMode": claudeMode,
-                "claude.bashEnabled": values[PortalDesktopSettingKey.claudeBashEnabled.rawValue] ?? "true",
-                "claude.strictMCPEnabled": values[PortalDesktopSettingKey.claudeStrictMCPEnabled.rawValue] ?? "false",
-                "claude.toolSearchEnabled": values[PortalDesktopSettingKey.claudeToolSearchEnabled.rawValue] ?? "true"
-            ]
+            var providerSettings = projection.providerSettings
+            providerSettings["claude.toolSearchEnabled"] = values[PortalDesktopSettingKey.claudeToolSearchEnabled.rawValue] ?? "true"
             if providerID != .claudeCompatible {
                 let backend = try Self.backendSettings(providerID: providerID, values: values)
                 providerSettings["claude.backendID"] = providerID.rawValue
@@ -165,13 +146,9 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
                 providerSettings["claude.backendSonnetModel"] = backend.sonnetModel
                 providerSettings["claude.backendOpusModel"] = backend.opusModel
             }
-            return .init(mode: mode, providerSettings: providerSettings)
-        case .openCodeACP:
-            let permission = values[PortalDesktopSettingKey.openCodePermissionLevel.rawValue] ?? "managedDefault"
-            return .init(mode: permission == "fullAccess" ? "fullAccess" : fallbackMode, providerSettings: [:])
-        case .cursorACP:
-            let permission = values[PortalDesktopSettingKey.cursorPermissionLevel.rawValue] ?? "managedDefault"
-            return .init(mode: permission == "fullAccess" ? "fullAccess" : fallbackMode, providerSettings: [:])
+            return .init(mode: projection.mode, providerSettings: providerSettings)
+        case .openCodeACP, .cursorACP:
+            return .init(mode: projection.mode, providerSettings: projection.providerSettings)
         case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
             return .init(mode: fallbackMode, providerSettings: [:])
         }
@@ -212,13 +189,11 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
         )
     }
 
-    private nonisolated static func executionMode(_ permission: String, fallback: String) -> String {
-        switch permission {
-        case "readOnly": "readOnly"
-        case "fullAccess": "fullAccess"
-        case "defaultPermission", "autoReview": "workspaceWrite"
-        default: fallback
+    private func liveDirectAgentPermissions(values: [String: String]) async -> DirectAgentPermissionsSettings {
+        if let stored = try? await store.directAgentPermissionDocument() {
+            return stored.value
         }
+        return .projected(fromPortalValues: values)
     }
 
     private nonisolated static func boolean(_ key: PortalDesktopSettingKey, values: [String: String]) -> Bool {

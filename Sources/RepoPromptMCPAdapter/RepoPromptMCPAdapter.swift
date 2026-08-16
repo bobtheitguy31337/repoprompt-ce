@@ -293,11 +293,11 @@ private actor AuthorityToolBackend {
         switch operation {
         case "get":
             if let key = arguments["key"]?.stringValue {
-                return try await routingAppSetting(key: key)
+                return try await typedAppSetting(key: key)
             }
         case "set":
             if let key = arguments["key"]?.stringValue {
-                return try await replaceRoutingAppSetting(key: key, value: arguments["value"])
+                return try await replaceTypedAppSetting(key: key, value: arguments["value"])
             }
             throw ServiceAPIError(code: .invalidRequest, message: "app_settings set requires key")
         default:
@@ -310,6 +310,156 @@ private actor AuthorityToolBackend {
             capabilities: capabilities,
             providers: providers
         ))
+    }
+
+    private func typedAppSetting(key: String) async throws -> Value {
+        switch key {
+        case "models.planning_model", "context_builder.agent", "context_builder.model":
+            return try await routingAppSetting(key: key)
+        case "direct_agents.codex.sandbox",
+             "direct_agents.codex.approval_policy",
+             "direct_agents.codex.approval_reviewer",
+             "direct_agents.codex.bash_enabled",
+             "direct_agents.claude.permission_mode",
+             "direct_agents.claude.bash_enabled",
+             "direct_agents.claude.mcp_strict",
+             "direct_agents.opencode.permission_level",
+             "direct_agents.cursor.permission_level",
+             "subagents.policy":
+            return try await permissionAppSetting(key: key)
+        default:
+            throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
+        }
+    }
+
+    private func replaceTypedAppSetting(key: String, value: Value?) async throws -> Value {
+        switch key {
+        case "models.planning_model", "context_builder.agent", "context_builder.model":
+            return try await replaceRoutingAppSetting(key: key, value: value)
+        case "direct_agents.codex.sandbox",
+             "direct_agents.codex.approval_policy",
+             "direct_agents.codex.approval_reviewer",
+             "direct_agents.codex.bash_enabled",
+             "direct_agents.claude.permission_mode",
+             "direct_agents.claude.bash_enabled",
+             "direct_agents.claude.mcp_strict",
+             "direct_agents.opencode.permission_level",
+             "direct_agents.cursor.permission_level":
+            return try await replacePermissionAppSetting(key: key, value: value)
+        case "subagents.policy":
+            return try await replaceSubagentPolicyAppSetting(value: value)
+        default:
+            throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
+        }
+    }
+
+    private func permissionAppSetting(key: String) async throws -> Value {
+        let settings = try await authority.directAgentPermissions().settings
+        let value: Value
+        switch key {
+        case "direct_agents.codex.sandbox":
+            value = .string(settings.codex.sandboxMode.rawValue)
+        case "direct_agents.codex.approval_policy":
+            value = .string(settings.codex.approvalPolicy.rawValue)
+        case "direct_agents.codex.approval_reviewer":
+            value = .string(settings.codex.approvalReviewer.rawValue)
+        case "direct_agents.codex.bash_enabled":
+            value = .bool(settings.codex.bashEnabled)
+        case "direct_agents.claude.permission_mode":
+            value = .string(settings.claude.permissionMode.rawValue)
+        case "direct_agents.claude.bash_enabled":
+            value = .bool(settings.claude.bashEnabled)
+        case "direct_agents.claude.mcp_strict":
+            value = .bool(settings.claude.mcpStrictModeEnabled)
+        case "direct_agents.opencode.permission_level":
+            value = .string(settings.openCode.permissionLevel.rawValue)
+        case "direct_agents.cursor.permission_level":
+            value = .string(settings.cursor.permissionLevel.rawValue)
+        case "subagents.policy":
+            value = .string(try await authority.subagentPermissions().settings.policy.rawValue)
+        default:
+            throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
+        }
+        return .object(["key": .string(key), "value": value])
+    }
+
+    private func replacePermissionAppSetting(key: String, value: Value?) async throws -> Value {
+        let current = try await authority.directAgentPermissions()
+        var settings = current.settings
+        switch key {
+        case "direct_agents.codex.sandbox":
+            settings.codex.sandboxMode = try Self.enumValue(value, as: CodexSandboxMode.self, key: key)
+        case "direct_agents.codex.approval_policy":
+            settings.codex.approvalPolicy = try Self.enumValue(value, as: CodexApprovalPolicy.self, key: key)
+        case "direct_agents.codex.approval_reviewer":
+            settings.codex.approvalReviewer = try Self.enumValue(value, as: CodexApprovalReviewer.self, key: key)
+        case "direct_agents.codex.bash_enabled":
+            settings.codex.bashEnabled = try Self.boolValue(value, key: key)
+        case "direct_agents.claude.permission_mode":
+            settings.claude.permissionMode = try Self.enumValue(value, as: ClaudeDirectPermissionMode.self, key: key)
+        case "direct_agents.claude.bash_enabled":
+            settings.claude.bashEnabled = try Self.boolValue(value, key: key)
+        case "direct_agents.claude.mcp_strict":
+            settings.claude.mcpStrictModeEnabled = try Self.boolValue(value, key: key)
+        case "direct_agents.opencode.permission_level":
+            settings.openCode.permissionLevel = try Self.enumValue(value, as: ManagedDirectPermissionLevel.self, key: key)
+        case "direct_agents.cursor.permission_level":
+            settings.cursor.permissionLevel = try Self.enumValue(value, as: ManagedDirectPermissionLevel.self, key: key)
+        default:
+            throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
+        }
+        _ = try await authority.replaceDirectAgentPermissions(
+            .init(expectedRevision: current.revision, settings: settings),
+            attribution: settingsAttribution
+        )
+        return try await permissionAppSetting(key: key)
+    }
+
+    private func replaceSubagentPolicyAppSetting(value: Value?) async throws -> Value {
+        let current = try await authority.subagentPermissions()
+        let policy = try Self.enumValue(value, as: SubagentPermissionPolicy.self, key: "subagents.policy")
+        _ = try await authority.replaceSubagentPermissions(
+            .init(
+                expectedRevision: current.revision,
+                settings: .init(
+                    policy: policy,
+                    codex: current.settings.codex,
+                    claude: current.settings.claude,
+                    openCode: current.settings.openCode,
+                    cursor: current.settings.cursor
+                )
+            ),
+            attribution: settingsAttribution
+        )
+        return try await permissionAppSetting(key: "subagents.policy")
+    }
+
+    private var settingsAttribution: SettingsMutationAttribution {
+        SettingsMutationAttribution(
+            actorID: binding.actor.goblinUserID,
+            actorLabel: binding.actor.displayName,
+            channel: "mcp"
+        )
+    }
+
+    private static func boolValue(_ value: Value?, key: String) throws -> Bool {
+        if let bool = value?.boolValue { return bool }
+        if let raw = value?.stringValue {
+            if raw == "true" { return true }
+            if raw == "false" { return false }
+        }
+        throw ServiceAPIError(code: .invalidRequest, message: "\(key) must be a Boolean")
+    }
+
+    private static func enumValue<ValueType: RawRepresentable>(
+        _ value: Value?,
+        as type: ValueType.Type,
+        key: String
+    ) throws -> ValueType where ValueType.RawValue == String {
+        guard let raw = value?.stringValue, let parsed = type.init(rawValue: raw) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "\(key) is not a supported value")
+        }
+        return parsed
     }
 
     private func routingAppSetting(key: String) async throws -> Value {

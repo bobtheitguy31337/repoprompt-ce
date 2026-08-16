@@ -3,6 +3,7 @@ import Foundation
 public enum ServerSettingsDomain: String, Codable, CaseIterable, Sendable {
     case agentModels
     case subagentPermissions
+    case directAgentPermissions
     case contextBuilder
     case mcpModelPresets
     case advanced

@@ -1001,7 +1001,7 @@ public actor RepoPromptHeadlessAuthority {
         let cursor = try await store.nextCursor()
         let snapshot = SessionSnapshot(sessionID: sessionID, projectID: input.projectID, parentSessionID: nil, rootSessionID: sessionID, creator: actor, provider: input.provider, model: input.model, visibility: input.visibility, state: .idle, runGeneration: 0, turnEpoch: 0, revision: 1, transcript: [], interactions: [], cursor: cursor)
         let agent = AgentSnapshot(agentID: sessionID, sessionID: sessionID, rootSessionID: sessionID, parentAgentID: nil, role: "root", state: .idle, revision: 1)
-        let permissions = ExecutionPermissionSnapshot(sessionID: sessionID, mode: input.initialPermissionMode ?? "workspaceWrite", providerSettings: input.initialProviderSettings ?? [:], revision: 1, updatedActor: actor)
+        let permissions = await rootLaunchPermissions(sessionID: sessionID, input: input, actor: actor)
         let collaboration = CollaborationMetadataSnapshot(sessionID: sessionID, visibility: input.visibility, collaborativeSteeringEnabled: false, controllerUserID: actor.goblinUserID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
         var worktrees: [WorktreeBindingSnapshot] = []
         if let worktreeService, !project.roots.isEmpty {
@@ -1070,12 +1070,29 @@ public actor RepoPromptHeadlessAuthority {
         } else {
             nil
         }
-        var initialProviderSettings = childPermission?.providerSettings ?? input.initialProviderSettings ?? [:]
+        let liveRoot = input.parentSessionID == nil
+            ? await liveDirectAgentDefaults(providerID: providerSettingsID)
+            : nil
+        var initialProviderSettings = childPermission?.providerSettings
+            ?? mergedRootProviderSettings(live: liveRoot, explicit: input.initialProviderSettings)
         if let reasoningEffort = input.initialProviderSettings?["provider.reasoningEffort"] {
             initialProviderSettings["provider.reasoningEffort"] = reasoningEffort
         }
         if let providerSettingsID { initialProviderSettings["provider.settingsID"] = providerSettingsID.rawValue }
-        let initialPermissionMode = childPermission?.mode ?? input.initialPermissionMode ?? "workspaceWrite"
+        let initialPermissionMode: String
+        if let childPermission {
+            initialPermissionMode = childPermission.mode
+        } else if let providerSettingsID, providerSettingsID.hasTypedDirectAgentProfile {
+            if let permissionID = initialProviderSettings["provider.permissionId"],
+               let derived = Self.executionMode(forPermissionID: permissionID)
+            {
+                initialPermissionMode = derived
+            } else {
+                initialPermissionMode = liveRoot?.mode ?? "workspaceWrite"
+            }
+        } else {
+            initialPermissionMode = input.initialPermissionMode ?? liveRoot?.mode ?? "workspaceWrite"
+        }
         let sessionID = ids.next()
         let rootSessionID = parent?.rootSessionID ?? sessionID
         let seededSelection: SelectionSnapshot
@@ -1550,6 +1567,40 @@ public actor RepoPromptHeadlessAuthority {
             throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
         }
         return try await serverSettings.replaceGlobalAgentModels(request, attribution: attribution)
+    }
+
+    public func directAgentPermissions() async throws -> DirectAgentPermissionsSettingsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
+        }
+        return await serverSettings.directAgentPermissions()
+    }
+
+    public func replaceDirectAgentPermissions(
+        _ request: ReplaceDirectAgentPermissionsSettingsRequest,
+        attribution: SettingsMutationAttribution
+    ) async throws -> DirectAgentPermissionsSettingsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
+        }
+        return try await serverSettings.replaceDirectAgentPermissions(request, attribution: attribution)
+    }
+
+    public func subagentPermissions() async throws -> SubagentPermissionSettingsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
+        }
+        return await serverSettings.subagentPermissions()
+    }
+
+    public func replaceSubagentPermissions(
+        _ request: ReplaceSubagentPermissionSettingsRequest,
+        attribution: SettingsMutationAttribution
+    ) async throws -> SubagentPermissionSettingsSnapshot {
+        guard let serverSettings else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Server settings are unavailable")
+        }
+        return try await serverSettings.replaceSubagentPermissions(request, attribution: attribution)
     }
 
     public func agentDiscovery(sessionID: UUID, rolesOnly: Bool = false) async throws -> MCPAgentDiscoverySnapshot {
@@ -2925,10 +2976,69 @@ public actor RepoPromptHeadlessAuthority {
     }
 
     private func runtimeProviderSettings(providerID: ProviderSettingsID?) async -> [String: String] {
-        guard let providerID, let directProviderDefaults,
-              let defaults = try? await directProviderDefaults.directProviderRuntimeDefaults(for: providerID)
-        else { return [:] }
-        return defaults.providerSettings
+        await liveDirectAgentDefaults(providerID: providerID)?.providerSettings ?? [:]
+    }
+
+    private func liveDirectAgentDefaults(providerID: ProviderSettingsID?) async -> DirectProviderRuntimeDefaults? {
+        guard let providerID else { return nil }
+        if let directProviderDefaults,
+           let defaults = try? await directProviderDefaults.directProviderRuntimeDefaults(for: providerID)
+        {
+            return defaults
+        }
+        if let stored = try? await store.directAgentPermissionDocument() {
+            let projection = stored.value.projection(for: providerID)
+            return .init(mode: projection.mode, providerSettings: projection.providerSettings)
+        }
+        let projection = DirectAgentPermissionsSettings.default.projection(for: providerID)
+        return .init(mode: projection.mode, providerSettings: projection.providerSettings)
+    }
+
+    private func mergedRootProviderSettings(
+        live: DirectProviderRuntimeDefaults?,
+        explicit: [String: String]?
+    ) -> [String: String] {
+        var settings = live?.providerSettings ?? [:]
+        if let explicit {
+            settings.merge(explicit) { _, new in new }
+        }
+        return settings
+    }
+
+    private func rootLaunchPermissions(
+        sessionID: UUID,
+        input: CreateSessionInput,
+        actor: ExternalActor
+    ) async -> ExecutionPermissionSnapshot {
+        let providerSettingsID = input.providerSettingsID ?? ProviderSettingsID.defaultSettingsID(for: input.provider)
+        let live = await liveDirectAgentDefaults(providerID: providerSettingsID)
+        var settings = mergedRootProviderSettings(live: live, explicit: input.initialProviderSettings)
+        if let providerSettingsID { settings["provider.settingsID"] = providerSettingsID.rawValue }
+        let typed = providerSettingsID?.hasTypedDirectAgentProfile == true
+        let mode: String
+        if typed, let permissionID = settings["provider.permissionId"], let derived = Self.executionMode(forPermissionID: permissionID) {
+            mode = derived
+        } else if typed {
+            mode = live?.mode ?? "workspaceWrite"
+        } else {
+            mode = input.initialPermissionMode ?? live?.mode ?? "workspaceWrite"
+        }
+        return ExecutionPermissionSnapshot(
+            sessionID: sessionID,
+            mode: mode,
+            providerSettings: settings,
+            revision: 1,
+            updatedActor: actor
+        )
+    }
+
+    /// Composer `permissionId` is the permission API. Leftover 3-mode
+    /// `initialPermissionMode` must not invent a second mapping.
+    private static func executionMode(forPermissionID raw: String) -> String? {
+        if raw.hasSuffix(".readOnly") { return "readOnly" }
+        if raw.hasSuffix(".fullAccess") { return "fullAccess" }
+        if raw.contains(".") { return "workspaceWrite" }
+        return nil
     }
 
     private func ensureWritable() throws {

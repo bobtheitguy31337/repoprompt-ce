@@ -35,6 +35,19 @@ public struct ResolvedSubagentPermission: Sendable, Equatable {
 }
 
 public struct SubagentPermissionResolver: Sendable {
+    private static let identityKeys: Set<String> = [
+        "provider.settingsID",
+        "provider.reasoningEffort",
+        "provider.serviceTier",
+        "claude.backendID",
+        "claude.backendBaseURL",
+        "claude.backendAuthHeader",
+        "claude.backendModelBehavior",
+        "claude.backendHaikuModel",
+        "claude.backendSonnetModel",
+        "claude.backendOpusModel"
+    ]
+
     private let settings: ServerSettingsService?
     private let directDefaults: (any DirectProviderRuntimeDefaultsProviding)?
 
@@ -53,24 +66,15 @@ public struct SubagentPermissionResolver: Sendable {
                 revision: 0,
                 updatedAt: Date(timeIntervalSince1970: 0)
             )
-        let inherited: DirectProviderRuntimeDefaults?
-        if let directDefaults {
-            inherited = try? await directDefaults.directProviderRuntimeDefaults(for: providerID)
-        } else {
-            inherited = nil
-        }
+        let inherited = await liveDirectAgents(for: providerID)
         let resolved: DirectProviderRuntimeDefaults
         switch snapshot.settings.policy {
-        case .inheritProviderSettings:
-            resolved = inherited ?? safeDefaults(providerID: providerID, preserving: [:])
         case .safeManaged:
-            resolved = safeDefaults(providerID: providerID, preserving: inherited?.providerSettings ?? [:])
+            resolved = safeManaged(providerID: providerID, identity: inherited)
+        case .inheritProviderSettings:
+            resolved = inherited ?? Self.directAgentDefaults(for: providerID)
         case .custom:
-            resolved = customDefaults(
-                providerID: providerID,
-                settings: snapshot.settings,
-                preserving: inherited?.providerSettings ?? [:]
-            )
+            resolved = customDefaults(providerID: providerID, settings: snapshot.settings, inherited: inherited)
         }
         var providerSettings = resolved.providerSettings
         providerSettings["provider.settingsID"] = providerID.rawValue
@@ -84,78 +88,108 @@ public struct SubagentPermissionResolver: Sendable {
         )
     }
 
-    private func safeDefaults(
+    private func liveDirectAgents(for providerID: ProviderSettingsID) async -> DirectProviderRuntimeDefaults? {
+        guard let directDefaults else { return nil }
+        return try? await directDefaults.directProviderRuntimeDefaults(for: providerID)
+    }
+
+    private func safeManaged(
         providerID: ProviderSettingsID,
-        preserving settings: [String: String]
+        identity: DirectProviderRuntimeDefaults?
     ) -> DirectProviderRuntimeDefaults {
-        switch providerID {
-        case .codex:
-            return codex(.autoReview, preserving: settings)
-        case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom:
-            return claude(.requireApproval, preserving: settings)
-        case .openCodeACP, .cursorACP, .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
-            return managed(.managedDefault, preserving: settings)
-        }
+        let sealed = Self.sealedSafeManaged(for: providerID)
+        return .init(
+            mode: sealed.mode,
+            providerSettings: Self.merge(keys: Self.identityKeys, from: identity?.providerSettings, into: sealed.providerSettings)
+        )
     }
 
     private func customDefaults(
         providerID: ProviderSettingsID,
         settings: SubagentPermissionSettings,
-        preserving providerSettings: [String: String]
+        inherited: DirectProviderRuntimeDefaults?
+    ) -> DirectProviderRuntimeDefaults {
+        let base = inherited ?? Self.directAgentDefaults(for: providerID)
+        let overlay = Self.customLevelProjection(providerID: providerID, settings: settings)
+        var values = base.providerSettings
+        for (key, value) in overlay.providerSettings {
+            values[key] = value
+        }
+        return .init(mode: overlay.mode, providerSettings: values)
+    }
+
+    private static func sealedSafeManaged(for providerID: ProviderSettingsID) -> DirectProviderRuntimeDefaults {
+        switch providerID {
+        case .codex:
+            var settings = DirectAgentPermissionsSettings(
+                codex: .from(permissionLevel: "autoReview", bashEnabled: true)
+            ).projection(for: .codex).providerSettings
+            settings["codex.enabledMCPServers"] = "[]"
+            return .init(mode: "workspaceWrite", providerSettings: settings)
+        case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom:
+            return DirectAgentPermissionsSettings(
+                claude: .init(permissionMode: .requireApproval, bashEnabled: false, mcpStrictModeEnabled: true)
+            ).projection(for: providerID).asRuntimeDefaults
+        case .openCodeACP, .cursorACP, .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
+            return DirectAgentPermissionsSettings.default.projection(for: providerID).asRuntimeDefaults
+        }
+    }
+
+    private static func customLevelProjection(
+        providerID: ProviderSettingsID,
+        settings: SubagentPermissionSettings
     ) -> DirectProviderRuntimeDefaults {
         switch providerID {
         case .codex:
-            codex(settings.codex, preserving: providerSettings)
+            let projected = DirectAgentPermissionsSettings(
+                codex: .from(permissionLevel: settings.codex.rawValue)
+            ).projection(for: .codex)
+            var values = projected.providerSettings
+            values.removeValue(forKey: "codex.bashEnabled")
+            return .init(mode: projected.mode, providerSettings: values)
         case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom:
-            claude(settings.claude, preserving: providerSettings)
+            let projected = DirectAgentPermissionsSettings(
+                claude: .from(permissionLevel: settings.claude.rawValue)
+            ).projection(for: providerID)
+            var values = projected.providerSettings
+            values.removeValue(forKey: "claude.bashEnabled")
+            values.removeValue(forKey: "claude.strictMCPEnabled")
+            return .init(mode: projected.mode, providerSettings: values)
         case .openCodeACP:
-            managed(settings.openCode, preserving: providerSettings)
+            return DirectAgentPermissionsSettings(
+                openCode: .init(permissionLevel: settings.openCode == .fullAccess ? .fullAccess : .managedDefault)
+            ).projection(for: .openCodeACP).asRuntimeDefaults
         case .cursorACP:
-            managed(settings.cursor, preserving: providerSettings)
+            return DirectAgentPermissionsSettings(
+                cursor: .init(permissionLevel: settings.cursor == .fullAccess ? .fullAccess : .managedDefault)
+            ).projection(for: .cursorACP).asRuntimeDefaults
         case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
-            managed(.managedDefault, preserving: providerSettings)
+            return DirectAgentPermissionsSettings.default.projection(for: providerID).asRuntimeDefaults
         }
     }
 
-    private func codex(
-        _ mode: SubagentCodexPermissionMode,
-        preserving settings: [String: String]
-    ) -> DirectProviderRuntimeDefaults {
-        var values = settings
-        values["codex.approvalPolicy"] = mode == .defaultPermission ? "untrusted" : "on-request"
-        values["codex.approvalsReviewer"] = mode == .autoReview ? "auto_review" : "user"
-        let executionMode: String = switch mode {
-        case .readOnly: "readOnly"
-        case .defaultPermission, .autoReview: "workspaceWrite"
-        case .fullAccess: "fullAccess"
-        }
-        return .init(mode: executionMode, providerSettings: values)
+    private static func directAgentDefaults(for providerID: ProviderSettingsID) -> DirectProviderRuntimeDefaults {
+        DirectAgentPermissionsSettings.default.projection(for: providerID).asRuntimeDefaults
     }
 
-    private func claude(
-        _ mode: SubagentClaudePermissionMode,
-        preserving settings: [String: String]
-    ) -> DirectProviderRuntimeDefaults {
-        var values = settings
-        values["claude.permissionMode"] = switch mode {
-        case .requireApproval: "default"
-        case .autoApproveEdits: "acceptEdits"
-        case .auto: "auto"
-        case .fullAccess: "bypassPermissions"
+    private static func merge(
+        keys: Set<String>,
+        from source: [String: String]?,
+        into destination: [String: String]
+    ) -> [String: String] {
+        var values = destination
+        guard let source else { return values }
+        for key in keys {
+            if let value = source[key] {
+                values[key] = value
+            }
         }
-        return .init(
-            mode: mode == .fullAccess ? "fullAccess" : "workspaceWrite",
-            providerSettings: values
-        )
+        return values
     }
+}
 
-    private func managed(
-        _ mode: SubagentManagedPermissionMode,
-        preserving settings: [String: String]
-    ) -> DirectProviderRuntimeDefaults {
-        .init(
-            mode: mode == .fullAccess ? "fullAccess" : "workspaceWrite",
-            providerSettings: settings
-        )
+private extension DirectAgentRuntimeProjection {
+    var asRuntimeDefaults: DirectProviderRuntimeDefaults {
+        .init(mode: mode, providerSettings: providerSettings)
     }
 }

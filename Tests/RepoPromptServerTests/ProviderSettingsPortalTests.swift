@@ -51,15 +51,24 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertNil(initial.values["appearanceMode"])
 
         let updated = try await service.update(.init(expectedRevision: 0, changes: [
-            PortalDesktopSettingKey.codexPermissionLevel.rawValue: "readOnly",
-            PortalDesktopSettingKey.codexBashEnabled.rawValue: "false",
             PortalDesktopSettingKey.codexGoalsEnabled.rawValue: "false",
             PortalDesktopSettingKey.claudeGLMSonnetModel.rawValue: "glm-4.7"
         ]))
         XCTAssertEqual(updated.revision, 1)
+        do {
+            _ = try await service.update(.init(expectedRevision: 1, changes: [
+                PortalDesktopSettingKey.codexPermissionLevel.rawValue: "readOnly"
+            ]))
+            XCTFail("leftover permission keys must be read-only on the legacy authority")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .capabilityMissing)
+        }
         let defaults = try await service.runtimeDefaults(for: .codex)
-        XCTAssertEqual(defaults.mode, "readOnly")
-        XCTAssertEqual(defaults.providerSettings["codex.bashEnabled"], "false")
+        XCTAssertEqual(defaults.mode, "workspaceWrite")
+        XCTAssertEqual(defaults.providerSettings["codex.sandbox"], "workspace-write")
+        XCTAssertEqual(defaults.providerSettings["codex.approvalPolicy"], "on-request")
+        XCTAssertEqual(defaults.providerSettings["codex.approvalsReviewer"], "auto_review")
+        XCTAssertEqual(defaults.providerSettings["codex.bashEnabled"], "true")
         XCTAssertEqual(defaults.providerSettings["codex.goalsEnabled"], "false")
         let glmDefaults = try await service.runtimeDefaults(for: .claudeGLM)
         XCTAssertEqual(glmDefaults.providerSettings["claude.backendID"], ProviderSettingsID.claudeGLM.rawValue)
@@ -71,13 +80,13 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertEqual(kimi.modelBehavior, .noModel)
         XCTAssertEqual(kimi.authHeader, .anthropicAPIKey)
         let codexComposerProfile = try await service.composerCatalogProfile(for: .codex)
-        XCTAssertEqual(codexComposerProfile.permissionControl?.selectedID, "codex.readOnly")
+        XCTAssertEqual(codexComposerProfile.permissionControl?.selectedID, "codex.autoReview")
         XCTAssertFalse(codexComposerProfile.permissionControl?.choices.contains { $0.displayName == "Default" } == true)
-        XCTAssertEqual(Self.booleanValue("codex.bash", in: codexComposerProfile.toolControls), false)
+        XCTAssertEqual(Self.booleanValue("codex.bash", in: codexComposerProfile.toolControls), true)
         XCTAssertEqual(Self.booleanValue("codex.goals", in: codexComposerProfile.toolControls), false)
 
         do {
-            _ = try await service.update(.init(expectedRevision: 0, changes: [PortalDesktopSettingKey.codexBashEnabled.rawValue: "true"]))
+            _ = try await service.update(.init(expectedRevision: 0, changes: [PortalDesktopSettingKey.codexGoalsEnabled.rawValue: "true"]))
             XCTFail("expected stale settings revision")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .staleRevision)
@@ -104,6 +113,27 @@ final class ProviderSettingsPortalTests: XCTestCase {
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .invalidRequest)
         }
+    }
+
+    func testServerDefaultExecutionModeDoesNotReplaceTypedDirectAgentProfiles() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let service = PortalDesktopSettingsService(store: store)
+        _ = try await service.update(.init(expectedRevision: 0, changes: [
+            PortalDesktopSettingKey.serverDefaultExecutionMode.rawValue: "readOnly"
+        ]))
+
+        for providerID in [ProviderSettingsID.codex, .claudeCompatible, .openCodeACP, .cursorACP] {
+            let defaults = try await service.runtimeDefaults(for: providerID)
+            XCTAssertEqual(defaults.mode, "workspaceWrite", providerID.rawValue)
+            XCTAssertTrue(providerID.hasTypedDirectAgentProfile)
+        }
+        let codex = try await service.runtimeDefaults(for: .codex)
+        XCTAssertEqual(codex.providerSettings["codex.sandbox"], "workspace-write")
+        XCTAssertEqual(codex.providerSettings["codex.approvalsReviewer"], "auto_review")
+        let api = try await service.runtimeDefaults(for: .openAIAPI)
+        XCTAssertEqual(api.mode, "readOnly")
+        XCTAssertFalse(ProviderSettingsID.openAIAPI.hasTypedDirectAgentProfile)
     }
 
     private static func booleanValue(_ id: String, in controls: [ProviderComposerControlDescriptor]) -> Bool? {

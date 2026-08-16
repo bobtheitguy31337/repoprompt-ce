@@ -29,13 +29,66 @@ final class DirectProviderRuntimeTests: XCTestCase {
             workingDirectory: "/workspace"
         )
         XCTAssertEqual(requireApproval.approvalsReviewer, "user")
+
+        let typedWinsOverMode = CodexAppServerProviderRuntime.codexPolicy(
+            .init(mode: .workspaceWrite, providerSettings: [
+                "codex.sandbox": "danger-full-access",
+                "codex.approvalPolicy": "never",
+                "codex.approvalsReviewer": "user",
+            ]),
+            workingDirectory: "/workspace"
+        )
+        XCTAssertEqual(typedWinsOverMode.sandbox, "danger-full-access")
+        XCTAssertEqual(typedWinsOverMode.approvalPolicy, "never")
+        XCTAssertEqual(typedWinsOverMode.approvalsReviewer, "user")
     }
 
     func testSafeManagedCodexSubagentsUseAutoReviewReviewer() async {
         let resolved = await SubagentPermissionResolver(settings: nil, directDefaults: nil).resolve(providerID: .codex)
         XCTAssertEqual(resolved.mode, "workspaceWrite")
+        XCTAssertEqual(resolved.policy, .safeManaged)
+        XCTAssertEqual(resolved.providerSettings["codex.sandbox"], "workspace-write")
         XCTAssertEqual(resolved.providerSettings["codex.approvalsReviewer"], "auto_review")
         XCTAssertEqual(resolved.providerSettings["codex.approvalPolicy"], "on-request")
+        XCTAssertEqual(resolved.providerSettings["codex.bashEnabled"], "true")
+        XCTAssertEqual(resolved.providerSettings["codex.enabledMCPServers"], "[]")
+    }
+
+    func testSafeManagedSubagentsDoNotLeakDirectAgentPermissions() async {
+        let leaked = StaticDirectProviderDefaults(values: [
+            .codex: .init(mode: "fullAccess", providerSettings: [
+                "test.marker": "codex",
+                "codex.sandbox": "danger-full-access",
+                "codex.approvalPolicy": "never",
+                "codex.approvalsReviewer": "user",
+                "codex.bashEnabled": "false",
+                "provider.reasoningEffort": "high"
+            ]),
+            .claudeCompatible: .init(mode: "fullAccess", providerSettings: [
+                "test.marker": "claude",
+                "claude.permissionMode": "bypassPermissions",
+                "claude.bashEnabled": "true",
+                "claude.strictMCPEnabled": "false",
+                "claude.backendID": ProviderSettingsID.claudeGLM.rawValue
+            ])
+        ])
+        let resolver = SubagentPermissionResolver(settings: nil, directDefaults: leaked)
+        let codex = await resolver.resolve(providerID: .codex)
+        XCTAssertEqual(codex.mode, "workspaceWrite")
+        XCTAssertNil(codex.providerSettings["test.marker"])
+        XCTAssertEqual(codex.providerSettings["codex.sandbox"], "workspace-write")
+        XCTAssertEqual(codex.providerSettings["codex.approvalPolicy"], "on-request")
+        XCTAssertEqual(codex.providerSettings["codex.approvalsReviewer"], "auto_review")
+        XCTAssertEqual(codex.providerSettings["codex.bashEnabled"], "true")
+        XCTAssertEqual(codex.providerSettings["provider.reasoningEffort"], "high")
+
+        let claude = await resolver.resolve(providerID: .claudeCompatible)
+        XCTAssertEqual(claude.mode, "workspaceWrite")
+        XCTAssertNil(claude.providerSettings["test.marker"])
+        XCTAssertEqual(claude.providerSettings["claude.permissionMode"], "default")
+        XCTAssertEqual(claude.providerSettings["claude.bashEnabled"], "false")
+        XCTAssertEqual(claude.providerSettings["claude.strictMCPEnabled"], "true")
+        XCTAssertEqual(claude.providerSettings["claude.backendID"], ProviderSettingsID.claudeGLM.rawValue)
     }
 
     func testPublicAddressPolicyRejectsPrivateReservedMetadataAndTranslationRanges() {
@@ -767,6 +820,14 @@ private actor RecordingDirectTransport: ValidatedProviderEgressTransporting {
 
     func postCount() -> Int { posts }
     func lastPostedBody() -> Data? { postedBody }
+}
+
+private struct StaticDirectProviderDefaults: DirectProviderRuntimeDefaultsProviding {
+    let values: [ProviderSettingsID: DirectProviderRuntimeDefaults]
+
+    func directProviderRuntimeDefaults(for providerID: ProviderSettingsID) async throws -> DirectProviderRuntimeDefaults {
+        values[providerID] ?? .init(mode: "workspaceWrite", providerSettings: [:])
+    }
 }
 
 private func XCTAssertThrowsErrorAsync(

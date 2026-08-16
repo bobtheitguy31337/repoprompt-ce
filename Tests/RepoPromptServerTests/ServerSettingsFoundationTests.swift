@@ -17,6 +17,10 @@ final class ServerSettingsFoundationTests: XCTestCase {
             contextBuilderModelsByAgent: [ProviderSettingsID.codex.rawValue: "gpt-5.6-sol"]
         ))
         try assertRoundTrip(SubagentPermissionSettings(policy: .custom, codex: .readOnly, claude: .autoApproveEdits, openCode: .fullAccess, cursor: .managedDefault))
+        try assertRoundTrip(DirectAgentPermissionsSettings(
+            codex: .init(sandboxMode: .readOnly, approvalPolicy: .unlessTrusted, approvalReviewer: .user, bashEnabled: false),
+            claude: .init(permissionMode: .autoApproveEdits, bashEnabled: false, mcpStrictModeEnabled: true)
+        ))
         try assertRoundTrip(ContextBuilderSettingsProfile(
             budget: 100_000,
             enhancementMode: .augment,
@@ -42,6 +46,148 @@ final class ServerSettingsFoundationTests: XCTestCase {
             order: 0,
             rowRevision: 1
         ))
+    }
+
+    func testDirectAgentsPersistTypedSandboxApprovalReviewerBashAndMCPStrictAndRootLaunchLiveReadsThem() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let catalog = StaticProviderCatalog(response: Self.providerCatalog())
+        let service = ServerSettingsService(store: store, providerCatalog: catalog, projectCatalog: store)
+        let portal = PortalDesktopSettingsService(store: store)
+        let empty = await service.directAgentPermissions()
+        XCTAssertEqual(empty.revision, 0)
+        XCTAssertEqual(empty.settings.codex.sandboxMode, .workspaceWrite)
+        XCTAssertEqual(empty.settings.codex.approvalPolicy, .onRequest)
+        XCTAssertEqual(empty.settings.codex.approvalReviewer, .autoReview)
+        XCTAssertTrue(empty.settings.codex.bashEnabled)
+        XCTAssertEqual(empty.settings.claude.permissionMode, .requireApproval)
+        XCTAssertTrue(empty.settings.claude.mcpStrictModeEnabled)
+        let defaultClaude = try await portal.runtimeDefaults(for: .claudeCompatible)
+        XCTAssertEqual(defaultClaude.providerSettings["claude.strictMCPEnabled"], "true")
+
+        let projected = try await portal.runtimeDefaults(for: .codex)
+        XCTAssertEqual(projected.mode, "workspaceWrite")
+        XCTAssertEqual(projected.providerSettings["codex.sandbox"], "workspace-write")
+        XCTAssertEqual(projected.providerSettings["codex.approvalPolicy"], "on-request")
+        XCTAssertEqual(projected.providerSettings["codex.approvalsReviewer"], "auto_review")
+        XCTAssertEqual(projected.providerSettings["codex.bashEnabled"], "true")
+
+        var leftover = PortalDesktopSettingKey.defaultValues
+        leftover[PortalDesktopSettingKey.codexPermissionLevel.rawValue] = "fullAccess"
+        leftover[PortalDesktopSettingKey.claudeStrictMCPEnabled.rawValue] = "true"
+        _ = try await store.upsertPortalDesktopSettings(
+            .init(revision: 1, values: leftover, updatedAt: Date()),
+            expectedRevision: 0
+        )
+        let bagProjected = try await portal.runtimeDefaults(for: .codex)
+        XCTAssertEqual(bagProjected.mode, "fullAccess")
+        XCTAssertEqual(bagProjected.providerSettings["codex.sandbox"], "danger-full-access")
+        XCTAssertEqual(bagProjected.providerSettings["codex.approvalPolicy"], "never")
+        XCTAssertEqual(bagProjected.providerSettings["codex.approvalsReviewer"], "user")
+        let bagClaude = try await portal.runtimeDefaults(for: .claudeCompatible)
+        XCTAssertEqual(bagClaude.providerSettings["claude.strictMCPEnabled"], "true")
+
+        let written = try await service.replaceDirectAgentPermissions(
+            .init(
+                expectedRevision: 0,
+                settings: .init(
+                    codex: .init(
+                        sandboxMode: .readOnly,
+                        approvalPolicy: .unlessTrusted,
+                        approvalReviewer: .user,
+                        bashEnabled: false
+                    ),
+                    claude: .init(
+                        permissionMode: .autoApproveEdits,
+                        bashEnabled: false,
+                        mcpStrictModeEnabled: true
+                    )
+                )
+            ),
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(written.revision, 1)
+        XCTAssertEqual(written.settings.codex.permissionLevel, "readOnly")
+
+        let typedWins = try await portal.runtimeDefaults(for: .codex)
+        XCTAssertEqual(typedWins.mode, "readOnly")
+        XCTAssertEqual(typedWins.providerSettings["codex.sandbox"], "read-only")
+        XCTAssertEqual(typedWins.providerSettings["codex.approvalPolicy"], "untrusted")
+        XCTAssertEqual(typedWins.providerSettings["codex.approvalsReviewer"], "user")
+        XCTAssertEqual(typedWins.providerSettings["codex.bashEnabled"], "false")
+        let claude = try await portal.runtimeDefaults(for: .claudeCompatible)
+        XCTAssertEqual(claude.mode, "workspaceWrite")
+        XCTAssertEqual(claude.providerSettings["claude.permissionMode"], "acceptEdits")
+        XCTAssertEqual(claude.providerSettings["claude.bashEnabled"], "false")
+        XCTAssertEqual(claude.providerSettings["claude.strictMCPEnabled"], "true")
+
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("direct-agents-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let authority = RepoPromptHeadlessAuthority(
+            store: store,
+            serverSettings: service,
+            directProviderDefaults: portal
+        )
+        let actor = ExternalActor(goblinUserID: "direct", username: "direct", displayName: "Direct")
+        let project = try await authority.createProject(
+            input: .init(name: "Direct", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "direct-project",
+            requestDigest: "direct-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "direct-session",
+            requestDigest: "direct-session"
+        )
+        let permissions = try await authority.authoritySessionSnapshot(sessionID: session.sessionID).permissions
+        XCTAssertEqual(permissions.mode, "readOnly")
+        XCTAssertEqual(permissions.providerSettings["codex.sandbox"], "read-only")
+        XCTAssertEqual(permissions.providerSettings["codex.approvalPolicy"], "untrusted")
+        XCTAssertEqual(permissions.providerSettings["codex.approvalsReviewer"], "user")
+        XCTAssertEqual(permissions.providerSettings["codex.bashEnabled"], "false")
+        XCTAssertEqual(permissions.providerSettings["provider.permissionId"], "codex.readOnly")
+    }
+
+    func testSubagentCustomEmptyCodexDefaultsToDefaultPermissionAndInheritUsesLiveDirectAgents() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
+            projectCatalog: store
+        )
+        XCTAssertEqual(SubagentPermissionSettings.safeManaged.codex, .defaultPermission)
+        let inheritedDefaults = StaticDirectProviderDefaults(values: [
+            .codex: .init(mode: "fullAccess", providerSettings: [
+                "codex.sandbox": "danger-full-access",
+                "codex.approvalPolicy": "never",
+                "codex.bashEnabled": "false"
+            ])
+        ])
+        let resolver = SubagentPermissionResolver(settings: service, directDefaults: inheritedDefaults)
+        _ = try await service.replaceSubagentPermissions(
+            .init(expectedRevision: 0, settings: .init(policy: .inheritProviderSettings)),
+            attribution: Self.attribution
+        )
+        let inherited = await resolver.resolve(providerID: .codex)
+        XCTAssertEqual(inherited.mode, "fullAccess")
+        XCTAssertEqual(inherited.providerSettings["codex.sandbox"], "danger-full-access")
+        XCTAssertEqual(inherited.providerSettings["codex.bashEnabled"], "false")
+
+        _ = try await service.replaceSubagentPermissions(
+            .init(expectedRevision: 1, settings: .init(policy: .custom)),
+            attribution: Self.attribution
+        )
+        let customEmpty = await resolver.resolve(providerID: .codex)
+        XCTAssertEqual(customEmpty.mode, "workspaceWrite")
+        XCTAssertEqual(customEmpty.providerSettings["codex.sandbox"], "workspace-write")
+        XCTAssertEqual(customEmpty.providerSettings["codex.approvalPolicy"], "on-request")
+        XCTAssertEqual(customEmpty.providerSettings["codex.approvalsReviewer"], "user")
+        XCTAssertEqual(customEmpty.providerSettings["codex.bashEnabled"], "false")
+        XCTAssertEqual(customEmpty.providerSettings["provider.permissionId"], "codex.defaultPermission")
     }
 
     func testLegacyContextBuilderPromptsDecodeSafelyAndAreIgnored() async throws {
@@ -213,6 +359,16 @@ final class ServerSettingsFoundationTests: XCTestCase {
             .init(expectedRevision: 0, settings: .init(policy: .custom, codex: .readOnly)),
             attribution: attribution
         )
+        _ = try await service.replaceDirectAgentPermissions(
+            .init(
+                expectedRevision: 0,
+                settings: .init(
+                    codex: .init(sandboxMode: .readOnly, approvalPolicy: .onRequest, approvalReviewer: .user, bashEnabled: false),
+                    claude: .init(permissionMode: .auto, bashEnabled: true, mcpStrictModeEnabled: true)
+                )
+            ),
+            attribution: attribution
+        )
         _ = try await service.replaceModelPresets(
             .init(expectedRevision: 0, presets: [
                 .init(
@@ -254,6 +410,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertEqual(recoveredAgentModels.effectiveProfile, global.globalProfile)
         let recoveredContextBuilder = try await service.contextBuilder(projectID: projectID)
         let recoveredSubagents = await service.subagentPermissions()
+        let recoveredDirectAgents = await service.directAgentPermissions()
         let recoveredModelPresets = try await service.modelPresets()
         let recoveredAdvanced = try await service.advanced()
         let recoveredSelectionPresets = try await service.selectionPresets(projectID: projectID)
@@ -261,6 +418,11 @@ final class ServerSettingsFoundationTests: XCTestCase {
         let operational = try await store.operationalSnapshot()
         XCTAssertEqual(recoveredContextBuilder.projectRevision, 1)
         XCTAssertEqual(recoveredSubagents.settings.policy, .custom)
+        XCTAssertEqual(recoveredDirectAgents.settings.codex.sandboxMode, .readOnly)
+        XCTAssertEqual(recoveredDirectAgents.settings.codex.approvalReviewer, .user)
+        XCTAssertFalse(recoveredDirectAgents.settings.codex.bashEnabled)
+        XCTAssertEqual(recoveredDirectAgents.settings.claude.permissionMode, .auto)
+        XCTAssertTrue(recoveredDirectAgents.settings.claude.mcpStrictModeEnabled)
         XCTAssertEqual(recoveredModelPresets.presets.first?.order, 0)
         XCTAssertFalse(recoveredAdvanced.settings.codeMapsEnabled)
         XCTAssertEqual(recoveredSelectionPresets.presets.first?.name, "Sources")
@@ -392,7 +554,8 @@ final class ServerSettingsFoundationTests: XCTestCase {
         let legacySnapshot = try await service.snapshot()
         XCTAssertEqual(legacySnapshot.values[PortalDesktopSettingKey.contextBuilderBudget.rawValue], "120000")
         XCTAssertEqual(PortalDesktopSettingKey.contextBuilderBudget.mutability, .supersededByTypedSettings)
-        XCTAssertTrue(PortalDesktopSettingKey.codexPermissionLevel.isMutable)
+        XCTAssertEqual(PortalDesktopSettingKey.codexPermissionLevel.mutability, .supersededByTypedSettings)
+        XCTAssertFalse(PortalDesktopSettingKey.codexPermissionLevel.isMutable)
 
         do {
             _ = try await service.update(.init(expectedRevision: 1, changes: [
@@ -750,6 +913,69 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertNil(explicitInput.model)
     }
 
+    func testLeftoverInitialPermissionModeDoesNotReplaceTypedDirectAgentLaunch() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("leftover-mode-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let catalog = StaticProviderCatalog(response: Self.providerCatalog())
+        let service = ServerSettingsService(store: store, providerCatalog: catalog, projectCatalog: store)
+        let portal = PortalDesktopSettingsService(store: store)
+        let authority = RepoPromptHeadlessAuthority(
+            store: store,
+            serverSettings: service,
+            directProviderDefaults: portal
+        )
+        let actor = ExternalActor(goblinUserID: "leftover", username: "leftover", displayName: "Leftover")
+        let project = try await authority.createProject(
+            input: .init(name: "Leftover", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "leftover-project",
+            requestDigest: "leftover-project"
+        )
+        let leftover = try await authority.createSession(
+            input: .init(
+                projectID: project.projectID,
+                provider: .codex,
+                visibility: .privateSession,
+                initialPermissionMode: "readOnly"
+            ),
+            externalActor: actor,
+            idempotencyKey: "leftover-session",
+            requestDigest: "leftover-session"
+        )
+        let leftoverPermissions = try await authority.authoritySessionSnapshot(sessionID: leftover.sessionID).permissions
+        XCTAssertEqual(leftoverPermissions.mode, "workspaceWrite")
+        XCTAssertEqual(leftoverPermissions.providerSettings["codex.sandbox"], "workspace-write")
+        XCTAssertEqual(leftoverPermissions.providerSettings["provider.permissionId"], "codex.autoReview")
+
+        let override = try await authority.createSession(
+            input: .init(
+                projectID: project.projectID,
+                provider: .codex,
+                visibility: .privateSession,
+                initialProviderSettings: ["provider.permissionId": "codex.readOnly"]
+            ),
+            externalActor: actor,
+            idempotencyKey: "permission-id-session",
+            requestDigest: "permission-id-session"
+        )
+        let overridePermissions = try await authority.authoritySessionSnapshot(sessionID: override.sessionID).permissions
+        XCTAssertEqual(overridePermissions.mode, "readOnly")
+        XCTAssertEqual(overridePermissions.providerSettings["provider.permissionId"], "codex.readOnly")
+
+        let routed = try await service.createSessionInput(
+            from: .init(
+                projectID: project.projectID,
+                routingTarget: .pair,
+                visibility: .privateSession,
+                initialPermissionMode: "fullAccess"
+            )
+        )
+        XCTAssertNil(routed.initialPermissionMode)
+    }
+
     func testApplyRecommendationsWritesStickyOracleAndContextBuilderAndClearsRoleOverrides() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
@@ -916,6 +1142,80 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertEqual(readBuilder["value"] as? String, "claude-opus-5")
     }
 
+    func testAppSettingsPermissionKeysWriteTheTypedPermissionStore() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("app-settings-permissions-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let service = ServerSettingsService(
+            store: store,
+            providerCatalog: StaticProviderCatalog(response: Self.providerCatalog()),
+            projectCatalog: store
+        )
+        let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
+        let actor = ExternalActor(goblinUserID: "mcp-permissions", username: "mcp-permissions", displayName: "MCP Permissions")
+        let project = try await authority.createProject(
+            input: .init(name: "Permissions", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "permissions-project",
+            requestDigest: "permissions-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "permissions-session",
+            requestDigest: "permissions-session"
+        )
+        let adapter = RepoPromptMCPAdapter(authority: authority)
+        let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
+
+        func invoke(_ object: [String: Any]) async throws -> [String: Any] {
+            let data = try await adapter.invoke(
+                toolName: "app_settings",
+                argumentsJSON: try JSONSerialization.data(withJSONObject: object),
+                binding: binding
+            )
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+
+        let defaults = try await invoke(["op": "get", "key": "direct_agents.codex.sandbox"])
+        XCTAssertEqual(defaults["value"] as? String, "workspace-write")
+        let claudeStrict = try await invoke(["op": "get", "key": "direct_agents.claude.mcp_strict"])
+        XCTAssertEqual(claudeStrict["value"] as? Bool, true)
+
+        let written = try await invoke([
+            "op": "set",
+            "key": "direct_agents.codex.sandbox",
+            "value": "read-only"
+        ])
+        XCTAssertEqual(written["value"] as? String, "read-only")
+        _ = try await invoke([
+            "op": "set",
+            "key": "direct_agents.codex.approval_reviewer",
+            "value": "user"
+        ])
+        _ = try await invoke([
+            "op": "set",
+            "key": "direct_agents.claude.permission_mode",
+            "value": "acceptEdits"
+        ])
+        _ = try await invoke([
+            "op": "set",
+            "key": "subagents.policy",
+            "value": "inheritProviderSettings"
+        ])
+
+        let stored = try await authority.directAgentPermissions()
+        XCTAssertEqual(stored.settings.codex.sandboxMode, .readOnly)
+        XCTAssertEqual(stored.settings.codex.approvalReviewer, .user)
+        XCTAssertEqual(stored.settings.claude.permissionMode, .autoApproveEdits)
+        let subagents = try await authority.subagentPermissions()
+        XCTAssertEqual(subagents.settings.policy, .inheritProviderSettings)
+        let readPolicy = try await invoke(["op": "get", "key": "subagents.policy"])
+        XCTAssertEqual(readPolicy["value"] as? String, "inheritProviderSettings")
+    }
+
     func testChildCreationEnforcesSafeInheritAndCustomWithExactProviderIdentity() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
@@ -959,11 +1259,19 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertEqual(safe.provider, .claudeCompatible)
         XCTAssertEqual(safePermissions.providerSettings["claude.backendID"], ProviderSettingsID.claudeGLM.rawValue)
         XCTAssertEqual(safePermissions.providerSettings["claude.permissionMode"], "default")
+        XCTAssertEqual(safePermissions.providerSettings["claude.bashEnabled"], "false")
+        XCTAssertEqual(safePermissions.providerSettings["claude.strictMCPEnabled"], "true")
+        XCTAssertNil(safePermissions.providerSettings["test.marker"])
         for providerID in [ProviderSettingsID.codex, .openCodeACP, .cursorACP] {
             let child = try await authority.spawnChildSession(parentSessionID: parent.sessionID, providerSettingsID: providerID, initialPrompt: "safe-\(providerID.rawValue)")
             let permissions = try await authority.authoritySessionSnapshot(sessionID: child.sessionID).permissions
             XCTAssertNotEqual(permissions.mode, "fullAccess")
-            XCTAssertEqual(permissions.providerSettings["test.marker"], providerID == .openCodeACP ? "opencode" : providerID.rawValue.replacingOccurrences(of: "ACP", with: "").lowercased())
+            XCTAssertNil(permissions.providerSettings["test.marker"])
+            if providerID == .codex {
+                XCTAssertEqual(permissions.providerSettings["codex.sandbox"], "workspace-write")
+                XCTAssertEqual(permissions.providerSettings["codex.approvalsReviewer"], "auto_review")
+                XCTAssertEqual(permissions.providerSettings["codex.approvalPolicy"], "on-request")
+            }
         }
 
         _ = try await service.replaceSubagentPermissions(

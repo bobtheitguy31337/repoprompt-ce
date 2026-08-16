@@ -372,7 +372,7 @@ function desktopSettingsFixture(overrides = {}) {
       codexEnabledMCPServers: '["RepoPromptCE"]',
       claudePermissionLevel: "requireApproval",
       claudeBashEnabled: "true",
-      claudeStrictMCPEnabled: "false",
+      claudeStrictMCPEnabled: "true",
       claudeToolSearchEnabled: "true",
       claudeGLMDisplayName: "CC Zai",
       claudeGLMBaseURL: "https://api.z.ai/api/anthropic",
@@ -488,6 +488,25 @@ function typedSettingsFixtures(providers, bootstrap) {
       effectiveProfile: emptyProfile,
       recommendationProfileVersion: "202_608",
       recommendations,
+      updatedAt: "1970-01-01T00:00:00Z",
+    },
+    directAgentPermissions: {
+      settings: {
+        codex: {
+          sandboxMode: "workspace-write",
+          approvalPolicy: "on-request",
+          approvalReviewer: "auto-review",
+          bashEnabled: true,
+        },
+        claude: {
+          permissionMode: "default",
+          bashEnabled: true,
+          mcpStrictModeEnabled: true,
+        },
+        openCode: { permissionLevel: "managedDefault" },
+        cursor: { permissionLevel: "managedDefault" },
+      },
+      revision: 0,
       updatedAt: "1970-01-01T00:00:00Z",
     },
     subagentPermissions: {
@@ -716,6 +735,17 @@ async function createHarness({
     }
     if (call.path.includes("settings/agent-models/apply-recommendations")) {
       return jsonResponse(context.typedSettings.agentModels);
+    }
+    if (call.path === "api/v1/settings/direct-agent-permissions") {
+      if (call.method === "PATCH") {
+        const payload = JSON.parse(call.body);
+        context.typedSettings.directAgentPermissions = {
+          ...context.typedSettings.directAgentPermissions,
+          settings: payload.settings,
+          revision: context.typedSettings.directAgentPermissions.revision + 1,
+        };
+      }
+      return jsonResponse(context.typedSettings.directAgentPermissions);
     }
     if (call.path === "api/v1/settings/subagent-permissions") {
       if (call.method === "PATCH") {
@@ -1188,9 +1218,13 @@ test("overview live-reads typed Agent Models assignments", async (t) => {
   t.after(() => harness.close());
   const text = harness.document.getElementById("settings-content").textContent;
   assert.match(text, /Live routing/);
+  assert.match(text, /Live permissions/);
   assert.match(text, /Unconfigured/);
   assert.match(text, /Tracks recommendation/);
   assert.match(text, /Fail-closed when unassigned/);
+  assert.match(text, /Workspace Write/);
+  assert.match(text, /Safe Managed/);
+  assert.match(text, /Require Approval/);
 });
 
 test("desktop recommendation assessment explains OpenCode-only connections without inventing role assignments", async (t) => {
@@ -1279,6 +1313,9 @@ test("Agent Permissions exposes every runtime-backed desktop direct-provider con
     "Default Execution Mode",
     "Codex Direct Agent",
     "Permission Level",
+    "Sandbox",
+    "Approval Policy",
+    "Approval Reviewer",
     "Core tools",
     "Bash",
     "Search",
@@ -1301,7 +1338,7 @@ test("Agent Permissions exposes every runtime-backed desktop direct-provider con
   ]) {
     assert.ok(text.includes(expected), `missing ${expected}`);
   }
-  assert.equal(content.querySelectorAll("select").length, 10);
+  assert.equal(content.querySelectorAll("select").length, 12);
   assert.equal(content.querySelectorAll('input[type="checkbox"]').length, 8);
   assert.match(text, /frozen into every child session/);
 });
@@ -1410,6 +1447,48 @@ test("typed settings pages mutate revisioned server authorities", async (t) => {
   window.location.hash = "#settings/agent-permissions";
   window.dispatchEvent(new window.HashChangeEvent("hashchange"));
   await settle();
+  const sandbox = document.querySelector('select[aria-label="Sandbox"]');
+  change(window, sandbox, "read-only");
+  submit(
+    window,
+    [...document.querySelectorAll("form")].find((form) =>
+      form.textContent.includes("Save Direct Agents"),
+    ),
+  );
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/settings/direct-agent-permissions",
+    ),
+  );
+  const directPayload = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/settings/direct-agent-permissions",
+    ).body,
+  );
+  assert.deepEqual(Object.keys(directPayload).sort(), [
+    "expectedRevision",
+    "settings",
+  ]);
+  assert.deepEqual(Object.keys(directPayload.settings).sort(), [
+    "claude",
+    "codex",
+    "cursor",
+    "openCode",
+  ]);
+  assert.deepEqual(Object.keys(directPayload.settings.codex).sort(), [
+    "approvalPolicy",
+    "approvalReviewer",
+    "bashEnabled",
+    "sandboxMode",
+  ]);
+  assert.equal(directPayload.settings.codex.sandboxMode, "read-only");
+  assert.equal(directPayload.settings.claude.permissionMode, "default");
+  assert.equal(directPayload.settings.claude.mcpStrictModeEnabled, true);
+
   const policy = document.querySelector(
     'select[aria-label="Sub-agent permission policy"]',
   );

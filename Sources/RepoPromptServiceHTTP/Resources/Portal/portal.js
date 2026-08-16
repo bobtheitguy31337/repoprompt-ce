@@ -69,6 +69,7 @@
     },
     typedSettings: {
       agentModels: null,
+      directAgentPermissions: null,
       subagentPermissions: null,
       contextBuilder: null,
       modelPresets: null,
@@ -569,6 +570,11 @@
             : "api/v1/settings/agent-models",
         );
         break;
+      case "directAgentPermissions":
+        state.typedSettings.directAgentPermissions = await api(
+          "api/v1/settings/direct-agent-permissions",
+        );
+        break;
       case "subagentPermissions":
         state.typedSettings.subagentPermissions = await api(
           "api/v1/settings/subagent-permissions",
@@ -633,6 +639,7 @@
   async function loadTypedSettings() {
     await Promise.all([
       loadSettingsDomain("agentModels"),
+      loadSettingsDomain("directAgentPermissions"),
       loadSettingsDomain("subagentPermissions"),
       loadSettingsDomain("contextBuilder"),
       loadSettingsDomain("modelPresets"),
@@ -2036,28 +2043,13 @@
   }
 
   function providerRuntimeControls(provider, title = "Permissions & Runtime") {
-    const card = desktopCard(title);
+    const card = desktopCard(
+      title,
+      "Permission Level is edited on Agent Permissions. These leftover tool flags still apply at launch.",
+    );
     if (provider.providerID === "codex") {
       card.append(
-        selectSetting(
-          "codexPermissionLevel",
-          "Permission Level",
-          "Controls approvals and sandbox access for direct Codex agents.",
-          [
-            ["readOnly", "Read Only"],
-            ["defaultPermission", "Default Permission"],
-            ["autoReview", "Auto Review"],
-            ["fullAccess", "Full Access"],
-          ],
-          "autoReview",
-        ),
         element("h3", "desktop-subheading", "Core tools"),
-        toggleSetting(
-          "codexBashEnabled",
-          "Bash",
-          "Allow Codex to run shell commands in its approved execution mode.",
-          true,
-        ),
         toggleSetting(
           "codexSearchEnabled",
           "Search",
@@ -2091,31 +2083,7 @@
       card.append(mcp);
     } else if (provider.providerID === "claudeCompatible") {
       card.append(
-        selectSetting(
-          "claudePermissionLevel",
-          "Permission Level",
-          "Controls Claude Code permission prompts.",
-          [
-            ["requireApproval", "Require Approval"],
-            ["autoApproveEdits", "Auto-Approve Edits"],
-            ["auto", "Auto"],
-            ["fullAccess", "Full Access"],
-          ],
-          "requireApproval",
-        ),
         element("h3", "desktop-subheading", "Tools"),
-        toggleSetting(
-          "claudeBashEnabled",
-          "Bash",
-          "Allow Claude Code's native Bash tool.",
-          true,
-        ),
-        toggleSetting(
-          "claudeStrictMCPEnabled",
-          "RepoPrompt Only (Strict MCP)",
-          "Launch with strict MCP configuration so only RepoPrompt tools are active.",
-          false,
-        ),
         toggleSetting(
           "claudeToolSearchEnabled",
           "Lazy Tool Loading",
@@ -2129,22 +2097,13 @@
         ),
       );
     } else {
-      const key =
-        provider.providerID === "openCodeACP"
-          ? "openCodePermissionLevel"
-          : "cursorPermissionLevel";
       card.append(
-        selectSetting(
-          key,
+        desktopRow(
           provider.providerID === "cursorACP"
             ? "ACP Auto-Approve"
             : "ACP Session Mode",
-          "Choose the provider's managed mode or full access.",
-          [
-            ["managedDefault", "Managed Default"],
-            ["fullAccess", "Full Access"],
-          ],
-          "managedDefault",
+          "Typed Direct Agents settings are the permission authority.",
+          element("span", "read-only-value", liveManagedPermissionLabel(provider.providerID)),
         ),
       );
     }
@@ -2799,14 +2758,14 @@
 
   function renderAgentPermissions() {
     const fallback = desktopCard(
-      "Direct Agents",
-      "These settings are runtime-backed and apply to new portal sessions. Provider-specific controls override the shared fallback where applicable.",
+      "Portal Session Default",
+      "Typed Direct Agents settings are the permission authority. The 3-mode fallback applies only to providers with no typed profile.",
     );
     fallback.append(
       selectSetting(
         "serverDefaultExecutionMode",
         "Default Execution Mode",
-        "Fallback sandbox mode for OpenCode, Cursor, and providers without a more specific mapping.",
+        "Session default only for API providers that have no typed Direct Agents profile. It does not replace Codex, Claude, OpenCode, or Cursor permissions.",
         [
           ["readOnly", "Read Only"],
           ["workspaceWrite", "Workspace Write"],
@@ -2818,14 +2777,235 @@
     const byID = Object.fromEntries(
       orderedProviders().map((provider) => [provider.providerID, provider]),
     );
-    const providerCards = [
-      [byID.codex, "Codex Direct Agent"],
-      [byID.claudeCompatible, "Claude Code Direct Agent"],
-      [byID.openCodeACP, "OpenCode Direct Agent"],
-      [byID.cursorACP, "Cursor Direct Agent"],
-    ]
-      .filter(([provider]) => provider)
-      .map(([provider, title]) => providerRuntimeControls(provider, title));
+    const snapshot = state.typedSettings.directAgentPermissions;
+    const providerCards = [];
+    if (snapshot) {
+      const settings = snapshot.settings;
+      const form = element("form", "typed-settings-form");
+      const sandbox = typedSelect(
+        "Sandbox",
+        [
+          ["read-only", "Read Only"],
+          ["workspace-write", "Workspace Write"],
+          ["danger-full-access", "Full Access"],
+        ],
+        settings.codex.sandboxMode,
+      );
+      const approval = typedSelect(
+        "Approval Policy",
+        [
+          ["on-request", "On Request"],
+          ["unless-trusted", "Unless Trusted"],
+          ["never", "Never"],
+        ],
+        settings.codex.approvalPolicy,
+      );
+      const reviewer = typedSelect(
+        "Approval Reviewer",
+        [
+          ["user", "User"],
+          ["auto-review", "Auto Review"],
+        ],
+        settings.codex.approvalReviewer,
+      );
+      const codexBash = typedToggle("Bash", settings.codex.bashEnabled);
+      const claudeMode = typedSelect(
+        "Permission Level",
+        [
+          ["default", "Require Approval"],
+          ["acceptEdits", "Auto-Approve Edits"],
+          ["auto", "Auto"],
+          ["bypassPermissions", "Full Access"],
+        ],
+        settings.claude.permissionMode,
+      );
+      const claudeBash = typedToggle("Bash", settings.claude.bashEnabled);
+      const claudeStrict = typedToggle(
+        "RepoPrompt Only (Strict MCP)",
+        settings.claude.mcpStrictModeEnabled,
+      );
+      const openCodeLevel = typedSelect(
+        "ACP Session Mode",
+        [
+          ["managedDefault", "Managed Default"],
+          ["fullAccess", "Full Access"],
+        ],
+        settings.openCode.permissionLevel,
+      );
+      const cursorLevel = typedSelect(
+        "ACP Auto-Approve",
+        [
+          ["managedDefault", "Managed Default"],
+          ["fullAccess", "Full Access"],
+        ],
+        settings.cursor.permissionLevel,
+      );
+      const codexCard = desktopCard(
+        "Codex Direct Agent",
+        "Independent sandbox, approval, and reviewer fields from the typed Direct Agents store.",
+      );
+      const derived = element(
+        "span",
+        "read-only-value",
+        liveCodexPermissionLevel(settings.codex),
+      );
+      codexCard.append(
+        desktopRow(
+          "Permission Level",
+          "Derived from sandbox and reviewer the same way Desktop does.",
+          derived,
+        ),
+        desktopRow(
+          "Sandbox",
+          "Controls the Codex sandbox boundary for new direct sessions.",
+          sandbox,
+        ),
+        desktopRow(
+          "Approval Policy",
+          "When Codex must ask before acting.",
+          approval,
+        ),
+        desktopRow(
+          "Approval Reviewer",
+          "User review or Auto Review for workspace-write sessions.",
+          reviewer,
+        ),
+        desktopRow(
+          "Bash",
+          "Allow Codex to run shell commands in its approved execution mode.",
+          codexBash.toggle,
+        ),
+      );
+      if (byID.codex) {
+        codexCard.append(
+          element("h3", "desktop-subheading", "Core tools"),
+          toggleSetting(
+            "codexSearchEnabled",
+            "Search",
+            "Allow live web search requests from Codex.",
+            true,
+          ),
+          toggleSetting(
+            "codexGoalsEnabled",
+            "Goals",
+            "Enable /goal support and the goal lifecycle for Codex Agent Mode.",
+            true,
+          ),
+          toggleSetting(
+            "codexReasoningSummariesEnabled",
+            "Reasoning Summaries",
+            "Request model reasoning summaries for app-server threads.",
+            false,
+          ),
+          toggleSetting(
+            "codexMemoriesEnabled",
+            "Local Memories",
+            "Allow Codex to generate and use memories in its isolated server home.",
+            false,
+          ),
+          desktopRow(
+            "MCP servers",
+            "RepoPrompt is required for Agent Mode.",
+            element("span", "required-pill", "RepoPrompt · Required"),
+          ),
+        );
+      }
+      const claudeCard = desktopCard(
+        "Claude Code Direct Agent",
+        "Typed Claude permission mode, Bash, and MCP-strict. MCP-strict defaults on.",
+      );
+      claudeCard.append(
+        desktopRow(
+          "Permission Level",
+          "Controls Claude Code permission prompts.",
+          claudeMode,
+        ),
+        desktopRow(
+          "Bash",
+          "Allow Claude Code's native Bash tool.",
+          claudeBash.toggle,
+        ),
+        desktopRow(
+          "RepoPrompt Only (Strict MCP)",
+          "Launch with strict MCP configuration so only RepoPrompt tools are active.",
+          claudeStrict.toggle,
+        ),
+      );
+      if (byID.claudeCompatible) {
+        claudeCard.append(
+          element("h3", "desktop-subheading", "Tools"),
+          toggleSetting(
+            "claudeToolSearchEnabled",
+            "Lazy Tool Loading",
+            "Claude searches for each tool before use; this saves context but adds latency.",
+            true,
+          ),
+          desktopRow(
+            "Sys Prompt Packaging",
+            "Desktop also offers Replace System Prompt and User Message (No Native). The shared Claude runtime currently sends RepoPrompt instructions as a user message and keeps Claude Code's native prompt.",
+            element("span", "required-pill", "User Message (Keep Native)"),
+          ),
+        );
+      }
+      const openCodeCard = desktopCard(
+        "OpenCode Direct Agent",
+        "Typed ACP session mode from the Direct Agents store.",
+      );
+      openCodeCard.append(
+        desktopRow(
+          "ACP Session Mode",
+          "Choose the provider's managed mode or full access.",
+          openCodeLevel,
+        ),
+      );
+      const cursorCard = desktopCard(
+        "Cursor Direct Agent",
+        "Typed ACP auto-approve from the Direct Agents store.",
+      );
+      cursorCard.append(
+        desktopRow(
+          "ACP Auto-Approve",
+          "Choose the provider's managed mode or full access.",
+          cursorLevel,
+        ),
+      );
+      const save = element("button", "primary-button", "Save Direct Agents");
+      save.type = "submit";
+      form.append(codexCard, claudeCard, openCodeCard, cursorCard, save);
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        mutateDomain(
+          "directAgentPermissions",
+          save,
+          () =>
+            api("api/v1/settings/direct-agent-permissions", {
+              method: "PATCH",
+              body: JSON.stringify({
+                expectedRevision: snapshot.revision,
+                settings: {
+                  codex: {
+                    sandboxMode: sandbox.value,
+                    approvalPolicy: approval.value,
+                    approvalReviewer: reviewer.value,
+                    bashEnabled: codexBash.input.checked,
+                  },
+                  claude: {
+                    permissionMode: claudeMode.value,
+                    bashEnabled: claudeBash.input.checked,
+                    mcpStrictModeEnabled: claudeStrict.input.checked,
+                  },
+                  openCode: { permissionLevel: openCodeLevel.value },
+                  cursor: { permissionLevel: cursorLevel.value },
+                },
+              }),
+            }),
+          (value) => {
+            state.typedSettings.directAgentPermissions = value;
+          },
+        );
+      });
+      providerCards.push(form);
+    }
     const subagentSnapshot = state.typedSettings.subagentPermissions;
     const subagents = desktopCard(
       "Sub-Agents",
@@ -4883,6 +5063,59 @@
       : "Connect a CLI provider";
   }
 
+  function liveCodexPermissionLevel(codex) {
+    if (!codex) return "Auto Review";
+    if (codex.sandboxMode === "read-only") return "Read Only";
+    if (codex.sandboxMode === "danger-full-access") return "Full Access";
+    return codex.approvalReviewer === "auto-review"
+      ? "Auto Review"
+      : "Default Permission";
+  }
+
+  function liveSandboxLabel(mode) {
+    return (
+      {
+        "read-only": "Read Only",
+        "workspace-write": "Workspace Write",
+        "danger-full-access": "Full Access",
+      }[mode] || mode
+    );
+  }
+
+  function liveClaudePermissionLabel(mode) {
+    return (
+      {
+        default: "Require Approval",
+        acceptEdits: "Auto-Approve Edits",
+        auto: "Auto",
+        bypassPermissions: "Full Access",
+      }[mode] || mode
+    );
+  }
+
+  function liveManagedPermissionLabel(providerID) {
+    const settings = state.typedSettings.directAgentPermissions?.settings;
+    const level =
+      providerID === "cursorACP"
+        ? settings?.cursor?.permissionLevel
+        : settings?.openCode?.permissionLevel;
+    return level === "fullAccess" ? "Full Access" : "Managed Default";
+  }
+
+  function liveDirectAgentStatus() {
+    const settings = state.typedSettings.directAgentPermissions?.settings;
+    if (!settings) return "Loading";
+    return `Codex ${liveSandboxLabel(settings.codex.sandboxMode)} · ${liveCodexPermissionLevel(settings.codex)}`;
+  }
+
+  function liveSubagentStatus() {
+    const policy = state.typedSettings.subagentPermissions?.settings?.policy;
+    if (policy === "safeManaged") return "Safe Managed";
+    if (policy === "inheritProviderSettings") return "Inherit";
+    if (policy === "custom") return "Custom";
+    return "Editable";
+  }
+
   function renderOverview() {
     const content = document.getElementById("settings-content");
     disposeSensitiveInputs(content);
@@ -4947,9 +5180,9 @@
     );
     routeRow(
       "Agent Permissions",
-      "Direct agents plus Safe Managed, Inherit, and Custom sub-agent policy.",
+      "Typed Direct Agents plus Safe Managed, Inherit, and Custom sub-agent policy.",
       "agent-permissions",
-      "Editable",
+      liveDirectAgentStatus(),
     );
     content.append(routes);
     const liveRoutes = desktopCard(
@@ -4973,6 +5206,51 @@
       );
     });
     content.append(liveRoutes);
+
+    const livePermissions = desktopCard(
+      "Live permissions",
+      "Effective Direct Agents and Sub-Agents policy from the typed permission store.",
+    );
+    const permissionSettings =
+      state.typedSettings.directAgentPermissions?.settings;
+    const subagentSettings =
+      state.typedSettings.subagentPermissions?.settings;
+    [
+      [
+        "Codex",
+        permissionSettings
+          ? `${liveSandboxLabel(permissionSettings.codex.sandboxMode)} · ${liveCodexPermissionLevel(permissionSettings.codex)}`
+          : "Loading",
+        "Independent sandbox, approval, and reviewer. Not the 3-mode fallback.",
+      ],
+      [
+        "Claude",
+        permissionSettings
+          ? liveClaudePermissionLabel(permissionSettings.claude.permissionMode)
+          : "Loading",
+        "Typed permission mode, Bash, and MCP-strict.",
+      ],
+      [
+        "OpenCode",
+        liveManagedPermissionLabel("openCodeACP"),
+        "Typed ACP session mode.",
+      ],
+      [
+        "Cursor",
+        liveManagedPermissionLabel("cursorACP"),
+        "Typed ACP auto-approve.",
+      ],
+      [
+        "Sub-Agents",
+        liveSubagentStatus(),
+        "Safe Managed, Inherit, or Custom frozen into child sessions.",
+      ],
+    ].forEach(([title, status, detail]) => {
+      livePermissions.append(
+        desktopRow(title, detail, element("span", "read-only-value", status)),
+      );
+    });
+    content.append(livePermissions);
 
     const providerCard = desktopCard(
       "CLI Provider Status",
@@ -5002,13 +5280,13 @@
 
     const defaults = desktopCard(
       "Portal Session Default",
-      "Runtime-backed fallback used when a direct provider permission does not choose a stricter execution mode.",
+      "Thin-client fallback for providers with no typed Direct Agents profile. Typed Codex, Claude, OpenCode, and Cursor permissions win.",
     );
     defaults.append(
       selectSetting(
         "serverDefaultExecutionMode",
         "Execution Mode",
-        "Fallback execution mode for new portal sessions.",
+        "Session default only when no typed permission profile applies.",
         [
           ["readOnly", "Read Only"],
           ["workspaceWrite", "Workspace Write"],
