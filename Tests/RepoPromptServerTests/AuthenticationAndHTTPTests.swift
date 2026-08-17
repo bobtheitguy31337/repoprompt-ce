@@ -9,7 +9,7 @@ import RepoPromptServiceProtocol
 import XCTest
 
 final class AuthenticationAndHTTPTests: XCTestCase {
-    private let responseSigningKey = InternalSigningKey(keyID: "response-v1", role: .sync, direction: "repoprompt-to-goblin-v1", secret: Data("response-secret".utf8))
+    private let responseSigningKey = InternalSigningKey(keyID: "response-v1", role: .sync, direction: InternalHMACDirection.repoPromptToClient, secret: Data("response-secret".utf8))
 
     func testConfigurationAcceptsOverlappingRoleKeysAndRejectsDuplicateIdentity() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -23,9 +23,10 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         }
         var environment = try [
             "REPOPROMPT_TLS_CERT_FILE": "/cert", "REPOPROMPT_TLS_KEY_FILE": "/key", "REPOPROMPT_TLS_CLIENT_CA_FILE": "/ca",
-            "REPOPROMPT_GOBLIN_APP_HMAC_FILE": secret("app"), "REPOPROMPT_GOBLIN_SYNC_HMAC_FILE": secret("sync"),
+            "REPOPROMPT_OPERATOR_CERT_IDENTITY": "operator.internal",
+            "REPOPROMPT_APP_HMAC_FILE": secret("app"), "REPOPROMPT_SYNC_HMAC_FILE": secret("sync"),
             "REPOPROMPT_OPERATOR_HMAC_FILE": secret("operator"), "REPOPROMPT_EVENT_HMAC_FILE": secret("event"),
-            "REPOPROMPT_GOBLIN_APP_PREVIOUS_KEY_ID": "app-v0", "REPOPROMPT_GOBLIN_APP_PREVIOUS_HMAC_FILE": secret("app-v0")
+            "REPOPROMPT_APP_PREVIOUS_KEY_ID": "app-v0", "REPOPROMPT_APP_PREVIOUS_HMAC_FILE": secret("app-v0")
         ]
         let configuration = try RepoPromptServerConfiguration.environment(environment)
         XCTAssertEqual(configuration.signingKeys.count, 4)
@@ -52,9 +53,58 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         XCTAssertThrowsError(try RepoPromptServerConfiguration.environment(environment))
         environment["REPOPROMPT_ENABLED_PROVIDERS"] = "codex"
 
-        environment["REPOPROMPT_GOBLIN_SYNC_PREVIOUS_KEY_ID"] = "app-v0"
-        environment["REPOPROMPT_GOBLIN_SYNC_PREVIOUS_HMAC_FILE"] = try secret("sync-v0")
+        environment["REPOPROMPT_SYNC_PREVIOUS_KEY_ID"] = "app-v0"
+        environment["REPOPROMPT_SYNC_PREVIOUS_HMAC_FILE"] = try secret("sync-v0")
         XCTAssertThrowsError(try RepoPromptServerConfiguration.environment(environment))
+    }
+
+    func testOperatorOnlyConfigurationBootsWithoutIntegrationHMAC() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let environment = [
+            "REPOPROMPT_TLS_CERT_FILE": "/cert",
+            "REPOPROMPT_TLS_KEY_FILE": "/key",
+            "REPOPROMPT_TLS_CLIENT_CA_FILE": "/ca",
+            "REPOPROMPT_OPERATOR_CERT_IDENTITY": "operator.internal",
+            "REPOPROMPT_STATE_DB": directory.appendingPathComponent("repoprompt.sqlite").path
+        ]
+        let configuration = try RepoPromptServerConfiguration.environment(environment)
+        XCTAssertTrue(configuration.signingKeys.isEmpty)
+        XCTAssertEqual(configuration.eventSigningKey.direction, InternalHMACDirection.repoPromptToClient)
+        XCTAssertGreaterThanOrEqual(configuration.eventSigningKey.secret.count, 32)
+        let again = try RepoPromptServerConfiguration.environment(environment)
+        XCTAssertEqual(configuration.eventSigningKey.secret, again.eventSigningKey.secret)
+        let unpairedAppHMAC = directory.appendingPathComponent("app.hmac")
+        try Data(String(repeating: "a", count: 32).utf8).write(to: unpairedAppHMAC)
+        var incomplete = environment
+        incomplete["REPOPROMPT_APP_HMAC_FILE"] = unpairedAppHMAC.path
+        XCTAssertThrowsError(try RepoPromptServerConfiguration.environment(incomplete))
+    }
+
+    func testNeutralAppEnvNamesLoadRepoPromptHMACDirections() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        func secret(_ name: String) throws -> String {
+            let path = directory.appendingPathComponent(name).path
+            let material = String(("\(name)-" + String(repeating: "x", count: 64)).prefix(32))
+            try Data(material.utf8).write(to: URL(fileURLWithPath: path))
+            return path
+        }
+        let configuration = try RepoPromptServerConfiguration.environment([
+            "REPOPROMPT_TLS_CERT_FILE": "/cert",
+            "REPOPROMPT_TLS_KEY_FILE": "/key",
+            "REPOPROMPT_TLS_CLIENT_CA_FILE": "/ca",
+            "REPOPROMPT_OPERATOR_CERT_IDENTITY": "operator.internal",
+            "REPOPROMPT_APP_HMAC_FILE": secret("app"),
+            "REPOPROMPT_SYNC_HMAC_FILE": secret("sync"),
+            "REPOPROMPT_EVENT_HMAC_FILE": secret("event")
+        ])
+        XCTAssertEqual(configuration.signingKeys.first { $0.role == .app }?.direction, InternalHMACDirection.appToRepoPrompt)
+        XCTAssertEqual(configuration.signingKeys.first { $0.role == .sync }?.direction, InternalHMACDirection.syncToRepoPrompt)
+        XCTAssertEqual(configuration.signingKeys.first { $0.role == .app }?.keyID, "app-v1")
+        XCTAssertEqual(configuration.eventSigningKey.direction, InternalHMACDirection.repoPromptToClient)
     }
 
     func testResponseSigningCoversJSONErrorsEmptyAndBinaryBodies() {
@@ -85,16 +135,34 @@ final class AuthenticationAndHTTPTests: XCTestCase {
 
     func testCertificateTrustConfigurationRejectsOverlappingRoleIdentities() throws {
         XCTAssertThrowsError(try CertificateIdentityRoleResolver.environment([
-            "REPOPROMPT_GOBLIN_APP_CERT_IDENTITY": "shared.internal",
-            "REPOPROMPT_GOBLIN_SYNC_CERT_IDENTITY": "shared.internal",
+            "REPOPROMPT_APP_CERT_IDENTITY": "shared.internal",
+            "REPOPROMPT_SYNC_CERT_IDENTITY": "shared.internal",
             "REPOPROMPT_OPERATOR_CERT_IDENTITY": "operator.internal"
         ]))
+    }
+
+    func testOperatorOnlyCertificateIdentityDoesNotRequireIntegrationPeers() throws {
+        XCTAssertNoThrow(try CertificateIdentityRoleResolver.environment([
+            "REPOPROMPT_OPERATOR_CERT_IDENTITY": "operator.internal"
+        ]))
+        XCTAssertThrowsError(try CertificateIdentityRoleResolver.environment([
+            "REPOPROMPT_OPERATOR_CERT_IDENTITY": "operator.internal",
+            "REPOPROMPT_APP_CERT_IDENTITY": "app.internal"
+        ]))
+    }
+
+    func testInternalRouteRoleRejectsUnknownNames() throws {
+        XCTAssertEqual(try JSONDecoder().decode(InternalRouteRole.self, from: Data(#""app""#.utf8)), .app)
+        XCTAssertEqual(try JSONDecoder().decode(InternalRouteRole.self, from: Data(#""sync""#.utf8)), .sync)
+        XCTAssertThrowsError(try JSONDecoder().decode(InternalRouteRole.self, from: Data(#""unknown""#.utf8)))
+        XCTAssertEqual(String(data: try JSONEncoder().encode(InternalRouteRole.app), encoding: .utf8), "\"app\"")
+        XCTAssertEqual(String(data: try JSONEncoder().encode(InternalRouteRole.sync), encoding: .utf8), "\"sync\"")
     }
 
     func testSignedRequestRejectsNonceReplayAndRoleMismatch() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let instant = Date(timeIntervalSince1970: 1000)
-        let key = InternalSigningKey(keyID: "sync-v1", role: .sync, direction: "goblin-sync-to-repoprompt-v1", secret: Data("secret".utf8))
+        let key = InternalSigningKey(keyID: "sync-v1", role: .sync, direction: InternalHMACDirection.syncToRepoPrompt, secret: Data("secret".utf8))
         let auth = InternalRequestAuthenticator(keys: [key], store: store, now: { instant })
         let timestamp = CanonicalSigning.iso8601String(instant)
         let nonce = "abcdefghijklmnop"
@@ -112,7 +180,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
     func testAuthorizationDecisionRevisionsAreDurablyMonotonicAndSingleUse() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let instant = Date(timeIntervalSince1970: 1000)
-        let key = InternalSigningKey(keyID: "app-v1", role: .app, direction: "goblin-app-to-repoprompt-v1", secret: Data("secret".utf8))
+        let key = InternalSigningKey(keyID: "app-v1", role: .app, direction: InternalHMACDirection.appToRepoPrompt, secret: Data("secret".utf8))
         let auth = InternalRequestAuthenticator(keys: [key], store: store, now: { instant })
 
         func request(revision: Int64, nonce: String, decisionID: UUID = UUID()) throws -> SignedInternalRequest {
@@ -542,7 +610,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         _ = try await store.archiveEvents(through: 1)
 
         let instant = Date(timeIntervalSince1970: 1000)
-        let key = InternalSigningKey(keyID: "sync-v1", role: .sync, direction: "goblin-sync-to-repoprompt-v1", secret: Data("secret".utf8))
+        let key = InternalSigningKey(keyID: "sync-v1", role: .sync, direction: InternalHMACDirection.syncToRepoPrompt, secret: Data("secret".utf8))
         let auth = InternalRequestAuthenticator(keys: [key], store: store, now: { instant })
         let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth, eventSigningKey: responseSigningKey)
         let app = Application(router: service.internalRouter())
@@ -591,7 +659,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         let metadata = try await store.metadata()
         _ = try await store.archiveEvents(through: 1)
         let instant = Date(timeIntervalSince1970: 1000)
-        let key = InternalSigningKey(keyID: "sync-v1", role: .sync, direction: "goblin-sync-to-repoprompt-v1", secret: Data("secret".utf8))
+        let key = InternalSigningKey(keyID: "sync-v1", role: .sync, direction: InternalHMACDirection.syncToRepoPrompt, secret: Data("secret".utf8))
         let auth = InternalRequestAuthenticator(keys: [key], store: store, now: { instant })
         let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth, eventSigningKey: responseSigningKey)
         let app = Application(router: service.internalRouter())

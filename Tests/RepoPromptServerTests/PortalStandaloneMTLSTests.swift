@@ -12,10 +12,10 @@ import X509
 import XCTest
 
 final class PortalStandaloneMTLSTests: XCTestCase {
-    func testOperatorCertificateMapsAndGoblinSyncIsRejected() throws {
+    func testOperatorCertificateMapsAndSyncIsRejectedFromPortal() throws {
         let resolver = CertificateIdentityRoleResolver(identities: [
-            "goblin-app": .app,
-            "goblin-sync": .sync,
+            "app.internal": .app,
+            "sync.internal": .sync,
             "repoprompt-operator": .operatorRole
         ])
         XCTAssertEqual(
@@ -23,11 +23,11 @@ final class PortalStandaloneMTLSTests: XCTestCase {
             .operatorRole
         )
         XCTAssertEqual(
-            try resolver.role(certificate: Self.nioCertificate(identity: "goblin-app")),
+            try resolver.role(certificate: Self.nioCertificate(identity: "app.internal")),
             .app
         )
         XCTAssertEqual(
-            try resolver.role(certificate: Self.nioCertificate(identity: "goblin-sync")),
+            try resolver.role(certificate: Self.nioCertificate(identity: "sync.internal")),
             .sync
         )
         XCTAssertFalse(RepoPromptPortalCertificateAuthorization.allows(.sync))
@@ -55,8 +55,8 @@ final class PortalStandaloneMTLSTests: XCTestCase {
             authenticator: InternalRequestAuthenticator(keys: [], store: store),
             eventSigningKey: InternalSigningKey(keyID: "response", role: .sync, direction: "test", secret: Data("secret".utf8)),
             certificateRoleResolver: CertificateIdentityRoleResolver(identities: [
-                "goblin-app": .app,
-                "goblin-sync": .sync,
+                "app.internal": .app,
+                "sync.internal": .sync,
                 "repoprompt-operator": .operatorRole
             ]),
             serverSettings: settings,
@@ -136,13 +136,13 @@ final class PortalStandaloneMTLSTests: XCTestCase {
         }
     }
 
-    func testGoblinSyncCertificateCannotUsePortalAndHMACDoesNotBypassMTLS() async throws {
+    func testSyncCertificateCannotUsePortalAndHMACDoesNotBypassMTLS() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
         let authority = RepoPromptHeadlessAuthority(store: store)
         let resolver = CertificateIdentityRoleResolver(identities: [
-            "goblin-app": .app,
-            "goblin-sync": .sync,
+            "app.internal": .app,
+            "sync.internal": .sync,
             "repoprompt-operator": .operatorRole
         ])
         let syncService = RepoPromptHTTPService(
@@ -151,7 +151,7 @@ final class PortalStandaloneMTLSTests: XCTestCase {
             authenticator: InternalRequestAuthenticator(keys: [], store: store),
             eventSigningKey: InternalSigningKey(keyID: "response", role: .sync, direction: "test", secret: Data("secret".utf8)),
             certificateRoleResolver: resolver,
-            portalPeerCertificateDER: try Self.certificateDER(identity: "goblin-sync")
+            portalPeerCertificateDER: try Self.certificateDER(identity: "sync.internal")
         )
         let syncApp = Application(router: syncService.internalRouter())
         try await syncApp.test(.router) { client in
@@ -166,8 +166,8 @@ final class PortalStandaloneMTLSTests: XCTestCase {
         let hmacKey = InternalSigningKey(
             keyID: "app-v1",
             role: .app,
-            direction: "goblin-app-to-repoprompt-v1",
-            secret: Data("chat-server-hmac-secret-32bytes!!".utf8)
+            direction: InternalHMACDirection.appToRepoPrompt,
+            secret: Data("app-hmac-test-secret-32bytes!!".utf8)
         )
         let hmacService = RepoPromptHTTPService(
             authority: authority,
@@ -181,7 +181,7 @@ final class PortalStandaloneMTLSTests: XCTestCase {
             try await client.execute(
                 uri: "/portal/api/v1/bootstrap",
                 method: .get,
-                headers: try Self.goblinHMACHeaders(path: "/portal/api/v1/bootstrap", key: hmacKey)
+                headers: try Self.appHMACHeaders(path: "/portal/api/v1/bootstrap", key: hmacKey)
             ) { response in
                 XCTAssertEqual(response.status, .unauthorized)
             }
@@ -197,7 +197,7 @@ final class PortalStandaloneMTLSTests: XCTestCase {
         return headers
     }
 
-    private static func goblinHMACHeaders(path: String, key: InternalSigningKey) throws -> HTTPFields {
+    private static func appHMACHeaders(path: String, key: InternalSigningKey) throws -> HTTPFields {
         let instant = Date(timeIntervalSince1970: 1_786_400_000)
         let timestamp = CanonicalSigning.iso8601String(instant)
         let nonce = "portalhmacnonce0001"

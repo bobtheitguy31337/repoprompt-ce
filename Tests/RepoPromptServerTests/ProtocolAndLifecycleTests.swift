@@ -20,14 +20,11 @@ final class ProtocolAndLifecycleTests: XCTestCase {
         XCTAssertNotEqual(signature, CanonicalSigning.hmacSHA256(message: canonical + "x", key: key))
     }
 
-    func testExternalActorEncodesUserIdAndDecodesLegacyGoblinUserId() throws {
+    func testExternalActorEncodesUserIdAndRejectsThirdPartyKeys() throws {
         let actor = ExternalActor(userID: "user-1", username: "alice", displayName: "Alice")
         let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(actor)) as? [String: Any]
         XCTAssertEqual(encoded?["userId"] as? String, "user-1")
-        XCTAssertNil(encoded?["goblinUserId"])
-        let legacy = Data(#"{"goblinUserId":"legacy-1","username":"alice","displayName":"Alice"}"#.utf8)
-        let decoded = try JSONDecoder().decode(ExternalActor.self, from: legacy)
-        XCTAssertEqual(decoded.userID, "legacy-1")
+        XCTAssertThrowsError(try JSONDecoder().decode(ExternalActor.self, from: Data(#"{"username":"alice","displayName":"Alice"}"#.utf8)))
     }
 
     func testV1DTOsUseLowerCamelKeysAndLogicalOnlyProjections() throws {
@@ -78,8 +75,8 @@ final class ProtocolAndLifecycleTests: XCTestCase {
         XCTAssertEqual(gate.accept(binding: .init(runID: binding.runID, generation: 2, turnEpoch: 4, connectionGeneration: 5)), .staleConnection)
     }
 
-    func testGoblinCommandFixtureDecodesEveryClosedV1Variant() throws {
-        let fixtureURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("Fixtures/goblin-session-commands-v1.json")
+    func testSessionCommandFixtureDecodesEveryClosedV1Variant() throws {
+        let fixtureURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("Fixtures/session-commands-v1.json")
         let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: fixtureURL)) as? [String: Any])
         XCTAssertEqual(fixture["schemaVersion"] as? Int, 1)
         let vectors = try XCTUnwrap(fixture["vectors"] as? [[String: Any]])
@@ -93,9 +90,9 @@ final class ProtocolAndLifecycleTests: XCTestCase {
         }
     }
 
-    func testGoblinSelectedMessageContextIsValidatedAndFrozenIntoInitialPrompt() throws {
+    func testSelectedMessageContextAcceptsCanonicalExplicitSelection() throws {
         let data = Data("""
-        {"projectId":"11111111-1111-4111-8111-111111111111","provider":"codex","visibility":"private","initialPrompt":"Investigate the regression","startImmediately":true,"selectedMessageContext":{"schemaVersion":1,"source":"goblin-explicit-selection","messages":[{"roomId":"room-1","messageId":"message-1","text":"Exact selected chat text","senderId":"user-1","timestamp":"2026-08-10T12:00:00.000Z","revision":"2026-08-10T12:00:01.000Z","threadId":"thread-1"}]}}
+        {"projectId":"11111111-1111-4111-8111-111111111111","provider":"codex","visibility":"private","initialPrompt":"Investigate the regression","startImmediately":true,"selectedMessageContext":{"schemaVersion":1,"source":"explicit-selection","messages":[{"roomId":"room-1","messageId":"message-1","text":"Exact selected chat text","senderId":"user-1","timestamp":"2026-08-10T12:00:00.000Z","revision":"2026-08-10T12:00:01.000Z","threadId":"thread-1"}]}}
         """.utf8)
         let decoded = try JSONDecoder.serviceDecoder.decode(CreateSessionInput.self, from: data)
         let frozen = try decoded.frozenForExecution()
@@ -103,5 +100,9 @@ final class ProtocolAndLifecycleTests: XCTestCase {
         XCTAssertNil(frozen.selectedMessageContext)
         XCTAssertTrue(try XCTUnwrap(frozen.initialPrompt).contains("Exact selected chat text"))
         XCTAssertTrue(try XCTUnwrap(frozen.initialPrompt).contains("Investigate the regression"))
+        XCTAssertTrue(try XCTUnwrap(frozen.initialPrompt).contains("source=\"explicit-selection\""))
+        XCTAssertThrowsError(try JSONDecoder.serviceDecoder.decode(CreateSessionInput.self, from: Data("""
+        {"projectId":"11111111-1111-4111-8111-111111111111","provider":"codex","visibility":"private","selectedMessageContext":{"schemaVersion":1,"source":"unknown-selection","messages":[{"roomId":"room-1","messageId":"message-1","text":"x","senderId":"user-1","timestamp":"2026-08-10T12:00:00.000Z","revision":"1"}]}}
+        """.utf8)).frozenForExecution())
     }
 }

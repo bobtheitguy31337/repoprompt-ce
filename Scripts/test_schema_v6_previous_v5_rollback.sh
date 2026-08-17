@@ -25,7 +25,7 @@ final class PreviousSchemaV5RollbackProbeTests: XCTestCase {
         let store = try await SQLiteServiceStore.open(storage: .file(path))
         let metadata = try await store.metadata()
         XCTAssertEqual(metadata.schemaVersion, 6)
-        let actor = ExternalActor(goblinUserID: "v5-probe", username: "v5-probe", displayName: "V5 Probe")
+        let actor = ExternalActor(userID: "v5-probe", username: "v5-probe", displayName: "V5 Probe")
         let projectID = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
         let cursor = try await store.nextCursor()
         let project = ProjectSnapshot(projectID: projectID, name: "v5 rollback write", creator: actor, state: .active, roots: [], revision: 1, cursor: cursor)

@@ -289,11 +289,7 @@ public struct CollaborationMetadataSnapshot: Codable, Hashable, Sendable {
         policyRevision = try container.decode(Int64.self, forKey: .policyRevision)
         controllerRevision = try container.decode(Int64.self, forKey: .controllerRevision)
         membershipRevision = try container.decode(Int64.self, forKey: .membershipRevision)
-        if let acknowledgement = try container.decodeIfPresent(CollaborationAcknowledgement.self, forKey: .collaborationAcknowledgement) {
-            collaborationAcknowledgement = acknowledgement
-        } else {
-            collaborationAcknowledgement = try container.decodeIfPresent(CollaborationAcknowledgement.self, forKey: .goblinAcknowledgement)
-        }
+        collaborationAcknowledgement = try container.decodeIfPresent(CollaborationAcknowledgement.self, forKey: .collaborationAcknowledgement)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -317,7 +313,6 @@ public struct CollaborationMetadataSnapshot: Codable, Hashable, Sendable {
         case controllerRevision
         case membershipRevision
         case collaborationAcknowledgement
-        case goblinAcknowledgement
     }
 }
 

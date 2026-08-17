@@ -11,10 +11,10 @@ import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 final class ProjectSourceProvisioningTests: XCTestCase {
-    func testExactGoblinProjectCreationFixtureDecodes() throws {
+    func testExactProjectCreationFixtureDecodes() throws {
         let fixtureURL = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
-            .appendingPathComponent("Fixtures/goblin-project-creation-v1.json")
+            .appendingPathComponent("Fixtures/project-creation-v1.json")
         let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: fixtureURL)) as? [String: Any])
         XCTAssertEqual(fixture["schemaVersion"] as? Int, 1)
         let vectors = try XCTUnwrap(fixture["vectors"] as? [[String: Any]])
@@ -66,7 +66,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
                 expectedRevision: 0,
                 name: "Configured",
                 logicalName: "workspace",
-                source: .configuredRoot(alias: "chat-server")
+                source: .configuredRoot(alias: "workspace")
             ),
             projectID: UUID(),
             rootID: UUID()
@@ -85,7 +85,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
                     expectedRevision: 0,
                     name: "Changed",
                     logicalName: "workspace",
-                    source: .configuredRoot(alias: "chat-server")
+                    source: .configuredRoot(alias: "workspace")
                 ),
                 projectID: UUID(),
                 rootID: UUID()
@@ -118,7 +118,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
                 expectedRevision: 0,
                 name: "Clone",
                 logicalName: "workspace",
-                source: .gitClone(remote: "https://GITHUB.com/degentlemen/chat-server.git", ref: "main")
+                source: .gitClone(remote: "https://GITHUB.com/repoprompt/repoprompt-ce.git", ref: "main")
             ),
             projectID: projectID,
             rootID: UUID()
@@ -162,11 +162,11 @@ final class ProjectSourceProvisioningTests: XCTestCase {
             git: git
         )
         for source in [
-            ProjectSourceOperationInput.Source.gitClone(remote: "https://token@github.com/degentlemen/chat-server.git", ref: "main"),
-            .gitClone(remote: "https://github.com/degentlemen/../other.git", ref: "main"),
-            .gitClone(remote: "https://evil.example/degentlemen/chat-server.git", ref: "main"),
-            .gitClone(remote: "https://github.com/degentlemen/chat-server.git", ref: "../main"),
-            .gitClone(remote: "https://github.com/degentlemen/chat-server.git", ref: "private/secret")
+            ProjectSourceOperationInput.Source.gitClone(remote: "https://token@github.com/repoprompt/repoprompt-ce.git", ref: "main"),
+            .gitClone(remote: "https://github.com/repoprompt/../other.git", ref: "main"),
+            .gitClone(remote: "https://evil.example/repoprompt/repoprompt-ce.git", ref: "main"),
+            .gitClone(remote: "https://github.com/repoprompt/repoprompt-ce.git", ref: "../main"),
+            .gitClone(remote: "https://github.com/repoprompt/repoprompt-ce.git", ref: "private/secret")
         ] {
             do {
                 _ = try await service.provision(
@@ -204,7 +204,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
             _ = try await service.provision(
                 input: .init(
                     operationID: UUID(), expectedRevision: 0, name: "Clone", logicalName: "root",
-                    source: .gitClone(remote: "https://github.com/degentlemen/chat-server.git", ref: "main-old")
+                    source: .gitClone(remote: "https://github.com/repoprompt/repoprompt-ce.git", ref: "main-old")
                 ),
                 projectID: UUID(),
                 rootID: UUID()
@@ -224,7 +224,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
         defer { Task { try? await store.close() } }
         let policy = try ProjectSourcePolicy.decode(fixture.policy(
             configuredPath: fixture.directory.path,
-            remoteRules: [["scheme": "ssh", "host": "github.com", "pathPrefix": "/degentlemen/"]]
+            remoteRules: [["scheme": "ssh", "host": "github.com", "pathPrefix": "/repoprompt/"]]
         ))
         XCTAssertThrowsError(try ProjectSourceProvisioningService(
             cloneRoot: fixture.cloneRoot.path,
@@ -610,7 +610,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
                     expectedRevision: 0,
                     name: "Clone",
                     logicalName: "root",
-                    source: .gitClone(remote: "https://github.com/degentlemen/chat-server.git", ref: "main")
+                    source: .gitClone(remote: "https://github.com/repoprompt/repoprompt-ce.git", ref: "main")
                 ),
                 projectID: projectID,
                 rootID: UUID()
@@ -644,7 +644,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
                 expectedRevision: 0,
                 name: "Clone",
                 logicalName: "workspace",
-                source: .gitClone(remote: "https://github.com/degentlemen/chat-server.git", ref: "main")
+                source: .gitClone(remote: "https://github.com/repoprompt/repoprompt-ce.git", ref: "main")
             ),
             projectID: projectID,
             rootID: UUID()
@@ -676,7 +676,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
             expectedRevision: 0,
             name: "Clone",
             logicalName: "workspace",
-            source: .gitClone(remote: "https://github.com/degentlemen/chat-server.git", ref: "main")
+            source: .gitClone(remote: "https://github.com/repoprompt/repoprompt-ce.git", ref: "main")
         )
 
         let first = try await authority.createProjectFromSource(
@@ -712,7 +712,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
                     expectedRevision: 1,
                     name: "stale",
                     logicalName: "workspace",
-                    source: .configuredRoot(alias: "chat-server")
+                    source: .configuredRoot(alias: "workspace")
                 ),
                 externalActor: actor,
                 idempotencyKey: "source-stale",
@@ -743,7 +743,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
         let actor = ExternalActor(userID: "concurrent-configured", username: "alice", displayName: "Alice")
         let input = ProjectSourceOperationInput(
             operationID: UUID(), expectedRevision: 0, name: "Configured", logicalName: "workspace",
-            source: .configuredRoot(alias: "chat-server")
+            source: .configuredRoot(alias: "workspace")
         )
         async let first = authority.createProjectFromSource(
             input: input, externalActor: actor, idempotencyKey: "same-key", requestDigest: "same-digest"
@@ -774,7 +774,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
         let actor = ExternalActor(userID: "concurrent-clone", username: "alice", displayName: "Alice")
         let input = ProjectSourceOperationInput(
             operationID: UUID(), expectedRevision: 0, name: "Clone", logicalName: "workspace",
-            source: .gitClone(remote: "https://github.com/degentlemen/chat-server.git", ref: "main")
+            source: .gitClone(remote: "https://github.com/repoprompt/repoprompt-ce.git", ref: "main")
         )
         async let first = authority.createProjectFromSource(
             input: input, externalActor: actor, idempotencyKey: "same-key", requestDigest: "same-digest"
@@ -807,7 +807,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
         let actor = ExternalActor(userID: "canceled-waiter", username: "alice", displayName: "Alice")
         let input = ProjectSourceOperationInput(
             operationID: UUID(), expectedRevision: 0, name: "Clone", logicalName: "workspace",
-            source: .gitClone(remote: "https://github.com/degentlemen/chat-server.git", ref: "main")
+            source: .gitClone(remote: "https://github.com/repoprompt/repoprompt-ce.git", ref: "main")
         )
         let primary = Task { try await authority.createProjectFromSource(
             input: input, externalActor: actor, idempotencyKey: "same-key", requestDigest: "same-digest"
@@ -855,11 +855,11 @@ final class ProjectSourceProvisioningTests: XCTestCase {
         let actor = ExternalActor(userID: "concurrent-conflict", username: "alice", displayName: "Alice")
         let clone = ProjectSourceOperationInput(
             operationID: UUID(), expectedRevision: 0, name: "Clone", logicalName: "workspace",
-            source: .gitClone(remote: "https://github.com/degentlemen/chat-server.git", ref: "main")
+            source: .gitClone(remote: "https://github.com/repoprompt/repoprompt-ce.git", ref: "main")
         )
         let configuredInput = ProjectSourceOperationInput(
             operationID: UUID(), expectedRevision: 0, name: "Configured", logicalName: "workspace",
-            source: .configuredRoot(alias: "chat-server")
+            source: .configuredRoot(alias: "workspace")
         )
         let first = Task { try await authority.createProjectFromSource(
             input: clone, externalActor: actor, idempotencyKey: "reused-key", requestDigest: "digest-a"
@@ -981,13 +981,13 @@ private struct Fixture {
 
     func policy(
         configuredPath: String,
-        remoteRules: [[String: String]] = [["scheme": "https", "host": "github.com", "pathPrefix": "/degentlemen/"]],
+        remoteRules: [[String: String]] = [["scheme": "https", "host": "github.com", "pathPrefix": "/repoprompt/"]],
         allowedRefPatterns: [String] = ["^(main|release/[A-Za-z0-9._-]+)$"],
         deniedRefPatterns: [String] = ["^private/.*$"]
     ) throws -> Data {
         try JSONSerialization.data(withJSONObject: [
             "schemaVersion": 1,
-            "configuredRoots": [["alias": "chat-server", "path": configuredPath, "writable": true]],
+            "configuredRoots": [["alias": "workspace", "path": configuredPath, "writable": true]],
             "git": [
                 "remoteRules": remoteRules,
                 "allowedRefPatterns": allowedRefPatterns,
@@ -1005,7 +1005,7 @@ private actor FakeProjectSourceGitRunner: ProjectSourceGitRunning {
     private var invocations: [ProjectSourceGitInvocation] = []
     private let failClone: Bool
     private let cloneDelay: Duration?
-    private var origin = "https://github.com/degentlemen/chat-server.git"
+    private var origin = "https://github.com/repoprompt/repoprompt-ce.git"
 
     init(failClone: Bool = false, cloneDelay: Duration? = nil) {
         self.failClone = failClone

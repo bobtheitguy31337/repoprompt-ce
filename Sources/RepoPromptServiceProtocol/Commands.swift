@@ -331,8 +331,10 @@ public struct SelectedMessageContext: Codable, Hashable, Sendable {
         self.messages = messages
     }
 
+    public static let explicitSelectionSource = "explicit-selection"
+
     public func validated() throws -> Self {
-        guard schemaVersion == 1, source == "goblin-explicit-selection", !messages.isEmpty, messages.count <= 50 else {
+        guard schemaVersion == 1, source == Self.explicitSelectionSource, !messages.isEmpty, messages.count <= 50 else {
             throw ServiceAPIError(code: .invalidRequest, message: "Selected message context is invalid")
         }
         var totalBytes = 0
@@ -354,7 +356,7 @@ public struct SelectedMessageContext: Codable, Hashable, Sendable {
             let thread = message.threadID.map { " threadId=\($0)" } ?? ""
             return "[roomId=\(message.roomID) messageId=\(message.messageID) senderId=\(message.senderID) timestamp=\(message.timestamp) revision=\(message.revision)\(thread)]\n\(message.text)"
         }.joined(separator: "\n\n")
-        let context = "<selected-message-context schemaVersion=\"1\" source=\"goblin-explicit-selection\">\n\(rendered)\n</selected-message-context>"
+        let context = "<selected-message-context schemaVersion=\"1\" source=\"\(Self.explicitSelectionSource)\">\n\(rendered)\n</selected-message-context>"
         guard let userPrompt, !userPrompt.isEmpty else { return context }
         return "\(context)\n\n<user-request>\n\(userPrompt)\n</user-request>"
     }

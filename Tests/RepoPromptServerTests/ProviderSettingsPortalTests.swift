@@ -490,15 +490,18 @@ final class ProviderSettingsPortalTests: XCTestCase {
         let app = Application(router: service.internalRouter())
         try await app.test(.router) { client in
             try await client.execute(uri: "/portal", method: .get) { response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertEqual(response.headers[.cacheControl], "private, no-store")
+            }
+            try await client.execute(uri: "/portal/api/v1/bootstrap", method: .get) { response in
                 XCTAssertEqual(response.status, .unauthorized)
                 XCTAssertNil(response.headers[.init("x-internal-signature")!])
-                XCTAssertEqual(response.headers[.cacheControl], "private, no-store")
             }
         }
         try await store.close()
     }
 
-    func testPortalCertificateRolesAllowOperatorAndGoblinProxyOnly() {
+    func testPortalCertificateRolesAllowOperatorAndAppProxyOnly() {
         XCTAssertTrue(RepoPromptPortalCertificateAuthorization.allows(.operatorRole))
         XCTAssertTrue(RepoPromptPortalCertificateAuthorization.allows(.app))
         XCTAssertFalse(RepoPromptPortalCertificateAuthorization.allows(.sync))

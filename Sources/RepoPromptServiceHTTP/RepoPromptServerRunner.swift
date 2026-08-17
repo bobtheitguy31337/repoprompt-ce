@@ -1,6 +1,7 @@
 import Foundation
 import Hummingbird
 import HummingbirdTLS
+import NIOSSL
 import RepoPromptAgentRuntimeCore
 import RepoPromptHeadlessRuntime
 import RepoPromptMCPAdapter
@@ -21,7 +22,9 @@ public struct RepoPromptServerConfiguration: Sendable {
     public let healthPort: Int
     public let certificatePath: String
     public let privateKeyPath: String
-    public let clientCAPath: String
+    public let clientCAPath: String?
+    public let operatorCertIdentity: String?
+    public var usesMutualTLS: Bool { clientCAPath != nil }
     public let signingKeys: [InternalSigningKey]
     public let eventSigningKey: InternalSigningKey
     public let providerExecutables: [ProviderKind: String]
@@ -52,6 +55,10 @@ public struct RepoPromptServerConfiguration: Sendable {
             let data = try Data(contentsOf: URL(fileURLWithPath: path))
             return Data(String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines).utf8)
         }
+        func secretFromFile(_ path: String) throws -> Data {
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            return Data(String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines).utf8)
+        }
         func previousKey(prefix: String, role: InternalRouteRole, direction: String) throws -> InternalSigningKey? {
             let id = environment["\(prefix)_PREVIOUS_KEY_ID"]
             let file = environment["\(prefix)_PREVIOUS_HMAC_FILE"]
@@ -59,16 +66,78 @@ public struct RepoPromptServerConfiguration: Sendable {
             guard let id, !id.isEmpty, file != nil else { throw ConfigurationError.invalid("\(prefix) previous key ID and HMAC file must be configured together") }
             return try InternalSigningKey(keyID: id, role: role, direction: direction, secret: secret("\(prefix)_PREVIOUS_HMAC_FILE"), active: false)
         }
-        let app = try InternalSigningKey(keyID: environment["REPOPROMPT_GOBLIN_APP_KEY_ID"] ?? "goblin-app-v1", role: .app, direction: "goblin-app-to-repoprompt-v1", secret: secret("REPOPROMPT_GOBLIN_APP_HMAC_FILE"))
-        let sync = try InternalSigningKey(keyID: environment["REPOPROMPT_GOBLIN_SYNC_KEY_ID"] ?? "goblin-sync-v1", role: .sync, direction: "goblin-sync-to-repoprompt-v1", secret: secret("REPOPROMPT_GOBLIN_SYNC_HMAC_FILE"))
-        let operatorKey = try InternalSigningKey(keyID: environment["REPOPROMPT_OPERATOR_KEY_ID"] ?? "repoprompt-operator-v1", role: .operatorRole, direction: "repoprompt-operator-to-repoprompt-v1", secret: secret("REPOPROMPT_OPERATOR_HMAC_FILE"))
-        let event = try InternalSigningKey(keyID: environment["REPOPROMPT_EVENT_KEY_ID"] ?? "repoprompt-event-v1", role: .sync, direction: "repoprompt-to-goblin-v1", secret: secret("REPOPROMPT_EVENT_HMAC_FILE"))
-        let signingKeys = try [
-            app, sync, operatorKey,
-            previousKey(prefix: "REPOPROMPT_GOBLIN_APP", role: .app, direction: app.direction),
-            previousKey(prefix: "REPOPROMPT_GOBLIN_SYNC", role: .sync, direction: sync.direction),
-            previousKey(prefix: "REPOPROMPT_OPERATOR", role: .operatorRole, direction: operatorKey.direction)
-        ].compactMap(\.self)
+        func optionalSigningKey(
+            hmacFile: String,
+            keyIDName: String,
+            defaultKeyID: String,
+            role: InternalRouteRole,
+            direction: String
+        ) throws -> InternalSigningKey? {
+            guard let path = environment[hmacFile], !path.isEmpty else { return nil }
+            return try InternalSigningKey(
+                keyID: environment[keyIDName].flatMap { $0.isEmpty ? nil : $0 } ?? defaultKeyID,
+                role: role,
+                direction: direction,
+                secret: secret(hmacFile)
+            )
+        }
+        let app = try optionalSigningKey(
+            hmacFile: "REPOPROMPT_APP_HMAC_FILE",
+            keyIDName: "REPOPROMPT_APP_KEY_ID",
+            defaultKeyID: "app-v1",
+            role: .app,
+            direction: InternalHMACDirection.appToRepoPrompt
+        )
+        let sync = try optionalSigningKey(
+            hmacFile: "REPOPROMPT_SYNC_HMAC_FILE",
+            keyIDName: "REPOPROMPT_SYNC_KEY_ID",
+            defaultKeyID: "sync-v1",
+            role: .sync,
+            direction: InternalHMACDirection.syncToRepoPrompt
+        )
+        if (app == nil) != (sync == nil) {
+            throw ConfigurationError.invalid("App and sync HMAC files must be configured together")
+        }
+        let operatorKey = try optionalSigningKey(
+            hmacFile: "REPOPROMPT_OPERATOR_HMAC_FILE",
+            keyIDName: "REPOPROMPT_OPERATOR_KEY_ID",
+            defaultKeyID: "repoprompt-operator-v1",
+            role: .operatorRole,
+            direction: InternalHMACDirection.operatorToRepoPrompt
+        )
+        let stateDatabase = environment["REPOPROMPT_STATE_DB"] ?? "/var/lib/repoprompt/state/repoprompt.sqlite"
+        let event: InternalSigningKey
+        if let eventFile = environment["REPOPROMPT_EVENT_HMAC_FILE"], !eventFile.isEmpty {
+            event = try InternalSigningKey(
+                keyID: environment["REPOPROMPT_EVENT_KEY_ID"] ?? "repoprompt-event-v1",
+                role: .sync,
+                direction: environment["REPOPROMPT_EVENT_DIRECTION"].flatMap { $0.isEmpty ? nil : $0 } ?? InternalHMACDirection.repoPromptToClient,
+                secret: secret("REPOPROMPT_EVENT_HMAC_FILE")
+            )
+        } else {
+            let eventURL = URL(fileURLWithPath: stateDatabase).deletingLastPathComponent().appendingPathComponent("event-signing.hmac")
+            try FileManager.default.createDirectory(at: eventURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: eventURL.path) {
+                try randomHMACSecret().write(to: eventURL, options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: eventURL.path)
+            }
+            event = try InternalSigningKey(
+                keyID: environment["REPOPROMPT_EVENT_KEY_ID"] ?? "repoprompt-event-v1",
+                role: .sync,
+                direction: InternalHMACDirection.repoPromptToClient,
+                secret: secretFromFile(eventURL.path)
+            )
+        }
+        var signingKeys = [app, sync, operatorKey].compactMap(\.self)
+        if let app, let previous = try previousKey(prefix: "REPOPROMPT_APP", role: .app, direction: app.direction) {
+            signingKeys.append(previous)
+        }
+        if let sync, let previous = try previousKey(prefix: "REPOPROMPT_SYNC", role: .sync, direction: sync.direction) {
+            signingKeys.append(previous)
+        }
+        if let operatorKey, let previous = try previousKey(prefix: "REPOPROMPT_OPERATOR", role: .operatorRole, direction: operatorKey.direction) {
+            signingKeys.append(previous)
+        }
         let allSigningKeys = signingKeys + [event]
         guard allSigningKeys.allSatisfy({
             $0.keyID.range(of: "^[A-Za-z0-9_.:-]{1,128}$", options: .regularExpression) != nil && $0.secret.count >= 32
@@ -137,7 +206,6 @@ public struct RepoPromptServerConfiguration: Sendable {
             (.cursorACP, environment["REPOPROMPT_CURSOR_MODEL_CATALOG_FILE"]),
             (.xAI, environment["REPOPROMPT_XAI_MODEL_CATALOG_FILE"])
         ], label: "Provider model catalog")
-        let stateDatabase = environment["REPOPROMPT_STATE_DB"] ?? "/var/lib/repoprompt/state/repoprompt.sqlite"
         let vaultKey: ProviderVaultKey?
         if let keyFile = environment["REPOPROMPT_PROVIDER_VAULT_MASTER_KEY_FILE"], !keyFile.isEmpty {
             guard keyFile.hasPrefix("/") else { throw ConfigurationError.invalid("Provider vault master key path must be absolute") }
@@ -181,7 +249,18 @@ public struct RepoPromptServerConfiguration: Sendable {
             sshPrivateKeyPath: environment["REPOPROMPT_GIT_SSH_KEY_FILE"],
             sshKnownHostsPath: environment["REPOPROMPT_GIT_KNOWN_HOSTS_FILE"]
         )
-        return try Self(
+        let trustDirectory = URL(fileURLWithPath: stateDatabase).deletingLastPathComponent().appendingPathComponent("trust")
+        let tlsCert = environment["REPOPROMPT_TLS_CERT_FILE"].flatMap { $0.isEmpty ? nil : $0 }
+        let tlsKey = environment["REPOPROMPT_TLS_KEY_FILE"].flatMap { $0.isEmpty ? nil : $0 }
+        if (tlsCert == nil) != (tlsKey == nil) {
+            throw ConfigurationError.invalid("TLS certificate and key files must be configured together")
+        }
+        let clientCAPath = environment["REPOPROMPT_TLS_CLIENT_CA_FILE"].flatMap { $0.isEmpty ? nil : $0 }
+        let operatorCertIdentity = environment["REPOPROMPT_OPERATOR_CERT_IDENTITY"].flatMap { $0.isEmpty ? nil : $0 }
+        if (clientCAPath == nil) != (operatorCertIdentity == nil) {
+            throw ConfigurationError.invalid("TLS client CA and operator certificate identity must be configured together")
+        }
+        return Self(
             stateDatabasePath: stateDatabase,
             worktreeDirectory: environment["REPOPROMPT_WORKTREE_DIR"] ?? "/srv/repoprompt/worktrees",
             artifactDirectory: environment["REPOPROMPT_ARTIFACT_DIR"] ?? "/var/lib/repoprompt/artifacts",
@@ -190,7 +269,10 @@ public struct RepoPromptServerConfiguration: Sendable {
             providerHomeDirectory: environment["REPOPROMPT_PROVIDER_HOME_DIR"] ?? URL(fileURLWithPath: stateDatabase).deletingLastPathComponent().appendingPathComponent("provider-homes").path,
             bindHost: environment["REPOPROMPT_BIND_HOST"] ?? "0.0.0.0", bindPort: Int(environment["REPOPROMPT_BIND_PORT"] ?? "9443") ?? 9443,
             healthHost: "127.0.0.1", healthPort: Int(environment["REPOPROMPT_HEALTH_PORT"] ?? "9080") ?? 9080,
-            certificatePath: required("REPOPROMPT_TLS_CERT_FILE"), privateKeyPath: required("REPOPROMPT_TLS_KEY_FILE"), clientCAPath: required("REPOPROMPT_TLS_CLIENT_CA_FILE"),
+            certificatePath: tlsCert ?? trustDirectory.appendingPathComponent("server.crt").path,
+            privateKeyPath: tlsKey ?? trustDirectory.appendingPathComponent("server.key").path,
+            clientCAPath: clientCAPath,
+            operatorCertIdentity: operatorCertIdentity,
             signingKeys: signingKeys, eventSigningKey: event,
             providerExecutables: providers,
             enabledProviders: enabledProviders,
@@ -221,6 +303,32 @@ public enum ConfigurationError: Error, CustomStringConvertible { case missing(St
         case let .invalid(message): message
         }
     }
+}
+
+private func operatorOnboardingBanner(bindHost: String, bindPort: Int, needsSetup: Bool, setupToken: String?) -> String {
+    let host = bindHost == "0.0.0.0" || bindHost == "::" ? "127.0.0.1" : bindHost
+    var lines = [
+        "",
+        "RepoPrompt Server is ready.",
+        "Open https://\(host):\(bindPort)/portal/"
+    ]
+    if needsSetup, let setupToken {
+        lines.append("Create the operator password on first visit.")
+        lines.append("Setup token (required unless you are on this machine): \(setupToken)")
+    } else {
+        lines.append("Sign in with the operator password.")
+    }
+    lines.append("")
+    return lines.joined(separator: "\n")
+}
+
+private func randomHMACSecret() -> Data {
+    var bytes = [UInt8](repeating: 0, count: 32)
+    var generator = SystemRandomNumberGenerator()
+    for index in bytes.indices {
+        bytes[index] = UInt8.random(in: .min ... .max, using: &generator)
+    }
+    return Data(bytes)
 }
 
 private struct RestoreActivationRequest: Decodable {
@@ -275,12 +383,26 @@ public enum RepoPromptServerRunner {
         }
 
         // Parse all trust material before any listener can report ready.
-        let certificateRoles = try CertificateIdentityRoleResolver.environment()
-        let tls = try RepoPromptTLSConfiguration.mutualTLS13(
-            certificatePath: configuration.certificatePath,
-            privateKeyPath: configuration.privateKeyPath,
-            trustRootsPath: configuration.clientCAPath
-        )
+        let certificateRoles: CertificateIdentityRoleResolver?
+        let tls: TLSConfiguration
+        if configuration.usesMutualTLS, let clientCAPath = configuration.clientCAPath {
+            certificateRoles = try CertificateIdentityRoleResolver.environment()
+            tls = try RepoPromptTLSConfiguration.mutualTLS13(
+                certificatePath: configuration.certificatePath,
+                privateKeyPath: configuration.privateKeyPath,
+                trustRootsPath: clientCAPath
+            )
+        } else {
+            try LocalServerTLSMaterial.ensure(
+                certificatePath: configuration.certificatePath,
+                privateKeyPath: configuration.privateKeyPath
+            )
+            certificateRoles = nil
+            tls = try RepoPromptTLSConfiguration.serverTLS13(
+                certificatePath: configuration.certificatePath,
+                privateKeyPath: configuration.privateKeyPath
+            )
+        }
         let instanceID = UUID()
         let store = try await SQLiteServiceStore.open(
             storage: .file(configuration.stateDatabasePath),
@@ -541,7 +663,8 @@ public enum RepoPromptServerRunner {
             composerAttachments: composerAttachments,
             submissionCoordinator: submissionCoordinator,
             transcriptPresentation: transcriptPresentation,
-            portalDesktopSettings: portalDesktopSettings
+            portalDesktopSettings: portalDesktopSettings,
+            portalPasswordLoginEnabled: !configuration.usesMutualTLS
         )
         let internalApplication = try Application(
             router: service.internalRouter(),
@@ -559,6 +682,16 @@ public enum RepoPromptServerRunner {
             )
         )
         await durabilityOperations.start()
+        if !configuration.usesMutualTLS {
+            let needsSetup = try await store.hasOperatorAccount() == false
+            let setupToken = needsSetup ? try await store.issueOperatorSetupToken() : nil
+            FileHandle.standardError.write(Data(operatorOnboardingBanner(
+                bindHost: configuration.bindHost,
+                bindPort: configuration.bindPort,
+                needsSetup: needsSetup,
+                setupToken: setupToken
+            ).utf8))
+        }
         let mcpAdapter = RepoPromptMCPAdapter(authority: authority)
         let mcpSocketURL = URL(
             fileURLWithPath: CodexRepoPromptMCPConfig.socketPath(),

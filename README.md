@@ -136,6 +136,9 @@ is unchanged and does not use the generated workspace.
   worktrees and `.worktreeinclude` local file copying.
 - **MCP server and CLI integration**: Connect external MCP-compatible tools and
   CLI agents to RepoPrompt CE's repository context and agent harness.
+- **RepoPrompt Server**: Run the same Agent Mode authority on Linux with an
+  operator mTLS portal. Chat collaboration is optional. See
+  [`docs/server/getting-started.md`](docs/server/getting-started.md).
 - **Multi-root workspaces**: Work across related repositories, packages, and
   documentation folders in one workspace.
 - **Reviewable handoffs**: Inspect and refine selected context before sending it
@@ -164,6 +167,8 @@ third-party notices in
   Agent Mode provider architecture
 - [`docs/architecture/xcode-workspace.md`](docs/architecture/xcode-workspace.md):
   generated Xcode developer workflow and boundaries
+- [`docs/server/getting-started.md`](docs/server/getting-started.md): build, test,
+  and run RepoPrompt Server without a chat peer
 - [`docs/releasing.md`](docs/releasing.md): release-candidate and publishing
   workflows
 - [`docs/open-source-readiness.md`](docs/open-source-readiness.md): public

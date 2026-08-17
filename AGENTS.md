@@ -4,15 +4,23 @@ This is a Swift Package macOS app for RepoPrompt CE.
 
 Prefer the coordinated developer daemon (`make dev-*`, see "Developer daemon / coordinated validation" below) for builds, runs, and tests. It runs every job through a lane-serialized queue so concurrent agents do not build, launch, or test over each other, and it returns a ticket for each job so long builds can be detached and checked on later instead of blocking. The plain `make` / `swift` / `./Scripts` commands shown below are the uncoordinated fallback for when the daemon is unavailable.
 
-## Degentlemen sandbox fast path
+## RepoPrompt Server
 
-For work delivered through the Degentlemen `sandbox` branches, also read `/Users/jared/Projects/degentlemen-chat/AGENTS.md`.
+Linux and `REPOPROMPT_SERVER_ONLY=1` builds use the server target graph (no AppKit). Contributor on-ramp: [`docs/server/getting-started.md`](docs/server/getting-started.md).
+
+```bash
+make dev-server-build
+make dev-server-test
+```
+
+First-run boot does not need TLS files or a client certificate. Open `/portal/` and create the operator password. Mutual TLS remains optional for production. Integration HMAC files are optional.
+
+## Sandbox fast path
 
 - Work in an isolated worktree based on `sandbox` and implement a coherent feature slice before integration.
 - Run one focused daemon-coordinated batch after the slice is complete and before integration. Record the exact commands/results. Do not automatically run full root/provider suites, `pr-ready`, release lanes, test ledgers, or live app smoke.
 - A clean cherry-pick or merge into `sandbox` does not require another test run. Rerun only tests whose covered code changed during conflict resolution or an intentional integration edit.
 - Ordinary sandbox work does not require Context Builder, Oracle, a design review, or a review agent. Reserve them for genuine ambiguity, high-risk security/data migration design, or an explicit owner request.
-- Push RepoPrompt and chat-server `sandbox` before the single final `chat-ops/sandbox` deployment trigger. Never deploy directly or over SSH.
 - After successful delivery, remove the completed worktree, prune, and verify the worktree list. Preserve any dirty, unmerged, active, or shared worktree and report the blocker.
 
 ### Sandbox contribution safety
@@ -250,7 +258,7 @@ See `docs/architecture/source-layout.md` for the full ownership map and document
 
 ## Swift style and test workflow
 
-Prefer conductor-coordinated commands so multiple worktrees do not contend for Swift/Xcode state. For a Degentlemen sandbox slice, choose the smallest commands that cover the completed behavior and run that exact batch once immediately before integration. Examples:
+Prefer conductor-coordinated commands so multiple worktrees do not contend for Swift/Xcode state. For a sandbox slice, choose the smallest commands that cover the completed behavior and run that exact batch once immediately before integration. Examples:
 
 ```bash
 make dev-format-check                              # only when touched Swift formatting needs checking

@@ -27,7 +27,6 @@ public struct ExternalActor: Codable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case userID = "userId"
-        case goblinUserID = "goblinUserId"
         case username, displayName
     }
 
@@ -35,24 +34,6 @@ public struct ExternalActor: Codable, Hashable, Sendable {
         self.userID = userID
         self.username = username
         self.displayName = displayName
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        if let userID = try container.decodeIfPresent(String.self, forKey: .userID) {
-            self.userID = userID
-        } else {
-            self.userID = try container.decode(String.self, forKey: .goblinUserID)
-        }
-        username = try container.decode(String.self, forKey: .username)
-        displayName = try container.decode(String.self, forKey: .displayName)
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(userID, forKey: .userID)
-        try container.encode(username, forKey: .username)
-        try container.encode(displayName, forKey: .displayName)
     }
 }
 

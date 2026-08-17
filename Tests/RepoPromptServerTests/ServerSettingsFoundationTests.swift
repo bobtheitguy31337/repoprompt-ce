@@ -419,7 +419,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         }
     }
 
-    func testChatServerGoblinDoesNotInheritTrustedClientAlwaysAllowAndUserCreateStaysUngated() async throws {
+    func testUntrustedIntegrationActorDoesNotInheritTrustedClientAlwaysAllowAndUserCreateStaysUngated() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
         let service = ServerSettingsService(
@@ -428,8 +428,8 @@ final class ServerSettingsFoundationTests: XCTestCase {
             projectCatalog: store
         )
         let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
-        let goblin = ExternalActor(
-            userID: "goblin-chat-server",
+        let untrusted = ExternalActor(
+            userID: "untrusted-chat-host",
             username: "claude-code",
             displayName: "Claude Code v2.1"
         )
@@ -443,45 +443,45 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertTrue(
             trusted.settings.shouldAutoApprove(
                 operation: .createWorkspace,
-                clientID: goblin.displayName
+                clientID: untrusted.displayName
             )
         )
 
-        let projectRoot = FileManager.default.temporaryDirectory.appendingPathComponent("ws-goblin-\(UUID().uuidString)")
+        let projectRoot = FileManager.default.temporaryDirectory.appendingPathComponent("ws-untrusted-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: projectRoot) }
         let project = try await authority.createProject(
-            input: .init(name: "Goblin", roots: [.init(logicalName: "root", path: projectRoot.path, writable: true)]),
-            externalActor: goblin,
-            idempotencyKey: "ws-goblin-project",
-            requestDigest: "ws-goblin-project"
+            input: .init(name: "Integration", roots: [.init(logicalName: "root", path: projectRoot.path, writable: true)]),
+            externalActor: untrusted,
+            idempotencyKey: "ws-untrusted-project",
+            requestDigest: "ws-untrusted-project"
         )
-        XCTAssertEqual(project.name, "Goblin")
+        XCTAssertEqual(project.name, "Integration")
 
         let session = try await authority.createSession(
             input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
-            externalActor: goblin,
-            idempotencyKey: "ws-goblin-session",
-            requestDigest: "ws-goblin-session"
+            externalActor: untrusted,
+            idempotencyKey: "ws-untrusted-session",
+            requestDigest: "ws-untrusted-session"
         )
         let adapter = RepoPromptMCPAdapter(authority: authority)
         let baseline = HeadlessCodexMCPToolPolicy.advertisedToolNames(isRootSession: true)
         let victim = try XCTUnwrap(baseline.sorted().first)
         let kept = try XCTUnwrap(baseline.sorted().first { $0 != victim })
-        let goblinBinding = RepoPromptMCPBinding(
+        let untrustedBinding = RepoPromptMCPBinding(
             sessionID: session.sessionID,
-            actor: goblin,
+            actor: untrusted,
             mcpClientID: RepoPromptMCPBinding.untrustedClientID
         )
-        XCTAssertEqual(goblinBinding.mcpClientID, "unknown-client")
-        XCTAssertEqual(RepoPromptMCPBinding(sessionID: session.sessionID, actor: goblin).mcpClientID, goblinBinding.mcpClientID)
+        XCTAssertEqual(untrustedBinding.mcpClientID, "unknown-client")
+        XCTAssertEqual(RepoPromptMCPBinding(sessionID: session.sessionID, actor: untrusted).mcpClientID, untrustedBinding.mcpClientID)
         do {
             _ = try await adapter.invoke(
                 toolName: "manage_workspaces",
                 argumentsJSON: JSONSerialization.data(withJSONObject: ["action": "create", "name": "Denied"], options: [.sortedKeys]),
-                binding: goblinBinding
+                binding: untrustedBinding
             )
-            XCTFail("chat-server Goblin identity must not inherit Desktop Always Allow")
+            XCTFail("untrusted chat-host identity must not inherit Desktop Always Allow")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .invalidRequest)
             XCTAssertEqual(error.message, WorkspaceApprovalOperation.createWorkspace.deniedByUserMessage)
@@ -500,9 +500,9 @@ final class ServerSettingsFoundationTests: XCTestCase {
             _ = try await adapter.invoke(
                 toolName: victim,
                 argumentsJSON: JSONSerialization.data(withJSONObject: ["op": "list"], options: [.sortedKeys]),
-                binding: goblinBinding
+                binding: untrustedBinding
             )
-            XCTFail("disabled tools must stay omitted for the chat-server MCP binding")
+            XCTFail("disabled tools must stay omitted for the untrusted MCP binding")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .invalidRequest)
             XCTAssertEqual(error.message, "Tool '\(victim)' is disabled.")
@@ -1463,7 +1463,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         }
     }
 
-    func testGoblinSessionStartWithoutProviderResolvesPairRoute() async throws {
+    func testSessionStartWithoutProviderResolvesPairRoute() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
         let projectID = UUID()

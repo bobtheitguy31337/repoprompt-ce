@@ -622,11 +622,11 @@ public actor SQLiteServiceStore {
     }
 
     public func collaboration(sessionID: UUID) async throws -> CollaborationMetadataSnapshot? {
-        guard let row = try await connection.query("SELECT visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision,goblin_acknowledgement_json FROM collaboration_metadata WHERE session_id=?", [.text(sessionID.uuidString)]).first,
+        guard let row = try await connection.query("SELECT visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision,collaboration_acknowledgement_json FROM collaboration_metadata WHERE session_id=?", [.text(sessionID.uuidString)]).first,
               let visibility = Visibility(rawValue: row.column("visibility")?.string ?? ""),
               let controllerUserID = row.column("controller_user_id")?.string
         else { return nil }
-        let acknowledgement = try row.column("goblin_acknowledgement_json")?.string.map {
+        let acknowledgement = try row.column("collaboration_acknowledgement_json")?.string.map {
             try decoder.decode(CollaborationAcknowledgement.self, from: Data($0.utf8))
         }
         return CollaborationMetadataSnapshot(sessionID: sessionID, visibility: visibility, collaborativeSteeringEnabled: row.column("collaborative_steering_enabled")?.integer == 1, controllerUserID: controllerUserID, policyRevision: Int64(row.column("policy_revision")?.integer ?? 1), controllerRevision: Int64(row.column("controller_revision")?.integer ?? 1), membershipRevision: Int64(row.column("membership_revision")?.integer ?? 1), collaborationAcknowledgement: acknowledgement)
@@ -1239,7 +1239,7 @@ public actor SQLiteServiceStore {
     private func upsertCollaboration(_ metadata: CollaborationMetadataSnapshot) async throws {
         let acknowledgement: SQLiteData = try metadata.collaborationAcknowledgement.map { try .text(encodeText($0)) } ?? .null
         _ = try await connection.query(
-            "INSERT INTO collaboration_metadata(session_id,schema_version,visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision,goblin_acknowledgement_json,updated_at) VALUES(?,1,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET visibility=excluded.visibility,collaborative_steering_enabled=excluded.collaborative_steering_enabled,controller_user_id=excluded.controller_user_id,policy_revision=excluded.policy_revision,controller_revision=excluded.controller_revision,membership_revision=excluded.membership_revision,goblin_acknowledgement_json=excluded.goblin_acknowledgement_json,updated_at=CURRENT_TIMESTAMP",
+            "INSERT INTO collaboration_metadata(session_id,schema_version,visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision,collaboration_acknowledgement_json,updated_at) VALUES(?,1,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET visibility=excluded.visibility,collaborative_steering_enabled=excluded.collaborative_steering_enabled,controller_user_id=excluded.controller_user_id,policy_revision=excluded.policy_revision,controller_revision=excluded.controller_revision,membership_revision=excluded.membership_revision,collaboration_acknowledgement_json=excluded.collaboration_acknowledgement_json,updated_at=CURRENT_TIMESTAMP",
             [.text(metadata.sessionID.uuidString), .text(metadata.visibility.rawValue), .integer(metadata.collaborativeSteeringEnabled ? 1 : 0), .text(metadata.controllerUserID), .integer(Int(metadata.policyRevision)), .integer(Int(metadata.controllerRevision)), .integer(Int(metadata.membershipRevision)), acknowledgement]
         )
     }
@@ -1632,7 +1632,7 @@ public actor SQLiteServiceStore {
         try await addColumnIfMissing(table: "service_metadata", column: "activation_generation", definition: "INTEGER NOT NULL DEFAULT 1")
         try await addColumnIfMissing(table: "service_metadata", column: "activation_token_digest", definition: "TEXT")
         try await addColumnIfMissing(table: "service_metadata", column: "activation_instance_id", definition: "TEXT")
-        try await addColumnIfMissing(table: "collaboration_metadata", column: "goblin_acknowledgement_json", definition: "TEXT")
+        try await addColumnIfMissing(table: "collaboration_metadata", column: "collaboration_acknowledgement_json", definition: "TEXT")
         try await addColumnIfMissing(table: "owned_resources", column: "external_id", definition: "TEXT")
         try await addColumnIfMissing(table: "owned_resources", column: "temporary_path_identity", definition: "TEXT")
         try await addColumnIfMissing(table: "owned_resources", column: "content_digest", definition: "TEXT")
@@ -1641,6 +1641,15 @@ public actor SQLiteServiceStore {
         try await addColumnIfMissing(table: "owned_resources", column: "updated_at", definition: "REAL NOT NULL DEFAULT 0")
         try await addColumnIfMissing(table: "snapshot_checkpoints", column: "retention_class", definition: "TEXT NOT NULL DEFAULT 'rolling'")
         try await addColumnIfMissing(table: "snapshot_checkpoints", column: "archive_id", definition: "TEXT")
+        _ = try await connection.query(
+            "CREATE TABLE IF NOT EXISTS operator_accounts(username TEXT PRIMARY KEY,password_salt TEXT NOT NULL,password_hash TEXT NOT NULL,iterations INTEGER NOT NULL,created_at TEXT NOT NULL)"
+        )
+        _ = try await connection.query(
+            "CREATE TABLE IF NOT EXISTS operator_sessions(session_id TEXT PRIMARY KEY,username TEXT NOT NULL,token_hash TEXT NOT NULL,created_at TEXT NOT NULL,expires_at REAL NOT NULL)"
+        )
+        _ = try await connection.query(
+            "CREATE TABLE IF NOT EXISTS operator_setup_tokens(token_hash TEXT PRIMARY KEY,created_at TEXT NOT NULL,consumed_at TEXT)"
+        )
         for statement in SchemaV2.statements {
             _ = try await connection.query(statement)
         }

@@ -91,7 +91,7 @@ final class AuthorityTests: XCTestCase {
             expiresAt: Date().addingTimeInterval(60),
             requestID: requestID,
             correlationID: correlationID,
-            keyID: "test-goblin",
+            keyID: "test-app",
             signature: "verified-upstream"
         )
         let mismatchedDecision = AuthorizationDecision(
@@ -1243,7 +1243,7 @@ private func signedDecision(
         expiresAt: Date().addingTimeInterval(30),
         requestID: UUID(),
         correlationID: UUID(),
-        keyID: "test-goblin",
+        keyID: "test-app",
         signature: "verified-upstream"
     )
 }

@@ -50,11 +50,11 @@ These are evidence, not deployment guarantees; E14 must reinspect immediately be
 | Delta | Rationale | Upstream/removal condition |
 |---|---|---|
 | Server-only SwiftPM graph and `RepoPromptServer` product | Linux must not resolve AppKit/SwiftUI/Sparkle/bridging dependencies | upstream once target ownership stabilizes; remove local delta after equivalent upstream server product lands |
-| `RepoPromptServiceProtocol` | stable DTO/event/error/signing contract for the chat-server integration | generally upstreamable; HMAC identities `goblin-app` / `goblin-sync` remain fork-local deployment strings |
+| `RepoPromptServiceProtocol` | stable DTO/event/error/signing contract for optional chat-host integration | generally upstreamable; HMAC identities are `app` / `sync` / `repoprompt-operator` |
 | `RepoPromptAgentRuntimeCore` / `RepoPromptWorkspaceRuntimeCore` | portable authority seams and deterministic ports | converge with upstream `RepoPromptDomainRuntime`; remove duplicates after macOS and MCP cutover |
 | `RepoPromptServicePersistence` | SQLiteNIO schema, migrations, events, idempotency, nonces, restore namespace | upstreamable server substrate |
 | `RepoPromptHeadlessRuntime` | exact-ID project/session authority and provider/process supervision | replace any overlapping types with upstream extracted runtime as it lands |
-| `RepoPromptServiceHTTP` / executable | Hummingbird TLS/HMAC/SSE/product service | server product delta; HMAC identities `goblin-app` / `goblin-sync` stay fork-local |
+| `RepoPromptServiceHTTP` / executable | Hummingbird TLS/HMAC/SSE/product service | server product delta; HMAC identities are `app` / `sync` / `repoprompt-operator` |
 | Ubuntu CI and `Dockerfile.server` | canonical Linux validation and image | upstreamable once release policy approves Linux artifacts |
 
 ## Current contract deviations / blockers
@@ -68,7 +68,7 @@ These are evidence, not deployment guarantees; E14 must reinspect immediately be
 7. Readiness currently covers startup migration/integrity/configuration and quiesce state; enabled-provider preflight, writable-volume capacity, and per-project degradation reporting are not yet complete.
 8. The 19 Remote/Iroh commits were preserved but not replayed for the scope reason above.
 
-Chat-server can rely on protocol v1 DTO/error names, store-scoped `storeId:sequence` cursors, TLS/HMAC header names, role separation, loopback health ports, and the implemented project/session/snapshot/event routes. They must treat `capability_missing` as expected for the incomplete tool/provider routes until the convergence work above lands.
+Chat hosts can rely on protocol v1 DTO/error names, store-scoped `storeId:sequence` cursors, TLS/HMAC header names, role separation, loopback health ports, and the implemented project/session/snapshot/event routes. They must treat `capability_missing` as expected for the incomplete tool/provider routes until the convergence work above lands.
 
 ## Local validation constraints
 

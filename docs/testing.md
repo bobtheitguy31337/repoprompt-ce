@@ -27,6 +27,7 @@ Do not use smoke as the only protection for deterministic logic. Without a prede
 ## Add and run root or provider XCTest coverage
 
 - **Root target:** place app-integrated and root-package tests under `Tests/RepoPromptTests` and validate with `make dev-test`.
+- **Server target:** place Linux/server contracts under `Tests/RepoPromptServerTests` and validate with `make dev-server-test`.
 - **Provider target:** place provider protocol, codec, translation, launch-argument, or model-mapping tests under `Packages/RepoPromptAgentProviders/Tests/RepoPromptClaudeCompatibleProviderTests` and validate with `make dev-provider-test`.
 - Keep one coherent contract per method. Labeled tables are appropriate when cases differ only by input, boundary, or expected outcome.
 - Control time, randomness, locale, environment, resources, ordering, and concurrency. Prefer gates, clocks, or continuations over sleeps, and verify meaningful cleanup or ownership.

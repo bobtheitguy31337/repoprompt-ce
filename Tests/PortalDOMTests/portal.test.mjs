@@ -3422,7 +3422,6 @@ test("standalone operator surfaces use relative portal APIs without chat-server"
     assert.match(call.path, /^api\/v1\//, call.path);
     assert.doesNotMatch(call.path, /^https?:/i);
     assert.doesNotMatch(call.path, /\/internal\//);
-    assert.doesNotMatch(call.path, /chat\.degentlemen/);
     assert.equal(call.headers.Authorization, undefined);
     assert.equal(call.headers["x-internal-signature"], undefined);
     assert.equal(call.headers["X-Internal-Signature"], undefined);

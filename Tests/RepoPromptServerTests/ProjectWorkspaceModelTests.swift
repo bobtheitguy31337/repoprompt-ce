@@ -19,7 +19,7 @@ final class ProjectWorkspaceModelTests: XCTestCase {
 
         let addition = try JSONDecoder.serviceDecoder.decode(
             AddProjectRepositoryInput.self,
-            from: Data(#"{"schemaVersion":1,"expectedRevision":1,"logicalName":"server","source":{"type":"gitClone","remote":"https://github.com/degentlemen/chat-server.git","ref":"main"}}"#.utf8)
+            from: Data(#"{"schemaVersion":1,"expectedRevision":1,"logicalName":"server","source":{"type":"gitClone","remote":"https://github.com/repoprompt/repoprompt-ce.git","ref":"main"}}"#.utf8)
         )
         XCTAssertEqual(addition.logicalName, "server")
         XCTAssertThrowsError(try JSONDecoder.serviceDecoder.decode(
@@ -28,7 +28,7 @@ final class ProjectWorkspaceModelTests: XCTestCase {
         ))
         XCTAssertThrowsError(try JSONDecoder.serviceDecoder.decode(
             AddProjectRepositoryInput.self,
-            from: Data(#"{"schemaVersion":1,"expectedRevision":1,"logicalName":"server","source":{"type":"gitClone","remote":"https://github.com/degentlemen/chat-server.git","ref":"main","token":"secret"}}"#.utf8)
+            from: Data(#"{"schemaVersion":1,"expectedRevision":1,"logicalName":"server","source":{"type":"gitClone","remote":"https://github.com/repoprompt/repoprompt-ce.git","ref":"main","token":"secret"}}"#.utf8)
         ))
     }
 
@@ -81,7 +81,7 @@ final class ProjectWorkspaceModelTests: XCTestCase {
         let firstInput = AddProjectRepositoryInput(
             expectedRevision: 1,
             logicalName: "server",
-            source: .init(remote: "https://github.com/degentlemen/chat-server.git", ref: "main")
+            source: .init(remote: "https://github.com/repoprompt/repoprompt-ce.git", ref: "main")
         )
         let first = try await authority.addProjectRepository(
             projectID: project.projectID,
@@ -104,7 +104,7 @@ final class ProjectWorkspaceModelTests: XCTestCase {
             input: .init(
                 expectedRevision: 2,
                 logicalName: "ops",
-                source: .init(remote: "https://github.com/degentlemen/chat-server.git", ref: "main")
+                source: .init(remote: "https://github.com/repoprompt/repoprompt-ce.git", ref: "main")
             ),
             externalActor: actor,
             idempotencyKey: "add-ops",
@@ -175,7 +175,7 @@ final class ProjectWorkspaceModelTests: XCTestCase {
                 input: .init(
                     expectedRevision: 1,
                     logicalName: "server",
-                    source: .init(remote: "https://github.com/degentlemen/chat-server.git", ref: "main")
+                    source: .init(remote: "https://github.com/repoprompt/repoprompt-ce.git", ref: "main")
                 ),
                 externalActor: actor,
                 idempotencyKey: "blocked-add",
@@ -241,7 +241,7 @@ final class ProjectWorkspaceModelTests: XCTestCase {
             "schemaVersion": 1,
             "configuredRoots": [],
             "git": [
-                "remoteRules": [["scheme": "https", "host": "github.com", "pathPrefix": "/degentlemen/"]],
+                "remoteRules": [["scheme": "https", "host": "github.com", "pathPrefix": "/repoprompt/"]],
                 "allowedRefPatterns": ["^main$"],
                 "deniedRefPatterns": [],
                 "maximumCloneBytes": 8_388_608,
@@ -343,7 +343,7 @@ private actor WorkspaceModelGitRunner: ProjectSourceGitRunning {
             return invocation.arguments[index + 1]
         }
         if invocation.arguments.contains("get-url") {
-            return "https://github.com/degentlemen/chat-server.git"
+            return "https://github.com/repoprompt/repoprompt-ce.git"
         }
         if invocation.arguments.contains("--verify") {
             return String(repeating: "a", count: 40)

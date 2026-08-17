@@ -723,7 +723,7 @@ final class AgentTurnIntentCompilerTests: XCTestCase {
     }
 
     func testStructuredFirstTurnFreezesSelectedMessageContextForCanonicalAndProviderInput() async throws {
-        let context = SelectedMessageContext(source: "goblin-explicit-selection", messages: [
+        let context = SelectedMessageContext(source: "explicit-selection", messages: [
             .init(roomID: "room-1", messageID: "message-1", text: "Exact selected chat text", senderID: "sender-1", timestamp: "2026-08-12T12:00:00Z", revision: "7", threadID: "thread-1")
         ])
         let provider = CompiledProviderTurnConfiguration(runtimeKind: .codex, providerRawModelValue: "gpt-5.6-sol-high", executionPolicy: .init(), supportsNativeImages: true, normalizedToolValues: [:])
@@ -1548,7 +1548,7 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
         let fixture = try await StructuredStartFixture.make()
         defer { Task { try? await fixture.store.close(); try? FileManager.default.removeItem(at: fixture.root) } }
         let submissionKey = UUID().uuidString.lowercased()
-        let selectedContext = SelectedMessageContext(source: "goblin-explicit-selection", messages: [
+        let selectedContext = SelectedMessageContext(source: "explicit-selection", messages: [
             .init(roomID: "room-1", messageID: "message-1", text: "Exact selected chat text", senderID: "sender-1", timestamp: "2026-08-12T12:00:00Z", revision: "3", threadID: "thread-1")
         ])
         let submission = AgentTurnSubmissionWire(

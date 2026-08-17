@@ -27,17 +27,21 @@ public struct CertificateIdentityRoleResolver: Sendable {
             guard let value = environment[name], !value.isEmpty else { throw ConfigurationError.missing(name) }
             return value.lowercased()
         }
-        let app = try required("REPOPROMPT_GOBLIN_APP_CERT_IDENTITY")
-        let sync = try required("REPOPROMPT_GOBLIN_SYNC_CERT_IDENTITY")
         let operatorIdentity = try required("REPOPROMPT_OPERATOR_CERT_IDENTITY")
-        guard Set([app, sync, operatorIdentity]).count == 3 else {
-            throw ConfigurationError.invalid("Client certificate identities must be unique across roles")
+        let app = environment["REPOPROMPT_APP_CERT_IDENTITY"].flatMap { $0.isEmpty ? nil : $0.lowercased() }
+        let sync = environment["REPOPROMPT_SYNC_CERT_IDENTITY"].flatMap { $0.isEmpty ? nil : $0.lowercased() }
+        if (app == nil) != (sync == nil) {
+            throw ConfigurationError.invalid("App and sync client certificate identities must be configured together")
         }
-        return Self(identities: [
-            app: .app,
-            sync: .sync,
-            operatorIdentity: .operatorRole
-        ])
+        var identities = [operatorIdentity: InternalRouteRole.operatorRole]
+        if let app, let sync {
+            guard Set([app, sync, operatorIdentity]).count == 3 else {
+                throw ConfigurationError.invalid("Client certificate identities must be unique across roles")
+            }
+            identities[app] = .app
+            identities[sync] = .sync
+        }
+        return Self(identities: identities)
     }
 
     public func role(certificate: NIOSSLCertificate) throws -> InternalRouteRole {

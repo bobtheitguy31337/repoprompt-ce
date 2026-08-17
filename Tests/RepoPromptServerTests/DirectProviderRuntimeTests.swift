@@ -227,7 +227,7 @@ final class DirectProviderRuntimeTests: XCTestCase {
             baseURL: nil,
             preferredModel: "openai/gpt-test",
             maximumOutputTokens: 8192,
-            customHeaders: ["HTTP-Referer": "https://chat.degentlemen.io", "X-Title": "Degentlemen Chat"],
+                customHeaders: ["HTTP-Referer": "https://example.invalid", "X-Title": "RepoPrompt Server"],
             contentTypePolicy: .applicationJSON,
             revision: 1,
             updatedAt: Date()

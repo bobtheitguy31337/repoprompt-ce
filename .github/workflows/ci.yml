@@ -192,8 +192,9 @@ jobs:
           ports="$(docker image inspect repoprompt-server:ci --format '{{json .Config.ExposedPorts}}')"
           grep -Fq '9443/tcp' <<<"$ports"
           grep -Fq '9080/tcp' <<<"$ports"
-          test "$(docker image inspect repoprompt-server:ci --format '{{index .Config.Labels "io.degentlemen.repoprompt.protocol-version"}}')" = "1"
-          test "$(docker image inspect repoprompt-server:ci --format '{{index .Config.Labels "io.degentlemen.repoprompt.provider.codex"}}')" = "0.147.0;app-server-v2"
+          test "$(docker image inspect repoprompt-server:ci --format '{{index .Config.Labels "io.repoprompt.protocol-version"}}')" = "1"
+          test "$(docker image inspect repoprompt-server:ci --format '{{index .Config.Labels "io.repoprompt.schema-version"}}')" = "6"
+          test "$(docker image inspect repoprompt-server:ci --format '{{index .Config.Labels "io.repoprompt.provider.codex"}}')" = "0.147.0;app-server-v2"
           docker run --rm --entrypoint /bin/sh repoprompt-server:ci -c '
             test "$(id -u)" = 65532
             test -x /usr/local/bin/RepoPromptServer

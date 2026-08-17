@@ -66,16 +66,16 @@ LABEL org.opencontainers.image.title="RepoPromptServer" \
       org.opencontainers.image.version="$REPOPROMPT_VERSION" \
       org.opencontainers.image.revision="$REPOPROMPT_COMMIT" \
       org.opencontainers.image.created="$SOURCE_DATE_EPOCH" \
-      io.degentlemen.repoprompt.protocol-version="1" \
-      io.degentlemen.repoprompt.schema-version="3" \
-      io.degentlemen.repoprompt.runtime-uid="65532" \
-      io.degentlemen.repoprompt.port.internal-api="9443/tcp;mtls" \
-      io.degentlemen.repoprompt.port.portal="9443/tcp;mtls-operator" \
-      io.degentlemen.repoprompt.port.health="9080/tcp;loopback-only" \
-      io.degentlemen.repoprompt.provider.codex="0.147.0;app-server-v2" \
-      io.degentlemen.repoprompt.provider.claude-compatible="2.1.226;stream-json-v1" \
-      io.degentlemen.repoprompt.provider.opencode="1.15.11;acp-v1" \
-      io.degentlemen.repoprompt.provider.cursor="2026.08.04-aaa8809;acp-v1-beta"
+      io.repoprompt.protocol-version="1" \
+      io.repoprompt.schema-version="6" \
+      io.repoprompt.runtime-uid="65532" \
+      io.repoprompt.port.internal-api="9443/tcp;mtls" \
+      io.repoprompt.port.portal="9443/tcp;mtls-operator" \
+      io.repoprompt.port.health="9080/tcp;loopback-only" \
+      io.repoprompt.provider.codex="0.147.0;app-server-v2" \
+      io.repoprompt.provider.claude-compatible="2.1.226;stream-json-v1" \
+      io.repoprompt.provider.opencode="1.15.11;acp-v1" \
+      io.repoprompt.provider.cursor="2026.08.04-aaa8809;acp-v1-beta"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git tini util-linux && rm -rf /var/lib/apt/lists/* && \
     groupadd --gid 65532 repoprompt && useradd --uid 65532 --gid 65532 --home-dir /var/lib/repoprompt --create-home --shell /usr/sbin/nologin repoprompt && \
     install -d -o 65532 -g 65532 /var/lib/repoprompt/state /var/lib/repoprompt/artifacts /srv/repoprompt/projects /srv/repoprompt/worktrees /var/cache/repoprompt

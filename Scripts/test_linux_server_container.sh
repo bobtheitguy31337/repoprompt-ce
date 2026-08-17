@@ -54,6 +54,24 @@ printf '%s' 'event-test-secret-00000000000000' >"$temporary/event.hmac"
 chmod 0755 "$temporary"
 chmod 0644 "$temporary"/*.crt "$temporary"/*.key "$temporary"/*.hmac
 
+run_operator_only_container() {
+  docker run -d --name "$container" --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m,uid=65532,gid=65532 \
+    --mount "type=bind,src=$temporary,dst=/run/repoprompt/trust,readonly" \
+    --mount "type=volume,src=$state_volume,dst=/var/lib/repoprompt/state" \
+    --mount "type=volume,src=$artifact_volume,dst=/var/lib/repoprompt/artifacts" \
+    --mount "type=volume,src=$project_volume,dst=/srv/repoprompt/projects" \
+    --mount "type=volume,src=$worktree_volume,dst=/srv/repoprompt/worktrees" \
+    --mount "type=volume,src=$cache_volume,dst=/var/cache/repoprompt" \
+    -e REPOPROMPT_TLS_CERT_FILE=/run/repoprompt/trust/server.crt \
+    -e REPOPROMPT_TLS_KEY_FILE=/run/repoprompt/trust/server.key \
+    -e REPOPROMPT_TLS_CLIENT_CA_FILE=/run/repoprompt/trust/ca.crt \
+    -e REPOPROMPT_OPERATOR_CERT_IDENTITY=operator.internal \
+    -e REPOPROMPT_ENABLED_PROVIDERS= \
+    -e REPOPROMPT_MINIMUM_FREE_BYTES=1 \
+    -e REPOPROMPT_MINIMUM_FREE_NODES=1 \
+    "$image" >/dev/null
+}
+
 run_container() {
   docker run -d --name "$container" --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m,uid=65532,gid=65532 \
     --mount "type=bind,src=$temporary,dst=/run/repoprompt/trust,readonly" \
@@ -65,12 +83,12 @@ run_container() {
     -e REPOPROMPT_TLS_CERT_FILE=/run/repoprompt/trust/server.crt \
     -e REPOPROMPT_TLS_KEY_FILE=/run/repoprompt/trust/server.key \
     -e REPOPROMPT_TLS_CLIENT_CA_FILE=/run/repoprompt/trust/ca.crt \
-    -e REPOPROMPT_GOBLIN_APP_HMAC_FILE=/run/repoprompt/trust/app.hmac \
-    -e REPOPROMPT_GOBLIN_SYNC_HMAC_FILE=/run/repoprompt/trust/sync.hmac \
+    -e REPOPROMPT_APP_HMAC_FILE=/run/repoprompt/trust/app.hmac \
+    -e REPOPROMPT_SYNC_HMAC_FILE=/run/repoprompt/trust/sync.hmac \
     -e REPOPROMPT_OPERATOR_HMAC_FILE=/run/repoprompt/trust/operator.hmac \
     -e REPOPROMPT_EVENT_HMAC_FILE=/run/repoprompt/trust/event.hmac \
-    -e REPOPROMPT_GOBLIN_APP_CERT_IDENTITY=app.internal \
-    -e REPOPROMPT_GOBLIN_SYNC_CERT_IDENTITY=sync.internal \
+    -e REPOPROMPT_APP_CERT_IDENTITY=app.internal \
+    -e REPOPROMPT_SYNC_CERT_IDENTITY=sync.internal \
     -e REPOPROMPT_OPERATOR_CERT_IDENTITY=operator.internal \
     -e REPOPROMPT_ENABLED_PROVIDERS= \
     -e REPOPROMPT_MINIMUM_FREE_BYTES=1 \
@@ -97,10 +115,10 @@ wait_ready() {
 
 # The image contract is part of the runtime API.
 test "$(docker image inspect "$image" --format '{{.Config.User}}')" = '65532:65532'
-test "$(docker image inspect "$image" --format '{{index .Config.Labels "io.degentlemen.repoprompt.schema-version"}}')" = '2'
+test "$(docker image inspect "$image" --format '{{index .Config.Labels "io.repoprompt.schema-version"}}')" = '6'
 test "$(docker image inspect "$image" --format '{{json .Config.ExposedPorts}}')" = '{"9080/tcp":{},"9443/tcp":{}}'
-test "$(docker image inspect "$image" --format '{{index .Config.Labels "io.degentlemen.repoprompt.port.internal-api"}}')" = '9443/tcp;mtls'
-test "$(docker image inspect "$image" --format '{{index .Config.Labels "io.degentlemen.repoprompt.port.health"}}')" = '9080/tcp;loopback-only'
+test "$(docker image inspect "$image" --format '{{index .Config.Labels "io.repoprompt.port.internal-api"}}')" = '9443/tcp;mtls'
+test "$(docker image inspect "$image" --format '{{index .Config.Labels "io.repoprompt.port.health"}}')" = '9080/tcp;loopback-only'
 
 # Portal resources must be readable and their directory traversable by the
 # image's non-root runtime user. SwiftPM build output may otherwise preserve
@@ -124,6 +142,11 @@ docker run --rm --entrypoint /bin/sh "$image" -c '
 docker run --rm --entrypoint /bin/sh "$image" -c \
   'codex --version | grep -F "0.147.0" && claude --version | grep -F "2.1.226" && opencode --version | grep -F "1.15.11" && cursor-agent --version | grep -F "2026.08.04-aaa8809"' >/dev/null
 docker run --rm --init --entrypoint /usr/local/bin/RepoPromptServer "$image" process-family-smoke | grep -F 'process-family smoke passed' >/dev/null
+
+run_operator_only_container
+wait_ready
+test "$(docker exec "$container" curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --resolve repoprompt:9443:127.0.0.1 --cacert /run/repoprompt/trust/ca.crt --cert /run/repoprompt/trust/operator.crt --key /run/repoprompt/trust/operator.key https://repoprompt:9443/portal/)" = '200'
+docker rm -f "$container" >/dev/null
 
 run_container
 wait_ready

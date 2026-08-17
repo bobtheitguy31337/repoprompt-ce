@@ -1,13 +1,13 @@
 ---
 name: rpce-contribution-check
-description: Validate RepoPrompt CE commits and pushes. Degentlemen sandbox delivery uses lightweight sandbox-commit/sandbox-push modes; upstream, production, release, and PR-ready work retains repository guardrails and heavyweight lanes. All paths preserve staged/outgoing redacted secret scanning, clean push boundaries, and destructive-operation approval.
+description: Validate RepoPrompt CE commits and pushes. Sandbox delivery uses lightweight sandbox-commit/sandbox-push modes; upstream, production, release, and PR-ready work retains repository guardrails and heavyweight lanes. All paths preserve staged/outgoing redacted secret scanning, clean push boundaries, and destructive-operation approval.
 ---
 
 # RepoPrompt CE Contribution Check
 
 Read `AGENTS.md` first and choose the lane for the actual destination.
 
-## Degentlemen sandbox lane
+## Sandbox lane
 
 After the coherent feature's single focused batch, use:
 

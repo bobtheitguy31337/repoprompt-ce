@@ -7460,7 +7460,76 @@
       clearAgentPoll();
     });
     renderRoute();
-    loadAll(false);
+    ensureOperatorSession().then((ready) => {
+      if (ready) loadAll(false);
+    });
+  }
+
+  async function ensureOperatorSession() {
+    const gate = document.getElementById("auth-gate");
+    const form = document.getElementById("auth-form");
+    const error = document.getElementById("auth-error");
+    const status = await api("api/v1/auth/status");
+    if (status.authenticated) {
+      gate.hidden = true;
+      return true;
+    }
+    gate.hidden = false;
+    if (!status.passwordLoginEnabled) {
+      document.getElementById("auth-title").textContent = "Operator certificate required";
+      document.getElementById("auth-copy").textContent =
+        "This server uses mutual TLS. Import the operator client certificate in your browser, then reload.";
+      form.hidden = true;
+      return false;
+    }
+    form.hidden = false;
+    const setup = !!status.needsSetup;
+    document.getElementById("auth-title").textContent = setup
+      ? "Create the operator password"
+      : "Sign in";
+    document.getElementById("auth-copy").textContent = setup
+      ? "This is the first launch. Choose a password for the operator account. If you are not on this machine, paste the setup token printed in the server log."
+      : "Enter the operator password to open the portal.";
+    document.getElementById("auth-token-field").hidden = !setup;
+    document.getElementById("auth-confirm-field").hidden = !setup;
+    document.getElementById("auth-password").autocomplete = setup
+      ? "new-password"
+      : "current-password";
+    document.getElementById("auth-submit").textContent = setup
+      ? "Create password"
+      : "Sign in";
+    return await new Promise((resolve) => {
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        error.hidden = true;
+        const password = document.getElementById("auth-password").value;
+        try {
+          if (setup) {
+            const confirmation = document.getElementById(
+              "auth-password-confirm",
+            ).value;
+            await api("api/v1/setup", {
+              method: "POST",
+              body: JSON.stringify({
+                password,
+                passwordConfirmation: confirmation,
+                setupToken: document.getElementById("auth-token").value.trim(),
+              }),
+            });
+          } else {
+            await api("api/v1/login", {
+              method: "POST",
+              body: JSON.stringify({ password }),
+            });
+          }
+          gate.hidden = true;
+          resolve(true);
+        } catch (failure) {
+          error.hidden = false;
+          error.textContent = failure.message;
+        }
+      });
+    });
   }
 
   if (window.__REPOPROMPT_PORTAL_TEST_HOOK__) {

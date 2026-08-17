@@ -1,6 +1,7 @@
 import Crypto
 import Foundation
 import Hummingbird
+import NIOCore
 import NIOSSL
 import RepoPromptAgentRuntimeCore
 import RepoPromptHeadlessRuntime
@@ -30,6 +31,7 @@ public struct RepoPromptHTTPService: Sendable {
     private let transcriptPresentation: AgentTranscriptPresentationService?
     private let portalDesktopSettings: PortalDesktopSettingsService
     private let portalPeerCertificateDER: Data?
+    private let portalPasswordLoginEnabled: Bool
 
     public init(
         authority: RepoPromptHeadlessAuthority,
@@ -48,7 +50,8 @@ public struct RepoPromptHTTPService: Sendable {
         submissionDispatchQueue: AgentSubmissionDispatchQueue? = nil,
         transcriptPresentation: AgentTranscriptPresentationService? = nil,
         portalDesktopSettings: PortalDesktopSettingsService? = nil,
-        portalPeerCertificateDER: Data? = nil
+        portalPeerCertificateDER: Data? = nil,
+        portalPasswordLoginEnabled: Bool = true
     ) {
         self.authority = authority
         self.store = store
@@ -68,6 +71,7 @@ public struct RepoPromptHTTPService: Sendable {
         self.transcriptPresentation = transcriptPresentation
         self.portalDesktopSettings = portalDesktopSettings ?? PortalDesktopSettingsService(store: store)
         self.portalPeerCertificateDER = portalPeerCertificateDER
+        self.portalPasswordLoginEnabled = portalPasswordLoginEnabled
         self.readiness = readiness ?? RepoPromptReadinessService(
             authority: authority,
             store: store,
@@ -85,27 +89,40 @@ public struct RepoPromptHTTPService: Sendable {
     public func internalRouter() -> Router<RepoPromptRequestContext> {
         let router = Router<RepoPromptRequestContext>(context: RepoPromptRequestContext.self)
         router.get("/portal") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
             if request.uri.string.split(separator: "?", maxSplits: 1).first == "/portal" {
                 return RepoPromptPortalAssets.canonicalRedirect()
             }
             return try RepoPromptPortalAssets.response(for: .index)
         } }
         router.get("/portal/assets/:name") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
             let name = try context.parameters.require("name")
             guard let asset = RepoPromptPortalAssets.Asset(routeName: name) else {
                 throw ServiceAPIError(code: .notFound, message: "Portal asset not found")
             }
             return try RepoPromptPortalAssets.response(for: asset)
         } }
+        router.get("/portal/api/v1/auth/status") { request, context in await portalRespond(request) {
+            try portalJSON(await portalAuthStatus(request: request, context: context))
+        } }
+        router.post("/portal/api/v1/setup") { request, context in await portalRespond(request) {
+            try validatePortalMutation(request)
+            return try await completePortalSetup(request: request, context: context)
+        } }
+        router.post("/portal/api/v1/login") { request, context in await portalRespond(request) {
+            try validatePortalMutation(request)
+            return try await completePortalLogin(request: request)
+        } }
+        router.post("/portal/api/v1/logout") { request, context in await portalRespond(request) {
+            try validatePortalMutation(request)
+            return try await completePortalLogout(request: request)
+        } }
         router.get("/portal/api/v1/bootstrap") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             let bootstrap = try await portalBootstrap()
             return try portalJSON(bootstrap)
         } }
         router.get("/portal/api/v1/sessions/:id/transcript") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let limit = request.uri.queryParameters.get("limit", as: Int.self) ?? 200
             let beforeSequence = request.uri.queryParameters.get("beforeSequence", as: Int64.self)
@@ -119,7 +136,7 @@ public struct RepoPromptHTTPService: Sendable {
             ))
         } }
         router.post("/portal/api/v1/sessions") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(PortalCreateSessionRequest.self, from: data)
@@ -160,7 +177,7 @@ public struct RepoPromptHTTPService: Sendable {
             return try portalJSON(RepoPromptPortalSessionProjection.project(snapshot), status: .accepted)
         } }
         router.post("/portal/api/v1/sessions/:id/messages") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
@@ -176,182 +193,182 @@ public struct RepoPromptHTTPService: Sendable {
             return try portalJSON(receipt, status: .accepted)
         } }
         router.get("/portal/api/v1/desktop-settings") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             return try await portalJSON(requirePortalDesktopSettings().snapshot())
         } }
         router.patch("/portal/api/v1/desktop-settings") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let input = try await JSONDecoder.serviceDecoder.decode(UpdatePortalDesktopSettingsRequest.self, from: bodyData(request))
             return try await portalJSON(requirePortalDesktopSettings().update(input))
         } }
         router.get("/portal/api/v1/settings/agent-models") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             return try await portalJSON(requireServerSettings().agentModels())
         } }
         router.patch("/portal/api/v1/settings/agent-models") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let input = try await JSONDecoder.serviceDecoder.decode(ReplaceGlobalAgentModelsRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().replaceGlobalAgentModels(input, attribution: principal.settingsAttribution))
         } }
         router.post("/portal/api/v1/settings/agent-models/apply-recommendations") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let input = try await JSONDecoder.serviceDecoder.decode(ApplyAgentModelRecommendationsRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().applyGlobalAgentModelRecommendations(input, attribution: principal.settingsAttribution))
         } }
         router.get("/portal/api/v1/projects/:id/settings/agent-models") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             let projectID = try context.parameters.require("id", as: UUID.self)
             return try await portalJSON(requireServerSettings().agentModels(projectID: projectID))
         } }
         router.patch("/portal/api/v1/projects/:id/settings/agent-models") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             let input = try await JSONDecoder.serviceDecoder.decode(ReplaceProjectAgentModelsRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().replaceProjectAgentModels(projectID: projectID, request: input, attribution: principal.settingsAttribution))
         } }
         router.post("/portal/api/v1/projects/:id/settings/agent-models/copy-global") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             let input = try await JSONDecoder.serviceDecoder.decode(CopyGlobalAgentModelsToProjectRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().copyGlobalAgentModelsToProject(projectID: projectID, request: input, attribution: principal.settingsAttribution))
         } }
         router.post("/portal/api/v1/projects/:id/settings/agent-models/copy-project") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             let input = try await JSONDecoder.serviceDecoder.decode(CopyProjectAgentModelsToGlobalRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().copyProjectAgentModelsToGlobal(projectID: projectID, request: input, attribution: principal.settingsAttribution))
         } }
         router.post("/portal/api/v1/projects/:id/settings/agent-models/apply-recommendations") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             let input = try await JSONDecoder.serviceDecoder.decode(ApplyAgentModelRecommendationsRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().applyProjectAgentModelRecommendations(projectID: projectID, request: input, attribution: principal.settingsAttribution))
         } }
         router.get("/portal/api/v1/settings/subagent-permissions") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             return try await portalJSON(requireServerSettings().subagentPermissions())
         } }
         router.patch("/portal/api/v1/settings/subagent-permissions") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let input = try await JSONDecoder.serviceDecoder.decode(ReplaceSubagentPermissionSettingsRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().replaceSubagentPermissions(input, attribution: principal.settingsAttribution))
         } }
         router.get("/portal/api/v1/settings/direct-agent-permissions") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             return try await portalJSON(requireServerSettings().directAgentPermissions())
         } }
         router.patch("/portal/api/v1/settings/direct-agent-permissions") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let input = try await JSONDecoder.serviceDecoder.decode(ReplaceDirectAgentPermissionsSettingsRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().replaceDirectAgentPermissions(input, attribution: principal.settingsAttribution))
         } }
         router.get("/portal/api/v1/settings/context-builder") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             return try await portalJSON(requireServerSettings().contextBuilder())
         } }
         router.patch("/portal/api/v1/settings/context-builder") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let input = try await JSONDecoder.serviceDecoder.decode(ReplaceGlobalContextBuilderSettingsRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().replaceGlobalContextBuilder(input, attribution: principal.settingsAttribution))
         } }
         router.get("/portal/api/v1/projects/:id/settings/context-builder") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             let projectID = try context.parameters.require("id", as: UUID.self)
             return try await portalJSON(requireServerSettings().contextBuilder(projectID: projectID))
         } }
         router.patch("/portal/api/v1/projects/:id/settings/context-builder") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             let input = try await JSONDecoder.serviceDecoder.decode(ReplaceProjectContextBuilderSettingsRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().replaceProjectContextBuilder(projectID: projectID, request: input, attribution: principal.settingsAttribution))
         } }
         router.post("/portal/api/v1/projects/:id/settings/context-builder/copy-global") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             let input = try await JSONDecoder.serviceDecoder.decode(CopyGlobalContextBuilderToProjectRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().copyGlobalContextBuilderToProject(projectID: projectID, request: input, attribution: principal.settingsAttribution))
         } }
         router.get("/portal/api/v1/settings/model-presets") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             return try await portalJSON(requireServerSettings().modelPresets())
         } }
         router.patch("/portal/api/v1/settings/model-presets") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let input = try await JSONDecoder.serviceDecoder.decode(ReplaceMCPModelPresetsRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().replaceModelPresets(input, attribution: principal.settingsAttribution))
         } }
         router.get("/portal/api/v1/settings/advanced") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             return try await portalJSON(requireServerSettings().advanced())
         } }
         router.patch("/portal/api/v1/settings/advanced") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let input = try await JSONDecoder.serviceDecoder.decode(ReplaceAdvancedServerSettingsRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().replaceAdvanced(input, attribution: principal.settingsAttribution))
         } }
         router.get("/portal/api/v1/settings/workspace-approvals") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             return try await portalJSON(requireServerSettings().workspaceApprovals())
         } }
         router.patch("/portal/api/v1/settings/workspace-approvals") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let input = try await JSONDecoder.serviceDecoder.decode(ReplaceWorkspaceApprovalSettingsRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().replaceWorkspaceApprovals(input, attribution: principal.settingsAttribution))
         } }
         router.get("/portal/api/v1/settings/mcp-disabled-tools") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             return try await portalJSON(requireServerSettings().mcpDisabledTools())
         } }
         router.patch("/portal/api/v1/settings/mcp-disabled-tools") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let input = try await JSONDecoder.serviceDecoder.decode(ReplaceMCPDisabledToolsSettingsRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().replaceMCPDisabledTools(input, attribution: principal.settingsAttribution))
         } }
         router.get("/portal/api/v1/settings/show-model-presets") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             return try await portalJSON(requireServerSettings().showModelPresets())
         } }
         router.patch("/portal/api/v1/settings/show-model-presets") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let input = try await JSONDecoder.serviceDecoder.decode(ReplaceMCPShowModelPresetsSettingsRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().replaceShowModelPresets(input, attribution: principal.settingsAttribution))
         } }
         router.get("/portal/api/v1/sessions/:id/selection") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             return try await portalJSON(authority.selectionSnapshot(sessionID: sessionID))
         } }
         router.get("/portal/api/v1/projects/:id/selection-presets") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             let projectID = try context.parameters.require("id", as: UUID.self)
             return try await portalJSON(authority.projectSelectionPresets(projectID: projectID))
         } }
         router.post("/portal/api/v1/projects/:id/selection-presets") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             let input = try await JSONDecoder.serviceDecoder.decode(CreateProjectSelectionPresetRequest.self, from: bodyData(request))
             return try await portalJSON(authority.createProjectSelectionPreset(projectID: projectID, request: input, attribution: principal.settingsAttribution), status: .created)
         } }
         router.patch("/portal/api/v1/projects/:id/selection-presets/:presetID") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             let presetID = try context.parameters.require("presetID", as: UUID.self)
@@ -359,7 +376,7 @@ public struct RepoPromptHTTPService: Sendable {
             return try await portalJSON(authority.updateProjectSelectionPreset(projectID: projectID, presetID: presetID, request: input, attribution: principal.settingsAttribution))
         } }
         router.delete("/portal/api/v1/projects/:id/selection-presets/:presetID") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             let presetID = try context.parameters.require("presetID", as: UUID.self)
@@ -367,39 +384,39 @@ public struct RepoPromptHTTPService: Sendable {
             return try await portalJSON(authority.deleteProjectSelectionPreset(projectID: projectID, presetID: presetID, request: input, attribution: principal.settingsAttribution))
         } }
         router.post("/portal/api/v1/projects/:id/selection-presets/reorder") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             let input = try await JSONDecoder.serviceDecoder.decode(ReorderProjectSelectionPresetsRequest.self, from: bodyData(request))
             return try await portalJSON(authority.reorderProjectSelectionPresets(projectID: projectID, request: input, attribution: principal.settingsAttribution))
         } }
         router.post("/portal/api/v1/projects/:id/selection-presets/capture") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             let input = try await JSONDecoder.serviceDecoder.decode(CaptureProjectSelectionPresetRequest.self, from: bodyData(request))
             return try await portalJSON(authority.captureProjectSelectionPreset(projectID: projectID, request: input, attribution: principal.settingsAttribution), status: .created)
         } }
         router.post("/portal/api/v1/projects/:id/selection-presets/apply") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             let input = try await JSONDecoder.serviceDecoder.decode(ApplyProjectSelectionPresetRequest.self, from: bodyData(request))
             return try await portalJSON(authority.applyProjectSelectionPreset(projectID: projectID, request: input, actor: principal.externalActor))
         } }
         router.get("/portal/api/v1/workflows") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             return try await portalJSON(authority.workflowRepositorySnapshot())
         } }
         router.post("/portal/api/v1/workflows") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let data = try await bodyData(request)
             let input = try Self.decodeStrictWorkflowPayload(CreateServerWorkflowRequest.self, data: data, allowedKeys: ["expectedRevision", "name", "definition", "enabled", "visible", "featured"])
             return try await portalJSON(authority.createWorkflow(input, attribution: principal.settingsAttribution), status: .created)
         } }
         router.patch("/portal/api/v1/workflows/:id") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let workflowID = try context.parameters.require("id")
             let data = try await bodyData(request)
@@ -407,7 +424,7 @@ public struct RepoPromptHTTPService: Sendable {
             return try await portalJSON(authority.updateWorkflow(workflowID: workflowID, request: input, attribution: principal.settingsAttribution))
         } }
         router.delete("/portal/api/v1/workflows/:id") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let workflowID = try context.parameters.require("id")
             let data = try await bodyData(request)
@@ -415,7 +432,7 @@ public struct RepoPromptHTTPService: Sendable {
             return try await portalJSON(authority.deleteWorkflow(workflowID: workflowID, request: input, attribution: principal.settingsAttribution))
         } }
         router.post("/portal/api/v1/workflows/:id/clone") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let workflowID = try context.parameters.require("id")
             let data = try await bodyData(request)
@@ -423,7 +440,7 @@ public struct RepoPromptHTTPService: Sendable {
             return try await portalJSON(authority.cloneWorkflow(workflowID: workflowID, request: input, attribution: principal.settingsAttribution), status: .created)
         } }
         router.patch("/portal/api/v1/workflows/:id/visibility") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let workflowID = try context.parameters.require("id")
             let data = try await bodyData(request)
@@ -431,37 +448,37 @@ public struct RepoPromptHTTPService: Sendable {
             return try await portalJSON(authority.setWorkflowVisibility(workflowID: workflowID, request: input, attribution: principal.settingsAttribution))
         } }
         router.post("/portal/api/v1/workflows/reorder") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let data = try await bodyData(request)
             let input = try Self.decodeStrictWorkflowPayload(ReorderServerWorkflowsRequest.self, data: data, allowedKeys: ["expectedRevision", "featuredWorkflowIDs"])
             return try await portalJSON(authority.reorderWorkflows(input, attribution: principal.settingsAttribution))
         } }
         router.patch("/portal/api/v1/workflows/preferences") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let data = try await bodyData(request)
             let input = try Self.decodeStrictWorkflowPayload(UpdateServerWorkflowPreferencesRequest.self, data: data, allowedKeys: ["expectedRevision", "includeSessionCleanupGuidance"])
             return try await portalJSON(authority.updateWorkflowPreferences(input, attribution: principal.settingsAttribution))
         } }
         router.post("/portal/api/v1/workflows/reload") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let data = try await bodyData(request)
             let input = try Self.decodeStrictWorkflowPayload(ReloadServerWorkflowsRequest.self, data: data, allowedKeys: ["expectedRevision"])
             return try await portalJSON(authority.reloadWorkflows(input, attribution: principal.settingsAttribution))
         } }
         router.get("/portal/api/v1/provider-settings") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             let catalog = try await requireProviderSettings().catalog()
             return try portalJSON(catalog)
         } }
         router.get("/portal/api/v1/provider-settings/:id/direct-configuration") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(context: context)
+            _ = try await authenticatePortal(request: request, context: context)
             return try await portalJSON(requireProviderSettings().directConfiguration(providerID: providerSettingsID(context)))
         } }
         router.patch("/portal/api/v1/provider-settings/:id/direct-configuration") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let input = try await JSONDecoder.serviceDecoder.decode(UpdateDirectProviderConfigurationRequest.self, from: bodyData(request))
             let configuration = try await requireProviderSettings().updateDirectConfiguration(
@@ -472,7 +489,7 @@ public struct RepoPromptHTTPService: Sendable {
             return try portalJSON(configuration)
         } }
         router.patch("/portal/api/v1/provider-settings/:id") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let id = try context.parameters.require("id")
             guard let providerID = ProviderSettingsID(rawValue: id) else {
@@ -484,21 +501,21 @@ public struct RepoPromptHTTPService: Sendable {
             return try portalJSON(snapshot)
         } }
         router.post("/portal/api/v1/provider-settings/:id/enable") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let input = try await JSONDecoder.serviceDecoder.decode(SetProviderEnabledRequest.self, from: bodyData(request))
             let snapshot = try await requireProviderSettings().setEnabled(providerID: providerSettingsID(context), enabled: true, request: input, attribution: principal.providerAttribution)
             return try portalJSON(snapshot)
         } }
         router.post("/portal/api/v1/provider-settings/:id/disable") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let input = try await JSONDecoder.serviceDecoder.decode(SetProviderEnabledRequest.self, from: bodyData(request))
             let snapshot = try await requireProviderSettings().setEnabled(providerID: providerSettingsID(context), enabled: false, request: input, attribution: principal.providerAttribution)
             return try portalJSON(snapshot)
         } }
         router.post("/portal/api/v1/provider-settings/:id/auth-flows") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let id = try context.parameters.require("id")
             guard let providerID = ProviderSettingsID(rawValue: id) else {
@@ -514,7 +531,7 @@ public struct RepoPromptHTTPService: Sendable {
             return try portalJSON(challenge, status: .accepted)
         } }
         router.post("/portal/api/v1/provider-settings/:id/connect") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let providerID = try providerSettingsID(context)
             let input = try await JSONDecoder.serviceDecoder.decode(ConnectProviderRequest.self, from: bodyData(request))
@@ -522,31 +539,31 @@ public struct RepoPromptHTTPService: Sendable {
             return try portalJSON(snapshot, status: .created)
         } }
         router.post("/portal/api/v1/provider-settings/:id/test") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let snapshot = try await requireProviderSettings().testConnection(providerID: providerSettingsID(context), attribution: principal.providerAttribution)
             return try portalJSON(snapshot)
         } }
         router.post("/portal/api/v1/provider-settings/:id/disconnect") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let snapshot = try await requireProviderSettings().disconnect(providerID: providerSettingsID(context), attribution: principal.providerAttribution)
             return try portalJSON(snapshot)
         } }
         router.post("/portal/api/v1/provider-settings/:id/revoke") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let snapshot = try await requireProviderSettings().disconnect(providerID: providerSettingsID(context), attribution: principal.providerAttribution, revoke: true)
             return try portalJSON(snapshot)
         } }
         router.get("/portal/api/v1/provider-auth-flows/:flowID") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             let flowID = try context.parameters.require("flowID", as: UUID.self)
             let status = try await requireProviderSettings().pollAuthFlow(flowID: flowID, ownerID: principal.actorID)
             return try portalJSON(status)
         } }
         router.delete("/portal/api/v1/provider-auth-flows/:flowID") { request, context in await portalRespond(request) {
-            let principal = try await authenticatePortal(context: context)
+            let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
             let flowID = try context.parameters.require("flowID", as: UUID.self)
             try await requireProviderSettings().cancelAuthFlow(flowID: flowID, ownerID: principal.actorID)
@@ -1276,9 +1293,109 @@ public struct RepoPromptHTTPService: Sendable {
         let externalActor: ExternalActor
     }
 
-    private func authenticatePortal(context: RepoPromptRequestContext) async throws -> PortalAuthenticatedPrincipal {
+    private struct PortalAuthStatusResponse: Encodable {
+        let needsSetup: Bool
+        let authenticated: Bool
+        let username: String?
+        let passwordLoginEnabled: Bool
+    }
+
+    private struct PortalSetupRequest: Decodable {
+        let password: String
+        let passwordConfirmation: String
+        let setupToken: String?
+    }
+
+    private struct PortalLoginRequest: Decodable {
+        let username: String?
+        let password: String
+    }
+
+    private func portalAuthStatus(request: Request, context: RepoPromptRequestContext) async throws -> PortalAuthStatusResponse {
+        let hasAccount = try await store.hasOperatorAccount()
+        let needsSetup = portalPasswordLoginEnabled && !hasAccount
+        let principal = try? await authenticatePortal(request: request, context: context)
+        return PortalAuthStatusResponse(
+            needsSetup: needsSetup,
+            authenticated: principal != nil,
+            username: principal.map { $0.externalActor.username },
+            passwordLoginEnabled: portalPasswordLoginEnabled
+        )
+    }
+
+    private func completePortalSetup(request: Request, context: RepoPromptRequestContext) async throws -> Response {
+        guard portalPasswordLoginEnabled else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Password setup is not enabled for this server")
+        }
+        let input = try JSONDecoder.serviceDecoder.decode(PortalSetupRequest.self, from: try await bodyData(request))
+        guard input.password == input.passwordConfirmation else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Password confirmation does not match")
+        }
+        try await store.createOperatorAccount(
+            password: input.password,
+            setupToken: input.setupToken,
+            allowMissingSetupToken: isLoopback(context)
+        )
+        let token = try await store.createOperatorSession()
+        return portalSessionResponse(token: token, status: .created)
+    }
+
+    private func completePortalLogin(request: Request) async throws -> Response {
+        guard portalPasswordLoginEnabled else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Password login is not enabled for this server")
+        }
+        let input = try JSONDecoder.serviceDecoder.decode(PortalLoginRequest.self, from: try await bodyData(request))
+        let username = (input.username?.isEmpty == false ? input.username : nil) ?? SQLiteServiceStore.defaultOperatorUsername
+        guard try await store.verifyOperatorPassword(username: username, password: input.password) else {
+            throw ServiceAPIError(code: .internalAuthFailed, message: "Operator username or password is incorrect")
+        }
+        let token = try await store.createOperatorSession(username: username)
+        return portalSessionResponse(token: token)
+    }
+
+    private func completePortalLogout(request: Request) async throws -> Response {
+        if let token = operatorSessionToken(from: request) {
+            try await store.deleteOperatorSession(token: token)
+        }
+        var response = try portalJSON(["ok": true])
+        response.headers[.setCookie] = "rpce_operator_session=; Path=/portal; HttpOnly; SameSite=Strict; Secure; Max-Age=0"
+        return response
+    }
+
+    private func portalSessionResponse(token: String, status: HTTPResponse.Status = .ok) -> Response {
+        var response = (try? portalJSON(["ok": true], status: status)) ?? Response(status: status)
+        response.headers[.setCookie] = "rpce_operator_session=\(token); Path=/portal; HttpOnly; SameSite=Strict; Secure; Max-Age=43200"
+        return response
+    }
+
+    private func operatorSessionToken(from request: Request) -> String? {
+        guard let header = request.headers[.cookie] else { return nil }
+        return header.split(separator: ";").lazy
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { $0.hasPrefix("rpce_operator_session=") }
+            .map { String($0.dropFirst("rpce_operator_session=".count)) }
+    }
+
+    private func isLoopback(_ context: RepoPromptRequestContext) -> Bool {
+        guard let ip = context.channel.remoteAddress?.ipAddress else { return false }
+        return ip == "127.0.0.1" || ip == "::1" || ip == "0:0:0:0:0:0:0:1"
+    }
+
+    private func authenticatePortal(request: Request, context: RepoPromptRequestContext) async throws -> PortalAuthenticatedPrincipal {
+        if let token = operatorSessionToken(from: request),
+           let username = try await store.operatorSessionUsername(token: token)
+        {
+            let actorID = "operator:\(username)"
+            let actorLabel = "\(username) portal"
+            return PortalAuthenticatedPrincipal(
+                actorID: actorID,
+                providerAttribution: ProviderMutationAttribution(actorID: actorID, actorLabel: actorLabel, channel: "portal-password"),
+                settingsAttribution: SettingsMutationAttribution(actorID: actorID, actorLabel: actorLabel, channel: "portal-password"),
+                externalActor: ExternalActor(userID: actorID, username: username, displayName: actorLabel)
+            )
+        }
         guard let certificateRoleResolver else {
-            throw ServiceAPIError(code: .internalAuthFailed, message: "An authorized portal client certificate is required")
+            throw ServiceAPIError(code: .internalAuthFailed, message: "Sign in to the operator portal")
         }
         let certificate: NIOSSLCertificate
         if let portalPeerCertificateDER {
@@ -1367,7 +1484,7 @@ public struct RepoPromptHTTPService: Sendable {
 
     private func providerAttribution(_ auth: AuthenticatedInternalRequest) -> ProviderMutationAttribution {
         if let actor = auth.decision?.actor {
-            return .init(actorID: actor.userID, actorLabel: actor.username, channel: "goblin-app")
+            return .init(actorID: actor.userID, actorLabel: actor.username, channel: "app")
         }
         return .init(actorID: "signing-key:\(auth.keyID)", actorLabel: auth.role.rawValue, channel: "internal-hmac")
     }
@@ -1553,7 +1670,7 @@ public struct RepoPromptHTTPService: Sendable {
 
     private func authenticate(_ request: Request, context: RepoPromptRequestContext, body: Data, roles: Set<InternalRouteRole>, operation: String, projectID: UUID? = nil, sessionID: UUID? = nil, pathAndQuery: String? = nil) async throws -> AuthenticatedInternalRequest {
         guard let keyID = request.headers[.internalKeyID], let timestamp = request.headers[.internalTimestamp], let nonce = request.headers[.internalNonce], let bodyDigest = request.headers[.internalBodyDigest], let signature = request.headers[.internalSignature] else { throw ServiceAPIError(code: .internalAuthFailed, message: "Signed internal headers are required") }
-        let decisionHeader = request.headers[.authorizationDecision] ?? request.headers[.legacyAuthorizationDecision]
+        let decisionHeader = request.headers[.authorizationDecision]
         let decisionData = decisionHeader.flatMap(CanonicalSigning.base64URLDecode)
         let authenticated = try await authenticator.verify(SignedInternalRequest(method: String(describing: request.method), pathAndQuery: pathAndQuery ?? request.uri.string, timestamp: timestamp, nonce: nonce, body: body, bodyDigest: bodyDigest, authorizationDecisionData: decisionData, authorizationDecisionDigest: request.headers[.internalAuthorizationDigest], keyID: keyID, signature: signature), allowedRoles: roles, operation: operation, projectID: projectID, sessionID: sessionID)
         if let certificateRoleResolver {

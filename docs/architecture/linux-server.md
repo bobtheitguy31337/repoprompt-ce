@@ -1,8 +1,8 @@
 # RepoPrompt Linux Server Authority
 
-Status: implementation baseline for E0-E6 (2026-08-09)
+Status: operator-only standalone boot (2026-08-17). The 2026-08-09 E0–E6 extraction remains the architectural baseline.
 
-`RepoPromptServer` is a non-UI Swift executable and the only writer for one server state database. The executable parses environment configuration and delegates to `RepoPromptServerRunner`; domain and transport logic do not live in the executable target.
+`RepoPromptServer` is a non-UI Swift executable and the only writer for one server state database. The executable parses environment configuration and delegates to `RepoPromptServerRunner`; domain and transport logic do not live in the executable target. Chat collaboration is an optional HMAC adapter. First-run operator password login is enough to serve `/portal`. Mutual TLS remains optional for production.
 
 ## Target graph
 
@@ -35,7 +35,7 @@ Linux, and macOS builds with `REPOPROMPT_SERVER_ONLY=1`, resolve only this graph
 
 ## Persistence
 
-`RepoPromptServicePersistence` uses SQLiteNIO 1.13.0. Startup enables foreign keys, WAL, `synchronous=FULL`, and a five-second busy timeout, applies checksum-addressed schema v1, and runs `PRAGMA quick_check` before readiness.
+`RepoPromptServicePersistence` uses SQLiteNIO 1.13.0. Startup enables foreign keys, WAL, `synchronous=FULL`, and a five-second busy timeout, applies checksum-addressed schema migrations through **schema v6**, and runs `PRAGMA quick_check` before readiness.
 
 The v1 migration creates the complete E4 table inventory: service metadata, projects and roots, templates and selections, sessions/agents/runs, worktrees, workflows, process families/members, interactions, execution permissions, contexts/transcripts/events, artifacts/owned resources, snapshots, idempotency, nonces, audit, and migrations. Project/session snapshots, transcript rows, canonical events, and idempotency results publish in one `BEGIN IMMEDIATE` transaction. Global sequence allocation is store-scoped. Restore activation assigns a fresh `store_id` and records provenance.
 
@@ -43,14 +43,14 @@ The v1 migration creates the complete E4 table inventory: service metadata, proj
 
 - Mutual TLS 1.3 listener: `0.0.0.0:9443` by default.
 - Content-free loopback health listener: `127.0.0.1:9080`.
-- Roles are closed: `goblin-app`, `goblin-sync`, and `repoprompt-operator`.
+- Roles encode as `app`, `sync`, and `repoprompt-operator`. First-run portal login is an operator password. Mutual TLS and integration HMAC files are optional; omit them for a local password-mode boot.
 - Requests use canonical method/path/timestamp/nonce/body/decision/key-ID HMAC input.
 - Nonces persist before dispatch and reject replay.
 - Human operations require a separately signed, operation/request/target-bound authorization decision with a maximum 30-second lifetime. When that decision is present, Linux binds it (operation, actor, target, digest, expiry, and collaboration revisions) and does not re-evaluate local creator/controller/steering eligibility. Standalone portal, operator MCP, and unsigned in-process callers still use local host policy.
 - Agent Models persist as a global profile plus optional per-project envelopes. The project key is the Linux multi-user substitute for Desktop’s window workspace. Inheritance still matches Desktop: inherit uses the global profile even when a leftover project snapshot exists; switching to override materializes from that leftover or from global; global writes store `inheritGlobal` rather than `projectOverride`; and copy is bidirectional (`copy-global` and `copy-project`).
 - SSE subscribes before replay, drains durable pages to a captured watermark, deduplicates the bounded live buffer by global sequence, and emits signed application-framed events; lagging subscribers are disconnected with a reconnect cursor.
 - Cursor namespace changes or replay-floor violations return the stable `cursor_expired` contract.
-- Thin-client composer surfaces stay on the internal API: `catalog/composer-suggestions`, project `composer-attachments` stage/resolve/preview/delete, and turn/start `attachmentIds` / `taggedFiles` / `resolvedSuggestionTokens`. Chat-server forwards those instead of owning a leftover composer store.
+- Thin-client composer surfaces stay on the internal API: `catalog/composer-suggestions`, project `composer-attachments` stage/resolve/preview/delete, and turn/start `attachmentIds` / `taggedFiles` / `resolvedSuggestionTokens`. A chat host forwards those instead of owning a leftover composer store.
 
 Provider and Git credentials are not accepted through HTTP and are never stored in the service database. Secret values are loaded from files; the executable does not print them.
 
@@ -72,13 +72,13 @@ Agent Models scope is a Linux multi-user extension keyed by **project**, not a D
 
 ## Image contract
 
-`Dockerfile.server` builds only `RepoPromptServer`, runs it as fixed UID/GID 65532, includes `tini` and `curl`, and retains image metadata for both fixed ports: `9443/tcp` is the mTLS internal API and `9080/tcp` is the loopback-only health listener used by the image probe. The `io.degentlemen.repoprompt.port.*` OCI labels make those scopes explicit; deployments must not publish 9080. Compose must still set read-only root, dropped capabilities, no-new-privileges, resource/PID/log bounds, persistent state/project/worktree/cache volumes, internal networks, and runtime secret mounts.
+`Dockerfile.server` builds only `RepoPromptServer`, runs it as fixed UID/GID 65532, includes `tini` and `curl`, and retains image metadata for both fixed ports: `9443/tcp` is the mTLS internal API and `9080/tcp` is the loopback-only health listener used by the image probe. OCI labels use `io.repoprompt.*` (`schema-version=6`). Deployments must not publish 9080. Compose must still set read-only root, dropped capabilities, no-new-privileges, resource/PID/log bounds, persistent state/project/worktree/cache volumes, internal networks, and runtime secret mounts.
 
 ## Validation
 
 ```sh
-REPOPROMPT_SERVER_ONLY=1 swift build --disable-automatic-resolution --product RepoPromptServer
-REPOPROMPT_SERVER_ONLY=1 swift test --disable-automatic-resolution --filter RepoPromptServerTests
+make dev-server-build
+make dev-server-test
 docker build -f Dockerfile.server .
 ```
 
@@ -88,14 +88,14 @@ Ubuntu 24.04 runs the same build and focused tests in `.github/workflows/linux-s
 
 This baseline establishes the reusable target, persistence, protocol, supervision, and service boundaries. The existing macOS `AgentModeViewModel` and direct-headless MCP implementation have not yet been cut over to these targets; see the fork-delta ledger for the explicit remaining convergence work.
 
-Collaboration eligibility for signed HTTP callers is owned by the authorization decision. Linux binds the decision to the operation, request digest, actor, target, expiry, and collaboration revisions (or the exact next revisions for `setSessionVisibility` / `setCollaborativeSteering`). A verified decision is not re-checked against stored creator/controller/steering flags. Unsigned callers (portal operator mTLS, MCP, in-process tests) still use local host policy: session creators own visibility and steering writes, the current controller owns other mutations, and `sendFollowup` / `submitTurn` / `steerSession` may be performed by non-controllers only when the session is collaborative and collaborative steering is enabled. `buildContext` stays a view operation. HMAC identities remain the deployment strings `goblin-app` / `goblin-sync` / `repoprompt-operator`.
+Collaboration eligibility for signed HTTP callers is owned by the authorization decision. Linux binds the decision to the operation, request digest, actor, target, expiry, and collaboration revisions (or the exact next revisions for `setSessionVisibility` / `setCollaborativeSteering`). A verified decision is not re-checked against stored creator/controller/steering flags. Unsigned callers (portal operator mTLS, MCP, in-process tests) still use local host policy: session creators own visibility and steering writes, the current controller owns other mutations, and `sendFollowup` / `submitTurn` / `steerSession` may be performed by non-controllers only when the session is collaborative and collaborative steering is enabled. `buildContext` stays a view operation. HMAC identities encode as `app` / `sync` / `repoprompt-operator`.
 
 
 # RepoPrompt Server web portal
 
 The standalone portal is a RepoPrompt-owned operator surface served by
 `RepoPromptServer` at `/portal` on the existing operator-mTLS listener. It is
-independently usable; later Goblin integration can use API, SSO, or deep links
+independently usable. Chat integration can use API, SSO, or deep links
 without becoming the portal's UI or orchestration authority.
 
 ## Desktop-to-web product map
@@ -135,13 +135,15 @@ No screenshots or generated imitation artwork are part of this port.
 
 ## Runtime and browser contract
 
-Portal pages and APIs require a client certificate mapped to either
-`repoprompt-operator` for direct standalone access or `goblin-app` for an
-authenticated Goblin reverse proxy. Operator mTLS is sufficient on its own:
-settings and agent surfaces do not require chat-server, Goblin HMAC, or a
+Portal pages load without a client certificate. APIs require either an
+operator password session or a client certificate mapped to
+`repoprompt-operator` / `app`. First-run setup creates the operator password
+on `/portal/`. Operator mTLS remains optional for production:
+settings and agent surfaces do not require a chat peer, integration HMAC, or a
 reverse proxy. Browser code never receives an internal HMAC key or client
 certificate. The browser is a thin renderer over Swift-owned
-services and does not persist state in local or session storage. Assets and API
+services and does not persist application state in local or session storage
+beyond the HttpOnly operator session cookie. Assets and API
 URLs are path-relative so a same-origin gateway can preserve the complete
 RepoPrompt-owned HTML/CSS/JavaScript surface beneath `/portal/`. Mutations
 additionally require an exact HTTPS

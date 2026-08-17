@@ -1,8 +1,8 @@
 # RepoPrompt CE contribution validation matrix
 
-This matrix is for upstream, production, release, and PR-ready work. Degentlemen sandbox delivery uses one focused pre-integration batch plus the lightweight `sandbox-commit` / `sandbox-push` safety modes described below.
+This matrix is for upstream, production, release, and PR-ready work. Sandbox delivery uses one focused pre-integration batch plus the lightweight `sandbox-commit` / `sandbox-push` safety modes described below.
 
-## Degentlemen sandbox safety gates
+## Sandbox safety gates
 
 | Gate | Required command / evidence |
 | --- | --- |

@@ -14,6 +14,42 @@
     <link rel="stylesheet" href="assets/portal.css" />
   </head>
   <body>
+    <div id="auth-gate" class="auth-gate" hidden>
+      <div class="auth-card native-material">
+        <img class="app-icon" src="assets/repoprompt-icon.png" alt="" />
+        <h1 id="auth-title">RepoPrompt Server</h1>
+        <p id="auth-copy" class="auth-copy">Checking operator access…</p>
+        <form id="auth-form" hidden>
+          <label id="auth-token-field" hidden>
+            Setup token
+            <input id="auth-token" name="setupToken" autocomplete="off" spellcheck="false" />
+          </label>
+          <label>
+            Password
+            <input
+              id="auth-password"
+              type="password"
+              name="password"
+              autocomplete="current-password"
+              required
+            />
+          </label>
+          <label id="auth-confirm-field" hidden>
+            Confirm password
+            <input
+              id="auth-password-confirm"
+              type="password"
+              name="passwordConfirmation"
+              autocomplete="new-password"
+            />
+          </label>
+          <p id="auth-error" class="auth-error" role="alert" hidden></p>
+          <button id="auth-submit" class="primary-button" type="submit">
+            Continue
+          </button>
+        </form>
+      </div>
+    </div>
     <button class="skip-link" type="button" data-action="skip-content">
       Skip to content
     </button>
