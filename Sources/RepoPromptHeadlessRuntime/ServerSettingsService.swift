@@ -304,7 +304,7 @@ public actor ServerSettingsService {
         return route
     }
 
-    public func createSessionInput(from request: GoblinCreateSessionRequest) async throws -> CreateSessionInput {
+    public func createSessionInput(from request: CreateSessionRequest) async throws -> CreateSessionInput {
         if request.hasExplicitProviderRoute {
             return try request.explicitCreateSessionInput()
         }

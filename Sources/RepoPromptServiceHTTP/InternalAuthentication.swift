@@ -4,7 +4,7 @@ import Hummingbird
 import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 
-public enum InternalRouteRole: String, Codable, Sendable { case goblinApp = "goblin-app", goblinSync = "goblin-sync", operatorRole = "repoprompt-operator" }
+public enum InternalRouteRole: String, Codable, Sendable { case app = "goblin-app", sync = "goblin-sync", operatorRole = "repoprompt-operator" }
 
 public struct InternalSigningKey: Sendable {
     public let keyID: String
@@ -49,7 +49,7 @@ public struct SignedInternalRequest: Sendable {
 public struct AuthenticatedInternalRequest: Sendable {
     public let role: InternalRouteRole
     public let keyID: String
-    public let decision: GoblinAuthorizationDecision?
+    public let decision: AuthorizationDecision?
 }
 
 public actor InternalRequestAuthenticator {
@@ -78,9 +78,9 @@ public actor InternalRequestAuthenticator {
         guard CanonicalSigning.secureEquals(expected, request.signature) else { throw ServiceAPIError(code: .internalAuthFailed, message: "Request signature is invalid") }
         try await store.consumeNonce(direction: key.direction, keyID: key.keyID, nonce: request.nonce, observedAt: observed, expiresAt: observed.addingTimeInterval(60))
 
-        if key.role == .goblinApp {
-            guard let data = request.authorizationDecisionData else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "A Goblin authorization decision is required") }
-            let decision = try JSONDecoder.serviceDecoder.decode(GoblinAuthorizationDecision.self, from: data)
+        if key.role == .app {
+            guard let data = request.authorizationDecisionData else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "An authorization decision is required") }
+            let decision = try JSONDecoder.serviceDecoder.decode(AuthorizationDecision.self, from: data)
             guard decision.schemaVersion == 1, decision.operation == operation, decision.projectID == projectID, decision.sessionID == sessionID else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision target or operation does not match") }
             guard decision.requestDigest == CanonicalSigning.bodyDigest(request.body), decision.expiresAt >= observed, decision.issuedAt <= observed, decision.expiresAt.timeIntervalSince(decision.issuedAt) <= 30 else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision is stale or request-mismatched") }
             let unsigned = try CanonicalSigning.canonicalJSONObject(data, removingTopLevelKeys: ["signature"])
@@ -100,6 +100,7 @@ extension HTTPField.Name {
     static let internalBodyDigest = Self("x-internal-body-digest")!
     static let internalAuthorizationDigest = Self("x-internal-authorization-digest")!
     static let internalSignature = Self("x-internal-signature")!
-    static let goblinAuthorizationDecision = Self("X-Goblin-Authorization-Decision")!
+    static let authorizationDecision = Self("X-RepoPrompt-Authorization-Decision")!
+    static let legacyAuthorizationDecision = Self("X-Goblin-Authorization-Decision")!
     static let idempotencyKey = Self("Idempotency-Key")!
 }

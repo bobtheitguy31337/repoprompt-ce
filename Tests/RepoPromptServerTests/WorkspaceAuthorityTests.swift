@@ -46,7 +46,7 @@ final class WorkspaceAuthorityTests: XCTestCase {
             try? FileManager.default.removeItem(at: URL(fileURLWithPath: database.path + "-shm"))
         }
 
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let store = try await SQLiteServiceStore.open(storage: .file(database.path))
         let authority = RepoPromptHeadlessAuthority(store: store)
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p", requestDigest: "p")
@@ -99,7 +99,7 @@ final class WorkspaceAuthorityTests: XCTestCase {
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p", requestDigest: "p")
         let rootID = try XCTUnwrap(project.roots.first?.rootID)
         do {
@@ -118,7 +118,7 @@ final class WorkspaceAuthorityTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-root-identity", requestDigest: "p-root-identity")
         let rootID = try XCTUnwrap(project.roots.first?.rootID)
         try "later".write(to: root.appendingPathComponent("later.txt"), atomically: true, encoding: .utf8)
@@ -146,7 +146,7 @@ final class WorkspaceAuthorityTests: XCTestCase {
             try? FileManager.default.removeItem(at: URL(fileURLWithPath: database.path + "-wal"))
             try? FileManager.default.removeItem(at: URL(fileURLWithPath: database.path + "-shm"))
         }
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let initialStore = try await SQLiteServiceStore.open(storage: .file(database.path))
         let initialAuthority = RepoPromptHeadlessAuthority(store: initialStore)
         let project = try await initialAuthority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "persisted-root", requestDigest: "persisted-root")
@@ -176,7 +176,7 @@ final class WorkspaceAuthorityTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: base) }
         let service = try WorktreeRuntimeService(baseDirectory: base.path, runner: runner)
         let root = ProjectRootSnapshot(rootID: UUID(), logicalName: "source", canonicalPath: "/repo", writable: true)
-        let project = ProjectSnapshot(projectID: UUID(), name: "P", creator: .init(goblinUserID: "u", username: "u", displayName: "U"), state: .active, roots: [root], revision: 1, cursor: .init(storeID: UUID(), globalSequence: 1))
+        let project = ProjectSnapshot(projectID: UUID(), name: "P", creator: .init(userID: "u", username: "u", displayName: "U"), state: .active, roots: [root], revision: 1, cursor: .init(storeID: UUID(), globalSequence: 1))
         let binding = try await service.create(project: project, root: root, sessionID: UUID(), baseRef: "main", branch: "rp/session")
         XCTAssertEqual(binding.ownershipState, .active)
         let calls = await runner.calls()
@@ -197,7 +197,7 @@ final class WorkspaceAuthorityTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-template", requestDigest: "p-template")
         let rootID = try XCTUnwrap(project.roots.first?.rootID)
         let entry = LogicalSelectionEntry(rootID: rootID, logicalPath: "template.txt", mode: .full)
@@ -234,7 +234,7 @@ final class WorkspaceAuthorityTests: XCTestCase {
         let provider = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: "/usr/bin/true")], runner: runner)
         let artifactService = try ArtifactRuntimeService(baseDirectory: artifacts.path)
         let authority = RepoPromptHeadlessAuthority(store: store, artifactService: artifactService, providerAdapter: provider)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p", requestDigest: "p")
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "s", requestDigest: "s")
         let rootID = try XCTUnwrap(project.roots.first?.rootID)
@@ -276,7 +276,7 @@ final class WorkspaceAuthorityTests: XCTestCase {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let runtime = BlockingContextBuilderRuntime()
         let authority = try RepoPromptHeadlessAuthority(store: store, artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path), contextBuilderRuntime: runtime)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-cb-race", requestDigest: "p-cb-race")
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "s-cb-race", requestDigest: "s-cb-race")
         let rootID = try XCTUnwrap(project.roots.first?.rootID)
@@ -319,7 +319,7 @@ final class WorkspaceAuthorityTests: XCTestCase {
         let runner = QuestionWorkspaceRunner()
         let provider = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: "/usr/bin/true")], runner: runner)
         let authority = try RepoPromptHeadlessAuthority(store: store, artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path), providerAdapter: provider)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-question", requestDigest: "p-question")
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "s-question", requestDigest: "s-question")
 
@@ -373,7 +373,7 @@ final class WorkspaceAuthorityTests: XCTestCase {
             artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path, resources: store),
             providerAdapter: provider
         )
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(
             input: .init(name: "Read only", roots: [.init(logicalName: "docs", path: source.path, writable: false)]),
             externalActor: actor,
@@ -428,7 +428,7 @@ final class WorkspaceAuthorityTests: XCTestCase {
             artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path, resources: store),
             providerAdapter: provider
         )
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(
             input: .init(name: "Launch boundary", roots: [.init(logicalName: "docs", path: source.path, writable: false)]),
             externalActor: actor,
@@ -483,7 +483,7 @@ final class WorkspaceAuthorityTests: XCTestCase {
         let project = ProjectSnapshot(
             projectID: UUID(),
             name: "Empty",
-            creator: .init(goblinUserID: "u", username: "u", displayName: "U"),
+            creator: .init(userID: "u", username: "u", displayName: "U"),
             state: .active,
             roots: [],
             revision: 1,
@@ -578,7 +578,7 @@ final class WorkspaceAuthorityTests: XCTestCase {
             artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path, resources: store),
             providerAdapter: provider
         )
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(
             input: .init(name: "Merge fence", roots: [.init(logicalName: "source", path: source.path, writable: true)]),
             externalActor: actor,
@@ -654,7 +654,7 @@ final class WorkspaceAuthorityTests: XCTestCase {
             artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path, resources: store),
             providerAdapter: provider
         )
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(
             input: .init(name: "P", roots: [
                 .init(logicalName: "server", path: sourceA.path, writable: true),

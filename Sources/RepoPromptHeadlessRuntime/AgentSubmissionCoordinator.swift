@@ -68,7 +68,7 @@ public actor AgentSubmissionCoordinator {
             throw ServiceAPIError(code: .invalidRequest, message: "Idempotency-Key must be the submission UUID")
         }
         let targetKey = "project:\(projectID.uuidString.lowercased())"
-        guard let prior = try await store.agentSubmission(actorID: actor.goblinUserID, targetKey: targetKey, operation: "startSession", publicKey: publicSubmissionKey) else { return nil }
+        guard let prior = try await store.agentSubmission(actorID: actor.userID, targetKey: targetKey, operation: "startSession", publicKey: publicSubmissionKey) else { return nil }
         guard prior.requestDigest == requestDigest else {
             throw ServiceAPIError(code: .idempotencyConflict, message: "Submission key was reused with different content")
         }
@@ -112,7 +112,7 @@ public actor AgentSubmissionCoordinator {
         guard let submissionID = UUID(uuidString: publicSubmissionKey) else {
             throw ServiceAPIError(code: .invalidRequest, message: "Idempotency-Key must be the submission UUID")
         }
-        if let prior = try await store.agentSubmission(actorID: actor.goblinUserID, targetKey: targetKey, operation: operation, publicKey: publicSubmissionKey) {
+        if let prior = try await store.agentSubmission(actorID: actor.userID, targetKey: targetKey, operation: operation, publicKey: publicSubmissionKey) {
             guard prior.requestDigest == requestDigest else { throw ServiceAPIError(code: .idempotencyConflict, message: "Submission key was reused with different content") }
             switch prior.state {
             case .accepted:
@@ -143,7 +143,7 @@ public actor AgentSubmissionCoordinator {
         )
         let initial = AgentSubmissionRecord(
             submissionID: submissionID,
-            actorID: actor.goblinUserID,
+            actorID: actor.userID,
             targetKey: targetKey,
             operation: operation,
             publicKey: publicSubmissionKey,
@@ -165,7 +165,7 @@ public actor AgentSubmissionCoordinator {
         }
 
         do {
-            let context = ComposerCatalogContext(kind: catalogContextKind, projectID: session.projectID, sessionID: catalogContextKind == .session ? session.sessionID : nil, actorID: actor.goblinUserID, activeRun: false, mcpControlled: mcpControlled)
+            let context = ComposerCatalogContext(kind: catalogContextKind, projectID: session.projectID, sessionID: catalogContextKind == .session ? session.sessionID : nil, actorID: actor.userID, activeRun: false, mcpControlled: mcpControlled)
             let (effective, providerConfiguration, _, catalogWorkflowGuidance) = try await catalog.validate(submission.configuration, context: context, acceptedAt: now)
             guard session.provider == providerConfiguration.runtimeKind else {
                 throw ServiceAPIError(code: .capabilityMissing, message: "Session provider does not match the accepted configuration")
@@ -187,7 +187,7 @@ public actor AgentSubmissionCoordinator {
             let manifest = try await attachments.prepareAcceptance(
                 attachmentIDs: submission.content.attachmentIDs,
                 submissionID: submissionID,
-                actorID: actor.goblinUserID,
+                actorID: actor.userID,
                 projectID: session.projectID,
                 sessionID: session.sessionID,
                 turnID: identity.turnID,

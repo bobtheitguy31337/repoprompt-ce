@@ -670,7 +670,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
             git: FakeProjectSourceGitRunner()
         )
         let authority = RepoPromptHeadlessAuthority(store: store, projectSourceService: service)
-        let actor = ExternalActor(goblinUserID: "user-1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "user-1", username: "alice", displayName: "Alice")
         let input = ProjectSourceOperationInput(
             operationID: UUID(),
             expectedRevision: 0,
@@ -740,7 +740,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
             git: FakeProjectSourceGitRunner()
         )
         let authority = RepoPromptHeadlessAuthority(store: store, projectSourceService: service)
-        let actor = ExternalActor(goblinUserID: "concurrent-configured", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "concurrent-configured", username: "alice", displayName: "Alice")
         let input = ProjectSourceOperationInput(
             operationID: UUID(), expectedRevision: 0, name: "Configured", logicalName: "workspace",
             source: .configuredRoot(alias: "chat-server")
@@ -771,7 +771,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
             git: git
         )
         let authority = RepoPromptHeadlessAuthority(store: store, projectSourceService: service)
-        let actor = ExternalActor(goblinUserID: "concurrent-clone", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "concurrent-clone", username: "alice", displayName: "Alice")
         let input = ProjectSourceOperationInput(
             operationID: UUID(), expectedRevision: 0, name: "Clone", logicalName: "workspace",
             source: .gitClone(remote: "https://github.com/degentlemen/chat-server.git", ref: "main")
@@ -804,7 +804,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
             git: git
         )
         let authority = RepoPromptHeadlessAuthority(store: store, projectSourceService: service)
-        let actor = ExternalActor(goblinUserID: "canceled-waiter", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "canceled-waiter", username: "alice", displayName: "Alice")
         let input = ProjectSourceOperationInput(
             operationID: UUID(), expectedRevision: 0, name: "Clone", logicalName: "workspace",
             source: .gitClone(remote: "https://github.com/degentlemen/chat-server.git", ref: "main")
@@ -852,7 +852,7 @@ final class ProjectSourceProvisioningTests: XCTestCase {
             git: FakeProjectSourceGitRunner(cloneDelay: .milliseconds(200))
         )
         let authority = RepoPromptHeadlessAuthority(store: store, projectSourceService: service)
-        let actor = ExternalActor(goblinUserID: "concurrent-conflict", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "concurrent-conflict", username: "alice", displayName: "Alice")
         let clone = ProjectSourceOperationInput(
             operationID: UUID(), expectedRevision: 0, name: "Clone", logicalName: "workspace",
             source: .gitClone(remote: "https://github.com/degentlemen/chat-server.git", ref: "main")

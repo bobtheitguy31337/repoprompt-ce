@@ -204,7 +204,7 @@ public struct ExecutionPermissionUpdateInput: Codable, Sendable {
     }
 }
 
-public struct GoblinCollaborationAcknowledgement: Codable, Hashable, Sendable {
+public struct CollaborationAcknowledgement: Codable, Hashable, Sendable {
     public let decisionID: UUID
     public let acknowledgedPolicyRevision: Int64
     public let acknowledgedControllerRevision: Int64
@@ -258,9 +258,18 @@ public struct CollaborationMetadataSnapshot: Codable, Hashable, Sendable {
     public let policyRevision: Int64
     public let controllerRevision: Int64
     public let membershipRevision: Int64
-    public let goblinAcknowledgement: GoblinCollaborationAcknowledgement?
+    public let collaborationAcknowledgement: CollaborationAcknowledgement?
 
-    public init(sessionID: UUID, visibility: Visibility, collaborativeSteeringEnabled: Bool, controllerUserID: String, policyRevision: Int64, controllerRevision: Int64, membershipRevision: Int64, goblinAcknowledgement: GoblinCollaborationAcknowledgement? = nil) {
+    public init(
+        sessionID: UUID,
+        visibility: Visibility,
+        collaborativeSteeringEnabled: Bool,
+        controllerUserID: String,
+        policyRevision: Int64,
+        controllerRevision: Int64,
+        membershipRevision: Int64,
+        collaborationAcknowledgement: CollaborationAcknowledgement? = nil
+    ) {
         self.sessionID = sessionID
         self.visibility = visibility
         self.collaborativeSteeringEnabled = collaborativeSteeringEnabled
@@ -268,7 +277,35 @@ public struct CollaborationMetadataSnapshot: Codable, Hashable, Sendable {
         self.policyRevision = policyRevision
         self.controllerRevision = controllerRevision
         self.membershipRevision = membershipRevision
-        self.goblinAcknowledgement = goblinAcknowledgement
+        self.collaborationAcknowledgement = collaborationAcknowledgement
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decode(UUID.self, forKey: .sessionID)
+        visibility = try container.decode(Visibility.self, forKey: .visibility)
+        collaborativeSteeringEnabled = try container.decode(Bool.self, forKey: .collaborativeSteeringEnabled)
+        controllerUserID = try container.decode(String.self, forKey: .controllerUserID)
+        policyRevision = try container.decode(Int64.self, forKey: .policyRevision)
+        controllerRevision = try container.decode(Int64.self, forKey: .controllerRevision)
+        membershipRevision = try container.decode(Int64.self, forKey: .membershipRevision)
+        if let acknowledgement = try container.decodeIfPresent(CollaborationAcknowledgement.self, forKey: .collaborationAcknowledgement) {
+            collaborationAcknowledgement = acknowledgement
+        } else {
+            collaborationAcknowledgement = try container.decodeIfPresent(CollaborationAcknowledgement.self, forKey: .goblinAcknowledgement)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(sessionID, forKey: .sessionID)
+        try container.encode(visibility, forKey: .visibility)
+        try container.encode(collaborativeSteeringEnabled, forKey: .collaborativeSteeringEnabled)
+        try container.encode(controllerUserID, forKey: .controllerUserID)
+        try container.encode(policyRevision, forKey: .policyRevision)
+        try container.encode(controllerRevision, forKey: .controllerRevision)
+        try container.encode(membershipRevision, forKey: .membershipRevision)
+        try container.encodeIfPresent(collaborationAcknowledgement, forKey: .collaborationAcknowledgement)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -279,6 +316,7 @@ public struct CollaborationMetadataSnapshot: Codable, Hashable, Sendable {
         case policyRevision
         case controllerRevision
         case membershipRevision
+        case collaborationAcknowledgement
         case goblinAcknowledgement
     }
 }

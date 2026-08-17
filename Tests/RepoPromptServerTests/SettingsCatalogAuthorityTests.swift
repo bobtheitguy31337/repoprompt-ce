@@ -381,7 +381,7 @@ final class SettingsCatalogAuthorityTests: XCTestCase {
             authority: authority,
             store: store,
             authenticator: InternalRequestAuthenticator(keys: [], store: store),
-            eventSigningKey: InternalSigningKey(keyID: "response", role: .goblinSync, direction: "test", secret: Data("secret".utf8))
+            eventSigningKey: InternalSigningKey(keyID: "response", role: .sync, direction: "test", secret: Data("secret".utf8))
         )
         let app = Application(router: service.internalRouter())
         let projectID = UUID().uuidString
@@ -485,7 +485,7 @@ final class SettingsCatalogAuthorityTests: XCTestCase {
     }
 
     private static let actor = ExternalActor(
-        goblinUserID: "item3-test",
+        userID: "item3-test",
         username: "item3-test",
         displayName: "Item 3 Test"
     )

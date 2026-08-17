@@ -107,7 +107,7 @@ final class HistoryIdlePersistTests: XCTestCase {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let actor = ExternalActor(goblinUserID: "idle", username: "idle", displayName: "Idle")
+        let actor = ExternalActor(userID: "idle", username: "idle", displayName: "Idle")
         let project = try await authority.createProject(
             input: .init(name: "Idle", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
             externalActor: actor,

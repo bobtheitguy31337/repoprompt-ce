@@ -256,7 +256,7 @@ actor DirectHeadlessMCPService {
             serverSettings: serverSettings
         )
         try await authority.recover()
-        let actor = ExternalActor(goblinUserID: "direct-mcp", username: "direct-mcp", displayName: "Direct MCP")
+        let actor = ExternalActor(userID: "direct-mcp", username: "direct-mcp", displayName: "Direct MCP")
         let canonicalPaths = Set(locations.workingDirectories.map { $0.standardizedFileURL.resolvingSymlinksInPath().path })
         let existing = await authority.projectSnapshots().first { Set($0.roots.map(\.canonicalPath)) == canonicalPaths }
         let project: ProjectSnapshot

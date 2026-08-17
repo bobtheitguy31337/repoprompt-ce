@@ -406,7 +406,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
     }
 
     func testPortalSessionProjectionBoundsAndSanitizesTranscript() throws {
-        let actor = ExternalActor(goblinUserID: "portal-user", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "portal-user", username: "alice", displayName: "Alice")
         let sessionID = UUID()
         let transcript = [
             TranscriptEntry(
@@ -485,7 +485,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
             authority: authority,
             store: store,
             authenticator: InternalRequestAuthenticator(keys: [], store: store),
-            eventSigningKey: InternalSigningKey(keyID: "response", role: .goblinSync, direction: "test", secret: Data("secret".utf8))
+            eventSigningKey: InternalSigningKey(keyID: "response", role: .sync, direction: "test", secret: Data("secret".utf8))
         )
         let app = Application(router: service.internalRouter())
         try await app.test(.router) { client in
@@ -500,8 +500,8 @@ final class ProviderSettingsPortalTests: XCTestCase {
 
     func testPortalCertificateRolesAllowOperatorAndGoblinProxyOnly() {
         XCTAssertTrue(RepoPromptPortalCertificateAuthorization.allows(.operatorRole))
-        XCTAssertTrue(RepoPromptPortalCertificateAuthorization.allows(.goblinApp))
-        XCTAssertFalse(RepoPromptPortalCertificateAuthorization.allows(.goblinSync))
+        XCTAssertTrue(RepoPromptPortalCertificateAuthorization.allows(.app))
+        XCTAssertFalse(RepoPromptPortalCertificateAuthorization.allows(.sync))
     }
 
     func testCLIHealthNeverProjectsRawVersionProbeOutput() async throws {

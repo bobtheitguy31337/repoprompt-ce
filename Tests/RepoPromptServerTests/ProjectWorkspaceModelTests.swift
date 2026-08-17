@@ -49,7 +49,7 @@ final class ProjectWorkspaceModelTests: XCTestCase {
         )
         let provider = WorkspaceModelProvider()
         let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider, projectSourceService: service)
-        let actor = ExternalActor(goblinUserID: "workspace-owner", username: "owner", displayName: "Owner")
+        let actor = ExternalActor(userID: "workspace-owner", username: "owner", displayName: "Owner")
         let project = try await authority.createProject(
             input: .init(name: "  Empty Workspace  ", roots: []),
             externalActor: actor,
@@ -149,7 +149,7 @@ final class ProjectWorkspaceModelTests: XCTestCase {
         )
         let provider = WorkspaceBlockingProvider()
         let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider, projectSourceService: service)
-        let actor = ExternalActor(goblinUserID: "workspace-owner", username: "owner", displayName: "Owner")
+        let actor = ExternalActor(userID: "workspace-owner", username: "owner", displayName: "Owner")
         let project = try await authority.createProject(
             input: .init(name: "Workspace", roots: []),
             externalActor: actor,
@@ -207,7 +207,7 @@ final class ProjectWorkspaceModelTests: XCTestCase {
         )
         let provider = WorkspaceModelProvider()
         let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider, projectSourceService: service)
-        let actor = ExternalActor(goblinUserID: "workspace-owner", username: "owner", displayName: "Owner")
+        let actor = ExternalActor(userID: "workspace-owner", username: "owner", displayName: "Owner")
         let project = try await authority.createProject(
             input: .init(name: "No Git Workspace", roots: []),
             externalActor: actor,

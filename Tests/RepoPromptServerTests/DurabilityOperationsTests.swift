@@ -32,7 +32,7 @@ final class DurabilityOperationsTests: XCTestCase {
 
     func testRetentionArchivesOnlyContiguousPrefixOutsideBothWindows() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let projectID = UUID()
         var roots = [ProjectRootSnapshot(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)]
         for revision in 1 ... 8 {
@@ -71,7 +71,7 @@ final class DurabilityOperationsTests: XCTestCase {
 
     func testArchiveSegmentsAndProtectedCheckpointsAreImmutable() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let cursor = try await store.nextCursor()
         let project = ProjectSnapshot(
             projectID: UUID(),
@@ -188,7 +188,7 @@ final class DurabilityOperationsTests: XCTestCase {
 
     func testSessionEventCounterSurvivesArchiveDeletion() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let projectID = UUID()
         let roots = [ProjectRootSnapshot(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)]
         let sessionID = UUID()

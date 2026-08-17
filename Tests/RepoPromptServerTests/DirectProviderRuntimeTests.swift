@@ -488,7 +488,7 @@ final class DirectProviderRuntimeTests: XCTestCase {
         XCTAssertTrue(enabled.effectiveEnabled)
 
         let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: adapter)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(
             input: .init(name: "Direct", roots: [.init(logicalName: "source", path: projectRoot.resolvingSymlinksInPath().path, writable: true)]),
             externalActor: actor,

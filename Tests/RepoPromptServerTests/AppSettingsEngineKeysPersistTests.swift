@@ -61,7 +61,7 @@ final class AppSettingsEngineKeysPersistTests: XCTestCase {
             artifactService: try ArtifactRuntimeService(baseDirectory: artifacts.path),
             serverSettings: service
         )
-        let actor = ExternalActor(goblinUserID: "engine-keys", username: "engine-keys", displayName: "Engine Keys")
+        let actor = ExternalActor(userID: "engine-keys", username: "engine-keys", displayName: "Engine Keys")
         let project = try await authority.createProject(
             input: .init(name: "EngineKeys", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
             externalActor: actor,

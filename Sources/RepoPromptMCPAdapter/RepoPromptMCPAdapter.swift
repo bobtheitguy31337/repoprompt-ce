@@ -11,7 +11,7 @@ public struct RepoPromptMCPBinding: Sendable {
     /// Desktop `currentClientIdentifier()` — MCP initialize name, not the HTTP actor.
     public let mcpClientID: String
 
-    /// Goblin / chat-server Agent Mode sockets are not a Desktop MCP client.
+    /// Chat-server Agent Mode sockets are not a Desktop MCP client.
     /// Always Allow matches initialize `clientInfo.name`, never the HTTP actor.
     public static let untrustedClientID = "unknown-client"
 
@@ -812,7 +812,7 @@ private actor AuthorityToolBackend {
 
     private var settingsAttribution: SettingsMutationAttribution {
         SettingsMutationAttribution(
-            actorID: binding.actor.goblinUserID,
+            actorID: binding.actor.userID,
             actorLabel: binding.actor.displayName,
             channel: "mcp"
         )
@@ -1068,7 +1068,7 @@ private actor AuthorityToolBackend {
             _ = try await authority.replaceAdvancedSettings(
                 .init(expectedRevision: currentAdvanced.revision, settings: next),
                 attribution: SettingsMutationAttribution(
-                    actorID: binding.actor.goblinUserID,
+                    actorID: binding.actor.userID,
                     actorLabel: binding.actor.displayName,
                     channel: "mcp"
                 )
@@ -1080,7 +1080,7 @@ private actor AuthorityToolBackend {
             _ = try await authority.replaceAdvancedSettings(
                 .init(expectedRevision: currentAdvanced.revision, settings: next),
                 attribution: SettingsMutationAttribution(
-                    actorID: binding.actor.goblinUserID,
+                    actorID: binding.actor.userID,
                     actorLabel: binding.actor.displayName,
                     channel: "mcp"
                 )
@@ -1092,7 +1092,7 @@ private actor AuthorityToolBackend {
             _ = try await authority.replaceAdvancedSettings(
                 .init(expectedRevision: currentAdvanced.revision, settings: next),
                 attribution: SettingsMutationAttribution(
-                    actorID: binding.actor.goblinUserID,
+                    actorID: binding.actor.userID,
                     actorLabel: binding.actor.displayName,
                     channel: "mcp"
                 )
@@ -1104,7 +1104,7 @@ private actor AuthorityToolBackend {
             _ = try await authority.replaceAdvancedSettings(
                 .init(expectedRevision: currentAdvanced.revision, settings: next),
                 attribution: SettingsMutationAttribution(
-                    actorID: binding.actor.goblinUserID,
+                    actorID: binding.actor.userID,
                     actorLabel: binding.actor.displayName,
                     channel: "mcp"
                 )
@@ -1116,7 +1116,7 @@ private actor AuthorityToolBackend {
             _ = try await authority.replaceAdvancedSettings(
                 .init(expectedRevision: currentAdvanced.revision, settings: next),
                 attribution: SettingsMutationAttribution(
-                    actorID: binding.actor.goblinUserID,
+                    actorID: binding.actor.userID,
                     actorLabel: binding.actor.displayName,
                     channel: "mcp"
                 )
@@ -1128,7 +1128,7 @@ private actor AuthorityToolBackend {
             _ = try await authority.replaceAdvancedSettings(
                 .init(expectedRevision: currentAdvanced.revision, settings: next),
                 attribution: SettingsMutationAttribution(
-                    actorID: binding.actor.goblinUserID,
+                    actorID: binding.actor.userID,
                     actorLabel: binding.actor.displayName,
                     channel: "mcp"
                 )
@@ -1142,7 +1142,7 @@ private actor AuthorityToolBackend {
             _ = try await authority.replaceAdvancedSettings(
                 .init(expectedRevision: currentAdvanced.revision, settings: next),
                 attribution: SettingsMutationAttribution(
-                    actorID: binding.actor.goblinUserID,
+                    actorID: binding.actor.userID,
                     actorLabel: binding.actor.displayName,
                     channel: "mcp"
                 )
@@ -1154,7 +1154,7 @@ private actor AuthorityToolBackend {
             _ = try await authority.replaceAdvancedSettings(
                 .init(expectedRevision: currentAdvanced.revision, settings: next),
                 attribution: SettingsMutationAttribution(
-                    actorID: binding.actor.goblinUserID,
+                    actorID: binding.actor.userID,
                     actorLabel: binding.actor.displayName,
                     channel: "mcp"
                 )
@@ -1179,7 +1179,7 @@ private actor AuthorityToolBackend {
         _ = try await authority.replaceGlobalAgentModels(
             .init(expectedRevision: current.globalRevision, profile: profile),
             attribution: SettingsMutationAttribution(
-                actorID: binding.actor.goblinUserID,
+                actorID: binding.actor.userID,
                 actorLabel: binding.actor.displayName,
                 channel: "mcp"
             )

@@ -9,7 +9,7 @@ import RepoPromptServiceProtocol
 import XCTest
 
 final class AuthenticationAndHTTPTests: XCTestCase {
-    private let responseSigningKey = InternalSigningKey(keyID: "response-v1", role: .goblinSync, direction: "repoprompt-to-goblin-v1", secret: Data("response-secret".utf8))
+    private let responseSigningKey = InternalSigningKey(keyID: "response-v1", role: .sync, direction: "repoprompt-to-goblin-v1", secret: Data("response-secret".utf8))
 
     func testConfigurationAcceptsOverlappingRoleKeysAndRejectsDuplicateIdentity() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -30,7 +30,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         let configuration = try RepoPromptServerConfiguration.environment(environment)
         XCTAssertEqual(configuration.signingKeys.count, 4)
         XCTAssertEqual(configuration.signingKeys.first(where: { $0.keyID == "app-v0" })?.active, false)
-        XCTAssertEqual(configuration.signingKeys.first(where: { $0.keyID == "app-v0" })?.role, .goblinApp)
+        XCTAssertEqual(configuration.signingKeys.first(where: { $0.keyID == "app-v0" })?.role, .app)
         XCTAssertEqual(Set(configuration.providerExecutables.keys), [.codex, .claudeCompatible, .openCodeACP, .cursorACP])
         XCTAssertEqual(configuration.enabledProviders, [.codex, .claudeCompatible])
 
@@ -94,7 +94,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
     func testSignedRequestRejectsNonceReplayAndRoleMismatch() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let instant = Date(timeIntervalSince1970: 1000)
-        let key = InternalSigningKey(keyID: "sync-v1", role: .goblinSync, direction: "goblin-sync-to-repoprompt-v1", secret: Data("secret".utf8))
+        let key = InternalSigningKey(keyID: "sync-v1", role: .sync, direction: "goblin-sync-to-repoprompt-v1", secret: Data("secret".utf8))
         let auth = InternalRequestAuthenticator(keys: [key], store: store, now: { instant })
         let timestamp = CanonicalSigning.iso8601String(instant)
         let nonce = "abcdefghijklmnop"
@@ -102,8 +102,8 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         let authorizationDigest = CanonicalSigning.bodyDigest(Data())
         let canonical = CanonicalSigning.requestString(method: "GET", pathAndQuery: "/internal/v1/events", timestamp: timestamp, nonce: nonce, bodyDigest: bodyDigest, authorizationDecisionDigest: authorizationDigest, keyID: key.keyID)
         let request = SignedInternalRequest(method: "GET", pathAndQuery: "/internal/v1/events", timestamp: timestamp, nonce: nonce, body: Data(), bodyDigest: bodyDigest, authorizationDecisionData: nil, authorizationDecisionDigest: authorizationDigest, keyID: key.keyID, signature: CanonicalSigning.hmacSHA256(message: canonical, key: key.secret))
-        _ = try await auth.verify(request, allowedRoles: [.goblinSync], operation: "events")
-        do { _ = try await auth.verify(request, allowedRoles: [.goblinSync], operation: "events")
+        _ = try await auth.verify(request, allowedRoles: [.sync], operation: "events")
+        do { _ = try await auth.verify(request, allowedRoles: [.sync], operation: "events")
             XCTFail("expected replay rejection")
         } catch let error as ServiceAPIError { XCTAssertEqual(error.code, .internalAuthFailed) }
         try await store.close()
@@ -112,14 +112,14 @@ final class AuthenticationAndHTTPTests: XCTestCase {
     func testAuthorizationDecisionRevisionsAreDurablyMonotonicAndSingleUse() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let instant = Date(timeIntervalSince1970: 1000)
-        let key = InternalSigningKey(keyID: "app-v1", role: .goblinApp, direction: "goblin-app-to-repoprompt-v1", secret: Data("secret".utf8))
+        let key = InternalSigningKey(keyID: "app-v1", role: .app, direction: "goblin-app-to-repoprompt-v1", secret: Data("secret".utf8))
         let auth = InternalRequestAuthenticator(keys: [key], store: store, now: { instant })
 
         func request(revision: Int64, nonce: String, decisionID: UUID = UUID()) throws -> SignedInternalRequest {
-            let unsignedDecision = GoblinAuthorizationDecision(decisionID: decisionID, actor: .init(goblinUserID: "u1", username: "alice", displayName: "Alice"), operation: "listProjects", requestDigest: CanonicalSigning.bodyDigest(Data()), policyRevision: revision, controllerRevision: revision, membershipRevision: revision, issuedAt: instant, expiresAt: instant.addingTimeInterval(10), requestID: UUID(), correlationID: UUID(), keyID: key.keyID, signature: "")
+            let unsignedDecision = AuthorizationDecision(decisionID: decisionID, actor: .init(userID: "u1", username: "alice", displayName: "Alice"), operation: "listProjects", requestDigest: CanonicalSigning.bodyDigest(Data()), policyRevision: revision, controllerRevision: revision, membershipRevision: revision, issuedAt: instant, expiresAt: instant.addingTimeInterval(10), requestID: UUID(), correlationID: UUID(), keyID: key.keyID, signature: "")
             let unsignedData = try JSONEncoder.serviceEncoder.encode(unsignedDecision)
             let decisionSignature = CanonicalSigning.hmacSHA256(message: try CanonicalSigning.canonicalJSONObject(unsignedData, removingTopLevelKeys: ["signature"]), key: key.secret)
-            let decision = GoblinAuthorizationDecision(decisionID: unsignedDecision.decisionID, actor: unsignedDecision.actor, operation: unsignedDecision.operation, requestDigest: unsignedDecision.requestDigest, policyRevision: unsignedDecision.policyRevision, controllerRevision: unsignedDecision.controllerRevision, membershipRevision: unsignedDecision.membershipRevision, issuedAt: unsignedDecision.issuedAt, expiresAt: unsignedDecision.expiresAt, requestID: unsignedDecision.requestID, correlationID: unsignedDecision.correlationID, keyID: key.keyID, signature: decisionSignature)
+            let decision = AuthorizationDecision(decisionID: unsignedDecision.decisionID, actor: unsignedDecision.actor, operation: unsignedDecision.operation, requestDigest: unsignedDecision.requestDigest, policyRevision: unsignedDecision.policyRevision, controllerRevision: unsignedDecision.controllerRevision, membershipRevision: unsignedDecision.membershipRevision, issuedAt: unsignedDecision.issuedAt, expiresAt: unsignedDecision.expiresAt, requestID: unsignedDecision.requestID, correlationID: unsignedDecision.correlationID, keyID: key.keyID, signature: decisionSignature)
             let decisionData = try JSONEncoder.serviceEncoder.encode(decision)
             let timestamp = CanonicalSigning.iso8601String(instant)
             let path = "/internal/v1/projects"
@@ -130,9 +130,9 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         }
 
         let accepted = try request(revision: 2, nonce: "decisionrevision2")
-        _ = try await auth.verify(accepted, allowedRoles: [.goblinApp], operation: "listProjects")
+        _ = try await auth.verify(accepted, allowedRoles: [.app], operation: "listProjects")
         do {
-            _ = try await auth.verify(request(revision: 1, nonce: "decisionrevision1"), allowedRoles: [.goblinApp], operation: "listProjects")
+            _ = try await auth.verify(request(revision: 1, nonce: "decisionrevision1"), allowedRoles: [.app], operation: "listProjects")
             XCTFail("expected revision regression rejection")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .authorizationDecisionRejected)
@@ -479,7 +479,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "degraded", roots: [.init(logicalName: "root", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "project", requestDigest: "project")
         try FileManager.default.removeItem(at: root)
         let degraded = try await authority.refreshProject(projectID: project.projectID, expectedRevision: project.revision, actor: actor, idempotencyKey: "refresh", requestDigest: "refresh")
@@ -533,7 +533,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
     func testSSELastEventIDBelowReplayFloorReturnsControlFrame() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -542,7 +542,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         _ = try await store.archiveEvents(through: 1)
 
         let instant = Date(timeIntervalSince1970: 1000)
-        let key = InternalSigningKey(keyID: "sync-v1", role: .goblinSync, direction: "goblin-sync-to-repoprompt-v1", secret: Data("secret".utf8))
+        let key = InternalSigningKey(keyID: "sync-v1", role: .sync, direction: "goblin-sync-to-repoprompt-v1", secret: Data("secret".utf8))
         let auth = InternalRequestAuthenticator(keys: [key], store: store, now: { instant })
         let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth, eventSigningKey: responseSigningKey)
         let app = Application(router: service.internalRouter())
@@ -583,7 +583,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
     func testRESTExpiredCursorReturnsSnapshotRecoveryContract() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -591,7 +591,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         let metadata = try await store.metadata()
         _ = try await store.archiveEvents(through: 1)
         let instant = Date(timeIntervalSince1970: 1000)
-        let key = InternalSigningKey(keyID: "sync-v1", role: .goblinSync, direction: "goblin-sync-to-repoprompt-v1", secret: Data("secret".utf8))
+        let key = InternalSigningKey(keyID: "sync-v1", role: .sync, direction: "goblin-sync-to-repoprompt-v1", secret: Data("secret".utf8))
         let auth = InternalRequestAuthenticator(keys: [key], store: store, now: { instant })
         let service = RepoPromptHTTPService(authority: authority, store: store, authenticator: auth, eventSigningKey: responseSigningKey)
         let app = Application(router: service.internalRouter())
@@ -614,7 +614,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         childrenPerRoot: Int
     ) async throws -> (database: URL, store: SQLiteServiceStore, authority: RepoPromptHeadlessAuthority) {
         let database = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).sqlite")
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         var store = try await SQLiteServiceStore.open(storage: .file(database.path))
         let projectCursor = try await store.nextCursor()
         let projectID = UUID()

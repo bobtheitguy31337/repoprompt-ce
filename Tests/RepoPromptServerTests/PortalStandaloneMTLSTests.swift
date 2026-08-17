@@ -14,8 +14,8 @@ import XCTest
 final class PortalStandaloneMTLSTests: XCTestCase {
     func testOperatorCertificateMapsAndGoblinSyncIsRejected() throws {
         let resolver = CertificateIdentityRoleResolver(identities: [
-            "goblin-app": .goblinApp,
-            "goblin-sync": .goblinSync,
+            "goblin-app": .app,
+            "goblin-sync": .sync,
             "repoprompt-operator": .operatorRole
         ])
         XCTAssertEqual(
@@ -24,13 +24,13 @@ final class PortalStandaloneMTLSTests: XCTestCase {
         )
         XCTAssertEqual(
             try resolver.role(certificate: Self.nioCertificate(identity: "goblin-app")),
-            .goblinApp
+            .app
         )
         XCTAssertEqual(
             try resolver.role(certificate: Self.nioCertificate(identity: "goblin-sync")),
-            .goblinSync
+            .sync
         )
-        XCTAssertFalse(RepoPromptPortalCertificateAuthorization.allows(.goblinSync))
+        XCTAssertFalse(RepoPromptPortalCertificateAuthorization.allows(.sync))
         XCTAssertThrowsError(
             try resolver.role(certificate: Self.nioCertificate(identity: "repoprompt-operator", clientAuth: false))
         ) { error in
@@ -53,10 +53,10 @@ final class PortalStandaloneMTLSTests: XCTestCase {
             authority: authority,
             store: store,
             authenticator: InternalRequestAuthenticator(keys: [], store: store),
-            eventSigningKey: InternalSigningKey(keyID: "response", role: .goblinSync, direction: "test", secret: Data("secret".utf8)),
+            eventSigningKey: InternalSigningKey(keyID: "response", role: .sync, direction: "test", secret: Data("secret".utf8)),
             certificateRoleResolver: CertificateIdentityRoleResolver(identities: [
-                "goblin-app": .goblinApp,
-                "goblin-sync": .goblinSync,
+                "goblin-app": .app,
+                "goblin-sync": .sync,
                 "repoprompt-operator": .operatorRole
             ]),
             serverSettings: settings,
@@ -141,15 +141,15 @@ final class PortalStandaloneMTLSTests: XCTestCase {
         defer { Task { try? await store.close() } }
         let authority = RepoPromptHeadlessAuthority(store: store)
         let resolver = CertificateIdentityRoleResolver(identities: [
-            "goblin-app": .goblinApp,
-            "goblin-sync": .goblinSync,
+            "goblin-app": .app,
+            "goblin-sync": .sync,
             "repoprompt-operator": .operatorRole
         ])
         let syncService = RepoPromptHTTPService(
             authority: authority,
             store: store,
             authenticator: InternalRequestAuthenticator(keys: [], store: store),
-            eventSigningKey: InternalSigningKey(keyID: "response", role: .goblinSync, direction: "test", secret: Data("secret".utf8)),
+            eventSigningKey: InternalSigningKey(keyID: "response", role: .sync, direction: "test", secret: Data("secret".utf8)),
             certificateRoleResolver: resolver,
             portalPeerCertificateDER: try Self.certificateDER(identity: "goblin-sync")
         )
@@ -165,7 +165,7 @@ final class PortalStandaloneMTLSTests: XCTestCase {
 
         let hmacKey = InternalSigningKey(
             keyID: "app-v1",
-            role: .goblinApp,
+            role: .app,
             direction: "goblin-app-to-repoprompt-v1",
             secret: Data("chat-server-hmac-secret-32bytes!!".utf8)
         )

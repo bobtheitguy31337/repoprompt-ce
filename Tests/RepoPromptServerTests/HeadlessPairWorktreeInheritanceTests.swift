@@ -33,7 +33,7 @@ final class HeadlessPairWorktreeInheritanceTests: XCTestCase {
             worktreeService: worktreeService,
             artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path, resources: store)
         )
-        let actor = ExternalActor(goblinUserID: "pair", username: "pair", displayName: "Pair")
+        let actor = ExternalActor(userID: "pair", username: "pair", displayName: "Pair")
         let project = try await authority.createProject(
             input: .init(name: "Investigate", roots: [.init(logicalName: "source", path: source.path, writable: true)]),
             externalActor: actor,

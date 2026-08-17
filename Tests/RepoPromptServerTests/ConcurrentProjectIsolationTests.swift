@@ -32,7 +32,7 @@ final class ConcurrentProjectIsolationTests: XCTestCase {
         let worktreeService = try WorktreeRuntimeService(baseDirectory: worktrees.path, resources: store)
         let authority = RepoPromptHeadlessAuthority(store: store, worktreeService: worktreeService)
         try await authority.recover()
-        let actor = ExternalActor(goblinUserID: "iso", username: "iso", displayName: "Isolation")
+        let actor = ExternalActor(userID: "iso", username: "iso", displayName: "Isolation")
 
         let alpha = try await authority.createProject(
             input: .init(name: "Alpha", roots: [.init(logicalName: "source", path: alphaRoot.path, writable: true)]),

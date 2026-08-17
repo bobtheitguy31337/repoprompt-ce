@@ -603,7 +603,7 @@ final class AgentComposerWireContractTests: XCTestCase {
     func testSessionSnapshotAgentStateFieldsAreAdditiveAndVersioned() throws {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let sessionID = UUID(), projectID = UUID(), runID = UUID()
-        let actor = ExternalActor(goblinUserID: "actor-1", username: "actor", displayName: "Actor")
+        let actor = ExternalActor(userID: "actor-1", username: "actor", displayName: "Actor")
         let configuration = EffectiveTurnConfigurationWireSnapshot(testConfiguration(at: now))
         let defaults = SessionNextTurnDefaultsWireSnapshot(sessionID: sessionID, revision: 3, configuration: configuration, updatedAt: now)
         let presentation = RunPresentationWireSnapshot(sessionID: sessionID, runID: runID, generation: 2, turnEpoch: 2, phase: .waiting, phaseRevision: 4, runningStatusCode: "awaiting_input", runStartedAt: now, priorActivePhase: .working)
@@ -736,7 +736,7 @@ final class AgentTurnIntentCompilerTests: XCTestCase {
     }
 
     func testSnapshotTitlesPreferAgentLabelsAndFallBackToTheFirstUserPrompt() {
-        let actor = ExternalActor(goblinUserID: "user", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "user", username: "alice", displayName: "Alice")
         let sessionID = UUID()
         let session = SessionSnapshot(
             sessionID: sessionID,
@@ -926,7 +926,7 @@ final class SessionAuthorityStreamingTests: XCTestCase {
             projectID: UUID(),
             parentSessionID: nil,
             rootSessionID: sessionID,
-            creator: .init(goblinUserID: "owner", username: "owner", displayName: "Owner"),
+            creator: .init(userID: "owner", username: "owner", displayName: "Owner"),
             provider: .codex,
             model: "gpt-5.6-sol",
             visibility: .privateSession,
@@ -973,7 +973,7 @@ final class SessionAuthorityStreamingTests: XCTestCase {
             projectID: UUID(),
             parentSessionID: nil,
             rootSessionID: sessionID,
-            creator: .init(goblinUserID: "owner", username: "owner", displayName: "Owner"),
+            creator: .init(userID: "owner", username: "owner", displayName: "Owner"),
             provider: .codex,
             model: "gpt-5.6-sol",
             visibility: .privateSession,
@@ -1422,7 +1422,7 @@ final class RepoPromptHTTPComposerContractTests: XCTestCase {
         let fixture = try await StructuredStartFixture.make()
         defer { Task { try? await fixture.store.close(); try? FileManager.default.removeItem(at: fixture.root) } }
         let instant = Date(timeIntervalSince1970: 1_786_400_000)
-        let key = InternalSigningKey(keyID: "composer-http", role: .goblinApp, direction: "test", secret: Data("composer-http-contract-secret-32bytes".utf8))
+        let key = InternalSigningKey(keyID: "composer-http", role: .app, direction: "test", secret: Data("composer-http-contract-secret-32bytes".utf8))
         let path = "/internal/v1/catalog/composer?projectId=\(fixture.sessionInput.projectID.uuidString.lowercased())"
         let completeWorkflowGuidance = String(repeating: "Desktop parity 🚫 ", count: 2_000)
         let composedCatalog = RepoPromptServerRunner.composeAgentCatalog(
@@ -1522,7 +1522,7 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
 
         let body = try JSONEncoder.serviceEncoder.encode(AgentStartSessionWire(projectID: fixture.sessionInput.projectID, visibility: fixture.sessionInput.visibility, turn: invalid))
         let instant = Date(timeIntervalSince1970: 1_786_400_000)
-        let key = InternalSigningKey(keyID: "atomic-http", role: .goblinApp, direction: "test", secret: Data("atomic-http-secret".utf8))
+        let key = InternalSigningKey(keyID: "atomic-http", role: .app, direction: "test", secret: Data("atomic-http-secret".utf8))
         let service = RepoPromptHTTPService(authority: fixture.authority, store: fixture.store, authenticator: InternalRequestAuthenticator(keys: [key], store: fixture.store, now: { instant }), eventSigningKey: key, submissionCoordinator: fixture.coordinator)
         let app = Application(router: service.internalRouter())
         try await app.test(.router) { client in
@@ -1557,7 +1557,7 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
         )
         let body = try JSONEncoder.serviceEncoder.encode(AgentStartSessionWire(projectID: fixture.sessionInput.projectID, visibility: fixture.sessionInput.visibility, turn: submission, selectedMessageContext: selectedContext))
         let instant = Date(timeIntervalSince1970: 1_786_400_000)
-        let signingKey = InternalSigningKey(keyID: "atomic-http", role: .goblinApp, direction: "test", secret: Data("atomic-http-secret".utf8))
+        let signingKey = InternalSigningKey(keyID: "atomic-http", role: .app, direction: "test", secret: Data("atomic-http-secret".utf8))
         let dispatchQueue = AgentSubmissionDispatchQueue(authority: fixture.authority, coordinator: fixture.coordinator)
         let service = RepoPromptHTTPService(authority: fixture.authority, store: fixture.store, authenticator: InternalRequestAuthenticator(keys: [signingKey], store: fixture.store, now: { instant }), eventSigningKey: signingKey, submissionCoordinator: fixture.coordinator, submissionDispatchQueue: dispatchQueue)
         let app = Application(router: service.internalRouter())
@@ -1575,7 +1575,7 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
         let turn = try XCTUnwrap(turns.first)
         let canonical = try JSONDecoder.serviceDecoder.decode(CanonicalUserTurn.self, from: turn.canonicalUserTurnJSON)
         XCTAssertEqual(canonical.text, frozen)
-        let storedRecord = try await fixture.store.agentSubmission(actorID: fixture.actor.goblinUserID, targetKey: "project:\(fixture.sessionInput.projectID.uuidString.lowercased())", operation: "startSession", publicKey: submissionKey)
+        let storedRecord = try await fixture.store.agentSubmission(actorID: fixture.actor.userID, targetKey: "project:\(fixture.sessionInput.projectID.uuidString.lowercased())", operation: "startSession", publicKey: submissionKey)
         let stored = try XCTUnwrap(storedRecord)
         let compiled = try JSONDecoder.serviceDecoder.decode(CompiledProviderTurnInput.self, from: try XCTUnwrap(stored.compiledInputJSON))
         XCTAssertTrue(compiled.prompt.contains(frozen))
@@ -1593,7 +1593,7 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
         )
         let body = try JSONEncoder.serviceEncoder.encode(AgentStartSessionWire(projectID: fixture.sessionInput.projectID, visibility: fixture.sessionInput.visibility, turn: submission))
         let instant = Date(timeIntervalSince1970: 1_786_400_000)
-        let signingKey = InternalSigningKey(keyID: "atomic-http", role: .goblinApp, direction: "test", secret: Data("atomic-http-secret".utf8))
+        let signingKey = InternalSigningKey(keyID: "atomic-http", role: .app, direction: "test", secret: Data("atomic-http-secret".utf8))
         let gate = SubmissionDispatchGate()
         let coordinator = fixture.coordinator
         let dispatchQueue = AgentSubmissionDispatchQueue { accepted, _, _ in
@@ -1641,7 +1641,7 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
 
         let body = try JSONEncoder.serviceEncoder.encode(AgentStartSessionWire(projectID: fixture.sessionInput.projectID, visibility: fixture.sessionInput.visibility, turn: submission))
         let instant = Date(timeIntervalSince1970: 1_786_400_000)
-        let signingKey = InternalSigningKey(keyID: "atomic-http", role: .goblinApp, direction: "test", secret: Data("atomic-http-secret".utf8))
+        let signingKey = InternalSigningKey(keyID: "atomic-http", role: .app, direction: "test", secret: Data("atomic-http-secret".utf8))
         let dispatchQueue = AgentSubmissionDispatchQueue(authority: fixture.authority, coordinator: fixture.coordinator)
         let service = RepoPromptHTTPService(authority: fixture.authority, store: fixture.store, authenticator: InternalRequestAuthenticator(keys: [signingKey], store: fixture.store, now: { instant }), eventSigningKey: signingKey, submissionCoordinator: fixture.coordinator, submissionDispatchQueue: dispatchQueue)
         let app = Application(router: service.internalRouter())
@@ -1724,7 +1724,7 @@ private struct FailingComposerCatalog: AgentComposerCatalogProviding {
 
 private func composerCatalogHeaders(actor: ExternalActor, projectID: UUID, path: String, nonce: String, instant: Date, key: InternalSigningKey) throws -> HTTPFields {
     let bodyDigest = CanonicalSigning.bodyDigest(Data())
-    let unsigned = GoblinAuthorizationDecision(
+    let unsigned = AuthorizationDecision(
         decisionID: UUID(),
         actor: actor,
         projectID: projectID,
@@ -1742,7 +1742,7 @@ private func composerCatalogHeaders(actor: ExternalActor, projectID: UUID, path:
     )
     let unsignedData = try JSONEncoder.serviceEncoder.encode(unsigned)
     let decisionSignature = CanonicalSigning.hmacSHA256(message: try CanonicalSigning.canonicalJSONObject(unsignedData, removingTopLevelKeys: ["signature"]), key: key.secret)
-    let decision = GoblinAuthorizationDecision(decisionID: unsigned.decisionID, actor: actor, projectID: projectID, operation: unsigned.operation, requestDigest: bodyDigest, policyRevision: 1, controllerRevision: 1, membershipRevision: 1, issuedAt: instant, expiresAt: unsigned.expiresAt, requestID: unsigned.requestID, correlationID: unsigned.correlationID, keyID: key.keyID, signature: decisionSignature)
+    let decision = AuthorizationDecision(decisionID: unsigned.decisionID, actor: actor, projectID: projectID, operation: unsigned.operation, requestDigest: bodyDigest, policyRevision: 1, controllerRevision: 1, membershipRevision: 1, issuedAt: instant, expiresAt: unsigned.expiresAt, requestID: unsigned.requestID, correlationID: unsigned.correlationID, keyID: key.keyID, signature: decisionSignature)
     let decisionData = try JSONEncoder.serviceEncoder.encode(decision)
     let decisionDigest = CanonicalSigning.bodyDigest(decisionData)
     let timestamp = CanonicalSigning.iso8601String(instant)
@@ -1754,13 +1754,13 @@ private func composerCatalogHeaders(actor: ExternalActor, projectID: UUID, path:
     headers[.init("x-internal-body-digest")!] = bodyDigest
     headers[.init("x-internal-authorization-digest")!] = decisionDigest
     headers[.init("x-internal-signature")!] = CanonicalSigning.hmacSHA256(message: canonical, key: key.secret)
-    headers[.init("x-goblin-authorization-decision")!] = CanonicalSigning.base64URLEncode(decisionData)
+    headers[.init("x-repoprompt-authorization-decision")!] = CanonicalSigning.base64URLEncode(decisionData)
     return headers
 }
 
 private func structuredStartHeaders(body: Data, actor: ExternalActor, projectID: UUID, idempotencyKey: String, nonce: String, instant: Date, key: InternalSigningKey) throws -> HTTPFields {
     let bodyDigest = CanonicalSigning.bodyDigest(body)
-    let unsigned = GoblinAuthorizationDecision(
+    let unsigned = AuthorizationDecision(
         decisionID: UUID(),
         actor: actor,
         projectID: projectID,
@@ -1778,7 +1778,7 @@ private func structuredStartHeaders(body: Data, actor: ExternalActor, projectID:
     )
     let unsignedData = try JSONEncoder.serviceEncoder.encode(unsigned)
     let decisionSignature = CanonicalSigning.hmacSHA256(message: try CanonicalSigning.canonicalJSONObject(unsignedData, removingTopLevelKeys: ["signature"]), key: key.secret)
-    let decision = GoblinAuthorizationDecision(decisionID: unsigned.decisionID, actor: actor, projectID: projectID, operation: unsigned.operation, requestDigest: bodyDigest, policyRevision: 1, controllerRevision: 1, membershipRevision: 1, issuedAt: instant, expiresAt: unsigned.expiresAt, requestID: unsigned.requestID, correlationID: unsigned.correlationID, keyID: key.keyID, signature: decisionSignature)
+    let decision = AuthorizationDecision(decisionID: unsigned.decisionID, actor: actor, projectID: projectID, operation: unsigned.operation, requestDigest: bodyDigest, policyRevision: 1, controllerRevision: 1, membershipRevision: 1, issuedAt: instant, expiresAt: unsigned.expiresAt, requestID: unsigned.requestID, correlationID: unsigned.correlationID, keyID: key.keyID, signature: decisionSignature)
     let decisionData = try JSONEncoder.serviceEncoder.encode(decision)
     let decisionDigest = CanonicalSigning.bodyDigest(decisionData)
     let timestamp = CanonicalSigning.iso8601String(instant)
@@ -1791,7 +1791,7 @@ private func structuredStartHeaders(body: Data, actor: ExternalActor, projectID:
     headers[.init("x-internal-body-digest")!] = bodyDigest
     headers[.init("x-internal-authorization-digest")!] = decisionDigest
     headers[.init("x-internal-signature")!] = CanonicalSigning.hmacSHA256(message: canonical, key: key.secret)
-    headers[.init("x-goblin-authorization-decision")!] = CanonicalSigning.base64URLEncode(decisionData)
+    headers[.init("x-repoprompt-authorization-decision")!] = CanonicalSigning.base64URLEncode(decisionData)
     headers[.init("idempotency-key")!] = idempotencyKey
     return headers
 }
@@ -1799,7 +1799,7 @@ private func structuredStartHeaders(body: Data, actor: ExternalActor, projectID:
 private func sessionSnapshotHeaders(actor: ExternalActor, sessionID: UUID, path: String, nonce: String, instant: Date, key: InternalSigningKey) throws -> HTTPFields {
     let body = Data()
     let bodyDigest = CanonicalSigning.bodyDigest(body)
-    let unsigned = GoblinAuthorizationDecision(
+    let unsigned = AuthorizationDecision(
         decisionID: UUID(),
         actor: actor,
         sessionID: sessionID,
@@ -1817,7 +1817,7 @@ private func sessionSnapshotHeaders(actor: ExternalActor, sessionID: UUID, path:
     )
     let unsignedData = try JSONEncoder.serviceEncoder.encode(unsigned)
     let decisionSignature = CanonicalSigning.hmacSHA256(message: try CanonicalSigning.canonicalJSONObject(unsignedData, removingTopLevelKeys: ["signature"]), key: key.secret)
-    let decision = GoblinAuthorizationDecision(decisionID: unsigned.decisionID, actor: actor, sessionID: sessionID, operation: unsigned.operation, requestDigest: bodyDigest, policyRevision: 1, controllerRevision: 1, membershipRevision: 1, issuedAt: instant, expiresAt: unsigned.expiresAt, requestID: unsigned.requestID, correlationID: unsigned.correlationID, keyID: key.keyID, signature: decisionSignature)
+    let decision = AuthorizationDecision(decisionID: unsigned.decisionID, actor: actor, sessionID: sessionID, operation: unsigned.operation, requestDigest: bodyDigest, policyRevision: 1, controllerRevision: 1, membershipRevision: 1, issuedAt: instant, expiresAt: unsigned.expiresAt, requestID: unsigned.requestID, correlationID: unsigned.correlationID, keyID: key.keyID, signature: decisionSignature)
     let decisionData = try JSONEncoder.serviceEncoder.encode(decision)
     let decisionDigest = CanonicalSigning.bodyDigest(decisionData)
     let timestamp = CanonicalSigning.iso8601String(instant)
@@ -1829,7 +1829,7 @@ private func sessionSnapshotHeaders(actor: ExternalActor, sessionID: UUID, path:
     headers[.init("x-internal-body-digest")!] = bodyDigest
     headers[.init("x-internal-authorization-digest")!] = decisionDigest
     headers[.init("x-internal-signature")!] = CanonicalSigning.hmacSHA256(message: canonical, key: key.secret)
-    headers[.init("x-goblin-authorization-decision")!] = CanonicalSigning.base64URLEncode(decisionData)
+    headers[.init("x-repoprompt-authorization-decision")!] = CanonicalSigning.base64URLEncode(decisionData)
     return headers
 }
 
@@ -1849,7 +1849,7 @@ private struct StructuredStartFixture {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let actor = ExternalActor(goblinUserID: "atomic-start-owner", username: "owner", displayName: "Owner")
+        let actor = ExternalActor(userID: "atomic-start-owner", username: "owner", displayName: "Owner")
         let authority = RepoPromptHeadlessAuthority(store: store)
         let project = try await authority.createProject(input: .init(name: "Atomic start", roots: []), externalActor: actor, idempotencyKey: "project", requestDigest: "project")
         let configuration = ProviderCLIConfiguration(kind: .claudeCompatible, executable: "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift", protocolVersion: "stream-json-v1", credentialSourceDirectory: root.path)
@@ -1871,7 +1871,7 @@ private struct StructuredStartFixture {
         let refreshed = try await settings.catalog(refreshCLI: true, refreshRuntime: true)
         XCTAssertTrue(refreshed.providers.first(where: { $0.providerID == .claudeCompatible })?.preflight.ready == true)
         let catalog = AgentComposerCatalogService(providerSettings: settings, store: store)
-        let snapshot = try await catalog.snapshot(context: .init(kind: .project, projectID: project.projectID, actorID: actor.goblinUserID))
+        let snapshot = try await catalog.snapshot(context: .init(kind: .project, projectID: project.projectID, actorID: actor.userID))
         let model = try XCTUnwrap(snapshot.providerGroups.first { $0.providerID == .claudeCompatible }?.models.first)
         let attachments = try AgentComposerAttachmentStore(store: store, configuration: .init(stagingRoot: root.appendingPathComponent("staged").path, acceptedRoot: root.appendingPathComponent("accepted").path, minimumFreeBytes: 0))
         let coordinator = AgentSubmissionCoordinator(store: store, catalog: catalog, compiler: AgentTurnIntentCompiler(), attachments: attachments)

@@ -88,6 +88,6 @@ enum RepoPromptPortalRequestProtection {
 
 enum RepoPromptPortalCertificateAuthorization {
     static func allows(_ role: InternalRouteRole) -> Bool {
-        role == .operatorRole || role == .goblinApp
+        role == .operatorRole || role == .app
     }
 }

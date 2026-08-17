@@ -119,7 +119,7 @@ public actor RepoPromptHeadlessAuthority {
             )
             try await store.installInitialPolicies(
                 permissions: ExecutionPermissionSnapshot(sessionID: snapshot.sessionID, mode: "workspaceWrite", providerSettings: [:], revision: 1, updatedActor: snapshot.creator),
-                collaboration: CollaborationMetadataSnapshot(sessionID: snapshot.sessionID, visibility: snapshot.visibility, collaborativeSteeringEnabled: false, controllerUserID: snapshot.creator.goblinUserID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
+                collaboration: CollaborationMetadataSnapshot(sessionID: snapshot.sessionID, visibility: snapshot.visibility, collaborativeSteeringEnabled: false, controllerUserID: snapshot.creator.userID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
             )
         }
         for agent in try await store.agents() {
@@ -152,7 +152,7 @@ public actor RepoPromptHeadlessAuthority {
         correlationID: UUID? = nil
     ) async throws -> ProjectSnapshot {
         try ensureWritable()
-        let idempotency = IdempotencyInput(actorID: externalActor.goblinUserID, operation: "createProject", key: idempotencyKey, requestDigest: requestDigest)
+        let idempotency = IdempotencyInput(actorID: externalActor.userID, operation: "createProject", key: idempotencyKey, requestDigest: requestDigest)
         if let existing = try await store.idempotencyResult(idempotency) {
             return try await replayProject(response: existing.response, status: existing.status)
         }
@@ -221,7 +221,7 @@ public actor RepoPromptHeadlessAuthority {
         idempotencyKey: String,
         requestDigest: String
     ) async throws -> ProjectSourceOperationWireSnapshot {
-        let scope = externalActor.goblinUserID + "\u{0}" + idempotencyKey
+        let scope = externalActor.userID + "\u{0}" + idempotencyKey
         if var existing = inFlightProjectSourceOperations[scope] {
             guard existing.requestDigest == requestDigest else {
                 throw ServiceAPIError(code: .idempotencyConflict, message: "Idempotency key was reused with a different request")
@@ -273,7 +273,7 @@ public actor RepoPromptHeadlessAuthority {
             throw ServiceAPIError(code: .capabilityMissing, message: "Project source operations are not configured")
         }
         let idempotency = IdempotencyInput(
-            actorID: externalActor.goblinUserID,
+            actorID: externalActor.userID,
             operation: "createProjectFromSource",
             key: idempotencyKey,
             requestDigest: requestDigest
@@ -368,7 +368,7 @@ public actor RepoPromptHeadlessAuthority {
         idempotencyKey: String,
         requestDigest: String
     ) async throws -> ProjectSourceOperationWireSnapshot {
-        let scope = projectID.uuidString + "\u{0}" + externalActor.goblinUserID + "\u{0}" + idempotencyKey
+        let scope = projectID.uuidString + "\u{0}" + externalActor.userID + "\u{0}" + idempotencyKey
         if var existing = inFlightProjectSourceOperations[scope] {
             guard existing.requestDigest == requestDigest else {
                 throw ServiceAPIError(code: .idempotencyConflict, message: "Idempotency key was reused with a different request")
@@ -414,7 +414,7 @@ public actor RepoPromptHeadlessAuthority {
             throw ServiceAPIError(code: .capabilityMissing, message: "Project source operations are not configured")
         }
         let idempotency = IdempotencyInput(
-            actorID: externalActor.goblinUserID,
+            actorID: externalActor.userID,
             operation: "addProjectRepository:\(projectID.uuidString)",
             key: idempotencyKey,
             requestDigest: requestDigest
@@ -540,7 +540,7 @@ public actor RepoPromptHeadlessAuthority {
         requestDigest: String
     ) async throws -> ProjectSnapshot {
         try ensureWritable()
-        let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "renameProject", key: idempotencyKey, requestDigest: requestDigest)
+        let idempotency = IdempotencyInput(actorID: actor.userID, operation: "renameProject", key: idempotencyKey, requestDigest: requestDigest)
         if let existing = try await store.idempotencyResult(idempotency) {
             return try JSONDecoder.serviceDecoder.decode(ProjectSnapshot.self, from: existing.response)
         }
@@ -581,7 +581,7 @@ public actor RepoPromptHeadlessAuthority {
 
     public func updateProject(projectID: UUID, input: UpdateProjectInput, actor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> ProjectSnapshot {
         try ensureWritable()
-        let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "updateProject", key: idempotencyKey, requestDigest: requestDigest)
+        let idempotency = IdempotencyInput(actorID: actor.userID, operation: "updateProject", key: idempotencyKey, requestDigest: requestDigest)
         if let existing = try await store.idempotencyResult(idempotency) { return try JSONDecoder.serviceDecoder.decode(ProjectSnapshot.self, from: existing.response) }
         let current = try await projectSnapshot(projectID: projectID)
         guard current.revision == input.expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Project revision is stale", currentRevision: current.revision) }
@@ -616,7 +616,7 @@ public actor RepoPromptHeadlessAuthority {
 
     public func removeProject(projectID: UUID, expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws {
         try ensureWritable()
-        let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "removeProject", key: idempotencyKey, requestDigest: requestDigest)
+        let idempotency = IdempotencyInput(actorID: actor.userID, operation: "removeProject", key: idempotencyKey, requestDigest: requestDigest)
         if try await store.idempotencyResult(idempotency) != nil { return }
         let current = try await projectSnapshot(projectID: projectID)
         guard current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Project revision is stale", currentRevision: current.revision) }
@@ -702,7 +702,7 @@ public actor RepoPromptHeadlessAuthority {
         guard current.state == .idle else { return current }
         let command = SessionCommand.resumeSession(expectedRunID: nil, providerResumeMode: .fresh)
         let initialRun = IdempotencyInput(
-            actorID: externalActor.goblinUserID,
+            actorID: externalActor.userID,
             operation: command.operation,
             key: "\(idempotencyKey):initial-run",
             requestDigest: requestDigest
@@ -821,7 +821,7 @@ public actor RepoPromptHeadlessAuthority {
                 sessionID: seed.sessionID,
                 visibility: seed.visibility,
                 collaborativeSteeringEnabled: false,
-                controllerUserID: seed.creator.goblinUserID,
+                controllerUserID: seed.creator.userID,
                 policyRevision: 1,
                 controllerRevision: 1,
                 membershipRevision: 1
@@ -829,7 +829,7 @@ public actor RepoPromptHeadlessAuthority {
             let initialSelection = SelectionSnapshot(sessionID: seed.sessionID, entries: [], revision: 1)
             let key = "embedded-import:\(seed.sessionID.uuidString)"
             let idempotency = IdempotencyInput(
-                actorID: seed.creator.goblinUserID,
+                actorID: seed.creator.userID,
                 operation: "embeddedSessionImport",
                 key: key,
                 requestDigest: CanonicalSigning.bodyDigest(Data(key.utf8))
@@ -902,7 +902,7 @@ public actor RepoPromptHeadlessAuthority {
         await eventHub.publish(transcriptEvent)
         let command = SessionCommand.resumeSession(expectedRunID: nil, providerResumeMode: resumeMode)
         let idempotency = IdempotencyInput(
-            actorID: actor.goblinUserID,
+            actorID: actor.userID,
             operation: "embeddedProviderRun",
             key: idempotencyKey,
             requestDigest: requestDigest
@@ -938,7 +938,7 @@ public actor RepoPromptHeadlessAuthority {
             targetTurnEpoch: targetTurnEpoch,
             actor: actor,
             idempotency: .init(
-                actorID: actor.goblinUserID,
+                actorID: actor.userID,
                 operation: command.operation,
                 key: idempotencyKey,
                 requestDigest: requestDigest
@@ -969,7 +969,7 @@ public actor RepoPromptHeadlessAuthority {
             generation: binding.generation,
             actor: actor,
             idempotency: .init(
-                actorID: actor.goblinUserID,
+                actorID: actor.userID,
                 operation: command.operation,
                 key: idempotencyKey,
                 requestDigest: requestDigest
@@ -1008,7 +1008,7 @@ public actor RepoPromptHeadlessAuthority {
         let snapshot = SessionSnapshot(sessionID: sessionID, projectID: input.projectID, parentSessionID: nil, rootSessionID: sessionID, creator: actor, provider: input.provider, model: input.model, visibility: input.visibility, state: .idle, runGeneration: 0, turnEpoch: 0, revision: 1, transcript: [], interactions: [], cursor: cursor)
         let agent = AgentSnapshot(agentID: sessionID, sessionID: sessionID, rootSessionID: sessionID, parentAgentID: nil, role: "root", state: .idle, revision: 1)
         let permissions = await rootLaunchPermissions(sessionID: sessionID, input: input, actor: actor)
-        let collaboration = CollaborationMetadataSnapshot(sessionID: sessionID, visibility: input.visibility, collaborativeSteeringEnabled: false, controllerUserID: actor.goblinUserID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
+        let collaboration = CollaborationMetadataSnapshot(sessionID: sessionID, visibility: input.visibility, collaborativeSteeringEnabled: false, controllerUserID: actor.userID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
         var worktrees: [WorktreeBindingSnapshot] = []
         if let worktreeService, !project.roots.isEmpty {
             do {
@@ -1047,7 +1047,7 @@ public actor RepoPromptHeadlessAuthority {
 
     private func createAuthoritySession(input: CreateSessionInput, externalActor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> SessionSnapshot {
         try ensureWritable()
-        let idempotency = IdempotencyInput(actorID: externalActor.goblinUserID, operation: "startSession", key: idempotencyKey, requestDigest: requestDigest)
+        let idempotency = IdempotencyInput(actorID: externalActor.userID, operation: "startSession", key: idempotencyKey, requestDigest: requestDigest)
         if let existing = try await store.idempotencyResult(idempotency) {
             return try await replaySession(response: existing.response, status: existing.status)
         }
@@ -1121,7 +1121,7 @@ public actor RepoPromptHeadlessAuthority {
             revision: 1,
             updatedActor: externalActor
         )
-        let collaboration = CollaborationMetadataSnapshot(sessionID: sessionID, visibility: input.visibility, collaborativeSteeringEnabled: false, controllerUserID: externalActor.goblinUserID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
+        let collaboration = CollaborationMetadataSnapshot(sessionID: sessionID, visibility: input.visibility, collaborativeSteeringEnabled: false, controllerUserID: externalActor.userID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
         var initialWorktrees: [WorktreeBindingSnapshot] = []
         if input.parentSessionID == nil, let worktreeService, !project.roots.isEmpty {
             do {
@@ -1290,7 +1290,7 @@ public actor RepoPromptHeadlessAuthority {
         }
         let command = SessionCommand.resumeSession(expectedRunID: nil, providerResumeMode: .fresh)
         let idempotency = IdempotencyInput(
-            actorID: snapshot.creator.goblinUserID,
+            actorID: snapshot.creator.userID,
             operation: "agentRun",
             key: "agent-run:\(ids.next().uuidString)",
             requestDigest: CanonicalSigning.bodyDigest(Data(sessionID.uuidString.utf8))
@@ -1322,7 +1322,7 @@ public actor RepoPromptHeadlessAuthority {
             expectedGeneration: snapshot.runGeneration
         )
         let idempotency = IdempotencyInput(
-            actorID: snapshot.creator.goblinUserID,
+            actorID: snapshot.creator.userID,
             operation: "agentCancel",
             key: "agent-cancel:\(ids.next().uuidString)",
             requestDigest: CanonicalSigning.bodyDigest(Data(sessionID.uuidString.utf8))
@@ -1347,9 +1347,9 @@ public actor RepoPromptHeadlessAuthority {
         try await store.agents()
     }
 
-    public func execute(command: SessionCommand, sessionID: UUID, externalActor: ExternalActor, idempotencyKey: String, requestDigest: String, authorizationDecision: GoblinAuthorizationDecision? = nil) async throws -> CommandReceipt {
+    public func execute(command: SessionCommand, sessionID: UUID, externalActor: ExternalActor, idempotencyKey: String, requestDigest: String, authorizationDecision: AuthorizationDecision? = nil) async throws -> CommandReceipt {
         try ensureWritable()
-        let idempotency = IdempotencyInput(actorID: externalActor.goblinUserID, operation: command.operation, key: idempotencyKey, requestDigest: requestDigest)
+        let idempotency = IdempotencyInput(actorID: externalActor.userID, operation: command.operation, key: idempotencyKey, requestDigest: requestDigest)
         if let existing = try await store.idempotencyResult(idempotency) {
             return try JSONDecoder.serviceDecoder.decode(CommandReceipt.self, from: existing.response)
         }
@@ -1451,18 +1451,12 @@ public actor RepoPromptHeadlessAuthority {
                   before.transcript.last?.content == accepted.canonicalUserTurn.text
             else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Accepted session transcript is incomplete") }
         } else {
-            try await authorizeCollaborationPolicy(
-                session: before,
-                actor: actor,
-                operation: "submitTurn",
-                requestDigest: requestDigest
-            )
             try await session.appendHumanMessage(accepted.canonicalUserTurn.text, actor: actor, expectedRevision: before.revision)
             let cursor = try await store.nextCursor()
             let event = try await store.persistSession(replacingCursor(session.snapshot(), cursor: cursor), eventType: .transcriptMessage, actor: actor, correlationID: accepted.receipt.requestAnchorID, idempotency: nil)
             await eventHub.publish(event)
         }
-        let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "dispatchAcceptedTurn", key: accepted.receipt.submissionID.uuidString.lowercased(), requestDigest: requestDigest)
+        let idempotency = IdempotencyInput(actorID: actor.userID, operation: "dispatchAcceptedTurn", key: accepted.receipt.submissionID.uuidString.lowercased(), requestDigest: requestDigest)
         // Follow-ups continue the provider-native conversation exactly as the
         // Desktop engine does. `.auto` starts a new thread only when this session
         // has no durable provider identity or the provider cannot resume.
@@ -1863,7 +1857,7 @@ public actor RepoPromptHeadlessAuthority {
 
     public func refreshProject(projectID: UUID, expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> ProjectSnapshot {
         try ensureWritable()
-        let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "refreshProject", key: idempotencyKey, requestDigest: requestDigest)
+        let idempotency = IdempotencyInput(actorID: actor.userID, operation: "refreshProject", key: idempotencyKey, requestDigest: requestDigest)
         if let existing = try await store.idempotencyResult(idempotency) { return try JSONDecoder.serviceDecoder.decode(ProjectSnapshot.self, from: existing.response) }
         let current = try await projectSnapshot(projectID: projectID)
         guard current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Project revision is stale", currentRevision: current.revision) }
@@ -2048,7 +2042,7 @@ public actor RepoPromptHeadlessAuthority {
 
     public func replaceProjectSelectionTemplate(projectID: UUID, entries: [LogicalSelectionEntry], expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String, requestDigest: String) async throws -> ProjectSelectionTemplateSnapshot {
         try ensureWritable()
-        let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "replaceProjectSelectionTemplate", key: idempotencyKey, requestDigest: requestDigest)
+        let idempotency = IdempotencyInput(actorID: actor.userID, operation: "replaceProjectSelectionTemplate", key: idempotencyKey, requestDigest: requestDigest)
         if let existing = try await store.idempotencyResult(idempotency) { return try JSONDecoder.serviceDecoder.decode(ProjectSelectionTemplateSnapshot.self, from: existing.response) }
         let project = try await projectSnapshot(projectID: projectID)
         let current = try await projectSelectionTemplate(projectID: projectID)
@@ -2255,12 +2249,12 @@ public actor RepoPromptHeadlessAuthority {
         )
     }
 
-    public func replaceSelection(sessionID: UUID, entries: [LogicalSelectionEntry], expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> SelectionSnapshot {
+    public func replaceSelection(sessionID: UUID, entries: [LogicalSelectionEntry], expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil, authorizationDecision: AuthorizationDecision? = nil) async throws -> SelectionSnapshot {
         let idempotency = try mutationIdempotency(actor: actor, operation: "replaceSelection", key: idempotencyKey, digest: requestDigest)
         if let idempotency, let prior: SelectionSnapshot = try await priorResult(idempotency) { return prior }
         guard let selection = selections[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
         let session = try await sessionSnapshot(sessionID: sessionID)
-        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "replaceSelection")
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "replaceSelection", requestDigest: requestDigest, authorizationDecision: authorizationDecision)
         try await validateSelection(entries, projectID: session.projectID)
         let snapshot = try await selection.replace(entries, expectedRevision: expectedRevision)
         let event = try await store.persistSelection(snapshot, projectID: session.projectID, rootSessionID: session.rootSessionID, actor: actor, correlationID: ids.next(), idempotency: idempotency)
@@ -2268,14 +2262,14 @@ public actor RepoPromptHeadlessAuthority {
         return snapshot
     }
 
-    public func addSelection(sessionID: UUID, entries: [LogicalSelectionEntry], expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> SelectionSnapshot {
+    public func addSelection(sessionID: UUID, entries: [LogicalSelectionEntry], expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil, authorizationDecision: AuthorizationDecision? = nil) async throws -> SelectionSnapshot {
         let current = try await selectionSnapshot(sessionID: sessionID)
-        return try await replaceSelection(sessionID: sessionID, entries: current.entries + entries, expectedRevision: expectedRevision, actor: actor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
+        return try await replaceSelection(sessionID: sessionID, entries: current.entries + entries, expectedRevision: expectedRevision, actor: actor, idempotencyKey: idempotencyKey, requestDigest: requestDigest, authorizationDecision: authorizationDecision)
     }
 
-    public func removeSelection(sessionID: UUID, rootID: UUID, logicalPaths: Set<String>, expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> SelectionSnapshot {
+    public func removeSelection(sessionID: UUID, rootID: UUID, logicalPaths: Set<String>, expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil, authorizationDecision: AuthorizationDecision? = nil) async throws -> SelectionSnapshot {
         let current = try await selectionSnapshot(sessionID: sessionID)
-        return try await replaceSelection(sessionID: sessionID, entries: current.entries.filter { $0.rootID != rootID || !logicalPaths.contains($0.logicalPath) }, expectedRevision: expectedRevision, actor: actor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
+        return try await replaceSelection(sessionID: sessionID, entries: current.entries.filter { $0.rootID != rootID || !logicalPaths.contains($0.logicalPath) }, expectedRevision: expectedRevision, actor: actor, idempotencyKey: idempotencyKey, requestDigest: requestDigest, authorizationDecision: authorizationDecision)
     }
 
     public func permissionSnapshot(sessionID: UUID) async throws -> ExecutionPermissionSnapshot? {
@@ -2286,7 +2280,7 @@ public actor RepoPromptHeadlessAuthority {
     public func collaborationMetadata(sessionID: UUID) async throws -> CollaborationMetadataSnapshot {
         let session = try await sessionSnapshot(sessionID: sessionID)
         return try await store.collaboration(sessionID: sessionID)
-            ?? CollaborationMetadataSnapshot(sessionID: sessionID, visibility: session.visibility, collaborativeSteeringEnabled: false, controllerUserID: session.creator.goblinUserID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
+            ?? CollaborationMetadataSnapshot(sessionID: sessionID, visibility: session.visibility, collaborativeSteeringEnabled: false, controllerUserID: session.creator.userID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
     }
 
     public func authorizeSessionCollaboration(
@@ -2294,7 +2288,7 @@ public actor RepoPromptHeadlessAuthority {
         actor: ExternalActor,
         operation: String,
         requestDigest: String? = nil,
-        authorizationDecision: GoblinAuthorizationDecision? = nil
+        authorizationDecision: AuthorizationDecision? = nil
     ) async throws {
         let session = try await sessionSnapshot(sessionID: sessionID)
         try await authorizeCollaborationPolicy(
@@ -2306,9 +2300,9 @@ public actor RepoPromptHeadlessAuthority {
         )
     }
 
-    public func updateCollaborationMetadata(sessionID: UUID, input: CollaborationMetadataInput, actor: ExternalActor, idempotencyKey: String, requestDigest: String, idempotencyResponse: Data? = nil, authorizationDecision: GoblinAuthorizationDecision? = nil) async throws -> CollaborationMetadataSnapshot {
+    public func updateCollaborationMetadata(sessionID: UUID, input: CollaborationMetadataInput, actor: ExternalActor, idempotencyKey: String, requestDigest: String, idempotencyResponse: Data? = nil, authorizationDecision: AuthorizationDecision? = nil) async throws -> CollaborationMetadataSnapshot {
         try ensureWritable()
-        let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "setSessionVisibility", key: idempotencyKey, requestDigest: requestDigest)
+        let idempotency = IdempotencyInput(actorID: actor.userID, operation: "setSessionVisibility", key: idempotencyKey, requestDigest: requestDigest)
         if let prior: CollaborationMetadataSnapshot = try await priorResult(idempotency) { return prior }
         guard let session = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
         let authoritySession = await session.snapshot()
@@ -2335,10 +2329,10 @@ public actor RepoPromptHeadlessAuthority {
         guard resultingPolicyRevision == current.policyRevision + (policyChanged ? 1 : 0),
               resultingControllerRevision == current.controllerRevision + (controllerChanged ? 1 : 0),
               resultingMembershipRevision == current.membershipRevision + (membershipChanged ? 1 : 0)
-        else { throw ServiceAPIError(code: .staleRevision, message: "Goblin collaboration result revisions are not the exact next authority revisions", currentRevision: current.policyRevision) }
+        else { throw ServiceAPIError(code: .staleRevision, message: "Collaboration result revisions are not the exact next authority revisions", currentRevision: current.policyRevision) }
         if let authorizationDecision {
             guard authorizationDecision.sessionID == sessionID,
-                  authorizationDecision.actor.goblinUserID == actor.goblinUserID,
+                  authorizationDecision.actor.userID == actor.userID,
                   authorizationDecision.operation == "setSessionVisibility",
                   authorizationDecision.requestDigest == requestDigest,
                   authorizationDecision.policyRevision == resultingPolicyRevision,
@@ -2347,17 +2341,17 @@ public actor RepoPromptHeadlessAuthority {
                   authorizationDecision.issuedAt <= clock.now(),
                   authorizationDecision.expiresAt > clock.now(),
                   authorizationDecision.attributionLabels?.creatorUserID == nil
-                    || authorizationDecision.attributionLabels?.creatorUserID == authoritySession.creator.goblinUserID,
+                    || authorizationDecision.attributionLabels?.creatorUserID == authoritySession.creator.userID,
                   authorizationDecision.attributionLabels?.controllerUserID == nil
                     || authorizationDecision.attributionLabels?.controllerUserID == input.controllerUserID,
                   authorizationDecision.attributionLabels?.visibility == nil
                     || authorizationDecision.attributionLabels?.visibility == input.visibility
             else {
-                throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Goblin collaboration decision does not acknowledge the exact resulting revisions")
+                throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision does not acknowledge the exact resulting revisions")
             }
         }
         let acknowledgement = authorizationDecision.map {
-            GoblinCollaborationAcknowledgement(
+            CollaborationAcknowledgement(
                 decisionID: $0.decisionID,
                 acknowledgedPolicyRevision: $0.policyRevision,
                 acknowledgedControllerRevision: $0.controllerRevision,
@@ -2377,7 +2371,7 @@ public actor RepoPromptHeadlessAuthority {
             policyRevision: resultingPolicyRevision,
             controllerRevision: resultingControllerRevision,
             membershipRevision: resultingMembershipRevision,
-            goblinAcknowledgement: acknowledgement
+            collaborationAcknowledgement: acknowledgement
         )
         let currentSession = authoritySession
         let cursor = try await store.nextCursor()
@@ -2409,11 +2403,11 @@ public actor RepoPromptHeadlessAuthority {
     }
 
 
-    public func updatePermissions(sessionID: UUID, expectedRevision: Int64, mode: String, providerSettings: [String: String], actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> ExecutionPermissionSnapshot {
+    public func updatePermissions(sessionID: UUID, expectedRevision: Int64, mode: String, providerSettings: [String: String], actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil, authorizationDecision: AuthorizationDecision? = nil) async throws -> ExecutionPermissionSnapshot {
         let idempotency = try mutationIdempotency(actor: actor, operation: "updateExecutionPermissions", key: idempotencyKey, digest: requestDigest)
         if let idempotency, let prior: ExecutionPermissionSnapshot = try await priorResult(idempotency) { return prior }
         let session = try await sessionSnapshot(sessionID: sessionID)
-        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "updateExecutionPermissions")
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "updateExecutionPermissions", requestDigest: requestDigest, authorizationDecision: authorizationDecision)
         guard session.parentSessionID == nil else {
             throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Child execution permissions are frozen by sub-agent policy at creation")
         }
@@ -2441,11 +2435,11 @@ public actor RepoPromptHeadlessAuthority {
         return interaction
     }
 
-    public func answerInteraction(sessionID: UUID, interactionID: UUID, expectedRevision: Int64, payload: Data, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> InteractionSnapshot {
+    public func answerInteraction(sessionID: UUID, interactionID: UUID, expectedRevision: Int64, payload: Data, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil, authorizationDecision: AuthorizationDecision? = nil) async throws -> InteractionSnapshot {
         let idempotency = try mutationIdempotency(actor: actor, operation: "answerInteraction", key: idempotencyKey, digest: requestDigest)
         if let idempotency, let prior: InteractionSnapshot = try await priorResult(idempotency) { return prior }
         let session = try await sessionSnapshot(sessionID: sessionID)
-        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "answerInteraction")
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "answerInteraction", requestDigest: requestDigest, authorizationDecision: authorizationDecision)
         guard let current = try await store.interactions(sessionID: sessionID).first(where: { $0.interactionID == interactionID }) else { throw ServiceAPIError(code: .notFound, message: "Interaction not found") }
         guard current.state == .pending, current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Interaction revision is stale", currentRevision: current.revision) }
         if let expiresAt = current.expiresAt, expiresAt <= clock.now() { throw ServiceAPIError(code: .interactionSettled, message: "Interaction expired") }
@@ -2607,12 +2601,12 @@ public actor RepoPromptHeadlessAuthority {
         return try await authoritySessionSnapshot(sessionID: sessionID)
     }
 
-    public func createWorktree(sessionID: UUID, rootID: UUID, baseRef: String, branch: String, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> WorktreeBindingSnapshot {
+    public func createWorktree(sessionID: UUID, rootID: UUID, baseRef: String, branch: String, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil, authorizationDecision: AuthorizationDecision? = nil) async throws -> WorktreeBindingSnapshot {
         let idempotency = try mutationIdempotency(actor: actor, operation: "createWorktree", key: idempotencyKey, digest: requestDigest)
         if let idempotency, let prior: WorktreeBindingSnapshot = try await priorResult(idempotency) { return prior }
         guard let worktreeService else { throw ServiceAPIError(code: .capabilityMissing, message: "Worktree storage is not configured") }
         let session = try await sessionSnapshot(sessionID: sessionID)
-        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "createWorktree")
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "createWorktree", requestDigest: requestDigest, authorizationDecision: authorizationDecision)
         guard session.parentSessionID == nil else {
             throw ServiceAPIError(code: .worktreeConflict, message: "Only a root session may create project worktrees")
         }
@@ -2638,13 +2632,13 @@ public actor RepoPromptHeadlessAuthority {
         }
     }
 
-    public func bindWorktree(sessionID: UUID, bindingID: UUID, expectedRevision: Int64, expectedSelectionBindingRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> WorktreeBindingSnapshot {
+    public func bindWorktree(sessionID: UUID, bindingID: UUID, expectedRevision: Int64, expectedSelectionBindingRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil, authorizationDecision: AuthorizationDecision? = nil) async throws -> WorktreeBindingSnapshot {
         let idempotency = try mutationIdempotency(actor: actor, operation: "bindWorktree", key: idempotencyKey, digest: requestDigest)
         if let idempotency, let prior: WorktreeBindingSnapshot = try await priorResult(idempotency) { return prior }
         guard let sessionAuthority = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
         guard await sessionAuthority.activeBinding() == nil else { throw ServiceAPIError(code: .runAlreadyActive, message: "A worktree cannot be rebound while a run is active") }
         let session = await sessionAuthority.snapshot()
-        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "bindWorktree")
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "bindWorktree", requestDigest: requestDigest, authorizationDecision: authorizationDecision)
         guard let current = try await store.worktree(bindingID: bindingID), current.projectID == session.projectID else { throw ServiceAPIError(code: .notFound, message: "Worktree binding not found") }
         guard current.sessionID == nil || current.sessionID == sessionID else { throw ServiceAPIError(code: .worktreeConflict, message: "Worktree is owned by another session") }
         guard current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Worktree revision is stale", currentRevision: current.revision) }
@@ -2662,12 +2656,12 @@ public actor RepoPromptHeadlessAuthority {
         return rebound
     }
 
-    public func mergeWorktree(sessionID: UUID, bindingID: UUID, strategy: String, expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> WorktreeBindingSnapshot {
+    public func mergeWorktree(sessionID: UUID, bindingID: UUID, strategy: String, expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil, authorizationDecision: AuthorizationDecision? = nil) async throws -> WorktreeBindingSnapshot {
         let idempotency = try mutationIdempotency(actor: actor, operation: "mergeWorktree", key: idempotencyKey, digest: requestDigest)
         if let idempotency, let prior: WorktreeBindingSnapshot = try await priorResult(idempotency) { return prior }
         guard let worktreeService else { throw ServiceAPIError(code: .capabilityMissing, message: "Worktree storage is not configured") }
         let session = try await sessionSnapshot(sessionID: sessionID)
-        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "mergeWorktree")
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "mergeWorktree", requestDigest: requestDigest, authorizationDecision: authorizationDecision)
         guard let initialBinding = try await store.worktree(bindingID: bindingID),
               initialBinding.projectID == session.projectID,
               initialBinding.sessionID == sessionID
@@ -2695,12 +2689,12 @@ public actor RepoPromptHeadlessAuthority {
         return merged
     }
 
-    public func abortConflictedMerge(sessionID: UUID, bindingID: UUID, leaseID: UUID, expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil) async throws -> WorktreeBindingSnapshot {
+    public func abortConflictedMerge(sessionID: UUID, bindingID: UUID, leaseID: UUID, expectedRevision: Int64, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil, authorizationDecision: AuthorizationDecision? = nil) async throws -> WorktreeBindingSnapshot {
         let idempotency = try mutationIdempotency(actor: actor, operation: "abortConflictedMerge", key: idempotencyKey, digest: requestDigest)
         if let idempotency, let prior: WorktreeBindingSnapshot = try await priorResult(idempotency) { return prior }
         guard let worktreeService else { throw ServiceAPIError(code: .capabilityMissing, message: "Worktree storage is not configured") }
         let session = try await sessionSnapshot(sessionID: sessionID)
-        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "abortConflictedMerge")
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "abortConflictedMerge", requestDigest: requestDigest, authorizationDecision: authorizationDecision)
         guard let binding = try await store.worktree(bindingID: bindingID), binding.projectID == session.projectID, binding.sessionID == sessionID else {
             throw ServiceAPIError(code: .notFound, message: "Worktree binding not found")
         }
@@ -2741,7 +2735,7 @@ public actor RepoPromptHeadlessAuthority {
         return (artifact.snapshot, Data(complete[requested]), requested)
     }
 
-    public func buildContext(sessionID: UUID, expectedSelectionRevision: Int64, include: [String], actor: ExternalActor, requestDigest: String? = nil, authorizationDecision: GoblinAuthorizationDecision? = nil) async throws -> ArtifactSnapshot {
+    public func buildContext(sessionID: UUID, expectedSelectionRevision: Int64, include: [String], actor: ExternalActor, requestDigest: String? = nil, authorizationDecision: AuthorizationDecision? = nil) async throws -> ArtifactSnapshot {
         let session = try await sessionSnapshot(sessionID: sessionID)
         try await authorizeCollaborationPolicy(
             session: session,
@@ -2760,12 +2754,14 @@ public actor RepoPromptHeadlessAuthority {
         sessionID: UUID,
         input: ContextBuilderInput,
         actor: ExternalActor,
-        origin: ContextBuilderInvocationOrigin = .internal
+        origin: ContextBuilderInvocationOrigin = .internal,
+        requestDigest: String? = nil,
+        authorizationDecision: AuthorizationDecision? = nil
     ) async throws -> ContextBuilderSnapshot {
         guard let contextBuilderRuntime else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Context Builder runtime is not configured") }
         guard artifactService != nil else { throw ServiceAPIError(code: .capabilityMissing, message: "Context Builder requires durable artifact storage") }
         let session = try await sessionSnapshot(sessionID: sessionID)
-        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "runContextBuilder")
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "runContextBuilder", requestDigest: requestDigest, authorizationDecision: authorizationDecision)
         let effectiveSettings: EffectiveContextBuilderSettings
         let renderedInstructions: String
         if let serverSettings {
@@ -2967,10 +2963,10 @@ public actor RepoPromptHeadlessAuthority {
         )
     }
 
-    public func askOracle(sessionID: UUID, input: OracleInput, actor: ExternalActor) async throws -> OracleSnapshot {
+    public func askOracle(sessionID: UUID, input: OracleInput, actor: ExternalActor, requestDigest: String? = nil, authorizationDecision: AuthorizationDecision? = nil) async throws -> OracleSnapshot {
         guard let oracleRuntime else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Oracle runtime is not configured") }
         let session = try await sessionSnapshot(sessionID: sessionID)
-        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "askOracle")
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "askOracle", requestDigest: requestDigest, authorizationDecision: authorizationDecision)
         let project = try await projectSnapshot(projectID: session.projectID)
         let workingDirectory = try await executionLocation(session: session).workingDirectory
         let selection = try await selectionSnapshot(sessionID: sessionID)
@@ -3412,7 +3408,7 @@ public actor RepoPromptHeadlessAuthority {
     private func mutationIdempotency(actor: ExternalActor, operation: String, key: String?, digest: String?) throws -> IdempotencyInput? {
         switch (key, digest) {
         case (nil, nil): nil
-        case let (.some(key), .some(digest)): IdempotencyInput(actorID: actor.goblinUserID, operation: operation, key: key, requestDigest: digest)
+        case let (.some(key), .some(digest)): IdempotencyInput(actorID: actor.userID, operation: operation, key: key, requestDigest: digest)
         default: throw ServiceAPIError(code: .invalidRequest, message: "Idempotency key and request digest must be supplied together")
         }
     }
@@ -3716,7 +3712,7 @@ public actor RepoPromptHeadlessAuthority {
         session: SessionSnapshot,
         actor: ExternalActor,
         requestDigest: String? = nil,
-        authorizationDecision: GoblinAuthorizationDecision? = nil
+        authorizationDecision: AuthorizationDecision? = nil
     ) async throws {
         try await authorizeCollaborationPolicy(
             session: session,
@@ -3732,11 +3728,11 @@ public actor RepoPromptHeadlessAuthority {
         actor: ExternalActor,
         operation: String,
         requestDigest: String? = nil,
-        authorizationDecision: GoblinAuthorizationDecision? = nil
+        authorizationDecision: AuthorizationDecision? = nil
     ) async throws {
         let metadata = try await collaborationMetadata(sessionID: session.sessionID)
         if let authorizationDecision {
-            try evaluateGoblinCollaborationDecision(
+            try bindAuthorizationDecision(
                 authorizationDecision,
                 session: session,
                 metadata: metadata,
@@ -3744,28 +3740,29 @@ public actor RepoPromptHeadlessAuthority {
                 operation: operation,
                 requestDigest: requestDigest
             )
+            return
         }
         switch collaborationOperationClass(operation) {
         case .view:
             return
         case .policyOwner:
-            guard actor.goblinUserID == session.creator.goblinUserID else {
+            guard actor.userID == session.creator.userID else {
                 throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Only the session policy owner may perform this operation")
             }
         case .collaborativeSteering:
-            if actor.goblinUserID == metadata.controllerUserID { return }
+            if actor.userID == metadata.controllerUserID { return }
             guard session.visibility == .collaborative, metadata.collaborativeSteeringEnabled else {
                 throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Only the current collaboration controller may perform this operation")
             }
         case .controller:
-            guard actor.goblinUserID == metadata.controllerUserID else {
+            guard actor.userID == metadata.controllerUserID else {
                 throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Only the current collaboration controller may perform this operation")
             }
         }
     }
 
-    private func evaluateGoblinCollaborationDecision(
-        _ decision: GoblinAuthorizationDecision,
+    private func bindAuthorizationDecision(
+        _ decision: AuthorizationDecision,
         session: SessionSnapshot,
         metadata: CollaborationMetadataSnapshot,
         actor: ExternalActor,
@@ -3774,13 +3771,13 @@ public actor RepoPromptHeadlessAuthority {
     ) throws {
         guard decision.sessionID == session.sessionID,
               decision.operation == operation,
-              decision.actor.goblinUserID == actor.goblinUserID,
+              decision.actor.userID == actor.userID,
               requestDigest == nil || decision.requestDigest == requestDigest
         else {
-            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Verified Goblin authorization decision is not bound to this command")
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Verified authorization decision is not bound to this command")
         }
         guard decision.issuedAt <= clock.now(), decision.expiresAt > clock.now() else {
-            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Goblin authorization decision is stale")
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision is stale")
         }
         if operation == "setSessionVisibility" || operation == "setCollaborativeSteering" {
             return
@@ -3791,14 +3788,14 @@ public actor RepoPromptHeadlessAuthority {
         else {
             throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision revisions do not match durable session policy")
         }
-        if let creator = decision.attributionLabels?.creatorUserID, creator != session.creator.goblinUserID {
-            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Goblin attribution does not match the session creator")
+        if let creator = decision.attributionLabels?.creatorUserID, creator != session.creator.userID {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization attribution does not match the session creator")
         }
         if let controller = decision.attributionLabels?.controllerUserID, controller != metadata.controllerUserID {
-            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Goblin attribution does not match the current controller")
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization attribution does not match the current controller")
         }
         if let visibility = decision.attributionLabels?.visibility, visibility != metadata.visibility {
-            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Goblin attribution does not match session visibility")
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization attribution does not match session visibility")
         }
     }
 

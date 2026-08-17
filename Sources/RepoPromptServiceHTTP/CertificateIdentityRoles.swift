@@ -34,8 +34,8 @@ public struct CertificateIdentityRoleResolver: Sendable {
             throw ConfigurationError.invalid("Client certificate identities must be unique across roles")
         }
         return Self(identities: [
-            app: .goblinApp,
-            sync: .goblinSync,
+            app: .app,
+            sync: .sync,
             operatorIdentity: .operatorRole
         ])
     }

@@ -15,20 +15,20 @@ final class AuthorityTests: XCTestCase {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let provider = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: "/usr/bin/true")], runner: DelayedProviderRunner())
         let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
-        let owner = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
-        let controller = ExternalActor(goblinUserID: "u2", username: "bob", displayName: "Bob")
+        let owner = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
+        let controller = ExternalActor(userID: "u2", username: "bob", displayName: "Bob")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: owner, idempotencyKey: "policy-project", requestDigest: "policy-project")
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "hello"), externalActor: owner, idempotencyKey: "policy-session", requestDigest: "policy-session")
 
         let initialPermission = try await authority.permissionSnapshot(sessionID: session.sessionID)
         XCTAssertEqual(initialPermission?.mode, "workspaceWrite")
         let initial = try await authority.collaborationMetadata(sessionID: session.sessionID)
-        XCTAssertEqual(initial.controllerUserID, owner.goblinUserID)
+        XCTAssertEqual(initial.controllerUserID, owner.userID)
         XCTAssertEqual(initial.policyRevision, 1)
 
         let transferred = try await authority.updateCollaborationMetadata(
             sessionID: session.sessionID,
-            input: .init(expectedPolicyRevision: 1, expectedControllerRevision: 1, expectedMembershipRevision: 1, visibility: .collaborative, collaborativeSteeringEnabled: true, controllerUserID: controller.goblinUserID),
+            input: .init(expectedPolicyRevision: 1, expectedControllerRevision: 1, expectedMembershipRevision: 1, visibility: .collaborative, collaborativeSteeringEnabled: true, controllerUserID: controller.userID),
             actor: owner,
             idempotencyKey: "policy-transfer",
             requestDigest: "policy-transfer"
@@ -48,15 +48,15 @@ final class AuthorityTests: XCTestCase {
         try await store.close()
     }
 
-    func testGoblinCollaborationAcknowledgementIsExactEventedAndRestored() async throws {
+    func testCollaborationAcknowledgementIsExactEventedAndRestored() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let database = root.appendingPathComponent("authority.sqlite")
         let store = try await SQLiteServiceStore.open(storage: .file(database.path))
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let owner = ExternalActor(goblinUserID: "owner", username: "alice", displayName: "Alice")
-        let controller = ExternalActor(goblinUserID: "controller", username: "bob", displayName: "Bob")
+        let owner = ExternalActor(userID: "owner", username: "alice", displayName: "Alice")
+        let controller = ExternalActor(userID: "controller", username: "bob", displayName: "Bob")
         let project = try await authority.createProject(
             input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]),
             externalActor: owner,
@@ -72,7 +72,7 @@ final class AuthorityTests: XCTestCase {
         let requestID = UUID()
         let correlationID = UUID()
         let decisionID = UUID()
-        let decision = GoblinAuthorizationDecision(
+        let decision = AuthorizationDecision(
             decisionID: decisionID,
             actor: owner,
             sessionID: session.sessionID,
@@ -83,8 +83,8 @@ final class AuthorityTests: XCTestCase {
             controllerRevision: 2,
             membershipRevision: 2,
             attributionLabels: .init(
-                creatorUserID: owner.goblinUserID,
-                controllerUserID: controller.goblinUserID,
+                creatorUserID: owner.userID,
+                controllerUserID: controller.userID,
                 visibility: .collaborative
             ),
             issuedAt: Date().addingTimeInterval(-1),
@@ -94,7 +94,7 @@ final class AuthorityTests: XCTestCase {
             keyID: "test-goblin",
             signature: "verified-upstream"
         )
-        let mismatchedDecision = GoblinAuthorizationDecision(
+        let mismatchedDecision = AuthorizationDecision(
             decisionID: UUID(),
             actor: owner,
             sessionID: session.sessionID,
@@ -124,14 +124,14 @@ final class AuthorityTests: XCTestCase {
                     membershipRevision: 2,
                     visibility: .collaborative,
                     collaborativeSteeringEnabled: true,
-                    controllerUserID: controller.goblinUserID
+                    controllerUserID: controller.userID
                 ),
                 actor: owner,
                 idempotencyKey: "ack-mismatch",
                 requestDigest: "ack-digest",
                 authorizationDecision: mismatchedDecision
             )
-            XCTFail("expected operation-bound Goblin acknowledgement rejection")
+            XCTFail("expected operation-bound authorization acknowledgement rejection")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .authorizationDecisionRejected)
         }
@@ -148,14 +148,14 @@ final class AuthorityTests: XCTestCase {
                 membershipRevision: 2,
                 visibility: .collaborative,
                 collaborativeSteeringEnabled: true,
-                controllerUserID: controller.goblinUserID
+                controllerUserID: controller.userID
             ),
             actor: owner,
             idempotencyKey: "ack-update",
             requestDigest: "ack-digest",
             authorizationDecision: decision
         )
-        let expectedAck = GoblinCollaborationAcknowledgement(
+        let expectedAck = CollaborationAcknowledgement(
             decisionID: decisionID,
             acknowledgedPolicyRevision: 2,
             acknowledgedControllerRevision: 2,
@@ -166,7 +166,7 @@ final class AuthorityTests: XCTestCase {
             requestID: requestID,
             correlationID: correlationID
         )
-        XCTAssertEqual(updated.goblinAcknowledgement, expectedAck)
+        XCTAssertEqual(updated.collaborationAcknowledgement, expectedAck)
 
         let page = try await authority.events(after: session.cursor, limit: 10)
         let collaborationEvents = page.events.filter {
@@ -178,7 +178,7 @@ final class AuthorityTests: XCTestCase {
             let payloadData = try JSONEncoder.serviceEncoder.encode(event.payload.object)
             let payload = try JSONDecoder.serviceDecoder.decode(CollaborationMetadataSnapshot.self, from: payloadData)
             XCTAssertEqual(payload, updated)
-            XCTAssertEqual(payload.goblinAcknowledgement, expectedAck)
+            XCTAssertEqual(payload.collaborationAcknowledgement, expectedAck)
         }
 
         try await authority.quiesce()
@@ -188,31 +188,31 @@ final class AuthorityTests: XCTestCase {
         try await restoredAuthority.recover()
         let restored = try await restoredAuthority.collaborationMetadata(sessionID: session.sessionID)
         XCTAssertEqual(restored, updated)
-        XCTAssertEqual(restored.goblinAcknowledgement, expectedAck)
+        XCTAssertEqual(restored.collaborationAcknowledgement, expectedAck)
         try await restoredAuthority.quiesce()
         try await reopenedStore.close(clean: true)
     }
 
-    func testGoblinCollaborationPolicyIsEvaluatedEvenWhenADecisionIsPresent() async throws {
+    func testSignedAuthorizationDecisionBindsWithoutLocalEligibility() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let owner = ExternalActor(goblinUserID: "owner", username: "alice", displayName: "Alice")
-        let controller = ExternalActor(goblinUserID: "controller", username: "bob", displayName: "Bob")
-        let collaborator = ExternalActor(goblinUserID: "collaborator", username: "carol", displayName: "Carol")
+        let owner = ExternalActor(userID: "owner", username: "alice", displayName: "Alice")
+        let controller = ExternalActor(userID: "controller", username: "bob", displayName: "Bob")
+        let collaborator = ExternalActor(userID: "collaborator", username: "carol", displayName: "Carol")
         let project = try await authority.createProject(
             input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]),
             externalActor: owner,
-            idempotencyKey: "goblin-policy-project",
-            requestDigest: "goblin-policy-project"
+            idempotencyKey: "policy-project",
+            requestDigest: "policy-project"
         )
         let session = try await authority.createSession(
             input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "hello"),
             externalActor: owner,
-            idempotencyKey: "goblin-policy-session",
-            requestDigest: "goblin-policy-session"
+            idempotencyKey: "policy-session",
+            requestDigest: "policy-session"
         )
         _ = try await authority.updateCollaborationMetadata(
             sessionID: session.sessionID,
@@ -222,98 +222,52 @@ final class AuthorityTests: XCTestCase {
                 expectedMembershipRevision: 1,
                 visibility: .collaborative,
                 collaborativeSteeringEnabled: true,
-                controllerUserID: controller.goblinUserID
+                controllerUserID: controller.userID
             ),
             actor: owner,
-            idempotencyKey: "goblin-policy-transfer",
-            requestDigest: "goblin-policy-transfer"
+            idempotencyKey: "policy-transfer",
+            requestDigest: "policy-transfer"
         )
         let collaborative = try await authority.collaborationMetadata(sessionID: session.sessionID)
 
-        _ = try await authority.execute(
-            command: .sendFollowup(text: "steering", expectedSessionRevision: session.revision + 1),
-            sessionID: session.sessionID,
-            externalActor: collaborator,
-            idempotencyKey: "goblin-policy-steering",
-            requestDigest: "goblin-policy-steering",
-            authorizationDecision: goblinDecision(
-                actor: collaborator,
-                sessionID: session.sessionID,
-                projectID: project.projectID,
-                operation: "sendFollowup",
-                requestDigest: "goblin-policy-steering",
-                metadata: collaborative
-            )
-        )
-
         try await authority.authorizeSessionCollaboration(
             sessionID: session.sessionID,
             actor: collaborator,
-            operation: "buildContext",
-            requestDigest: "goblin-policy-context",
-            authorizationDecision: goblinDecision(
+            operation: "replaceSelection",
+            requestDigest: "policy-selection",
+            authorizationDecision: signedDecision(
                 actor: collaborator,
                 sessionID: session.sessionID,
                 projectID: project.projectID,
-                operation: "buildContext",
-                requestDigest: "goblin-policy-context",
-                metadata: collaborative
-            )
-        )
-        try await authority.authorizeSessionCollaboration(
-            sessionID: session.sessionID,
-            actor: collaborator,
-            operation: "submitTurn",
-            requestDigest: "goblin-policy-submit",
-            authorizationDecision: goblinDecision(
-                actor: collaborator,
-                sessionID: session.sessionID,
-                projectID: project.projectID,
-                operation: "submitTurn",
-                requestDigest: "goblin-policy-submit",
-                metadata: collaborative
-            )
-        )
-        do {
-            try await authority.authorizeSessionCollaboration(
-                sessionID: session.sessionID,
-                actor: collaborator,
                 operation: "replaceSelection",
-                requestDigest: "goblin-policy-selection",
-                authorizationDecision: goblinDecision(
-                    actor: collaborator,
-                    sessionID: session.sessionID,
-                    projectID: project.projectID,
-                    operation: "replaceSelection",
-                    requestDigest: "goblin-policy-selection",
-                    metadata: collaborative
-                )
+                requestDigest: "policy-selection",
+                metadata: collaborative
             )
-            XCTFail("expected Goblin-signed selection mutation to stay controller-only")
-        } catch let error as ServiceAPIError {
-            XCTAssertEqual(error.code, .authorizationDecisionRejected)
-        }
+        )
 
-        do {
-            _ = try await authority.execute(
-                command: .archiveSession(expectedRevision: session.revision + 2),
+        _ = try await authority.updateCollaborationMetadata(
+            sessionID: session.sessionID,
+            input: .init(
+                expectedPolicyRevision: collaborative.policyRevision,
+                visibility: .collaborative,
+                collaborativeSteeringEnabled: false,
+                controllerUserID: controller.userID
+            ),
+            actor: controller,
+            idempotencyKey: "policy-signed-visibility",
+            requestDigest: "policy-signed-visibility",
+            authorizationDecision: signedDecision(
+                actor: controller,
                 sessionID: session.sessionID,
-                externalActor: collaborator,
-                idempotencyKey: "goblin-policy-archive",
-                requestDigest: "goblin-policy-archive",
-                authorizationDecision: goblinDecision(
-                    actor: collaborator,
-                    sessionID: session.sessionID,
-                    projectID: project.projectID,
-                    operation: "archiveSession",
-                    requestDigest: "goblin-policy-archive",
-                    metadata: collaborative
-                )
+                projectID: project.projectID,
+                operation: "setSessionVisibility",
+                requestDigest: "policy-signed-visibility",
+                metadata: collaborative,
+                policyRevision: collaborative.policyRevision + 1,
+                controllerRevision: collaborative.controllerRevision,
+                membershipRevision: collaborative.membershipRevision
             )
-            XCTFail("expected Goblin-signed controller-only command to be rejected")
-        } catch let error as ServiceAPIError {
-            XCTAssertEqual(error.code, .authorizationDecisionRejected)
-        }
+        )
 
         do {
             _ = try await authority.updatePermissions(
@@ -322,113 +276,31 @@ final class AuthorityTests: XCTestCase {
                 mode: "disabled",
                 providerSettings: [:],
                 actor: collaborator,
-                idempotencyKey: "goblin-policy-permissions",
-                requestDigest: "goblin-policy-permissions"
+                idempotencyKey: "policy-permissions",
+                requestDigest: "policy-permissions"
             )
-            XCTFail("expected collaborator permission update to be rejected")
-        } catch let error as ServiceAPIError {
-            XCTAssertEqual(error.code, .authorizationDecisionRejected)
-        }
-
-        do {
-            _ = try await authority.updateCollaborationMetadata(
-                sessionID: session.sessionID,
-                input: .init(
-                    expectedPolicyRevision: collaborative.policyRevision,
-                    visibility: .collaborative,
-                    collaborativeSteeringEnabled: false,
-                    controllerUserID: controller.goblinUserID
-                ),
-                actor: controller,
-                idempotencyKey: "goblin-policy-non-owner",
-                requestDigest: "goblin-policy-non-owner",
-                authorizationDecision: goblinDecision(
-                    actor: controller,
-                    sessionID: session.sessionID,
-                    projectID: project.projectID,
-                    operation: "setSessionVisibility",
-                    requestDigest: "goblin-policy-non-owner",
-                    metadata: collaborative,
-                    policyRevision: collaborative.policyRevision + 1,
-                    controllerRevision: collaborative.controllerRevision,
-                    membershipRevision: collaborative.membershipRevision
-                )
-            )
-            XCTFail("expected non-owner collaboration write to be rejected")
-        } catch let error as ServiceAPIError {
-            XCTAssertEqual(error.code, .authorizationDecisionRejected)
-        }
-
-        let disabled = try await authority.updateCollaborationMetadata(
-            sessionID: session.sessionID,
-            input: .init(
-                expectedPolicyRevision: collaborative.policyRevision,
-                visibility: .collaborative,
-                collaborativeSteeringEnabled: false,
-                controllerUserID: controller.goblinUserID
-            ),
-            actor: owner,
-            idempotencyKey: "goblin-policy-disable-steering",
-            requestDigest: "goblin-policy-disable-steering"
-        )
-        do {
-            _ = try await authority.execute(
-                command: .sendFollowup(text: "blocked", expectedSessionRevision: session.revision + 2),
-                sessionID: session.sessionID,
-                externalActor: collaborator,
-                idempotencyKey: "goblin-policy-blocked",
-                requestDigest: "goblin-policy-blocked",
-                authorizationDecision: goblinDecision(
-                    actor: collaborator,
-                    sessionID: session.sessionID,
-                    projectID: project.projectID,
-                    operation: "sendFollowup",
-                    requestDigest: "goblin-policy-blocked",
-                    metadata: disabled
-                )
-            )
-            XCTFail("expected Goblin-signed steering followup to be rejected after steering is disabled")
-        } catch let error as ServiceAPIError {
-            XCTAssertEqual(error.code, .authorizationDecisionRejected)
-        }
-
-        do {
-            try await authority.authorizeSessionCollaboration(
-                sessionID: session.sessionID,
-                actor: collaborator,
-                operation: "submitTurn",
-                requestDigest: "goblin-policy-submit-blocked",
-                authorizationDecision: goblinDecision(
-                    actor: collaborator,
-                    sessionID: session.sessionID,
-                    projectID: project.projectID,
-                    operation: "submitTurn",
-                    requestDigest: "goblin-policy-submit-blocked",
-                    metadata: disabled
-                )
-            )
-            XCTFail("expected Goblin-signed submitTurn to be rejected after steering is disabled")
+            XCTFail("expected unsigned collaborator permission update to stay locally rejected")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .authorizationDecisionRejected)
         }
 
         do {
             _ = try await authority.execute(
-                command: .sendFollowup(text: "stale", expectedSessionRevision: session.revision + 2),
+                command: .sendFollowup(text: "stale", expectedSessionRevision: session.revision + 1),
                 sessionID: session.sessionID,
                 externalActor: controller,
-                idempotencyKey: "goblin-policy-stale",
-                requestDigest: "goblin-policy-stale",
-                authorizationDecision: goblinDecision(
+                idempotencyKey: "policy-stale",
+                requestDigest: "policy-stale",
+                authorizationDecision: signedDecision(
                     actor: controller,
                     sessionID: session.sessionID,
                     projectID: project.projectID,
                     operation: "sendFollowup",
-                    requestDigest: "goblin-policy-stale",
+                    requestDigest: "policy-stale",
                     metadata: collaborative
                 )
             )
-            XCTFail("expected stale Goblin collaboration revisions to be rejected")
+            XCTFail("expected stale authorization revisions to be rejected")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .authorizationDecisionRejected)
         }
@@ -445,7 +317,7 @@ final class AuthorityTests: XCTestCase {
         let runtime = SteeringProviderRuntime()
         let provider = ProviderCLIAdapter(runtimes: [runtime])
         let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-run", requestDigest: "p-run")
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "first"), externalActor: actor, idempotencyKey: "s-run", requestDigest: "s-run")
 
@@ -499,7 +371,7 @@ final class AuthorityTests: XCTestCase {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let runtime = PolicyRecordingProviderRuntime()
         let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: ProviderCLIAdapter(runtimes: [runtime]))
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-policy-runtime", requestDigest: "p-policy-runtime")
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "inspect"), externalActor: actor, idempotencyKey: "s-policy-runtime", requestDigest: "s-policy-runtime")
         _ = try await authority.updatePermissions(sessionID: session.sessionID, expectedRevision: 1, mode: "readOnly", providerSettings: ["codex.approvalPolicy": "never"], actor: actor)
@@ -525,7 +397,7 @@ final class AuthorityTests: XCTestCase {
             store: store,
             providerAdapter: ProviderCLIAdapter(runtimes: [runtime])
         )
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(
             input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]),
             externalActor: actor,
@@ -574,7 +446,7 @@ final class AuthorityTests: XCTestCase {
         let runtime = InteractiveEventProviderRuntime()
         let provider = ProviderCLIAdapter(runtimes: [runtime])
         let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-events", requestDigest: "p-events")
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "run"), externalActor: actor, idempotencyKey: "s-events", requestDigest: "s-events")
         _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "run-events", requestDigest: "run-events")
@@ -627,7 +499,7 @@ final class AuthorityTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "project-key", requestDigest: "project-digest")
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .collaborative, initialPrompt: "hello"), externalActor: actor, idempotencyKey: "session-key", requestDigest: "session-digest")
         XCTAssertEqual(session.projectID, project.projectID)
@@ -645,7 +517,7 @@ final class AuthorityTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "Old", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-mutate", requestDigest: "p-mutate")
         let updated = try await authority.updateProject(projectID: project.projectID, input: .init(expectedRevision: project.revision, name: "New", roots: [.init(logicalName: "renamed", path: root.path, writable: false)]), actor: actor, idempotencyKey: "p-update", requestDigest: "p-update")
         XCTAssertEqual(updated.name, "New")
@@ -669,7 +541,7 @@ final class AuthorityTests: XCTestCase {
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let projectInput = CreateProjectInput(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)])
         let project = try await authority.createProject(input: projectInput, externalActor: actor, idempotencyKey: "project-key", requestDigest: "project-digest")
         let repeatedProject = try await authority.createProject(input: projectInput, externalActor: actor, idempotencyKey: "project-key", requestDigest: "project-digest")
@@ -701,7 +573,7 @@ final class AuthorityTests: XCTestCase {
         await runtime.holdNextRun()
         let provider = ProviderCLIAdapter(runtimes: [runtime])
         let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-tree-cancel", requestDigest: "p-tree-cancel")
         let rootSession = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "root"), externalActor: actor, idempotencyKey: "s-tree-cancel", requestDigest: "s-tree-cancel")
         let child = try await authority.spawnChildSession(parentSessionID: rootSession.sessionID, initialPrompt: "child", role: "explore", label: "probe")
@@ -739,7 +611,7 @@ final class AuthorityTests: XCTestCase {
         await runtime.holdNextRun()
         let provider = ProviderCLIAdapter(runtimes: [runtime])
         let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-child-cancel", requestDigest: "p-child-cancel")
         let rootSession = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "root"), externalActor: actor, idempotencyKey: "s-child-cancel", requestDigest: "s-child-cancel")
         let childA = try await authority.spawnChildSession(parentSessionID: rootSession.sessionID, initialPrompt: "child-a", role: "explore", label: "probe-a")
@@ -772,7 +644,7 @@ final class AuthorityTests: XCTestCase {
         await runner.setDelay(.seconds(10))
         let provider = ProviderCLIAdapter(configurations: [.init(kind: .codex, executable: "/usr/bin/true")], runner: runner)
         let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-drain", requestDigest: "p-drain")
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "run"), externalActor: actor, idempotencyKey: "s-drain", requestDigest: "s-drain")
         _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "resume-drain", requestDigest: "resume-drain")
@@ -790,14 +662,14 @@ final class AuthorityTests: XCTestCase {
 
     func testIdempotencyKeyDigestConflictFailsClosed() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let cursor = try await store.nextCursor()
         let project = ProjectSnapshot(projectID: UUID(), name: "P", creator: actor, state: .active, roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)], revision: 1, cursor: cursor)
-        let key = IdempotencyInput(actorID: actor.goblinUserID, operation: "createProject", key: "same-key", requestDigest: "digest-a")
+        let key = IdempotencyInput(actorID: actor.userID, operation: "createProject", key: "same-key", requestDigest: "digest-a")
         _ = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: key)
 
         do {
-            _ = try await store.idempotencyResult(.init(actorID: actor.goblinUserID, operation: "createProject", key: "same-key", requestDigest: "digest-b"))
+            _ = try await store.idempotencyResult(.init(actorID: actor.userID, operation: "createProject", key: "same-key", requestDigest: "digest-b"))
             XCTFail("expected conflict")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .idempotencyConflict)
@@ -812,7 +684,7 @@ final class AuthorityTests: XCTestCase {
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "project-key", requestDigest: "project-digest")
         let stream = try await authority.subscribe(after: nil)
         _ = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "session-key", requestDigest: "session-digest")
@@ -841,7 +713,7 @@ final class AuthorityTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-transitions", requestDigest: "p-transitions")
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "s-transitions", requestDigest: "s-transitions")
         let rootID = try XCTUnwrap(project.roots.first?.rootID)
@@ -854,7 +726,7 @@ final class AuthorityTests: XCTestCase {
         let reboundSelection = try await authority.selectionSnapshot(sessionID: session.sessionID)
         XCTAssertEqual(reboundSelection.bindingRevision, 2)
 
-        _ = try await authority.execute(command: .setSessionVisibility(expectedPolicyRevision: 1, visibility: .collaborative, collaborativeSteeringEnabled: false, controllerUserID: actor.goblinUserID), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "visibility", requestDigest: "visibility")
+        _ = try await authority.execute(command: .setSessionVisibility(expectedPolicyRevision: 1, visibility: .collaborative, collaborativeSteeringEnabled: false, controllerUserID: actor.userID), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "visibility", requestDigest: "visibility")
         let visible = try await authority.sessionSnapshot(sessionID: session.sessionID)
         XCTAssertEqual(visible.visibility, .collaborative)
         _ = try await authority.execute(command: .archiveSession(expectedRevision: visible.revision), sessionID: session.sessionID, externalActor: actor, idempotencyKey: "archive", requestDigest: "archive")
@@ -870,7 +742,7 @@ final class AuthorityTests: XCTestCase {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let delivery = RecordingInteractionDelivery()
         let authority = RepoPromptHeadlessAuthority(store: store, interactionDelivery: delivery)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "p-interaction", requestDigest: "p-interaction")
         let session = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "s-interaction", requestDigest: "s-interaction")
         let requested = try await authority.requestInteraction(sessionID: session.sessionID, kind: .approval, payload: Data("approve?".utf8))
@@ -896,7 +768,7 @@ final class AuthorityTests: XCTestCase {
             store: store,
             providerAdapter: ProviderCLIAdapter(runtimes: [runtime])
         )
-        let actor = ExternalActor(goblinUserID: "macos", username: "macos", displayName: "macOS")
+        let actor = ExternalActor(userID: "macos", username: "macos", displayName: "macOS")
         let projectID = UUID()
         let rootID = UUID()
         let sessionID = UUID()
@@ -1033,7 +905,7 @@ final class AuthorityTests: XCTestCase {
             store: store,
             providerAdapter: ProviderCLIAdapter(runtimes: [FailingProviderRuntime()])
         )
-        let actor = ExternalActor(goblinUserID: "macos", username: "macos", displayName: "macOS")
+        let actor = ExternalActor(userID: "macos", username: "macos", displayName: "macOS")
         let projectID = UUID()
         let rootID = UUID()
         let sessionID = UUID()
@@ -1342,7 +1214,7 @@ private actor RecordingInteractionDelivery: InteractionDeliveryPort {
     }
 }
 
-private func goblinDecision(
+private func signedDecision(
     actor: ExternalActor,
     sessionID: UUID,
     projectID: UUID,
@@ -1352,8 +1224,8 @@ private func goblinDecision(
     policyRevision: Int64? = nil,
     controllerRevision: Int64? = nil,
     membershipRevision: Int64? = nil
-) -> GoblinAuthorizationDecision {
-    GoblinAuthorizationDecision(
+) -> AuthorizationDecision {
+    AuthorizationDecision(
         decisionID: UUID(),
         actor: actor,
         sessionID: sessionID,

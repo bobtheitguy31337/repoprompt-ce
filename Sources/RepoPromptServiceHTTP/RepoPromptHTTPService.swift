@@ -553,17 +553,17 @@ public struct RepoPromptHTTPService: Sendable {
             return HTTPResponses.empty()
         } }
         router.get("/internal/v1/provider-settings") { request, context in await respond(request) {
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp, .operatorRole], operation: "providerCatalog")
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app, .operatorRole], operation: "providerCatalog")
             return try await HTTPResponses.json(requireProviderSettings().catalog())
         } }
         router.get("/internal/v1/provider-settings/:id/direct-configuration") { request, context in await respond(request) {
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp, .operatorRole], operation: "providerDirectConfigurationRead")
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app, .operatorRole], operation: "providerDirectConfigurationRead")
             return try await HTTPResponses.json(requireProviderSettings().directConfiguration(providerID: providerSettingsID(context)))
         } }
         router.patch("/internal/v1/provider-settings/:id/direct-configuration") { request, context in await respond(request) {
             let data = try await bodyData(request)
             _ = try requireIdempotency(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerDirectConfigurationUpdate")
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app, .operatorRole], operation: "providerDirectConfigurationUpdate")
             let input = try JSONDecoder.serviceDecoder.decode(UpdateDirectProviderConfigurationRequest.self, from: data)
             return try await HTTPResponses.json(requireProviderSettings().updateDirectConfiguration(
                 providerID: providerSettingsID(context),
@@ -574,28 +574,28 @@ public struct RepoPromptHTTPService: Sendable {
         router.patch("/internal/v1/provider-settings/:id") { request, context in await respond(request) {
             let data = try await bodyData(request)
             _ = try requireIdempotency(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerUpdate")
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app, .operatorRole], operation: "providerUpdate")
             let input = try JSONDecoder.serviceDecoder.decode(UpdateProviderSettingsRequest.self, from: data)
             return try await HTTPResponses.json(requireProviderSettings().update(providerID: providerSettingsID(context), request: input, attribution: providerAttribution(auth)))
         } }
         router.post("/internal/v1/provider-settings/:id/enable") { request, context in await respond(request) {
             let data = try await bodyData(request)
             _ = try requireIdempotency(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerEnable")
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app, .operatorRole], operation: "providerEnable")
             let input = try JSONDecoder.serviceDecoder.decode(SetProviderEnabledRequest.self, from: data)
             return try await HTTPResponses.json(requireProviderSettings().setEnabled(providerID: providerSettingsID(context), enabled: true, request: input, attribution: providerAttribution(auth)))
         } }
         router.post("/internal/v1/provider-settings/:id/disable") { request, context in await respond(request) {
             let data = try await bodyData(request)
             _ = try requireIdempotency(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerDisable")
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app, .operatorRole], operation: "providerDisable")
             let input = try JSONDecoder.serviceDecoder.decode(SetProviderEnabledRequest.self, from: data)
             return try await HTTPResponses.json(requireProviderSettings().setEnabled(providerID: providerSettingsID(context), enabled: false, request: input, attribution: providerAttribution(auth)))
         } }
         router.post("/internal/v1/provider-settings/:id/connect") { request, context in await respond(request) {
             let data = try await bodyData(request)
             _ = try requireIdempotency(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerConnect")
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app, .operatorRole], operation: "providerConnect")
             let input = try JSONDecoder.serviceDecoder.decode(ConnectProviderRequest.self, from: data)
             let snapshot = try await requireProviderSettings().connect(providerID: providerSettingsID(context), request: input, attribution: providerAttribution(auth))
             return try HTTPResponses.json(snapshot, status: .created)
@@ -603,42 +603,42 @@ public struct RepoPromptHTTPService: Sendable {
         router.post("/internal/v1/provider-settings/:id/test") { request, context in await respond(request) {
             let data = try await bodyData(request)
             _ = try requireIdempotency(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerTest")
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app, .operatorRole], operation: "providerTest")
             return try await HTTPResponses.json(requireProviderSettings().testConnection(providerID: providerSettingsID(context), attribution: providerAttribution(auth)))
         } }
         router.post("/internal/v1/provider-settings/:id/disconnect") { request, context in await respond(request) {
             let data = try await bodyData(request)
             _ = try requireIdempotency(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerDisconnect")
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app, .operatorRole], operation: "providerDisconnect")
             return try await HTTPResponses.json(requireProviderSettings().disconnect(providerID: providerSettingsID(context), attribution: providerAttribution(auth)))
         } }
         router.post("/internal/v1/provider-settings/:id/revoke") { request, context in await respond(request) {
             let data = try await bodyData(request)
             _ = try requireIdempotency(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerRevoke")
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app, .operatorRole], operation: "providerRevoke")
             return try await HTTPResponses.json(requireProviderSettings().disconnect(providerID: providerSettingsID(context), attribution: providerAttribution(auth), revoke: true))
         } }
         router.post("/internal/v1/provider-settings/:id/auth-flows") { request, context in await respond(request) {
             let data = try await bodyData(request)
             _ = try requireIdempotency(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerAuthStart")
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app, .operatorRole], operation: "providerAuthStart")
             let input = try JSONDecoder.serviceDecoder.decode(StartProviderAuthFlowRequest.self, from: data)
             let status = try await requireProviderSettings().startAuthFlow(providerID: providerSettingsID(context), request: input, attribution: providerAttribution(auth))
             return try HTTPResponses.json(status, status: .accepted)
         } }
         router.get("/internal/v1/provider-auth-flows/:flowID") { request, context in await respond(request) {
-            let auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp, .operatorRole], operation: "providerAuthPoll")
+            let auth = try await authenticate(request, context: context, body: Data(), roles: [.app, .operatorRole], operation: "providerAuthPoll")
             let status = try await requireProviderSettings().pollAuthFlow(flowID: context.parameters.require("flowID", as: UUID.self), ownerID: providerAttribution(auth).actorID)
             return try HTTPResponses.json(status)
         } }
         router.delete("/internal/v1/provider-auth-flows/:flowID") { request, context in await respond(request) {
             let data = try await bodyData(request)
             _ = try requireIdempotency(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp, .operatorRole], operation: "providerAuthCancel")
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app, .operatorRole], operation: "providerAuthCancel")
             try await requireProviderSettings().cancelAuthFlow(flowID: context.parameters.require("flowID", as: UUID.self), ownerID: providerAttribution(auth).actorID)
             return HTTPResponses.empty()
         } }
-        router.get("/internal/v1/capabilities") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp, .goblinSync], operation: "capabilities")
+        router.get("/internal/v1/capabilities") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.app, .sync], operation: "capabilities")
             let meta = try await store.metadata()
             let models = try await composerCatalog?.compatibilityModels() ?? []
             return try await HTTPResponses.json(ServiceCapabilitiesResponse(
@@ -659,17 +659,17 @@ public struct RepoPromptHTTPService: Sendable {
             let sessionID = request.uri.queryParameters["sessionId"].flatMap { UUID(uuidString: String($0)) }
             guard (projectID != nil) != (sessionID != nil) else { throw ServiceAPIError(code: .invalidRequest, message: "Exactly one projectId or sessionId is required") }
             if let projectID {
-                let auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getComposerCatalog", projectID: projectID)
+                let auth = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getComposerCatalog", projectID: projectID)
                 _ = try await authority.projectSnapshot(projectID: projectID)
                 let actor = try requireActor(auth)
-                return try await HTTPResponses.privateJSON(requireComposerCatalog().snapshot(context: .init(kind: .project, projectID: projectID, actorID: actor.goblinUserID)))
+                return try await HTTPResponses.privateJSON(requireComposerCatalog().snapshot(context: .init(kind: .project, projectID: projectID, actorID: actor.userID)))
             }
             let resolvedSessionID = sessionID!
-            let auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getComposerCatalog", sessionID: resolvedSessionID)
+            let auth = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getComposerCatalog", sessionID: resolvedSessionID)
             let actor = try requireActor(auth)
             let snapshot = try await authority.authoritySessionSnapshot(sessionID: resolvedSessionID)
             let active = snapshot.activeRun.map { $0.endedAt == nil && $0.state == "running" } ?? false
-            return try await HTTPResponses.privateJSON(requireComposerCatalog().snapshot(context: .init(kind: .session, projectID: snapshot.session.projectID, sessionID: resolvedSessionID, actorID: actor.goblinUserID, activeRun: active)))
+            return try await HTTPResponses.privateJSON(requireComposerCatalog().snapshot(context: .init(kind: .session, projectID: snapshot.session.projectID, sessionID: resolvedSessionID, actorID: actor.userID, activeRun: active)))
         } }
         router.get("/internal/v1/catalog/composer-suggestions") { request, context in await respond(request) {
             let projectID = request.uri.queryParameters["projectId"].flatMap { UUID(uuidString: String($0)) }
@@ -679,17 +679,17 @@ public struct RepoPromptHTTPService: Sendable {
             let kinds = Set(String(request.uri.queryParameters["kinds"] ?? "nativeCommand,skill,file").split(separator: ",").compactMap { ComposerSuggestionWire.Kind(rawValue: String($0)) })
             guard !kinds.isEmpty, kinds.count <= 3 else { throw ServiceAPIError(code: .invalidRequest, message: "Suggestion kinds are invalid") }
             if let projectID {
-                let auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getComposerSuggestions", projectID: projectID)
+                let auth = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getComposerSuggestions", projectID: projectID)
                 _ = try await authority.projectSnapshot(projectID: projectID)
                 let actor = try requireActor(auth)
-                return try await HTTPResponses.privateJSON(requireComposerCatalog().suggestions(context: .init(kind: .project, projectID: projectID, actorID: actor.goblinUserID), query: query, kinds: kinds, limit: 50))
+                return try await HTTPResponses.privateJSON(requireComposerCatalog().suggestions(context: .init(kind: .project, projectID: projectID, actorID: actor.userID), query: query, kinds: kinds, limit: 50))
             }
             let resolvedSessionID = sessionID!
-            let auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getComposerSuggestions", sessionID: resolvedSessionID)
+            let auth = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getComposerSuggestions", sessionID: resolvedSessionID)
             let actor = try requireActor(auth)
             let snapshot = try await authority.authoritySessionSnapshot(sessionID: resolvedSessionID)
             let active = snapshot.activeRun.map { $0.endedAt == nil && $0.state == "running" } ?? false
-            return try await HTTPResponses.privateJSON(requireComposerCatalog().suggestions(context: .init(kind: .session, projectID: snapshot.session.projectID, sessionID: resolvedSessionID, actorID: actor.goblinUserID, activeRun: active), query: query, kinds: kinds, limit: 50))
+            return try await HTTPResponses.privateJSON(requireComposerCatalog().suggestions(context: .init(kind: .session, projectID: snapshot.session.projectID, sessionID: resolvedSessionID, actorID: actor.userID, activeRun: active), query: query, kinds: kinds, limit: 50))
         } }
         router.get("/internal/v1/diagnostics") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.operatorRole], operation: "diagnostics")
             let meta = try await store.metadata()
@@ -739,12 +739,12 @@ public struct RepoPromptHTTPService: Sendable {
             return Response(status: .ok, headers: headers, body: .init(byteBuffer: ByteBuffer(string: text)))
         } }
 
-        router.get("/internal/v1/projects") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "listProjects")
+        router.get("/internal/v1/projects") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "listProjects")
             let projects = await authority.projectSnapshots().map(ProjectWireSnapshot.init)
             return try await HTTPResponses.json(page(projects, request: request, defaultLimit: 100, maximumLimit: 500) { $0.projectID.uuidString })
         } }
         router.post("/internal/v1/projects") { request, context in await respond(request) { let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "createProject")
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "createProject")
             let input = try JSONDecoder.serviceDecoder.decode(CreateProjectWireInput.self, from: data)
             guard input.schemaVersion == 1, input.expectedRevision == 0 else {
                 throw ServiceAPIError(code: .invalidRequest, message: "Project creation contract is invalid")
@@ -766,7 +766,7 @@ public struct RepoPromptHTTPService: Sendable {
                 request,
                 context: context,
                 body: data,
-                roles: [.goblinApp],
+                roles: [.app],
                 operation: "addProjectRepository",
                 projectID: id
             )
@@ -784,14 +784,14 @@ public struct RepoPromptHTTPService: Sendable {
         } }
         router.patch("/internal/v1/projects/:id") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "renameProject", projectID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "renameProject", projectID: id)
             let input = try JSONDecoder.serviceDecoder.decode(RenameProjectInput.self, from: data)
             let snapshot = try await authority.renameProject(projectID: id, input: input, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data))
             return try HTTPResponses.json(ProjectWireSnapshot(snapshot))
         } }
         router.delete("/internal/v1/projects/:id") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "removeProject", projectID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "removeProject", projectID: id)
             let input = try JSONDecoder.serviceDecoder.decode(RemoveProjectInput.self, from: data)
             try await authority.removeProject(projectID: id, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data))
             return HTTPResponses.empty()
@@ -799,20 +799,20 @@ public struct RepoPromptHTTPService: Sendable {
         router.post("/internal/v1/projects/:id/composer-attachments") { request, context in await respond(request) {
             let projectID = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request, maximumBytes: 10 * 1_024 * 1_024 + 64 * 1_024)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "createComposerAttachment", projectID: projectID)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "createComposerAttachment", projectID: projectID)
             let actor = try requireActor(auth)
             let upload = try composerAttachmentUpload(data: data, contentType: request.headers[.contentType], fallbackDisplayName: String(request.uri.queryParameters["displayName"] ?? "image"))
             guard upload.displayName.utf8.count <= 256 else { throw ServiceAPIError(code: .invalidRequest, message: "Attachment display name exceeds its bound") }
-            let attachment = try await requireComposerAttachments().stage(data: upload.data, displayName: upload.displayName, declaredMediaType: upload.mediaType, actorID: actor.goblinUserID, projectID: projectID)
+            let attachment = try await requireComposerAttachments().stage(data: upload.data, displayName: upload.displayName, declaredMediaType: upload.mediaType, actorID: actor.userID, projectID: projectID)
             return try HTTPResponses.privateJSON(attachment, status: .created)
         } }
         router.post("/internal/v1/projects/:id/composer-attachments/resolve") { request, context in await respond(request) {
             let projectID = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "resolveComposerAttachments", projectID: projectID)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "resolveComposerAttachments", projectID: projectID)
             let input = try JSONDecoder.serviceDecoder.decode(ComposerAttachmentResolveRequest.self, from: data)
             let actor = try requireActor(auth)
-            return try await HTTPResponses.privateJSON(requireComposerAttachments().resolve(attachmentIDs: input.attachmentIDs, actorID: actor.goblinUserID, projectID: projectID))
+            return try await HTTPResponses.privateJSON(requireComposerAttachments().resolve(attachmentIDs: input.attachmentIDs, actorID: actor.userID, projectID: projectID))
         } }
         router.get("/internal/v1/projects/:id/composer-attachments/:attachmentId/preview") { request, context in await respond(request) {
             let projectID = try context.parameters.require("id", as: UUID.self)
@@ -822,29 +822,29 @@ public struct RepoPromptHTTPService: Sendable {
             if let visibleSessionID {
                 let session = try await authority.sessionSnapshot(sessionID: visibleSessionID)
                 guard session.projectID == projectID else { throw ServiceAPIError(code: .notFound, message: "Attachment is unavailable") }
-                auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "previewComposerAttachment", sessionID: visibleSessionID)
+                auth = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "previewComposerAttachment", sessionID: visibleSessionID)
             } else {
-                auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "previewComposerAttachment", projectID: projectID)
+                auth = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "previewComposerAttachment", projectID: projectID)
             }
             let actor = try requireActor(auth)
-            let preview = try await requireComposerAttachments().preview(attachmentID: attachmentID, actorID: actor.goblinUserID, projectID: projectID, visibleSessionID: visibleSessionID)
+            let preview = try await requireComposerAttachments().preview(attachmentID: attachmentID, actorID: actor.userID, projectID: projectID, visibleSessionID: visibleSessionID)
             return HTTPResponses.privateBytes(preview.1, contentType: preview.0.mediaType)
         } }
         router.delete("/internal/v1/projects/:id/composer-attachments/:attachmentId") { request, context in await respond(request) {
             let projectID = try context.parameters.require("id", as: UUID.self)
             let attachmentID = try context.parameters.require("attachmentId", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "deleteComposerAttachment", projectID: projectID)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "deleteComposerAttachment", projectID: projectID)
             let actor = try requireActor(auth)
-                try await requireComposerAttachments().delete(attachmentID: attachmentID, actorID: actor.goblinUserID, projectID: projectID)
+                try await requireComposerAttachments().delete(attachmentID: attachmentID, actorID: actor.userID, projectID: projectID)
                 return HTTPResponses.privateEmpty()
         } }
         router.get("/internal/v1/projects/:id/snapshot") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getProject", projectID: id)
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getProject", projectID: id)
             return try await HTTPResponses.json(ProjectWireSnapshot(authority.projectSnapshot(projectID: id)))
         } }
         router.get("/internal/v1/projects/:id/tree") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getProjectTree", projectID: id)
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getProjectTree", projectID: id)
             let rootID = try requireQueryUUID(request, name: "rootId")
             let path = String(request.uri.queryParameters["path"] ?? "")
             let depth = request.uri.queryParameters.get("depth", as: Int.self) ?? 4
@@ -854,61 +854,61 @@ public struct RepoPromptHTTPService: Sendable {
         } }
         router.post("/internal/v1/projects/:id/search") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            _ = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "searchProject", projectID: id)
+            _ = try await authenticate(request, context: context, body: data, roles: [.app], operation: "searchProject", projectID: id)
             let input = try JSONDecoder.serviceDecoder.decode(ProjectSearchRequest.self, from: data)
             guard (1 ... 500).contains(input.maximumResults), (1 ... 2_097_152).contains(input.maximumFileBytes) else { throw ServiceAPIError(code: .invalidRequest, message: "Search bounds exceed the v1 limit") }
             return try await HTTPResponses.json(authority.projectSearch(projectID: id, request: input))
         } }
         router.post("/internal/v1/projects/:id/file") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            _ = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "getFile", projectID: id)
+            _ = try await authenticate(request, context: context, body: data, roles: [.app], operation: "getFile", projectID: id)
             let input = try JSONDecoder.serviceDecoder.decode(ProjectFileRequest.self, from: data)
             guard (1 ... 2_097_152).contains(input.maximumBytes) else { throw ServiceAPIError(code: .invalidRequest, message: "File bound exceeds the v1 limit") }
             return try await HTTPResponses.json(authority.projectFile(projectID: id, request: input))
         } }
         router.post("/internal/v1/projects/:id/codemap") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            _ = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "getCodeMap", projectID: id)
+            _ = try await authenticate(request, context: context, body: data, roles: [.app], operation: "getCodeMap", projectID: id)
             let input = try JSONDecoder.serviceDecoder.decode(ProjectCodeMapRequest.self, from: data)
             guard (1 ... 5_242_880).contains(input.maximumBytes) else { throw ServiceAPIError(code: .invalidRequest, message: "CodeMap bound exceeds the v1 limit") }
             return try await HTTPResponses.json(authority.projectCodeMap(projectID: id, request: input))
         } }
         router.post("/internal/v1/projects/:id/diff") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            _ = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "getDiff", projectID: id)
+            _ = try await authenticate(request, context: context, body: data, roles: [.app], operation: "getDiff", projectID: id)
             let input = try JSONDecoder.serviceDecoder.decode(ProjectDiffRequest.self, from: data)
             guard (1 ... 2_097_152).contains(input.maximumBytes) else { throw ServiceAPIError(code: .invalidRequest, message: "Diff bound exceeds the v1 limit") }
             return try await HTTPResponses.json(authority.projectDiff(projectID: id, request: input))
         } }
         router.get("/internal/v1/projects/:id/worktrees") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "listWorktrees", projectID: id)
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "listWorktrees", projectID: id)
             let worktrees = try await authority.worktreeSnapshots(projectID: id).map(WorktreeWireSnapshot.init)
             return try await HTTPResponses.json(page(worktrees, request: request, defaultLimit: 100, maximumLimit: 500) { $0.bindingID.uuidString })
         } }
         router.get("/internal/v1/projects/:id/worktrees/:worktreeId") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let bindingID = try context.parameters.require("worktreeId", as: UUID.self)
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getWorktree", projectID: id)
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getWorktree", projectID: id)
             return try await HTTPResponses.json(WorktreeWireSnapshot(authority.worktreeSnapshot(projectID: id, bindingID: bindingID)))
         } }
         router.post("/internal/v1/projects/:id/refresh") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "refreshProject", projectID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "refreshProject", projectID: id)
             let input = try JSONDecoder.serviceDecoder.decode(ProjectRefreshInput.self, from: data)
             let snapshot = try await authority.refreshProject(projectID: id, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data))
             return try HTTPResponses.json(ProjectWireSnapshot(snapshot))
         } }
         router.get("/internal/v1/projects/:id/context/selection-template") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getProject", projectID: id)
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getProject", projectID: id)
             return try await HTTPResponses.json(authority.projectSelectionTemplate(projectID: id))
         } }
         router.put("/internal/v1/projects/:id/context/selection-template") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "updateProject", projectID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "updateProject", projectID: id)
             let input = try JSONDecoder.serviceDecoder.decode(ProjectSelectionTemplateMutationInput.self, from: data)
             return try await HTTPResponses.json(authority.replaceProjectSelectionTemplate(projectID: id, entries: input.entries, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data)))
         } }
 
-        router.get("/internal/v1/sessions") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "listSessions")
+        router.get("/internal/v1/sessions") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "listSessions")
             let sessions = try await authority.sessionSnapshots()
             return try await HTTPResponses.json(page(sessions, request: request, defaultLimit: 100, maximumLimit: 500) { $0.sessionID.uuidString })
         } }
@@ -919,7 +919,7 @@ public struct RepoPromptHTTPService: Sendable {
                 guard let provider = structured.turn.configuration.providerID.runtimeKind else {
                     throw ServiceAPIError(code: .capabilityMissing, message: "Selected provider has no execution adapter")
                 }
-                let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "startSession", projectID: structured.projectID)
+                let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "startSession", projectID: structured.projectID)
                 let actor = try requireActor(auth)
                 let selectedMessageContext = try structured.selectedMessageContext?.validated()
                 let shell = CreateSessionInput(projectID: structured.projectID, provider: provider, model: structured.turn.configuration.modelID, visibility: structured.visibility, startImmediately: false)
@@ -927,42 +927,42 @@ public struct RepoPromptHTTPService: Sendable {
                 try await requireSubmissionDispatchQueue().enqueue(accepted, actor: actor, requestDigest: requestDigest)
                 return try HTTPResponses.privateJSON(accepted.receipt, status: .accepted)
             }
-            let requestBody = try JSONDecoder.serviceDecoder.decode(GoblinCreateSessionRequest.self, from: data)
+            let requestBody = try JSONDecoder.serviceDecoder.decode(CreateSessionRequest.self, from: data)
             let input: CreateSessionInput
             if requestBody.hasExplicitProviderRoute {
                 input = try requestBody.explicitCreateSessionInput()
             } else {
                 input = try await requireServerSettings().createSessionInput(from: requestBody)
             }
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "startSession", projectID: input.projectID)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "startSession", projectID: input.projectID)
             guard input.parentSessionID == nil else { throw ServiceAPIError(code: .invalidRequest, message: "Public session creation cannot specify parentSessionID; child agents are created by agent_manage") }
             let snapshot = try await authority.createSession(input: input, externalActor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest)
             return try HTTPResponses.privateJSON(snapshot, status: .accepted)
         } }
         router.get("/internal/v1/sessions/:id/snapshot") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getSession", sessionID: id)
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getSession", sessionID: id)
             return try await HTTPResponses.privateJSON(authority.sessionDetailSnapshot(sessionID: id))
         } }
         router.get("/internal/v1/sessions/:id/transcript") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getTranscript", sessionID: id)
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getTranscript", sessionID: id)
             let transcript = try await authority.sessionSnapshot(sessionID: id).transcript
             return try await HTTPResponses.json(page(transcript, request: request, defaultLimit: 200, maximumLimit: 1000) { String(format: "%020lld", $0.sessionSequence) })
         } }
         router.get("/internal/v1/sessions/:id/transcript/presentation") { request, context in await respond(request) {
             let sessionID = try context.parameters.require("id", as: UUID.self)
-            let auth = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getTranscriptPresentation", sessionID: sessionID)
+            let auth = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getTranscriptPresentation", sessionID: sessionID)
             let actor = try requireActor(auth)
             let session = try await authority.sessionSnapshot(sessionID: sessionID)
             let metadata = try await authority.collaborationMetadata(sessionID: sessionID)
             let token = request.uri.queryParameters["pageToken"].map(String.init)
             let limit = request.uri.queryParameters.get("limit", as: Int.self) ?? 25
-            let page = try await requireTranscriptPresentation().page(sessionID: sessionID, actorID: actor.goblinUserID, legacyTranscript: session.transcript, interactions: session.interactions, pageToken: token, limit: limit, mutableInteractions: metadata.controllerUserID == actor.goblinUserID)
+            let page = try await requireTranscriptPresentation().page(sessionID: sessionID, actorID: actor.userID, legacyTranscript: session.transcript, interactions: session.interactions, pageToken: token, limit: limit, mutableInteractions: metadata.controllerUserID == actor.userID)
             return try HTTPResponses.privateJSON(page)
         } }
         router.post("/internal/v1/sessions/:id/turns") { request, context in await respond(request) {
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "submitTurn", sessionID: sessionID)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "submitTurn", sessionID: sessionID)
             let actor = try requireActor(auth)
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(AgentTurnSubmissionWire.self, from: data)
@@ -976,135 +976,135 @@ public struct RepoPromptHTTPService: Sendable {
         router.post("/internal/v1/sessions/:id/commands") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
             let command = try JSONDecoder.serviceDecoder.decode(SessionCommand.self, from: data)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: command.operation, sessionID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: command.operation, sessionID: id)
             let receipt = try await authority.execute(command: command, sessionID: id, externalActor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data), authorizationDecision: auth.decision)
             return try HTTPResponses.json(receipt, status: .accepted)
         } }
         router.get("/internal/v1/sessions/:id/context/selection") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getSelection", sessionID: id)
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getSelection", sessionID: id)
             return try await HTTPResponses.json(authority.selectionSnapshot(sessionID: id))
         } }
         router.put("/internal/v1/sessions/:id/context/selection") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "replaceSelection", sessionID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "replaceSelection", sessionID: id)
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(SelectionMutationInput.self, from: data)
             let requestDigest = CanonicalSigning.bodyDigest(data)
             try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "replaceSelection", requestDigest: requestDigest, authorizationDecision: auth.decision)
-            return try await HTTPResponses.json(authority.replaceSelection(sessionID: id, entries: input.entries, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest))
+            return try await HTTPResponses.json(authority.replaceSelection(sessionID: id, entries: input.entries, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest, authorizationDecision: auth.decision))
         } }
         router.post("/internal/v1/sessions/:id/context/selection/add") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "addToSelection", sessionID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "addToSelection", sessionID: id)
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(SelectionMutationInput.self, from: data)
             let requestDigest = CanonicalSigning.bodyDigest(data)
             try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "addToSelection", requestDigest: requestDigest, authorizationDecision: auth.decision)
-            return try await HTTPResponses.json(authority.addSelection(sessionID: id, entries: input.entries, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest))
+            return try await HTTPResponses.json(authority.addSelection(sessionID: id, entries: input.entries, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest, authorizationDecision: auth.decision))
         } }
         router.post("/internal/v1/sessions/:id/context/selection/remove") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "removeFromSelection", sessionID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "removeFromSelection", sessionID: id)
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(SelectionRemovalInput.self, from: data)
             let requestDigest = CanonicalSigning.bodyDigest(data)
             try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "removeFromSelection", requestDigest: requestDigest, authorizationDecision: auth.decision)
-            return try await HTTPResponses.json(authority.removeSelection(sessionID: id, rootID: input.rootID, logicalPaths: input.logicalPaths, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest))
+            return try await HTTPResponses.json(authority.removeSelection(sessionID: id, rootID: input.rootID, logicalPaths: input.logicalPaths, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest, authorizationDecision: auth.decision))
         } }
         router.get("/internal/v1/sessions/:id/permissions") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getExecutionPermissions", sessionID: id)
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getExecutionPermissions", sessionID: id)
             guard let snapshot = try await authority.permissionSnapshot(sessionID: id) else { return Response(status: .noContent) }
             return try HTTPResponses.json(snapshot)
         } }
         router.patch("/internal/v1/sessions/:id/permissions") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "updateExecutionPermissions", sessionID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "updateExecutionPermissions", sessionID: id)
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(ExecutionPermissionUpdateInput.self, from: data)
             let requestDigest = CanonicalSigning.bodyDigest(data)
             try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "updateExecutionPermissions", requestDigest: requestDigest, authorizationDecision: auth.decision)
-            return try await HTTPResponses.json(authority.updatePermissions(sessionID: id, expectedRevision: input.expectedRevision, mode: input.mode, providerSettings: input.providerSettings, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest))
+            return try await HTTPResponses.json(authority.updatePermissions(sessionID: id, expectedRevision: input.expectedRevision, mode: input.mode, providerSettings: input.providerSettings, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest, authorizationDecision: auth.decision))
         } }
         router.patch("/internal/v1/sessions/:id/execution-permissions") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "updateExecutionPermissions", sessionID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "updateExecutionPermissions", sessionID: id)
             let input = try JSONDecoder.serviceDecoder.decode(ExecutionPermissionUpdateInput.self, from: data)
             let requestDigest = CanonicalSigning.bodyDigest(data)
             try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "updateExecutionPermissions", requestDigest: requestDigest, authorizationDecision: auth.decision)
-            return try await HTTPResponses.json(authority.updatePermissions(sessionID: id, expectedRevision: input.expectedRevision, mode: input.mode, providerSettings: input.providerSettings, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: requestDigest))
+            return try await HTTPResponses.json(authority.updatePermissions(sessionID: id, expectedRevision: input.expectedRevision, mode: input.mode, providerSettings: input.providerSettings, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: requestDigest, authorizationDecision: auth.decision))
         } }
         router.patch("/internal/v1/sessions/:id/collaboration-metadata") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(CollaborationMetadataInput.self, from: data)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "setSessionVisibility", sessionID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "setSessionVisibility", sessionID: id)
             return try await HTTPResponses.json(authority.updateCollaborationMetadata(sessionID: id, input: input, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data), authorizationDecision: auth.decision))
         } }
         router.get("/internal/v1/sessions/:id/interactions") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getInteractions", sessionID: id)
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getInteractions", sessionID: id)
             let interactions = try await authority.interactionSnapshots(sessionID: id)
             return try await HTTPResponses.json(page(interactions, request: request, defaultLimit: 100, maximumLimit: 500) { $0.interactionID.uuidString })
         } }
         router.post("/internal/v1/sessions/:id/interactions/answer") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "answerInteraction", sessionID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "answerInteraction", sessionID: id)
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(InteractionAnswerInput.self, from: data)
             let requestDigest = CanonicalSigning.bodyDigest(data)
             try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "answerInteraction", requestDigest: requestDigest, authorizationDecision: auth.decision)
-            return try await HTTPResponses.json(authority.answerInteraction(sessionID: id, interactionID: input.interactionID, expectedRevision: input.expectedRevision, payload: input.payload, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest))
+            return try await HTTPResponses.json(authority.answerInteraction(sessionID: id, interactionID: input.interactionID, expectedRevision: input.expectedRevision, payload: input.payload, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest, authorizationDecision: auth.decision))
         } }
         router.post("/internal/v1/sessions/:id/interactions/:interactionId/answer") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let interactionID = try context.parameters.require("interactionId", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "answerInteraction", sessionID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "answerInteraction", sessionID: id)
             let input = try JSONDecoder.serviceDecoder.decode(InteractionAnswerInput.self, from: data)
             guard input.interactionID == interactionID else { throw ServiceAPIError(code: .invalidRequest, message: "Interaction path and body IDs do not match") }
             let requestDigest = CanonicalSigning.bodyDigest(data)
             try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "answerInteraction", requestDigest: requestDigest, authorizationDecision: auth.decision)
-            return try await HTTPResponses.json(authority.answerInteraction(sessionID: id, interactionID: interactionID, expectedRevision: input.expectedRevision, payload: input.payload, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: requestDigest))
+            return try await HTTPResponses.json(authority.answerInteraction(sessionID: id, interactionID: interactionID, expectedRevision: input.expectedRevision, payload: input.payload, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: requestDigest, authorizationDecision: auth.decision))
         } }
         router.post("/internal/v1/sessions/:id/worktrees") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "createWorktree", sessionID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "createWorktree", sessionID: id)
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(WorktreeCreateInput.self, from: data)
             let requestDigest = CanonicalSigning.bodyDigest(data)
             try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "createWorktree", requestDigest: requestDigest, authorizationDecision: auth.decision)
-            let snapshot = try await authority.createWorktree(sessionID: id, rootID: input.rootID, baseRef: input.baseRef, branch: input.branch, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest)
+            let snapshot = try await authority.createWorktree(sessionID: id, rootID: input.rootID, baseRef: input.baseRef, branch: input.branch, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest, authorizationDecision: auth.decision)
             return try HTTPResponses.json(WorktreeWireSnapshot(snapshot), status: .created)
         } }
         router.post("/internal/v1/sessions/:id/worktrees/merge") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "mergeWorktree", sessionID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "mergeWorktree", sessionID: id)
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(WorktreeMergeInput.self, from: data)
             let requestDigest = CanonicalSigning.bodyDigest(data)
             try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "mergeWorktree", requestDigest: requestDigest, authorizationDecision: auth.decision)
-            let snapshot = try await authority.mergeWorktree(sessionID: id, bindingID: input.bindingID, strategy: input.strategy, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest)
+            let snapshot = try await authority.mergeWorktree(sessionID: id, bindingID: input.bindingID, strategy: input.strategy, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest, authorizationDecision: auth.decision)
             return try HTTPResponses.json(WorktreeWireSnapshot(snapshot))
         } }
         router.patch("/internal/v1/sessions/:id/worktree-binding") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "bindWorktree", sessionID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "bindWorktree", sessionID: id)
             let input = try JSONDecoder.serviceDecoder.decode(WorktreeBindInput.self, from: data)
             let requestDigest = CanonicalSigning.bodyDigest(data)
             try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "bindWorktree", requestDigest: requestDigest, authorizationDecision: auth.decision)
-            let snapshot = try await authority.bindWorktree(sessionID: id, bindingID: input.bindingID, expectedRevision: input.expectedRevision, expectedSelectionBindingRevision: input.expectedSelectionBindingRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: requestDigest)
+            let snapshot = try await authority.bindWorktree(sessionID: id, bindingID: input.bindingID, expectedRevision: input.expectedRevision, expectedSelectionBindingRevision: input.expectedSelectionBindingRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: requestDigest, authorizationDecision: auth.decision)
             return try HTTPResponses.json(WorktreeWireSnapshot(snapshot))
         } }
         router.post("/internal/v1/sessions/:id/worktrees/:worktreeId/merge") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let bindingID = try context.parameters.require("worktreeId", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "mergeWorktree", sessionID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "mergeWorktree", sessionID: id)
             let input = try JSONDecoder.serviceDecoder.decode(WorktreeMergeInput.self, from: data)
             guard input.bindingID == bindingID else { throw ServiceAPIError(code: .invalidRequest, message: "Worktree path and body IDs do not match") }
             let requestDigest = CanonicalSigning.bodyDigest(data)
             try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "mergeWorktree", requestDigest: requestDigest, authorizationDecision: auth.decision)
-            let snapshot = try await authority.mergeWorktree(sessionID: id, bindingID: bindingID, strategy: input.strategy, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: requestDigest)
+            let snapshot = try await authority.mergeWorktree(sessionID: id, bindingID: bindingID, strategy: input.strategy, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: requestDigest, authorizationDecision: auth.decision)
             return try HTTPResponses.json(WorktreeWireSnapshot(snapshot))
         } }
         router.get("/internal/v1/sessions/:id/artifacts") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getArtifacts", sessionID: id)
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getArtifacts", sessionID: id)
             let artifacts = try await authority.artifactSnapshots(sessionID: id)
             return try await HTTPResponses.json(page(artifacts, request: request, defaultLimit: 100, maximumLimit: 500) { $0.artifactID.uuidString })
         } }
@@ -1114,7 +1114,7 @@ public struct RepoPromptHTTPService: Sendable {
             let signedTarget = requestedRange.map {
                 "\(request.uri.string)#range=bytes=\($0.lowerBound)-\($0.upperBound - 1)"
             } ?? request.uri.string
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "downloadArtifact", sessionID: id, pathAndQuery: signedTarget)
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "downloadArtifact", sessionID: id, pathAndQuery: signedTarget)
             let result = try await authority.artifactContent(sessionID: id, artifactID: artifactID, range: requestedRange)
             var headers = HTTPFields()
             headers[.contentType] = "application/octet-stream"
@@ -1126,37 +1126,37 @@ public struct RepoPromptHTTPService: Sendable {
             return Response(status: partial ? .partialContent : .ok, headers: headers, body: .init(byteBuffer: ByteBuffer(bytes: result.1)))
         } }
         router.get("/internal/v1/catalog/workflows") { request, context in await respond(request) {
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "listWorkflows")
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "listWorkflows")
             let workflows = try await authority.workflowSnapshots()
             return try await HTTPResponses.json(page(workflows, request: request, defaultLimit: 100, maximumLimit: 500) { $0.workflowID })
         } }
         router.get("/internal/v1/catalog/workflows/:id") { request, context in await respond(request) {
             let id = try context.parameters.require("id")
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getWorkflow")
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getWorkflow")
             return try await HTTPResponses.json(authority.workflowSnapshot(workflowID: id))
         } }
         router.get("/internal/v1/catalog/providers") { request, context in await respond(request) {
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "listProviders")
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "listProviders")
             let providers = await providerCatalog()
             return try await HTTPResponses.json(page(providers, request: request, defaultLimit: 100, maximumLimit: 500) { $0.kind.rawValue })
         } }
         router.get("/internal/v1/catalog/models") { request, context in await respond(request) {
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "listModels")
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "listModels")
             let models = try await requireComposerCatalog().compatibilityModels()
             return try await HTTPResponses.json(page(models, request: request, defaultLimit: 100, maximumLimit: 500) { "\($0.providerID?.rawValue ?? $0.provider.rawValue):\($0.id)" })
         } }
         router.get("/internal/v1/catalog/execution-modes") { request, context in await respond(request) {
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "listExecutionModes")
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "listExecutionModes")
             return try await HTTPResponses.json(page(executionModeCatalog(), request: request, defaultLimit: 100, maximumLimit: 500) { $0.id })
         } }
         router.get("/internal/v1/sessions/:id/children") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
-            _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "listSessionChildren", sessionID: id)
+            _ = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "listSessionChildren", sessionID: id)
             let children = try await authority.childSessionSnapshots(parentSessionID: id)
             return try await HTTPResponses.json(page(children, request: request, defaultLimit: 100, maximumLimit: 500) { $0.sessionID.uuidString })
         } }
         router.post("/internal/v1/sessions/:id/context/build") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "buildContext", sessionID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "buildContext", sessionID: id)
             _ = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(ContextBuildInput.self, from: data)
             let requestDigest = CanonicalSigning.bodyDigest(data)
@@ -1164,25 +1164,25 @@ public struct RepoPromptHTTPService: Sendable {
         } }
         router.post("/internal/v1/sessions/:id/context/context-builder") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "runContextBuilder", sessionID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "runContextBuilder", sessionID: id)
             _ = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(ContextBuilderInput.self, from: data)
             if let budget = input.budget, !(1 ... 1_000_000).contains(budget) {
                 throw ServiceAPIError(code: .invalidRequest, message: "Context Builder budget exceeds the v1 bound")
             }
             try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "runContextBuilder", requestDigest: CanonicalSigning.bodyDigest(data), authorizationDecision: auth.decision)
-            return try await HTTPResponses.json(authority.runContextBuilder(sessionID: id, input: input, actor: requireActor(auth), origin: .internal))
+            return try await HTTPResponses.json(authority.runContextBuilder(sessionID: id, input: input, actor: requireActor(auth), origin: .internal, requestDigest: CanonicalSigning.bodyDigest(data), authorizationDecision: auth.decision))
         } }
         router.post("/internal/v1/sessions/:id/context/oracle") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "askOracle", sessionID: id)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.app], operation: "askOracle", sessionID: id)
             _ = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(OracleInput.self, from: data)
             try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "askOracle", requestDigest: CanonicalSigning.bodyDigest(data), authorizationDecision: auth.decision)
-            return try await HTTPResponses.json(authority.askOracle(sessionID: id, input: input, actor: requireActor(auth)))
+            return try await HTTPResponses.json(authority.askOracle(sessionID: id, input: input, actor: requireActor(auth), requestDigest: CanonicalSigning.bodyDigest(data), authorizationDecision: auth.decision))
         } }
 
-        router.get("/internal/v1/events") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinSync], operation: "events")
+        router.get("/internal/v1/events") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.sync], operation: "events")
             let cursor = try parseCursor(request)
             let limit = request.uri.queryParameters.get("limit", as: Int.self) ?? 500
             guard (1 ... 1000).contains(limit) else {
@@ -1190,7 +1190,7 @@ public struct RepoPromptHTTPService: Sendable {
             }
             return try await HTTPResponses.json(authority.events(after: cursor, limit: limit))
         } }
-        router.get("/internal/v1/events/stream") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinSync], operation: "eventStream")
+        router.get("/internal/v1/events/stream") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.sync], operation: "eventStream")
             let stream: AsyncThrowingStream<EventEnvelope, Error>
             do {
                 stream = try await authority.subscribe(after: parseCursor(request))
@@ -1214,7 +1214,7 @@ public struct RepoPromptHTTPService: Sendable {
                 try await writer.finish(nil)
             })
         } }
-        router.get("/internal/v1/snapshot") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinSync], operation: "snapshot")
+        router.get("/internal/v1/snapshot") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.sync], operation: "snapshot")
             let snapshot = try await authority.authoritativeSnapshot()
             let agents = try await authority.agentSnapshots()
             let titles = RepoPromptPortalSessionProjection.snapshotTitles(sessions: snapshot.sessions, agents: agents)
@@ -1306,7 +1306,7 @@ public struct RepoPromptHTTPService: Sendable {
             actorID: actorID,
             providerAttribution: ProviderMutationAttribution(actorID: actorID, actorLabel: actorLabel, channel: "portal-mtls"),
             settingsAttribution: SettingsMutationAttribution(actorID: actorID, actorLabel: actorLabel, channel: "portal-mtls"),
-            externalActor: ExternalActor(goblinUserID: actorID, username: actorLabel, displayName: actorLabel)
+            externalActor: ExternalActor(userID: actorID, username: actorLabel, displayName: actorLabel)
         )
     }
 
@@ -1367,7 +1367,7 @@ public struct RepoPromptHTTPService: Sendable {
 
     private func providerAttribution(_ auth: AuthenticatedInternalRequest) -> ProviderMutationAttribution {
         if let actor = auth.decision?.actor {
-            return .init(actorID: actor.goblinUserID, actorLabel: actor.username, channel: "goblin-app")
+            return .init(actorID: actor.userID, actorLabel: actor.username, channel: "goblin-app")
         }
         return .init(actorID: "signing-key:\(auth.keyID)", actorLabel: auth.role.rawValue, channel: "internal-hmac")
     }
@@ -1553,7 +1553,8 @@ public struct RepoPromptHTTPService: Sendable {
 
     private func authenticate(_ request: Request, context: RepoPromptRequestContext, body: Data, roles: Set<InternalRouteRole>, operation: String, projectID: UUID? = nil, sessionID: UUID? = nil, pathAndQuery: String? = nil) async throws -> AuthenticatedInternalRequest {
         guard let keyID = request.headers[.internalKeyID], let timestamp = request.headers[.internalTimestamp], let nonce = request.headers[.internalNonce], let bodyDigest = request.headers[.internalBodyDigest], let signature = request.headers[.internalSignature] else { throw ServiceAPIError(code: .internalAuthFailed, message: "Signed internal headers are required") }
-        let decisionData = request.headers[.goblinAuthorizationDecision].flatMap(CanonicalSigning.base64URLDecode)
+        let decisionHeader = request.headers[.authorizationDecision] ?? request.headers[.legacyAuthorizationDecision]
+        let decisionData = decisionHeader.flatMap(CanonicalSigning.base64URLDecode)
         let authenticated = try await authenticator.verify(SignedInternalRequest(method: String(describing: request.method), pathAndQuery: pathAndQuery ?? request.uri.string, timestamp: timestamp, nonce: nonce, body: body, bodyDigest: bodyDigest, authorizationDecisionData: decisionData, authorizationDecisionDigest: request.headers[.internalAuthorizationDigest], keyID: keyID, signature: signature), allowedRoles: roles, operation: operation, projectID: projectID, sessionID: sessionID)
         if let certificateRoleResolver {
             guard let certificate = try await context.channel.nioSSL_peerCertificate().get() else { throw ServiceAPIError(code: .internalAuthFailed, message: "A client certificate is required") }

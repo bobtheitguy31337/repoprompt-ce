@@ -87,7 +87,7 @@ final class PersistenceTests: XCTestCase {
     func testEventsAreSignedBeforeDurablePublication() async throws {
         let key = ServiceEventSigningKey(keyID: "event-v1", secret: Data("event-secret".utf8))
         let store = try await SQLiteServiceStore.open(storage: .memory, eventSigningKey: key)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let cursor = try await store.nextCursor()
         let project = ProjectSnapshot(projectID: UUID(), name: "P", creator: actor, state: .active, roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)], revision: 1, cursor: cursor)
         let event = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: nil)
@@ -103,7 +103,7 @@ final class PersistenceTests: XCTestCase {
     func testLegacyBase64EventEnvelopeIsCanonicallyRepublished() async throws {
         let key = ServiceEventSigningKey(keyID: "event-v1", secret: Data("event-secret".utf8))
         let store = try await SQLiteServiceStore.open(storage: .memory, eventSigningKey: key)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let cursor = try await store.nextCursor()
         let project = ProjectSnapshot(projectID: UUID(), name: "P", creator: actor, state: .active, roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/private/source", writable: true)], revision: 1, cursor: cursor)
         let event = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: nil)
@@ -137,7 +137,7 @@ final class PersistenceTests: XCTestCase {
             let injector = PersistenceFaultInjector { observed in
                 if observed == faultPoint { throw InjectedPersistenceFault() }
             }
-            let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+            let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
             var store = try await SQLiteServiceStore.open(storage: .file(database.path), faultInjector: injector)
             let projectID = UUID()
             let cursor = try await store.nextCursor()
@@ -172,7 +172,7 @@ final class PersistenceTests: XCTestCase {
         }
         let store = try await SQLiteServiceStore.open(storage: .memory, faultInjector: injector)
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let actor = ExternalActor(goblinUserID: "concurrent-owner", username: "owner", displayName: "Owner")
+        let actor = ExternalActor(userID: "concurrent-owner", username: "owner", displayName: "Owner")
 
         async let first = authority.createProject(
             input: .init(name: "Concurrent workspace", roots: []),
@@ -194,7 +194,7 @@ final class PersistenceTests: XCTestCase {
         let events = try await store.events(after: nil, limit: 10)
         XCTAssertEqual(events.events.count(where: { $0.eventType == .projectCreated }), 1)
         let replay = try await store.idempotencyResult(.init(
-            actorID: actor.goblinUserID,
+            actorID: actor.userID,
             operation: "createProject",
             key: "same-create",
             requestDigest: "same-fingerprint"
@@ -222,7 +222,7 @@ final class PersistenceTests: XCTestCase {
 
     func testAtomicProjectPublicationUsesMonotonicSequence() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let projectID = UUID()
         let firstCursor = try await store.nextCursor()
         let first = ProjectSnapshot(projectID: projectID, name: "One", creator: actor, state: .active, roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)], revision: 1, cursor: firstCursor)
@@ -239,10 +239,10 @@ final class PersistenceTests: XCTestCase {
     func testRestoreChangesStoreNamespace() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let prior = try await store.metadata().storeID
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let priorCursor = try await store.nextCursor()
         let project = ProjectSnapshot(projectID: UUID(), name: "P", creator: actor, state: .active, roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)], revision: 1, cursor: priorCursor)
-        let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "createProject", key: "before-restore", requestDigest: "digest")
+        let idempotency = IdempotencyInput(actorID: actor.userID, operation: "createProject", key: "before-restore", requestDigest: "digest")
         _ = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: idempotency)
         let storedIdempotency = try await store.idempotencyResult(idempotency)
         XCTAssertNotNil(storedIdempotency)
@@ -281,7 +281,7 @@ final class PersistenceTests: XCTestCase {
             try? FileManager.default.removeItem(at: URL(fileURLWithPath: database.path + "-wal"))
             try? FileManager.default.removeItem(at: URL(fileURLWithPath: database.path + "-shm"))
         }
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         var store = try await SQLiteServiceStore.open(storage: .file(database.path))
         let projectCursor = try await store.nextCursor()
         let project = ProjectSnapshot(projectID: UUID(), name: "P", creator: actor, state: .active, roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)], revision: 1, cursor: projectCursor)
@@ -304,7 +304,7 @@ final class PersistenceTests: XCTestCase {
 
     func testTerminalCheckpointAndImmutableEventArchiveAdvanceReplayFloor() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let projectCursor = try await store.nextCursor()
         let project = ProjectSnapshot(projectID: UUID(), name: "P", creator: actor, state: .active, roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)], revision: 1, cursor: projectCursor)
         _ = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: nil)

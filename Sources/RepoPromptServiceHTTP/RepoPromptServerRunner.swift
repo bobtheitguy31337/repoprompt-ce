@@ -59,14 +59,14 @@ public struct RepoPromptServerConfiguration: Sendable {
             guard let id, !id.isEmpty, file != nil else { throw ConfigurationError.invalid("\(prefix) previous key ID and HMAC file must be configured together") }
             return try InternalSigningKey(keyID: id, role: role, direction: direction, secret: secret("\(prefix)_PREVIOUS_HMAC_FILE"), active: false)
         }
-        let app = try InternalSigningKey(keyID: environment["REPOPROMPT_GOBLIN_APP_KEY_ID"] ?? "goblin-app-v1", role: .goblinApp, direction: "goblin-app-to-repoprompt-v1", secret: secret("REPOPROMPT_GOBLIN_APP_HMAC_FILE"))
-        let sync = try InternalSigningKey(keyID: environment["REPOPROMPT_GOBLIN_SYNC_KEY_ID"] ?? "goblin-sync-v1", role: .goblinSync, direction: "goblin-sync-to-repoprompt-v1", secret: secret("REPOPROMPT_GOBLIN_SYNC_HMAC_FILE"))
+        let app = try InternalSigningKey(keyID: environment["REPOPROMPT_GOBLIN_APP_KEY_ID"] ?? "goblin-app-v1", role: .app, direction: "goblin-app-to-repoprompt-v1", secret: secret("REPOPROMPT_GOBLIN_APP_HMAC_FILE"))
+        let sync = try InternalSigningKey(keyID: environment["REPOPROMPT_GOBLIN_SYNC_KEY_ID"] ?? "goblin-sync-v1", role: .sync, direction: "goblin-sync-to-repoprompt-v1", secret: secret("REPOPROMPT_GOBLIN_SYNC_HMAC_FILE"))
         let operatorKey = try InternalSigningKey(keyID: environment["REPOPROMPT_OPERATOR_KEY_ID"] ?? "repoprompt-operator-v1", role: .operatorRole, direction: "repoprompt-operator-to-repoprompt-v1", secret: secret("REPOPROMPT_OPERATOR_HMAC_FILE"))
-        let event = try InternalSigningKey(keyID: environment["REPOPROMPT_EVENT_KEY_ID"] ?? "repoprompt-event-v1", role: .goblinSync, direction: "repoprompt-to-goblin-v1", secret: secret("REPOPROMPT_EVENT_HMAC_FILE"))
+        let event = try InternalSigningKey(keyID: environment["REPOPROMPT_EVENT_KEY_ID"] ?? "repoprompt-event-v1", role: .sync, direction: "repoprompt-to-goblin-v1", secret: secret("REPOPROMPT_EVENT_HMAC_FILE"))
         let signingKeys = try [
             app, sync, operatorKey,
-            previousKey(prefix: "REPOPROMPT_GOBLIN_APP", role: .goblinApp, direction: app.direction),
-            previousKey(prefix: "REPOPROMPT_GOBLIN_SYNC", role: .goblinSync, direction: sync.direction),
+            previousKey(prefix: "REPOPROMPT_GOBLIN_APP", role: .app, direction: app.direction),
+            previousKey(prefix: "REPOPROMPT_GOBLIN_SYNC", role: .sync, direction: sync.direction),
             previousKey(prefix: "REPOPROMPT_OPERATOR", role: .operatorRole, direction: operatorKey.direction)
         ].compactMap(\.self)
         let allSigningKeys = signingKeys + [event]
@@ -497,7 +497,7 @@ public enum RepoPromptServerRunner {
         for pending in try await submissionCoordinator.recover() {
             do {
                 let accepted = try await submissionCoordinator.acceptedForRecovery(pending)
-                let actor = ExternalActor(goblinUserID: pending.actorID, username: "recovered-submission", displayName: "Recovered submission")
+                let actor = ExternalActor(userID: pending.actorID, username: "recovered-submission", displayName: "Recovered submission")
                 try await authority.dispatchAcceptedFollowup(accepted, actor: actor, requestDigest: pending.requestDigest)
                 try await submissionCoordinator.markDispatched(submissionID: pending.submissionID)
             } catch {

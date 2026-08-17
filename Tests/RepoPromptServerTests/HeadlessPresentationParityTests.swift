@@ -136,7 +136,7 @@ final class HeadlessPresentationParityTests: XCTestCase {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let delivery = RecordingAskUserDelivery()
         let authority = RepoPromptHeadlessAuthority(store: store, interactionDelivery: delivery)
-        let actor = ExternalActor(goblinUserID: "u1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(
             input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]),
             externalActor: actor,

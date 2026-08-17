@@ -51,7 +51,7 @@ final class FileSystemScanningPersistTests: XCTestCase {
             projectCatalog: store
         )
         let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
-        let actor = ExternalActor(goblinUserID: "scan", username: "scan", displayName: "Scan")
+        let actor = ExternalActor(userID: "scan", username: "scan", displayName: "Scan")
         let project = try await authority.createProject(
             input: .init(name: "Scan", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
             externalActor: actor,

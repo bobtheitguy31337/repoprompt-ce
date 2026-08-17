@@ -308,7 +308,7 @@ public actor SQLiteServiceStore {
             let snapshotJSON = try encodeText(snapshot)
             let bindings: [SQLiteData] = [
                 .text(snapshot.sessionID.uuidString), .text(snapshot.projectID.uuidString), snapshot.parentSessionID.map { .text($0.uuidString) } ?? .null,
-                .text(snapshot.rootSessionID.uuidString), .text(snapshot.creator.goblinUserID), .text(snapshot.state.rawValue), .text(snapshot.provider.rawValue),
+                .text(snapshot.rootSessionID.uuidString), .text(snapshot.creator.userID), .text(snapshot.state.rawValue), .text(snapshot.provider.rawValue),
                 snapshot.model.map(SQLiteData.text) ?? .null, .text(snapshot.visibility.rawValue), .integer(Int(snapshot.runGeneration)), .integer(Int(snapshot.turnEpoch)),
                 .integer(Int(snapshot.revision)), .text(snapshotJSON)
             ]
@@ -627,9 +627,9 @@ public actor SQLiteServiceStore {
               let controllerUserID = row.column("controller_user_id")?.string
         else { return nil }
         let acknowledgement = try row.column("goblin_acknowledgement_json")?.string.map {
-            try decoder.decode(GoblinCollaborationAcknowledgement.self, from: Data($0.utf8))
+            try decoder.decode(CollaborationAcknowledgement.self, from: Data($0.utf8))
         }
-        return CollaborationMetadataSnapshot(sessionID: sessionID, visibility: visibility, collaborativeSteeringEnabled: row.column("collaborative_steering_enabled")?.integer == 1, controllerUserID: controllerUserID, policyRevision: Int64(row.column("policy_revision")?.integer ?? 1), controllerRevision: Int64(row.column("controller_revision")?.integer ?? 1), membershipRevision: Int64(row.column("membership_revision")?.integer ?? 1), goblinAcknowledgement: acknowledgement)
+        return CollaborationMetadataSnapshot(sessionID: sessionID, visibility: visibility, collaborativeSteeringEnabled: row.column("collaborative_steering_enabled")?.integer == 1, controllerUserID: controllerUserID, policyRevision: Int64(row.column("policy_revision")?.integer ?? 1), controllerRevision: Int64(row.column("controller_revision")?.integer ?? 1), membershipRevision: Int64(row.column("membership_revision")?.integer ?? 1), collaborationAcknowledgement: acknowledgement)
     }
 
     public func installInitialPolicies(permissions: ExecutionPermissionSnapshot, collaboration: CollaborationMetadataSnapshot) async throws {
@@ -914,7 +914,7 @@ public actor SQLiteServiceStore {
         } catch { throw ServiceAPIError(code: .internalAuthFailed, message: "Nonce has already been used") }
     }
 
-    public func consumeAuthorizationDecision(_ decision: GoblinAuthorizationDecision) async throws {
+    public func consumeAuthorizationDecision(_ decision: AuthorizationDecision) async throws {
         try await transaction {
             let scope = decision.sessionID.map { "session:\($0.uuidString)" }
                 ?? decision.projectID.map { "project:\($0.uuidString)" }
@@ -941,7 +941,7 @@ public actor SQLiteServiceStore {
                       decision.membershipRevision >= Int64(row.column("membership_revision")?.integer ?? 0)
                 else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision revision regressed") }
             }
-            _ = try await connection.query("INSERT INTO consumed_authorization_decisions(decision_id,scope_key,actor_id,policy_revision,controller_revision,membership_revision,consumed_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP)", [.text(decision.decisionID.uuidString), .text(scope), .text(decision.actor.goblinUserID), .integer(Int(decision.policyRevision)), .integer(Int(decision.controllerRevision)), .integer(Int(decision.membershipRevision))])
+            _ = try await connection.query("INSERT INTO consumed_authorization_decisions(decision_id,scope_key,actor_id,policy_revision,controller_revision,membership_revision,consumed_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP)", [.text(decision.decisionID.uuidString), .text(scope), .text(decision.actor.userID), .integer(Int(decision.policyRevision)), .integer(Int(decision.controllerRevision)), .integer(Int(decision.membershipRevision))])
             _ = try await connection.query("INSERT INTO authorization_revision_fences(scope_key,policy_revision,controller_revision,membership_revision,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(scope_key) DO UPDATE SET policy_revision=MAX(policy_revision,excluded.policy_revision),controller_revision=MAX(controller_revision,excluded.controller_revision),membership_revision=MAX(membership_revision,excluded.membership_revision),updated_at=CURRENT_TIMESTAMP", [.text(scope), .integer(Int(decision.policyRevision)), .integer(Int(decision.controllerRevision)), .integer(Int(decision.membershipRevision))])
         }
     }
@@ -1194,7 +1194,7 @@ public actor SQLiteServiceStore {
         let snapshotJSON = try encodeText(snapshot)
         let sessionBindings: [SQLiteData] = [
             .text(snapshot.sessionID.uuidString), .text(snapshot.projectID.uuidString), snapshot.parentSessionID.map { .text($0.uuidString) } ?? .null,
-            .text(snapshot.rootSessionID.uuidString), .text(snapshot.creator.goblinUserID), .text(snapshot.state.rawValue), .text(snapshot.provider.rawValue),
+            .text(snapshot.rootSessionID.uuidString), .text(snapshot.creator.userID), .text(snapshot.state.rawValue), .text(snapshot.provider.rawValue),
             snapshot.model.map(SQLiteData.text) ?? .null, .text(snapshot.visibility.rawValue), .integer(Int(snapshot.runGeneration)), .integer(Int(snapshot.turnEpoch)),
             .integer(Int(snapshot.revision)), .text(snapshotJSON)
         ]
@@ -1237,7 +1237,7 @@ public actor SQLiteServiceStore {
     }
 
     private func upsertCollaboration(_ metadata: CollaborationMetadataSnapshot) async throws {
-        let acknowledgement: SQLiteData = try metadata.goblinAcknowledgement.map { try .text(encodeText($0)) } ?? .null
+        let acknowledgement: SQLiteData = try metadata.collaborationAcknowledgement.map { try .text(encodeText($0)) } ?? .null
         _ = try await connection.query(
             "INSERT INTO collaboration_metadata(session_id,schema_version,visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision,goblin_acknowledgement_json,updated_at) VALUES(?,1,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET visibility=excluded.visibility,collaborative_steering_enabled=excluded.collaborative_steering_enabled,controller_user_id=excluded.controller_user_id,policy_revision=excluded.policy_revision,controller_revision=excluded.controller_revision,membership_revision=excluded.membership_revision,goblin_acknowledgement_json=excluded.goblin_acknowledgement_json,updated_at=CURRENT_TIMESTAMP",
             [.text(metadata.sessionID.uuidString), .text(metadata.visibility.rawValue), .integer(metadata.collaborativeSteeringEnabled ? 1 : 0), .text(metadata.controllerUserID), .integer(Int(metadata.policyRevision)), .integer(Int(metadata.controllerRevision)), .integer(Int(metadata.membershipRevision)), acknowledgement]

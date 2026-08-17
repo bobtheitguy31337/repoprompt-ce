@@ -63,7 +63,7 @@ final class CodeMapsDisablePersistTests: XCTestCase {
             artifactService: try ArtifactRuntimeService(baseDirectory: artifacts.path),
             serverSettings: service
         )
-        let actor = ExternalActor(goblinUserID: "maps", username: "maps", displayName: "Maps")
+        let actor = ExternalActor(userID: "maps", username: "maps", displayName: "Maps")
         let project = try await authority.createProject(
             input: .init(name: "Maps", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
             externalActor: actor,

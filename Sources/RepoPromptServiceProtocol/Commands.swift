@@ -424,9 +424,9 @@ public struct CreateSessionInput: Codable, Sendable {
     }
 }
 
-/// Goblin `POST /internal/v1/sessions` body. Explicit provider/model stays a
+/// Internal `POST /internal/v1/sessions` body. Explicit provider/model stays a
 /// composer/legacy path. Omitted provider resolves `routingTarget` (default Pair).
-public struct GoblinCreateSessionRequest: Codable, Sendable {
+public struct CreateSessionRequest: Codable, Sendable {
     public let projectID: UUID
     public let parentSessionID: UUID?
     public let routingTarget: AgentRoutingTarget?

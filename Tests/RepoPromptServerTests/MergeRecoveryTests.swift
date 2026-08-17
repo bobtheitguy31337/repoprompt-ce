@@ -15,7 +15,7 @@ final class MergeRecoveryTests: XCTestCase {
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
         addTeardownBlock { try await store.close() }
-        let actor = ExternalActor(goblinUserID: "owner", username: "owner", displayName: "Owner")
+        let actor = ExternalActor(userID: "owner", username: "owner", displayName: "Owner")
         let service = try WorktreeRuntimeService(baseDirectory: owned.path, runner: ConflictingMergeRunner(preMergeHead: "abc123"), resources: store)
         let authority = RepoPromptHeadlessAuthority(store: store, worktreeService: service)
         let project = try await authority.createProject(

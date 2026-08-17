@@ -19,7 +19,7 @@ final class RepoPromptMCPAdapterTests: XCTestCase {
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)
-        let actor = ExternalActor(goblinUserID: "mcp", username: "mcp", displayName: "MCP")
+        let actor = ExternalActor(userID: "mcp", username: "mcp", displayName: "MCP")
         let project = try await authority.createProject(
             input: .init(name: "Adapter", roots: [
                 .init(logicalName: "source", path: root.path, writable: true)
@@ -128,7 +128,7 @@ final class RepoPromptMCPAdapterTests: XCTestCase {
             attribution: .init(actorID: "certificate:mcp-workflows", actorLabel: "MCP Workflows", channel: "test")
         )
 
-        let actor = ExternalActor(goblinUserID: "mcp-workflows", username: "mcp-workflows", displayName: "MCP Workflows")
+        let actor = ExternalActor(userID: "mcp-workflows", username: "mcp-workflows", displayName: "MCP Workflows")
         let project = try await authority.createProject(
             input: .init(name: "Workflows", roots: [
                 .init(logicalName: "source", path: root.path, writable: true)
@@ -193,7 +193,7 @@ final class RepoPromptMCPAdapterTests: XCTestCase {
             artifactService: ArtifactRuntimeService(baseDirectory: artifacts.path),
             providerAdapter: provider
         )
-        let actor = ExternalActor(goblinUserID: "oracle", username: "oracle", displayName: "Oracle")
+        let actor = ExternalActor(userID: "oracle", username: "oracle", displayName: "Oracle")
         let project = try await authority.createProject(
             input: .init(name: "Oracle", roots: [.init(logicalName: "source", path: root.path, writable: true)]),
             externalActor: actor,

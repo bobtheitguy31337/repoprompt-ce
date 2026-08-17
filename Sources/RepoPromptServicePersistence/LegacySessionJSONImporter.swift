@@ -47,7 +47,7 @@ public enum LegacySessionJSONImporter {
 
         let importDigest = CanonicalSigning.bodyDigest(aggregate)
         try await store.beginLegacyImport(sourceDigest: importDigest)
-        let actor = ExternalActor(goblinUserID: "legacy-import", username: "legacy-import", displayName: "Legacy RepoPrompt Import")
+        let actor = ExternalActor(userID: "legacy-import", username: "legacy-import", displayName: "Legacy RepoPrompt Import")
         var sourceIsDirectory: ObjCBool = false
         _ = FileManager.default.fileExists(atPath: source.path, isDirectory: &sourceIsDirectory)
         let baseRoot = (projectRoot ?? (sourceIsDirectory.boolValue ? source : source.deletingLastPathComponent())).standardizedFileURL

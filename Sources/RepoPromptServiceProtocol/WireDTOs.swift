@@ -63,7 +63,7 @@ public struct ProjectWireSnapshot: Codable, Hashable, Sendable {
     }
 }
 
-/// Bounded project event payload consumed by Goblin projections. Physical
+/// Bounded project event payload consumed by chat-server projections. Physical
 /// roots remain in RepoPrompt persistence and never enter the event stream.
 public struct ProjectEventWirePayload: Codable, Hashable, Sendable {
     public let schemaVersion: Int

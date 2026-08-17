@@ -21,19 +21,38 @@ public struct ServiceCursor: Codable, Hashable, Sendable, Comparable {
 }
 
 public struct ExternalActor: Codable, Hashable, Sendable {
-    public let goblinUserID: String
+    public let userID: String
     public let username: String
     public let displayName: String
 
     private enum CodingKeys: String, CodingKey {
+        case userID = "userId"
         case goblinUserID = "goblinUserId"
         case username, displayName
     }
 
-    public init(goblinUserID: String, username: String, displayName: String) {
-        self.goblinUserID = goblinUserID
+    public init(userID: String, username: String, displayName: String) {
+        self.userID = userID
         self.username = username
         self.displayName = displayName
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let userID = try container.decodeIfPresent(String.self, forKey: .userID) {
+            self.userID = userID
+        } else {
+            self.userID = try container.decode(String.self, forKey: .goblinUserID)
+        }
+        username = try container.decode(String.self, forKey: .username)
+        displayName = try container.decode(String.self, forKey: .displayName)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(userID, forKey: .userID)
+        try container.encode(username, forKey: .username)
+        try container.encode(displayName, forKey: .displayName)
     }
 }
 
@@ -42,7 +61,7 @@ public enum ProviderKind: String, Codable, CaseIterable, Sendable { case codex, 
 public enum SessionLifecycleState: String, Codable, Sendable { case preparing, idle, running, waiting, completed, failed, canceled, interrupted, archived }
 public enum ProjectLifecycleState: String, Codable, Sendable { case active, degraded, archived }
 
-public struct GoblinAuthorizationDecision: Codable, Hashable, Sendable {
+public struct AuthorizationDecision: Codable, Hashable, Sendable {
     public struct AttributionLabels: Codable, Hashable, Sendable {
         public let creatorUserID: String?
         public let controllerUserID: String?

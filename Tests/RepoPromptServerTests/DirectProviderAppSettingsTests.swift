@@ -28,7 +28,7 @@ final class DirectProviderAppSettingsTests: XCTestCase {
             serverSettings: service,
             directProviderRegistry: registry
         )
-        let actor = ExternalActor(goblinUserID: "mcp-direct", username: "mcp-direct", displayName: "MCP Direct")
+        let actor = ExternalActor(userID: "mcp-direct", username: "mcp-direct", displayName: "MCP Direct")
         let project = try await authority.createProject(
             input: .init(name: "Direct", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
             externalActor: actor,

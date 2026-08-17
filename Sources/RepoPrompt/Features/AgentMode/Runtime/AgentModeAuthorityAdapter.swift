@@ -13,7 +13,7 @@ final class AgentModeAuthorityAdapter {
     static let shared = AgentModeAuthorityAdapter()
 
     private let actor = ExternalActor(
-        goblinUserID: "macos-local-user",
+        userID: "macos-local-user",
         username: NSUserName(),
         displayName: NSFullUserName().isEmpty ? NSUserName() : NSFullUserName()
     )

@@ -4,7 +4,7 @@ import RepoPromptServiceProtocol
 import XCTest
 
 final class ProtocolAndLifecycleTests: XCTestCase {
-    func testCanonicalRequestSigningMatchesGoblinGoldenVector() throws {
+    func testCanonicalRequestSigningMatchesGoldenVector() throws {
         let key = Data("test-key".utf8)
         let timestamp = "2026-08-10T12:34:56.789Z"
         let nonce = "YWJjZGVmZ2hpamtsbW5vcA"
@@ -20,11 +20,21 @@ final class ProtocolAndLifecycleTests: XCTestCase {
         XCTAssertNotEqual(signature, CanonicalSigning.hmacSHA256(message: canonical + "x", key: key))
     }
 
+    func testExternalActorEncodesUserIdAndDecodesLegacyGoblinUserId() throws {
+        let actor = ExternalActor(userID: "user-1", username: "alice", displayName: "Alice")
+        let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(actor)) as? [String: Any]
+        XCTAssertEqual(encoded?["userId"] as? String, "user-1")
+        XCTAssertNil(encoded?["goblinUserId"])
+        let legacy = Data(#"{"goblinUserId":"legacy-1","username":"alice","displayName":"Alice"}"#.utf8)
+        let decoded = try JSONDecoder().decode(ExternalActor.self, from: legacy)
+        XCTAssertEqual(decoded.userID, "legacy-1")
+    }
+
     func testV1DTOsUseLowerCamelKeysAndLogicalOnlyProjections() throws {
         let storeID = UUID()
         let cursor = ServiceCursor(storeID: storeID, globalSequence: 7)
         let rootID = UUID()
-        let actor = ExternalActor(goblinUserID: "user-1", username: "alice", displayName: "Alice")
+        let actor = ExternalActor(userID: "user-1", username: "alice", displayName: "Alice")
         let project = ProjectSnapshot(projectID: UUID(), name: "P", creator: actor, state: .active, roots: [.init(rootID: rootID, logicalName: "source", canonicalPath: "/private/source", writable: true)], revision: 1, cursor: cursor)
         let projectJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(ProjectWireSnapshot(project))) as? [String: Any])
         XCTAssertNotNil(projectJSON["projectId"])

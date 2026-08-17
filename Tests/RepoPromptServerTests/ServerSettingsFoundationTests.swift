@@ -134,7 +134,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             serverSettings: service,
             directProviderDefaults: portal
         )
-        let actor = ExternalActor(goblinUserID: "direct", username: "direct", displayName: "Direct")
+        let actor = ExternalActor(userID: "direct", username: "direct", displayName: "Direct")
         let project = try await authority.createProject(
             input: .init(name: "Direct", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
             externalActor: actor,
@@ -173,9 +173,9 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertFalse(missingJSON.autoApproveAll)
 
         let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
-        let actor = ExternalActor(goblinUserID: "mcp-client", username: "mcp", displayName: "MCP")
+        let actor = ExternalActor(userID: "mcp-client", username: "mcp", displayName: "MCP")
         do {
-            try await authority.authorizeWorkspaceOperation(.createWorkspace, clientID: actor.goblinUserID)
+            try await authority.authorizeWorkspaceOperation(.createWorkspace, clientID: actor.userID)
             XCTFail("default-off must not auto-approve workspace create")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .invalidRequest)
@@ -217,10 +217,10 @@ final class ServerSettingsFoundationTests: XCTestCase {
         )
         XCTAssertEqual(written.revision, 1)
         XCTAssertTrue(written.settings.autoApproveAll)
-        try await authority.authorizeWorkspaceOperation(.createWorkspace, clientID: actor.goblinUserID)
-        try await authority.authorizeWorkspaceOperation(.deleteWorkspace, clientID: actor.goblinUserID)
-        try await authority.authorizeWorkspaceOperation(.addFolder, clientID: actor.goblinUserID)
-        try await authority.authorizeWorkspaceOperation(.removeFolder, clientID: actor.goblinUserID)
+        try await authority.authorizeWorkspaceOperation(.createWorkspace, clientID: actor.userID)
+        try await authority.authorizeWorkspaceOperation(.deleteWorkspace, clientID: actor.userID)
+        try await authority.authorizeWorkspaceOperation(.addFolder, clientID: actor.userID)
+        try await authority.authorizeWorkspaceOperation(.removeFolder, clientID: actor.userID)
         _ = try await adapter.invoke(
             toolName: "manage_workspaces",
             argumentsJSON: JSONSerialization.data(withJSONObject: ["action": "create", "name": "Allowed"], options: [.sortedKeys]),
@@ -244,7 +244,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertFalse(missingJSON.shouldAutoApprove(operation: .addFolder, clientID: "any"))
 
         let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
-        let actor = ExternalActor(goblinUserID: "mcp-client", username: "mcp", displayName: "MCP")
+        let actor = ExternalActor(userID: "mcp-client", username: "mcp", displayName: "MCP")
         let enabled = try await authority.setAutoApproveOperation(
             .addFolder,
             enabled: true,
@@ -255,9 +255,9 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertFalse(enabled.settings.autoApproveAll)
         XCTAssertEqual(enabled.settings.autoApproveOperations, [.addFolder])
 
-        try await authority.authorizeWorkspaceOperation(.addFolder, clientID: actor.goblinUserID)
+        try await authority.authorizeWorkspaceOperation(.addFolder, clientID: actor.userID)
         do {
-            try await authority.authorizeWorkspaceOperation(.createWorkspace, clientID: actor.goblinUserID)
+            try await authority.authorizeWorkspaceOperation(.createWorkspace, clientID: actor.userID)
             XCTFail("unlisted ops must still deny when master auto-approve is off")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .invalidRequest)
@@ -309,7 +309,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         )
         XCTAssertTrue(disabled.settings.autoApproveOperations.isEmpty)
         do {
-            try await authority.authorizeWorkspaceOperation(.addFolder, clientID: actor.goblinUserID)
+            try await authority.authorizeWorkspaceOperation(.addFolder, clientID: actor.userID)
             XCTFail("clearing the per-op toggle must restore deny")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .invalidRequest)
@@ -333,7 +333,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertFalse(missingJSON.shouldAutoApprove(operation: .createWorkspace, clientID: "claude-code"))
 
         let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
-        let actor = ExternalActor(goblinUserID: "mcp-client", username: "mcp", displayName: "MCP")
+        let actor = ExternalActor(userID: "mcp-client", username: "mcp", displayName: "MCP")
         let trusted = try await authority.addAutoApproval(
             clientID: "claude-code",
             operation: .createWorkspace,
@@ -349,7 +349,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertTrue(trusted.settings.shouldAutoApprove(operation: .createWorkspace, clientID: "Claude Code v2.1"))
         XCTAssertFalse(trusted.settings.shouldAutoApprove(operation: .deleteWorkspace, clientID: "Claude Code v2.1"))
         XCTAssertFalse(trusted.settings.shouldAutoApprove(operation: .createWorkspace, clientID: "my-custom-client"))
-        XCTAssertFalse(trusted.settings.shouldAutoApprove(operation: .createWorkspace, clientID: actor.goblinUserID))
+        XCTAssertFalse(trusted.settings.shouldAutoApprove(operation: .createWorkspace, clientID: actor.userID))
 
         try await authority.authorizeWorkspaceOperation(.createWorkspace, clientID: "Claude Code v2.1")
         do {
@@ -360,7 +360,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             XCTAssertEqual(error.message, WorkspaceApprovalOperation.deleteWorkspace.deniedByUserMessage)
         }
         do {
-            try await authority.authorizeWorkspaceOperation(.createWorkspace, clientID: actor.goblinUserID)
+            try await authority.authorizeWorkspaceOperation(.createWorkspace, clientID: actor.userID)
             XCTFail("HTTP actor identity must not substitute for MCP client identity")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .invalidRequest)
@@ -429,7 +429,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         )
         let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
         let goblin = ExternalActor(
-            goblinUserID: "goblin-chat-server",
+            userID: "goblin-chat-server",
             username: "claude-code",
             displayName: "Claude Code v2.1"
         )
@@ -546,7 +546,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         )
         XCTAssertEqual(disabled.settings.disabledTools, ["experimental_tool", "manage_workspaces"])
 
-        let actor = ExternalActor(goblinUserID: "mcp-tools", username: "mcp", displayName: "MCP")
+        let actor = ExternalActor(userID: "mcp-tools", username: "mcp", displayName: "MCP")
         let projectRoot = FileManager.default.temporaryDirectory.appendingPathComponent("ws-disabled-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: projectRoot) }
@@ -631,7 +631,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertFalse(missingJSON.showModelPresets)
 
         let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
-        let actor = ExternalActor(goblinUserID: "mcp-presets", username: "mcp", displayName: "MCP")
+        let actor = ExternalActor(userID: "mcp-presets", username: "mcp", displayName: "MCP")
         let projectRoot = FileManager.default.temporaryDirectory.appendingPathComponent("ws-presets-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: projectRoot) }
@@ -1363,7 +1363,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
-        let actor = ExternalActor(goblinUserID: "roles", username: "roles", displayName: "Roles")
+        let actor = ExternalActor(userID: "roles", username: "roles", displayName: "Roles")
         let project = try await authority.createProject(
             input: .init(name: "Roles", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
             externalActor: actor,
@@ -1475,7 +1475,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             projectCatalog: StaticProjectCatalog(roots: [projectID: [rootID]])
         )
         let omitted = try JSONDecoder.serviceDecoder.decode(
-            GoblinCreateSessionRequest.self,
+            CreateSessionRequest.self,
             from: Data("""
             {"projectId":"\(projectID.uuidString)","visibility":"private","initialPrompt":"Inspect"}
             """.utf8)
@@ -1503,7 +1503,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         }
 
         let explicit = try JSONDecoder.serviceDecoder.decode(
-            GoblinCreateSessionRequest.self,
+            CreateSessionRequest.self,
             from: Data("""
             {"projectId":"\(projectID.uuidString)","provider":"codex","visibility":"private"}
             """.utf8)
@@ -1528,7 +1528,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             serverSettings: service,
             directProviderDefaults: portal
         )
-        let actor = ExternalActor(goblinUserID: "leftover", username: "leftover", displayName: "Leftover")
+        let actor = ExternalActor(userID: "leftover", username: "leftover", displayName: "Leftover")
         let project = try await authority.createProject(
             input: .init(name: "Leftover", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
             externalActor: actor,
@@ -1695,7 +1695,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             projectCatalog: store
         )
         let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
-        let actor = ExternalActor(goblinUserID: "mcp-settings", username: "mcp-settings", displayName: "MCP Settings")
+        let actor = ExternalActor(userID: "mcp-settings", username: "mcp-settings", displayName: "MCP Settings")
         let project = try await authority.createProject(
             input: .init(name: "Settings", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
             externalActor: actor,
@@ -1755,7 +1755,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             projectCatalog: store
         )
         let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
-        let actor = ExternalActor(goblinUserID: "mcp-packaging", username: "mcp-packaging", displayName: "MCP Packaging")
+        let actor = ExternalActor(userID: "mcp-packaging", username: "mcp-packaging", displayName: "MCP Packaging")
         let project = try await authority.createProject(
             input: .init(name: "Packaging", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
             externalActor: actor,
@@ -1827,7 +1827,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             projectCatalog: store
         )
         let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
-        let actor = ExternalActor(goblinUserID: "mcp-permissions", username: "mcp-permissions", displayName: "MCP Permissions")
+        let actor = ExternalActor(userID: "mcp-permissions", username: "mcp-permissions", displayName: "MCP Permissions")
         let project = try await authority.createProject(
             input: .init(name: "Permissions", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
             externalActor: actor,
@@ -1902,7 +1902,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         )
         let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
         let portal = PortalDesktopSettingsService(store: store)
-        let actor = ExternalActor(goblinUserID: "mcp-cli", username: "mcp-cli", displayName: "MCP CLI")
+        let actor = ExternalActor(userID: "mcp-cli", username: "mcp-cli", displayName: "MCP CLI")
         let project = try await authority.createProject(
             input: .init(name: "CLI", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
             externalActor: actor,
@@ -1992,7 +1992,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             projectCatalog: store
         )
         let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
-        let actor = ExternalActor(goblinUserID: "mcp-workspace", username: "mcp-workspace", displayName: "MCP Workspace")
+        let actor = ExternalActor(userID: "mcp-workspace", username: "mcp-workspace", displayName: "MCP Workspace")
         let project = try await authority.createProject(
             input: .init(name: "Workspace", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
             externalActor: actor,
@@ -2097,7 +2097,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             serverSettings: service,
             directProviderDefaults: inheritedDefaults
         )
-        let actor = ExternalActor(goblinUserID: "runtime", username: "runtime", displayName: "Runtime")
+        let actor = ExternalActor(userID: "runtime", username: "runtime", displayName: "Runtime")
         let project = try await authority.createProject(
             input: .init(name: "Runtime", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
             externalActor: actor,
@@ -2196,7 +2196,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             serverSettings: service,
             directProviderDefaults: runtimeDefaults
         )
-        let actor = ExternalActor(goblinUserID: "context", username: "context", displayName: "Context")
+        let actor = ExternalActor(userID: "context", username: "context", displayName: "Context")
         let project = try await authority.createProject(
             input: .init(name: "Context", roots: [.init(logicalName: "root", path: root.resolvingSymlinksInPath().path, writable: true)]),
             externalActor: actor,
@@ -2298,7 +2298,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             projectCatalog: store
         )
         let authority = RepoPromptHeadlessAuthority(store: store, serverSettings: service)
-        let actor = ExternalActor(goblinUserID: "advanced", username: "advanced", displayName: "Advanced")
+        let actor = ExternalActor(userID: "advanced", username: "advanced", displayName: "Advanced")
         let project = try await authority.createProject(
             input: .init(name: "Advanced", roots: [.init(logicalName: "root", path: root.path, writable: true)]),
             externalActor: actor,
@@ -2405,7 +2405,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
     }
 
     private func persistProject(projectID: UUID, rootID: UUID, store: SQLiteServiceStore) async throws {
-        let actor = ExternalActor(goblinUserID: "settings-test", username: "settings-test", displayName: "Settings Test")
+        let actor = ExternalActor(userID: "settings-test", username: "settings-test", displayName: "Settings Test")
         let project = ProjectSnapshot(
             projectID: projectID,
             name: "Settings",
