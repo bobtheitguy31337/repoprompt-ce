@@ -53,7 +53,7 @@ package enum DomainAppSettingsCatalog {
         enumString("ui.appearance_mode", "ui", "System", ["System", "Light", "Dark"], "App appearance mode."),
         bool("ui.show_tooltips", "ui", true, "Whether RepoPrompt shows app tooltips."),
         bool("ui.enable_keyboard_shortcuts", "ui", true, "Whether global keyboard shortcuts are enabled."),
-        DomainSettingDescriptor(key: "ui.font_scale", group: "ui", valueKind: .number, defaultValue: .number(13), description: "App-wide UI font scale preset body size.", allowedValues: [11, 12, 13, 14, 15, 16].map { .number(Double($0)) }),
+        DomainSettingDescriptor(key: "ui.font_scale", group: "ui", valueKind: .number, defaultValue: .number(14), description: "App-wide UI font scale preset body size.", allowedValues: [14, 16, 18].map { .number(Double($0)) }),
         DomainSettingDescriptor(key: "prompt_packaging.prompt_sections_order", group: "prompt_packaging", valueKind: .string, defaultValue: .string(#"["fileMap","fileContents","gitDiff","metaPrompts","userInstructions"]"#), description: "Serialized prompt section ordering used when packaging prompts."),
         bool("prompt_packaging.duplicate_user_instructions_at_top", "prompt_packaging", false, "Whether user instructions are duplicated at the top of packaged prompts."),
         enumString("prompt_packaging.file_path_display_option", "prompt_packaging", "Full", ["Full", "Relative"], "How file paths are displayed in packaged context."),
@@ -77,8 +77,8 @@ package enum DomainAppSettingsCatalog {
         bool("file_system.respect_cursorignore", "file_system", true, "Whether .cursorignore files are honored."),
         DomainSettingDescriptor(key: "file_system.global_ignore_defaults", group: "file_system", valueKind: .string, defaultValue: .string(""), description: "App-wide gitignore-style patterns."),
         bool("file_system.enable_hierarchical_ignores", "file_system", true, "Whether nested ignore files are honored."),
-        bool("file_system.skip_symlinks", "file_system", false, "Whether symbolic links are skipped."),
-        bool("file_system.show_empty_folders", "file_system", true, "Whether empty folders are shown."),
+        bool("file_system.skip_symlinks", "file_system", true, "Whether symbolic links are skipped."),
+        bool("file_system.show_empty_folders", "file_system", false, "Whether empty folders are shown."),
     ]
 
     private static let byKey = Dictionary(uniqueKeysWithValues: descriptors.map { ($0.key, $0) })

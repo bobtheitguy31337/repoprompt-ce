@@ -1820,8 +1820,18 @@ public actor RepoPromptHeadlessAuthority {
     }
 
     public func historyIdleThresholdMinutes(explicit: Int?) async throws -> Int {
-        if let explicit { return max(0, min(explicit, 60)) }
-        return try await advancedSettings().settings.historyIdleThresholdMinutes
+        if let explicit {
+            guard AdvancedServerSettings.HistoryIdleThreshold.range.contains(explicit) else {
+                throw ServiceAPIError(
+                    code: .invalidRequest,
+                    message: AdvancedServerSettings.HistoryIdleThreshold.rangeMessage
+                )
+            }
+            return explicit
+        }
+        return AdvancedServerSettings.HistoryIdleThreshold.clamped(
+            try await advancedSettings().settings.historyIdleThresholdMinutes
+        )
     }
 
     public func projectDiff(projectID: UUID, request: ProjectDiffRequest) async throws -> ProjectDiffSnapshot {
@@ -3523,7 +3533,7 @@ public actor RepoPromptHeadlessAuthority {
             }
             let fullPath = rootPath.map { AdvancedServerSettings.FilePathDisplay.joinedFullPath(rootPath: $0, logicalPath: entry.logicalPath) }
             let displayPath = advanced.settings.displayedFilePath(logicalPath: entry.logicalPath, fullPath: fullPath)
-            if entry.mode == .codeMap {
+            if entry.mode == .codeMap, !advanced.settings.codeMapsGloballyDisabled {
                 let codeMap = try await tool.codeMap(.init(rootID: entry.rootID, logicalPath: entry.logicalPath), settings: advanced.settings)
                 fileBlocks.append("## \(displayPath) [codemap:\(codeMap.status)]\n```\n\(codeMap.content)\n```")
                 continue

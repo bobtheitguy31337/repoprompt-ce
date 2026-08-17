@@ -2239,8 +2239,10 @@ final class ServerSettingsFoundationTests: XCTestCase {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("advanced-runtime-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        try "ignored.swift\n".write(to: root.appendingPathComponent(".gitignore"), atomically: true, encoding: .utf8)
-        try "needle".write(to: root.appendingPathComponent("ignored.swift"), atomically: true, encoding: .utf8)
+        try "git-ignored.swift\n".write(to: root.appendingPathComponent(".gitignore"), atomically: true, encoding: .utf8)
+        try "repo-ignored.swift\n".write(to: root.appendingPathComponent(".repo_ignore"), atomically: true, encoding: .utf8)
+        try "needle".write(to: root.appendingPathComponent("git-ignored.swift"), atomically: true, encoding: .utf8)
+        try "needle".write(to: root.appendingPathComponent("repo-ignored.swift"), atomically: true, encoding: .utf8)
         try "needle".write(to: root.appendingPathComponent("visible.swift"), atomically: true, encoding: .utf8)
         try FileManager.default.createDirectory(at: root.appendingPathComponent("empty"), withIntermediateDirectories: true)
 
@@ -2271,7 +2273,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             attribution: Self.attribution
         )
         let nextHits = try await authority.projectSearch(projectID: project.projectID, request: .init(rootID: rootID, query: "needle"))
-        XCTAssertEqual(Set(nextHits.map(\.logicalPath)), Set(["ignored.swift", "visible.swift"]))
+        XCTAssertEqual(Set(nextHits.map(\.logicalPath)), Set(["repo-ignored.swift", "visible.swift"]))
         let tree = try await authority.projectTree(projectID: project.projectID, request: .init(rootID: rootID))
         XCTAssertFalse(tree.contains(where: { $0.logicalPath == "empty" }))
         let storedThreshold = try await authority.historyIdleThresholdMinutes(explicit: nil)

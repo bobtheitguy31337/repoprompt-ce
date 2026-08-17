@@ -4049,10 +4049,9 @@
     );
     const boundaries = informationalCard(
       "Desktop Appearance Boundary",
-      "Desktop transcript, editor, tooltip, spell-check, and @-mention settings control SwiftUI components that do not exist in this portal.",
+      "This page is browser-local chrome. Engine appearance, font scale, tooltips, and keyboard-shortcut persist live on Advanced and MCP app_settings. Headless apply of those keys is a no-op.",
       [
         ["File-change collapsing", "Intentionally omitted"],
-        ["Tooltips / timestamps", "Intentionally omitted"],
         ["Spell checking", "Browser-owned"],
         ["@-mention menu and picker", "Desktop-only"],
       ],
@@ -4128,15 +4127,79 @@
     const history = document.createElement("input");
     history.type = "number";
     history.min = "0";
-    history.max = "60";
+    history.max = "1440";
     history.step = "1";
     history.value = String(settings.historyIdleThresholdMinutes);
     history.setAttribute("aria-label", "Default history idle threshold");
+    const globalIgnoreDefaults = document.createElement("textarea");
+    globalIgnoreDefaults.rows = 6;
+    globalIgnoreDefaults.value =
+      settings.globalIgnoreDefaults === undefined
+        ? ""
+        : String(settings.globalIgnoreDefaults);
+    globalIgnoreDefaults.setAttribute("aria-label", "Global ignore defaults");
     card.append(
       desktopRow(
         "History Idle Threshold",
-        "0–60 minutes; explicit history query overrides still win.",
+        "0–1440 minutes; omitted history queries use this stored default. Explicit idle_threshold_minutes still fail closed outside that range.",
         history,
+      ),
+      desktopRow(
+        "Global ignore defaults",
+        "App-wide gitignore-style patterns. Empty disables app-wide defaults; missing persist live-reads Desktop’s canonical list.",
+        globalIgnoreDefaults,
+      ),
+    );
+    const appearance = desktopCard(
+      "App Appearance",
+      "Persisted for thin clients and MCP app_settings. Headless apply is a no-op. This is not the browser-local Portal Appearance cookie.",
+    );
+    const appearanceMode = typedSelect(
+      "App appearance mode",
+      [
+        ["System", "System"],
+        ["Light", "Light"],
+        ["Dark", "Dark"],
+      ],
+      settings.appearanceMode || "System",
+    );
+    const fontScale = typedSelect(
+      "App font scale",
+      [
+        ["14", "Normal (14)"],
+        ["16", "Large (16)"],
+        ["18", "Extra Large (18)"],
+      ],
+      String(settings.fontScaleBodySize || 14),
+    );
+    const showTooltips = typedToggle(
+      "Show tooltips",
+      settings.showTooltips !== false,
+    );
+    const enableKeyboardShortcuts = typedToggle(
+      "Enable keyboard shortcuts",
+      settings.enableKeyboardShortcuts !== false,
+    );
+    appearance.append(
+      desktopRow(
+        "Appearance mode",
+        "System, Light, or Dark. MCP ui.appearance_mode writes this same field.",
+        appearanceMode,
+      ),
+      desktopRow(
+        "Font scale",
+        "Desktop body sizes 14 / 16 / 18. MCP ui.font_scale writes this same field.",
+        fontScale,
+      ),
+      desktopRow(
+        "Show tooltips",
+        "Persisted for thin clients. Headless apply is a no-op.",
+        showTooltips.toggle,
+      ),
+      desktopRow(
+        "Enable keyboard shortcuts",
+        "Persisted for thin clients. Headless apply is a no-op.",
+        enableKeyboardShortcuts.toggle,
       ),
     );
     const packaging = desktopCard(
@@ -4234,10 +4297,10 @@
       if (
         !Number.isInteger(historyIdleThresholdMinutes) ||
         historyIdleThresholdMinutes < 0 ||
-        historyIdleThresholdMinutes > 60
+        historyIdleThresholdMinutes > 1440
       ) {
         toast(
-          "History idle threshold must be an integer from 0 through 60.",
+          "History idle threshold must be an integer from 0 through 1440.",
           true,
         );
         return;
@@ -4267,7 +4330,13 @@
                     toggle.input.checked,
                   ]),
                 ),
+                codeMapsGloballyDisabled: !toggles.codeMapsEnabled.input.checked,
                 historyIdleThresholdMinutes,
+                globalIgnoreDefaults: globalIgnoreDefaults.value,
+                appearanceMode: appearanceMode.value,
+                fontScaleBodySize: Number(fontScale.value),
+                showTooltips: showTooltips.input.checked,
+                enableKeyboardShortcuts: enableKeyboardShortcuts.input.checked,
                 fileEditFormat: fileEdit.value,
                 customPlanningPrompt: planning.value,
                 modelTemperature,
@@ -4301,7 +4370,7 @@
       "Advanced",
       "Configure only canonical settings consumed by shared-server runtime operations.",
       "sliders",
-      [card, packaging, boundary],
+      [card, appearance, packaging, boundary],
     );
   }
 

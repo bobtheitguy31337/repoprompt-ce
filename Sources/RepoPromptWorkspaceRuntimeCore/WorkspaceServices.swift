@@ -174,8 +174,8 @@ public actor ProjectToolAuthority {
     }
 
     public func codeMap(_ request: ProjectCodeMapRequest, settings: AdvancedServerSettings = .default) async throws -> ProjectCodeMapSnapshot {
-        guard settings.codeMapsEnabled else {
-            throw ServiceAPIError(code: .capabilityMissing, message: "Code maps are disabled by Advanced server settings")
+        guard !settings.codeMapsGloballyDisabled else {
+            throw ServiceAPIError(code: .capabilityMissing, message: AdvancedServerSettings.codeMapsGloballyDisabledMCPMessage)
         }
         let path = try await project.authorize(rootID: request.rootID, logicalPath: request.logicalPath, filesystem: filesystem)
         var isDirectory: ObjCBool = false
@@ -309,6 +309,8 @@ public actor ProjectToolAuthority {
         return canonicalPath == canonicalRoot || canonicalPath.hasPrefix(canonicalRoot + "/")
     }
 
+    /// Desktop `IgnoreRulesManager.makeRootRules`: `.gitignore` always loads, then
+    /// `globalIgnoreDefaults`, then gated `.repo_ignore` / `.cursorignore`.
     private static func isIgnored(relativePath: String, rootPath: String, settings: AdvancedServerSettings) -> Bool {
         let components = relativePath.split(separator: "/").map(String.init)
         let directoryCount = max(0, components.count - 1)
@@ -317,32 +319,71 @@ public actor ProjectToolAuthority {
         for depth in depths {
             let base = components.prefix(depth).joined(separator: "/")
             let directory = base.isEmpty ? rootPath : URL(fileURLWithPath: rootPath).appendingPathComponent(base).path
-            let names = (settings.respectRepoIgnore ? [".gitignore"] : []) + (settings.respectCursorIgnore ? [".cursorignore"] : [])
-            for name in names {
-                guard let text = try? String(contentsOfFile: URL(fileURLWithPath: directory).appendingPathComponent(name).path, encoding: .utf8) else { continue }
-                let candidate = components.dropFirst(depth).joined(separator: "/")
-                for raw in text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init) {
-                    let line = raw.trimmingCharacters(in: .whitespaces)
-                    guard !line.isEmpty, !line.hasPrefix("#") else { continue }
-                    let negated = line.hasPrefix("!")
-                    let pattern = negated ? String(line.dropFirst()) : line
-                    if glob(pattern, matches: candidate) || glob(pattern, matches: components.last ?? candidate) {
-                        ignored = !negated
-                    }
-                }
+            let candidate = components.dropFirst(depth).joined(separator: "/")
+            applyIgnoreFile(named: ".gitignore", in: directory, candidate: candidate, ignored: &ignored)
+            if depth == 0 {
+                applyIgnoreText(settings.globalIgnoreDefaults, candidate: candidate, ignored: &ignored)
+            }
+            if settings.respectRepoIgnore {
+                applyIgnoreFile(named: ".repo_ignore", in: directory, candidate: candidate, ignored: &ignored)
+            }
+            if settings.respectCursorIgnore {
+                applyIgnoreFile(named: ".cursorignore", in: directory, candidate: candidate, ignored: &ignored)
             }
         }
         return ignored
     }
 
-    private static func glob(_ pattern: String, matches value: String) -> Bool {
-        var expression = "^"
-        for character in pattern.trimmingCharacters(in: CharacterSet(charactersIn: "/")) {
-            switch character {
-            case "*": expression += "[^/]*"
-            case "?": expression += "[^/]"
-            default: expression += NSRegularExpression.escapedPattern(for: String(character))
+    private static func applyIgnoreFile(named name: String, in directory: String, candidate: String, ignored: inout Bool) {
+        guard let text = try? String(
+            contentsOfFile: URL(fileURLWithPath: directory).appendingPathComponent(name).path,
+            encoding: .utf8
+        ) else { return }
+        applyIgnoreText(text, candidate: candidate, ignored: &ignored)
+    }
+
+    private static func applyIgnoreText(_ text: String, candidate: String, ignored: inout Bool) {
+        let leaf = candidate.split(separator: "/").map(String.init).last ?? candidate
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+            let negated = line.hasPrefix("!")
+            let pattern = negated ? String(line.dropFirst()) : line
+            if glob(pattern, matches: candidate) || glob(pattern, matches: leaf) {
+                ignored = !negated
             }
+        }
+    }
+
+    private static func glob(_ pattern: String, matches value: String) -> Bool {
+        let trimmed = pattern.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        var expression = "^"
+        var index = trimmed.startIndex
+        while index < trimmed.endIndex {
+            let character = trimmed[index]
+            if character == "*" {
+                let next = trimmed.index(after: index)
+                if next < trimmed.endIndex, trimmed[next] == "*" {
+                    let afterStar = trimmed.index(after: next)
+                    if afterStar < trimmed.endIndex, trimmed[afterStar] == "/" {
+                        expression += "(?:.*/)?"
+                        index = trimmed.index(after: afterStar)
+                        continue
+                    }
+                    expression += ".*"
+                    index = afterStar
+                    continue
+                }
+                expression += "[^/]*"
+                index = next
+                continue
+            }
+            if character == "?" {
+                expression += "[^/]"
+            } else {
+                expression += NSRegularExpression.escapedPattern(for: String(character))
+            }
+            index = trimmed.index(after: index)
         }
         if pattern.hasSuffix("/") { expression += "(?:/.*)?" }
         expression += "$"

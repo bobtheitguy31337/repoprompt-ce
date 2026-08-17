@@ -549,9 +549,15 @@ function typedSettingsFixtures(providers, bootstrap) {
         respectCursorIgnore: true,
         respectNestedIgnoreFiles: true,
         followSymbolicLinks: false,
-        showEmptyFolders: true,
+        showEmptyFolders: false,
         codeMapsEnabled: true,
-        historyIdleThresholdMinutes: 5,
+        codeMapsGloballyDisabled: false,
+        historyIdleThresholdMinutes: 10,
+        globalIgnoreDefaults: "",
+        appearanceMode: "System",
+        showTooltips: true,
+        enableKeyboardShortcuts: true,
+        fontScaleBodySize: 14,
         fileEditFormat: "Diff",
         customPlanningPrompt: "",
         modelTemperature: 0,
@@ -1768,11 +1774,19 @@ test("typed settings pages mutate revisioned server authorities", async (t) => {
     document.getElementById("settings-content").textContent,
     /File path display/,
   );
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /App Appearance/,
+  );
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /Global ignore defaults/,
+  );
   const historyThreshold = document.querySelector(
     'input[aria-label="Default history idle threshold"]',
   );
   assert.equal(historyThreshold.min, "0");
-  assert.equal(historyThreshold.max, "60");
+  assert.equal(historyThreshold.max, "1440");
   assert.equal(historyThreshold.step, "1");
   click(
     window,
@@ -1797,12 +1811,17 @@ test("typed settings pages mutate revisioned server authorities", async (t) => {
     "settings",
   ]);
   assert.deepEqual(Object.keys(advancedPayload.settings).sort(), [
+    "appearanceMode",
     "codeMapsEnabled",
+    "codeMapsGloballyDisabled",
     "customPlanningPrompt",
     "duplicateUserInstructionsAtTop",
+    "enableKeyboardShortcuts",
     "fileEditFormat",
     "filePathDisplayOption",
     "followSymbolicLinks",
+    "fontScaleBodySize",
+    "globalIgnoreDefaults",
     "historyIdleThresholdMinutes",
     "includeDatetimeInUserInstructions",
     "modelTemperature",
@@ -1812,11 +1831,18 @@ test("typed settings pages mutate revisioned server authorities", async (t) => {
     "respectRepoIgnore",
     "setModelTemperature",
     "showEmptyFolders",
+    "showTooltips",
   ]);
   assert.equal(advancedPayload.settings.fileEditFormat, "Diff");
   assert.equal(advancedPayload.settings.filePathDisplayOption, "Full");
   assert.equal(advancedPayload.settings.setModelTemperature, true);
-  assert.equal(advancedPayload.settings.historyIdleThresholdMinutes, 5);
+  assert.equal(advancedPayload.settings.historyIdleThresholdMinutes, 10);
+  assert.equal(advancedPayload.settings.appearanceMode, "System");
+  assert.equal(advancedPayload.settings.fontScaleBodySize, 14);
+  assert.equal(advancedPayload.settings.showTooltips, true);
+  assert.equal(advancedPayload.settings.enableKeyboardShortcuts, true);
+  assert.equal(advancedPayload.settings.codeMapsGloballyDisabled, false);
+  assert.equal(advancedPayload.settings.globalIgnoreDefaults, "");
 });
 
 test("settings save feedback persists across route rerenders and stays separate from catalog freshness", async (t) => {
@@ -2769,6 +2795,10 @@ test("portal appearance is browser-local and uses a strict versioned cookie", as
   assert.equal(
     harness.calls.some((call) => call.path.includes("appearance")),
     false,
+  );
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /Engine appearance, font scale, tooltips, and keyboard-shortcut persist live on Advanced/,
   );
 });
 

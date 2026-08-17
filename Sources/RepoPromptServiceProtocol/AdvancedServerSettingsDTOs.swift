@@ -104,12 +104,52 @@ public struct ModelOverrideMaps: Codable, Hashable, Sendable {
 }
 
 public struct AdvancedServerSettings: Codable, Hashable, Sendable {
+    /// Desktop `IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults`. Empty disables app-wide patterns.
+    public static let canonicalGlobalIgnoreDefaults: String = """
+    # RepoPrompt global ignore defaults (v2)
+    **/node_modules/
+    **/.npm/
+    **/.pnpm-store/
+    **/.yarn/
+    **/.cache/
+    **/bower_components/
+
+    **/__pycache__/
+    **/.pytest_cache/
+    **/.mypy_cache/
+
+    **/.gradle/
+    **/.m2/
+    **/.nuget/
+    **/.cargo/
+    **/.stack-work/
+    **/.ccache/
+
+    **/.idea/
+    **/.vscode/
+    **/.bundle/
+    **/.gem/
+
+    # Virtual environments
+    **/.venv/
+    **/venv/
+
+    # Common temp/junk files
+    **/*.swp
+    **/*~
+    **/*.tmp
+    **/*.temp
+    **/*.bak
+    """
+
     public let respectRepoIgnore: Bool
     public let respectCursorIgnore: Bool
     public let respectNestedIgnoreFiles: Bool
     public let followSymbolicLinks: Bool
     public let showEmptyFolders: Bool
-    public let codeMapsEnabled: Bool
+    public let globalIgnoreDefaults: String
+    public let codeMapsGloballyDisabled: Bool
+    public var codeMapsEnabled: Bool { !codeMapsGloballyDisabled }
     public let historyIdleThresholdMinutes: Int
     public let fileEditFormat: String
     public let customPlanningPrompt: String
@@ -125,15 +165,21 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
     public let filePathDisplayOption: String
     public let includeDatetimeInUserInstructions: Bool
     public let modelOverrides: ModelOverrideMaps
+    public let appearanceMode: String
+    public let showTooltips: Bool
+    public let enableKeyboardShortcuts: Bool
+    public let fontScaleBodySize: Double
 
     public init(
         respectRepoIgnore: Bool = true,
         respectCursorIgnore: Bool = true,
         respectNestedIgnoreFiles: Bool = true,
         followSymbolicLinks: Bool = false,
-        showEmptyFolders: Bool = true,
+        showEmptyFolders: Bool = false,
+        globalIgnoreDefaults: String = AdvancedServerSettings.canonicalGlobalIgnoreDefaults,
         codeMapsEnabled: Bool = true,
-        historyIdleThresholdMinutes: Int = 5,
+        codeMapsGloballyDisabled: Bool? = nil,
+        historyIdleThresholdMinutes: Int = HistoryIdleThreshold.defaultMinutes,
         fileEditFormat: String = FileEditFormat.defaultRaw,
         customPlanningPrompt: String = "",
         modelTemperature: Double = 0.0,
@@ -147,15 +193,20 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
         includeSavedPromptsInClipboard: Bool = true,
         filePathDisplayOption: String = FilePathDisplay.defaultRaw,
         includeDatetimeInUserInstructions: Bool = false,
-        modelOverrides: ModelOverrideMaps = .empty
+        modelOverrides: ModelOverrideMaps = .empty,
+        appearanceMode: String = AppearanceMode.defaultRaw,
+        showTooltips: Bool = true,
+        enableKeyboardShortcuts: Bool = true,
+        fontScaleBodySize: Double = FontScale.defaultRaw
     ) {
         self.respectRepoIgnore = respectRepoIgnore
         self.respectCursorIgnore = respectCursorIgnore
         self.respectNestedIgnoreFiles = respectNestedIgnoreFiles
         self.followSymbolicLinks = followSymbolicLinks
         self.showEmptyFolders = showEmptyFolders
-        self.codeMapsEnabled = codeMapsEnabled
-        self.historyIdleThresholdMinutes = historyIdleThresholdMinutes
+        self.globalIgnoreDefaults = globalIgnoreDefaults
+        self.codeMapsGloballyDisabled = codeMapsGloballyDisabled ?? !codeMapsEnabled
+        self.historyIdleThresholdMinutes = HistoryIdleThreshold.clamped(historyIdleThresholdMinutes)
         self.fileEditFormat = fileEditFormat
         self.customPlanningPrompt = customPlanningPrompt
         self.modelTemperature = modelTemperature
@@ -170,6 +221,10 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
         self.filePathDisplayOption = filePathDisplayOption
         self.includeDatetimeInUserInstructions = includeDatetimeInUserInstructions
         self.modelOverrides = modelOverrides
+        self.appearanceMode = AppearanceMode.resolved(from: appearanceMode).rawValue
+        self.showTooltips = showTooltips
+        self.enableKeyboardShortcuts = enableKeyboardShortcuts
+        self.fontScaleBodySize = FontScale.resolved(from: fontScaleBodySize).rawValue
     }
 
     public static let `default` = AdvancedServerSettings()
@@ -180,7 +235,9 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
         case respectNestedIgnoreFiles
         case followSymbolicLinks
         case showEmptyFolders
+        case globalIgnoreDefaults
         case codeMapsEnabled
+        case codeMapsGloballyDisabled
         case historyIdleThresholdMinutes
         case fileEditFormat
         case customPlanningPrompt
@@ -196,6 +253,10 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
         case filePathDisplayOption
         case includeDatetimeInUserInstructions
         case modelOverrides
+        case appearanceMode
+        case showTooltips
+        case enableKeyboardShortcuts
+        case fontScaleBodySize
     }
 
     public init(from decoder: Decoder) throws {
@@ -204,9 +265,19 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
         respectCursorIgnore = try container.decodeIfPresent(Bool.self, forKey: .respectCursorIgnore) ?? true
         respectNestedIgnoreFiles = try container.decodeIfPresent(Bool.self, forKey: .respectNestedIgnoreFiles) ?? true
         followSymbolicLinks = try container.decodeIfPresent(Bool.self, forKey: .followSymbolicLinks) ?? false
-        showEmptyFolders = try container.decodeIfPresent(Bool.self, forKey: .showEmptyFolders) ?? true
-        codeMapsEnabled = try container.decodeIfPresent(Bool.self, forKey: .codeMapsEnabled) ?? true
-        historyIdleThresholdMinutes = try container.decodeIfPresent(Int.self, forKey: .historyIdleThresholdMinutes) ?? 5
+        showEmptyFolders = try container.decodeIfPresent(Bool.self, forKey: .showEmptyFolders) ?? false
+        globalIgnoreDefaults = try container.decodeIfPresent(String.self, forKey: .globalIgnoreDefaults)
+            ?? Self.canonicalGlobalIgnoreDefaults
+        if let disabled = try container.decodeIfPresent(Bool.self, forKey: .codeMapsGloballyDisabled) {
+            codeMapsGloballyDisabled = disabled
+        } else if let enabled = try container.decodeIfPresent(Bool.self, forKey: .codeMapsEnabled) {
+            codeMapsGloballyDisabled = !enabled
+        } else {
+            codeMapsGloballyDisabled = false
+        }
+        historyIdleThresholdMinutes = HistoryIdleThreshold.clamped(
+            try container.decodeIfPresent(Int.self, forKey: .historyIdleThresholdMinutes) ?? HistoryIdleThreshold.defaultMinutes
+        )
         fileEditFormat = try container.decodeIfPresent(String.self, forKey: .fileEditFormat) ?? FileEditFormat.defaultRaw
         customPlanningPrompt = try container.decodeIfPresent(String.self, forKey: .customPlanningPrompt) ?? ""
         modelTemperature = try container.decodeIfPresent(Double.self, forKey: .modelTemperature) ?? 0.0
@@ -221,6 +292,14 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
         filePathDisplayOption = try container.decodeIfPresent(String.self, forKey: .filePathDisplayOption) ?? FilePathDisplay.defaultRaw
         includeDatetimeInUserInstructions = try container.decodeIfPresent(Bool.self, forKey: .includeDatetimeInUserInstructions) ?? false
         modelOverrides = try container.decodeIfPresent(ModelOverrideMaps.self, forKey: .modelOverrides) ?? .empty
+        appearanceMode = AppearanceMode.resolved(
+            from: try container.decodeIfPresent(String.self, forKey: .appearanceMode)
+        ).rawValue
+        showTooltips = try container.decodeIfPresent(Bool.self, forKey: .showTooltips) ?? true
+        enableKeyboardShortcuts = try container.decodeIfPresent(Bool.self, forKey: .enableKeyboardShortcuts) ?? true
+        fontScaleBodySize = FontScale.resolved(
+            from: try container.decodeIfPresent(Double.self, forKey: .fontScaleBodySize)
+        ).rawValue
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -230,7 +309,9 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
         try container.encode(respectNestedIgnoreFiles, forKey: .respectNestedIgnoreFiles)
         try container.encode(followSymbolicLinks, forKey: .followSymbolicLinks)
         try container.encode(showEmptyFolders, forKey: .showEmptyFolders)
+        try container.encode(globalIgnoreDefaults, forKey: .globalIgnoreDefaults)
         try container.encode(codeMapsEnabled, forKey: .codeMapsEnabled)
+        try container.encode(codeMapsGloballyDisabled, forKey: .codeMapsGloballyDisabled)
         try container.encode(historyIdleThresholdMinutes, forKey: .historyIdleThresholdMinutes)
         try container.encode(fileEditFormat, forKey: .fileEditFormat)
         try container.encode(customPlanningPrompt, forKey: .customPlanningPrompt)
@@ -246,6 +327,10 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
         try container.encode(filePathDisplayOption, forKey: .filePathDisplayOption)
         try container.encode(includeDatetimeInUserInstructions, forKey: .includeDatetimeInUserInstructions)
         try container.encode(modelOverrides, forKey: .modelOverrides)
+        try container.encode(appearanceMode, forKey: .appearanceMode)
+        try container.encode(showTooltips, forKey: .showTooltips)
+        try container.encode(enableKeyboardShortcuts, forKey: .enableKeyboardShortcuts)
+        try container.encode(fontScaleBodySize, forKey: .fontScaleBodySize)
     }
 
     /// Desktop `PromptViewModel.FileEditFormat`: Diff / Whole / None. Missing or invalid raw → Diff.
@@ -301,6 +386,79 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
         case .full:
             return fullPath ?? logicalPath
         }
+    }
+
+    /// Desktop `AppearanceMode`. Missing or invalid raw → System.
+    public enum AppearanceMode: String, CaseIterable, Sendable {
+        case system = "System"
+        case light = "Light"
+        case dark = "Dark"
+
+        public static let defaultRaw = AppearanceMode.system.rawValue
+
+        public static func resolved(from raw: String?) -> AppearanceMode {
+            AppearanceMode(rawValue: raw ?? defaultRaw) ?? .system
+        }
+    }
+
+    public func resolvedAppearanceMode() -> AppearanceMode {
+        AppearanceMode.resolved(from: appearanceMode)
+    }
+
+    /// Desktop `FontScalePreset` body sizes. Missing or invalid → 14.
+    public enum FontScale: Double, CaseIterable, Sendable {
+        case normal = 14
+        case large = 16
+        case extraLarge = 18
+
+        public static let defaultRaw = FontScale.normal.rawValue
+
+        public static func resolved(from raw: Double?) -> FontScale {
+            guard let raw else { return .normal }
+            return FontScale(rawValue: raw) ?? .normal
+        }
+    }
+
+    public func resolvedFontScale() -> FontScale {
+        FontScale.resolved(from: fontScaleBodySize)
+    }
+
+    /// Desktop MCP `file_system.skip_symlinks` is the inverse of `followSymbolicLinks`.
+    public var skipSymlinks: Bool { !followSymbolicLinks }
+
+    /// Desktop `AgentSessionMetadataRecord.defaultIdleThresholdMinutes` and MCP `idle_threshold_minutes`.
+    public enum HistoryIdleThreshold {
+        public static let defaultMinutes = 10
+        public static let range = 0 ... 1440
+        public static let integerRequiredMessage = "idle_threshold_minutes must be an integer"
+        public static let rangeMessage = "idle_threshold_minutes must be between 0 and 1440"
+
+        public static func clamped(_ raw: Int) -> Int {
+            min(max(range.lowerBound, raw), range.upperBound)
+        }
+
+        /// Desktop: gaps ≤ threshold count; gaps > threshold add 0.
+        public static func activeDurationSeconds(timestamps: [Date], thresholdMinutes: Int) -> Int {
+            let sorted = timestamps.sorted()
+            guard sorted.count >= 2 else { return 0 }
+            let thresholdSeconds = thresholdMinutes * 60
+            var total = 0
+            for (previous, next) in zip(sorted, sorted.dropFirst()) {
+                let gap = Int(max(0, next.timeIntervalSince(previous)))
+                if gap <= thresholdSeconds {
+                    total += gap
+                }
+            }
+            return total
+        }
+    }
+
+    public static let codeMapsGloballyDisabledMCPMessage =
+        "Code Maps are globally disabled in Advanced Settings; codemap-only selection modes and get_code_structure are unavailable."
+
+    /// Desktop `effectiveMCPCodeMapUsage`: disable remaps copy/chat usage to `.none` without mutating presets.
+    public func resolvedCodeMapUsage(_ usage: CodeMapUsage) -> CodeMapUsage {
+        codeMapsGloballyDisabled ? .none : usage
     }
 
     public func formattedUserInstructions(_ text: String, now: Date) -> String {
@@ -400,6 +558,13 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
     }
 
     public func replacing(
+        respectRepoIgnore: Bool? = nil,
+        respectCursorIgnore: Bool? = nil,
+        respectNestedIgnoreFiles: Bool? = nil,
+        followSymbolicLinks: Bool? = nil,
+        showEmptyFolders: Bool? = nil,
+        globalIgnoreDefaults: String? = nil,
+        codeMapsGloballyDisabled: Bool? = nil,
         fileEditFormat: String? = nil,
         customPlanningPrompt: String? = nil,
         modelTemperature: Double? = nil,
@@ -413,15 +578,20 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
         includeSavedPromptsInClipboard: Bool? = nil,
         filePathDisplayOption: String? = nil,
         includeDatetimeInUserInstructions: Bool? = nil,
-        modelOverrides: ModelOverrideMaps? = nil
+        modelOverrides: ModelOverrideMaps? = nil,
+        appearanceMode: String? = nil,
+        showTooltips: Bool? = nil,
+        enableKeyboardShortcuts: Bool? = nil,
+        fontScaleBodySize: Double? = nil
     ) -> AdvancedServerSettings {
         AdvancedServerSettings(
-            respectRepoIgnore: respectRepoIgnore,
-            respectCursorIgnore: respectCursorIgnore,
-            respectNestedIgnoreFiles: respectNestedIgnoreFiles,
-            followSymbolicLinks: followSymbolicLinks,
-            showEmptyFolders: showEmptyFolders,
-            codeMapsEnabled: codeMapsEnabled,
+            respectRepoIgnore: respectRepoIgnore ?? self.respectRepoIgnore,
+            respectCursorIgnore: respectCursorIgnore ?? self.respectCursorIgnore,
+            respectNestedIgnoreFiles: respectNestedIgnoreFiles ?? self.respectNestedIgnoreFiles,
+            followSymbolicLinks: followSymbolicLinks ?? self.followSymbolicLinks,
+            showEmptyFolders: showEmptyFolders ?? self.showEmptyFolders,
+            globalIgnoreDefaults: globalIgnoreDefaults ?? self.globalIgnoreDefaults,
+            codeMapsGloballyDisabled: codeMapsGloballyDisabled ?? self.codeMapsGloballyDisabled,
             historyIdleThresholdMinutes: historyIdleThresholdMinutes,
             fileEditFormat: fileEditFormat ?? self.fileEditFormat,
             customPlanningPrompt: customPlanningPrompt ?? self.customPlanningPrompt,
@@ -436,7 +606,11 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
             includeSavedPromptsInClipboard: includeSavedPromptsInClipboard ?? self.includeSavedPromptsInClipboard,
             filePathDisplayOption: filePathDisplayOption ?? self.filePathDisplayOption,
             includeDatetimeInUserInstructions: includeDatetimeInUserInstructions ?? self.includeDatetimeInUserInstructions,
-            modelOverrides: modelOverrides ?? self.modelOverrides
+            modelOverrides: modelOverrides ?? self.modelOverrides,
+            appearanceMode: appearanceMode ?? self.appearanceMode,
+            showTooltips: showTooltips ?? self.showTooltips,
+            enableKeyboardShortcuts: enableKeyboardShortcuts ?? self.enableKeyboardShortcuts,
+            fontScaleBodySize: fontScaleBodySize ?? self.fontScaleBodySize
         )
     }
 

@@ -336,6 +336,18 @@ private actor AuthorityToolBackend {
         switch key {
         case "models.planning_model", "models.preferred_compose_model", "models.sync_chat_model_with_oracle", "models.custom_planning_prompt", "models.file_edit_format", "models.temperature", "models.temperature_enabled", "prompt_packaging.prompt_sections_order", "prompt_packaging.duplicate_user_instructions_at_top", "prompt_packaging.file_path_display_option", "prompt_packaging.include_datetime_in_user_instructions", "context_builder.agent", "context_builder.model":
             return try await routingAppSetting(key: key)
+        case "ui.appearance_mode",
+             "ui.show_tooltips",
+             "ui.enable_keyboard_shortcuts",
+             "ui.font_scale",
+             "code_maps.globally_disabled",
+             "file_system.respect_repo_ignore",
+             "file_system.respect_cursorignore",
+             "file_system.global_ignore_defaults",
+             "file_system.enable_hierarchical_ignores",
+             "file_system.skip_symlinks",
+             "file_system.show_empty_folders":
+            return try await advancedAppSetting(key: key)
         case "direct_agents.codex.sandbox",
              "direct_agents.codex.approval_policy",
              "direct_agents.codex.approval_reviewer",
@@ -379,6 +391,18 @@ private actor AuthorityToolBackend {
         switch key {
         case "models.planning_model", "models.preferred_compose_model", "models.sync_chat_model_with_oracle", "models.custom_planning_prompt", "models.file_edit_format", "models.temperature", "models.temperature_enabled", "prompt_packaging.prompt_sections_order", "prompt_packaging.duplicate_user_instructions_at_top", "prompt_packaging.file_path_display_option", "prompt_packaging.include_datetime_in_user_instructions", "context_builder.agent", "context_builder.model":
             return try await replaceRoutingAppSetting(key: key, value: value)
+        case "ui.appearance_mode",
+             "ui.show_tooltips",
+             "ui.enable_keyboard_shortcuts",
+             "ui.font_scale",
+             "code_maps.globally_disabled",
+             "file_system.respect_repo_ignore",
+             "file_system.respect_cursorignore",
+             "file_system.global_ignore_defaults",
+             "file_system.enable_hierarchical_ignores",
+             "file_system.skip_symlinks",
+             "file_system.show_empty_folders":
+            return try await replaceAdvancedAppSetting(key: key, value: value)
         case "direct_agents.codex.sandbox",
              "direct_agents.codex.approval_policy",
              "direct_agents.codex.approval_reviewer",
@@ -846,6 +870,106 @@ private actor AuthorityToolBackend {
         return parsed
     }
 
+    private func advancedAppSetting(key: String) async throws -> Value {
+        let settings = try await authority.advancedSettings().settings
+        let value: Value
+        switch key {
+        case "ui.appearance_mode":
+            value = .string(settings.resolvedAppearanceMode().rawValue)
+        case "ui.show_tooltips":
+            value = .bool(settings.showTooltips)
+        case "ui.enable_keyboard_shortcuts":
+            value = .bool(settings.enableKeyboardShortcuts)
+        case "ui.font_scale":
+            value = .double(settings.resolvedFontScale().rawValue)
+        case "code_maps.globally_disabled":
+            value = .bool(settings.codeMapsGloballyDisabled)
+        case "file_system.respect_repo_ignore":
+            value = .bool(settings.respectRepoIgnore)
+        case "file_system.respect_cursorignore":
+            value = .bool(settings.respectCursorIgnore)
+        case "file_system.global_ignore_defaults":
+            value = .string(settings.globalIgnoreDefaults)
+        case "file_system.enable_hierarchical_ignores":
+            value = .bool(settings.respectNestedIgnoreFiles)
+        case "file_system.skip_symlinks":
+            value = .bool(settings.skipSymlinks)
+        case "file_system.show_empty_folders":
+            value = .bool(settings.showEmptyFolders)
+        default:
+            throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
+        }
+        return .object(["key": .string(key), "value": value])
+    }
+
+    private func replaceAdvancedAppSetting(key: String, value: Value?) async throws -> Value {
+        let current = try await authority.advancedSettings()
+        let next: AdvancedServerSettings
+        switch key {
+        case "ui.appearance_mode":
+            next = current.settings.replacing(
+                appearanceMode: try Self.enumValue(value, as: AdvancedServerSettings.AppearanceMode.self, key: key).rawValue
+            )
+        case "ui.show_tooltips":
+            next = current.settings.replacing(showTooltips: try Self.boolValue(value, key: key))
+        case "ui.enable_keyboard_shortcuts":
+            next = current.settings.replacing(enableKeyboardShortcuts: try Self.boolValue(value, key: key))
+        case "ui.font_scale":
+            next = current.settings.replacing(fontScaleBodySize: try Self.fontScaleValue(value, key: key))
+        case "code_maps.globally_disabled":
+            next = current.settings.replacing(codeMapsGloballyDisabled: try Self.boolValue(value, key: key))
+        case "file_system.respect_repo_ignore":
+            next = current.settings.replacing(respectRepoIgnore: try Self.boolValue(value, key: key))
+        case "file_system.respect_cursorignore":
+            next = current.settings.replacing(respectCursorIgnore: try Self.boolValue(value, key: key))
+        case "file_system.global_ignore_defaults":
+            next = current.settings.replacing(globalIgnoreDefaults: try Self.globalIgnoreDefaultsValue(value, key: key))
+        case "file_system.enable_hierarchical_ignores":
+            next = current.settings.replacing(respectNestedIgnoreFiles: try Self.boolValue(value, key: key))
+        case "file_system.skip_symlinks":
+            next = current.settings.replacing(followSymbolicLinks: !(try Self.boolValue(value, key: key)))
+        case "file_system.show_empty_folders":
+            next = current.settings.replacing(showEmptyFolders: try Self.boolValue(value, key: key))
+        default:
+            throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
+        }
+        _ = try await authority.replaceAdvancedSettings(
+            .init(expectedRevision: current.revision, settings: next),
+            attribution: settingsAttribution
+        )
+        return try await advancedAppSetting(key: key)
+    }
+
+    private static func fontScaleValue(_ value: Value?, key: String) throws -> Double {
+        let parsed: Double?
+        if let number = value?.doubleValue {
+            parsed = number
+        } else if let integer = value?.intValue {
+            parsed = Double(integer)
+        } else if let raw = value?.stringValue {
+            parsed = Double(raw)
+        } else {
+            parsed = nil
+        }
+        guard let raw = parsed, let preset = AdvancedServerSettings.FontScale(rawValue: raw) else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "\(key) must be one of \(AdvancedServerSettings.FontScale.allCases.map { String(format: "%.0f", $0.rawValue) }.joined(separator: ", "))"
+            )
+        }
+        return preset.rawValue
+    }
+
+    private static func globalIgnoreDefaultsValue(_ value: Value?, key: String) throws -> String {
+        guard let raw = value?.stringValue else {
+            throw ServiceAPIError(code: .invalidRequest, message: "\(key) must be a string")
+        }
+        guard raw.utf8.count <= 20_000 else {
+            throw ServiceAPIError(code: .invalidRequest, message: "\(key) exceeds its supported size")
+        }
+        return raw
+    }
+
     private func routingAppSetting(key: String) async throws -> Value {
         let snapshot = try await authority.globalAgentModels()
         let profile = snapshot.effectiveProfile
@@ -1149,6 +1273,9 @@ private actor AuthorityToolBackend {
                     : $0
             }
         case "demote":
+            if try await authority.advancedSettings().settings.codeMapsGloballyDisabled {
+                throw ServiceAPIError(code: .invalidRequest, message: AdvancedServerSettings.codeMapsGloballyDisabledMCPMessage)
+            }
             let demoted = try await Set(selectionEntries(paths: requested, mode: .codeMap).map {
                 "\($0.rootID.uuidString):\($0.logicalPath)"
             })
@@ -1249,6 +1376,18 @@ private actor AuthorityToolBackend {
     }
 
     private func codeStructure(_ arguments: [String: Value]) async throws -> Value {
+        if try await authority.advancedSettings().settings.codeMapsGloballyDisabled {
+            return try value(CodeStructureResult(
+                files: [],
+                updatesPending: false,
+                issues: [
+                    .init(
+                        code: "codemaps_disabled",
+                        message: "Codemap generation is disabled."
+                    )
+                ]
+            ))
+        }
         let selection = try await authority.selectionSnapshot(sessionID: binding.sessionID)
         let requested = arguments["paths"]?.arrayValue?.compactMap(\.stringValue) ?? []
         var paths = requested
@@ -1265,7 +1404,7 @@ private actor AuthorityToolBackend {
                 request: ProjectCodeMapRequest(rootID: path.root.rootID, logicalPath: path.logicalPath)
             ))
         }
-        return try value(CodeStructureResult(files: maps, updatesPending: false))
+        return try value(CodeStructureResult(files: maps, updatesPending: false, issues: nil))
     }
 
     private func workspaceContext(_ arguments: [String: Value]) async throws -> Value {
@@ -1656,7 +1795,17 @@ private actor AuthorityToolBackend {
         let all = try await authority.sessionSnapshots()
         let limit = min(max(arguments["limit"]?.intValue ?? 30, 1), 100)
         switch operation {
-        case "list_sessions": return try value(Array(all.suffix(limit)))
+        case "list_sessions":
+            let threshold = try await historyIdleThresholdMinutes(from: arguments)
+            return try value(Array(all.suffix(limit)).map { session in
+                HistoryListedSession(
+                    snapshot: session,
+                    activeDurationSeconds: AdvancedServerSettings.HistoryIdleThreshold.activeDurationSeconds(
+                        timestamps: session.transcript.map(\.timestamp),
+                        thresholdMinutes: threshold
+                    )
+                )
+            })
         case "get_session": return try await value(authority.sessionSnapshot(sessionID: agentSessionID(arguments)))
         case "search":
             let query = arguments["query"]?.stringValue?.lowercased() ?? ""
@@ -1665,20 +1814,18 @@ private actor AuthorityToolBackend {
                     || $0.transcript.contains { $0.content.lowercased().contains(query) }
             }.prefix(limit)))
         case "time":
-            let threshold = try await authority.historyIdleThresholdMinutes(explicit: arguments["idle_threshold_minutes"]?.intValue)
-            let maximumGap = TimeInterval(threshold * 60)
-            let activeSeconds = all.reduce(0.0) { total, session in
-                let timestamps = session.transcript.map(\.timestamp).sorted()
-                let duration = zip(timestamps, timestamps.dropFirst()).reduce(0.0) { subtotal, pair in
-                    subtotal + min(maximumGap, max(0, pair.1.timeIntervalSince(pair.0)))
-                }
-                return total + duration
+            let threshold = try await historyIdleThresholdMinutes(from: arguments)
+            let activeSeconds = all.reduce(0) { total, session in
+                total + AdvancedServerSettings.HistoryIdleThreshold.activeDurationSeconds(
+                    timestamps: session.transcript.map(\.timestamp),
+                    thresholdMinutes: threshold
+                )
             }
             return .object([
                 "session_count": .int(all.count),
                 "group_by": arguments["group_by"] ?? .string("session"),
                 "idle_threshold_minutes": .int(threshold),
-                "active_seconds": .double(activeSeconds)
+                "active_seconds": .int(activeSeconds)
             ])
         default:
             throw ServiceAPIError(code: .invalidRequest, message: "Unsupported history operation")
@@ -1833,6 +1980,22 @@ private actor AuthorityToolBackend {
         return text.replacingCharacters(in: range, with: replacement)
     }
 
+    private func historyIdleThresholdMinutes(from arguments: [String: Value]) async throws -> Int {
+        guard let raw = arguments["idle_threshold_minutes"] else {
+            return try await authority.historyIdleThresholdMinutes(explicit: nil)
+        }
+        if case .null = raw {
+            return try await authority.historyIdleThresholdMinutes(explicit: nil)
+        }
+        guard let minutes = raw.intValue else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: AdvancedServerSettings.HistoryIdleThreshold.integerRequiredMessage
+            )
+        }
+        return try await authority.historyIdleThresholdMinutes(explicit: minutes)
+    }
+
     private func value(_ encodable: some Encodable) throws -> Value {
         let data = try JSONEncoder.serviceEncoder.encode(encodable)
         return try JSONDecoder().decode(Value.self, from: data)
@@ -1842,6 +2005,21 @@ private actor AuthorityToolBackend {
 private struct MCPWorkflowListResult: Encodable, Sendable {
     let workflows: [WorkflowSnapshot]
     let revision: Int64
+}
+
+private struct HistoryListedSession: Encodable {
+    let snapshot: SessionSnapshot
+    let activeDurationSeconds: Int
+
+    func encode(to encoder: Encoder) throws {
+        try snapshot.encode(to: encoder)
+        var container = encoder.container(keyedBy: ExtraKeys.self)
+        try container.encode(activeDurationSeconds, forKey: .activeDurationSeconds)
+    }
+
+    private enum ExtraKeys: String, CodingKey {
+        case activeDurationSeconds = "active_duration_seconds"
+    }
 }
 
 public struct MCPAgentStartTarget: Sendable {
@@ -1912,12 +2090,19 @@ private struct WorkspaceResult: Encodable {
 }
 
 private struct CodeStructureResult: Encodable {
+    struct Issue: Encodable {
+        let code: String
+        let message: String
+    }
+
     let files: [ProjectCodeMapSnapshot]
     let updatesPending: Bool
+    let issues: [Issue]?
 
     enum CodingKeys: String, CodingKey {
         case files
         case updatesPending = "updates_pending"
+        case issues
     }
 }
 

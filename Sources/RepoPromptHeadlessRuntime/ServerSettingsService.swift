@@ -733,9 +733,6 @@ public actor ServerSettingsService {
         _ request: ReplaceAdvancedServerSettingsRequest,
         attribution: SettingsMutationAttribution
     ) async throws -> AdvancedServerSettingsSnapshot {
-        guard (0 ... 60).contains(request.settings.historyIdleThresholdMinutes) else {
-            throw ServiceAPIError(code: .invalidRequest, message: "History idle threshold is outside its supported range")
-        }
         guard (0 ... 2).contains(request.settings.modelTemperature) else {
             throw ServiceAPIError(code: .invalidRequest, message: "Model temperature is outside its supported range")
         }
