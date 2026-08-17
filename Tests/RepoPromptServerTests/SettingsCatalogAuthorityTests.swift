@@ -393,6 +393,7 @@ final class SettingsCatalogAuthorityTests: XCTestCase {
             (.get, "/portal/api/v1/projects/\(projectID)/settings/agent-models"),
             (.patch, "/portal/api/v1/projects/\(projectID)/settings/agent-models"),
             (.post, "/portal/api/v1/projects/\(projectID)/settings/agent-models/copy-global"),
+            (.post, "/portal/api/v1/projects/\(projectID)/settings/agent-models/copy-project"),
             (.post, "/portal/api/v1/projects/\(projectID)/settings/agent-models/apply-recommendations"),
             (.get, "/portal/api/v1/settings/subagent-permissions"),
             (.patch, "/portal/api/v1/settings/subagent-permissions"),

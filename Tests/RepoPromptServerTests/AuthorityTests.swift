@@ -193,6 +193,250 @@ final class AuthorityTests: XCTestCase {
         try await reopenedStore.close(clean: true)
     }
 
+    func testGoblinCollaborationPolicyIsEvaluatedEvenWhenADecisionIsPresent() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let owner = ExternalActor(goblinUserID: "owner", username: "alice", displayName: "Alice")
+        let controller = ExternalActor(goblinUserID: "controller", username: "bob", displayName: "Bob")
+        let collaborator = ExternalActor(goblinUserID: "collaborator", username: "carol", displayName: "Carol")
+        let project = try await authority.createProject(
+            input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]),
+            externalActor: owner,
+            idempotencyKey: "goblin-policy-project",
+            requestDigest: "goblin-policy-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession, initialPrompt: "hello"),
+            externalActor: owner,
+            idempotencyKey: "goblin-policy-session",
+            requestDigest: "goblin-policy-session"
+        )
+        _ = try await authority.updateCollaborationMetadata(
+            sessionID: session.sessionID,
+            input: .init(
+                expectedPolicyRevision: 1,
+                expectedControllerRevision: 1,
+                expectedMembershipRevision: 1,
+                visibility: .collaborative,
+                collaborativeSteeringEnabled: true,
+                controllerUserID: controller.goblinUserID
+            ),
+            actor: owner,
+            idempotencyKey: "goblin-policy-transfer",
+            requestDigest: "goblin-policy-transfer"
+        )
+        let collaborative = try await authority.collaborationMetadata(sessionID: session.sessionID)
+
+        _ = try await authority.execute(
+            command: .sendFollowup(text: "steering", expectedSessionRevision: session.revision + 1),
+            sessionID: session.sessionID,
+            externalActor: collaborator,
+            idempotencyKey: "goblin-policy-steering",
+            requestDigest: "goblin-policy-steering",
+            authorizationDecision: goblinDecision(
+                actor: collaborator,
+                sessionID: session.sessionID,
+                projectID: project.projectID,
+                operation: "sendFollowup",
+                requestDigest: "goblin-policy-steering",
+                metadata: collaborative
+            )
+        )
+
+        try await authority.authorizeSessionCollaboration(
+            sessionID: session.sessionID,
+            actor: collaborator,
+            operation: "buildContext",
+            requestDigest: "goblin-policy-context",
+            authorizationDecision: goblinDecision(
+                actor: collaborator,
+                sessionID: session.sessionID,
+                projectID: project.projectID,
+                operation: "buildContext",
+                requestDigest: "goblin-policy-context",
+                metadata: collaborative
+            )
+        )
+        try await authority.authorizeSessionCollaboration(
+            sessionID: session.sessionID,
+            actor: collaborator,
+            operation: "submitTurn",
+            requestDigest: "goblin-policy-submit",
+            authorizationDecision: goblinDecision(
+                actor: collaborator,
+                sessionID: session.sessionID,
+                projectID: project.projectID,
+                operation: "submitTurn",
+                requestDigest: "goblin-policy-submit",
+                metadata: collaborative
+            )
+        )
+        do {
+            try await authority.authorizeSessionCollaboration(
+                sessionID: session.sessionID,
+                actor: collaborator,
+                operation: "replaceSelection",
+                requestDigest: "goblin-policy-selection",
+                authorizationDecision: goblinDecision(
+                    actor: collaborator,
+                    sessionID: session.sessionID,
+                    projectID: project.projectID,
+                    operation: "replaceSelection",
+                    requestDigest: "goblin-policy-selection",
+                    metadata: collaborative
+                )
+            )
+            XCTFail("expected Goblin-signed selection mutation to stay controller-only")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .authorizationDecisionRejected)
+        }
+
+        do {
+            _ = try await authority.execute(
+                command: .archiveSession(expectedRevision: session.revision + 2),
+                sessionID: session.sessionID,
+                externalActor: collaborator,
+                idempotencyKey: "goblin-policy-archive",
+                requestDigest: "goblin-policy-archive",
+                authorizationDecision: goblinDecision(
+                    actor: collaborator,
+                    sessionID: session.sessionID,
+                    projectID: project.projectID,
+                    operation: "archiveSession",
+                    requestDigest: "goblin-policy-archive",
+                    metadata: collaborative
+                )
+            )
+            XCTFail("expected Goblin-signed controller-only command to be rejected")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .authorizationDecisionRejected)
+        }
+
+        do {
+            _ = try await authority.updatePermissions(
+                sessionID: session.sessionID,
+                expectedRevision: 1,
+                mode: "disabled",
+                providerSettings: [:],
+                actor: collaborator,
+                idempotencyKey: "goblin-policy-permissions",
+                requestDigest: "goblin-policy-permissions"
+            )
+            XCTFail("expected collaborator permission update to be rejected")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .authorizationDecisionRejected)
+        }
+
+        do {
+            _ = try await authority.updateCollaborationMetadata(
+                sessionID: session.sessionID,
+                input: .init(
+                    expectedPolicyRevision: collaborative.policyRevision,
+                    visibility: .collaborative,
+                    collaborativeSteeringEnabled: false,
+                    controllerUserID: controller.goblinUserID
+                ),
+                actor: controller,
+                idempotencyKey: "goblin-policy-non-owner",
+                requestDigest: "goblin-policy-non-owner",
+                authorizationDecision: goblinDecision(
+                    actor: controller,
+                    sessionID: session.sessionID,
+                    projectID: project.projectID,
+                    operation: "setSessionVisibility",
+                    requestDigest: "goblin-policy-non-owner",
+                    metadata: collaborative,
+                    policyRevision: collaborative.policyRevision + 1,
+                    controllerRevision: collaborative.controllerRevision,
+                    membershipRevision: collaborative.membershipRevision
+                )
+            )
+            XCTFail("expected non-owner collaboration write to be rejected")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .authorizationDecisionRejected)
+        }
+
+        let disabled = try await authority.updateCollaborationMetadata(
+            sessionID: session.sessionID,
+            input: .init(
+                expectedPolicyRevision: collaborative.policyRevision,
+                visibility: .collaborative,
+                collaborativeSteeringEnabled: false,
+                controllerUserID: controller.goblinUserID
+            ),
+            actor: owner,
+            idempotencyKey: "goblin-policy-disable-steering",
+            requestDigest: "goblin-policy-disable-steering"
+        )
+        do {
+            _ = try await authority.execute(
+                command: .sendFollowup(text: "blocked", expectedSessionRevision: session.revision + 2),
+                sessionID: session.sessionID,
+                externalActor: collaborator,
+                idempotencyKey: "goblin-policy-blocked",
+                requestDigest: "goblin-policy-blocked",
+                authorizationDecision: goblinDecision(
+                    actor: collaborator,
+                    sessionID: session.sessionID,
+                    projectID: project.projectID,
+                    operation: "sendFollowup",
+                    requestDigest: "goblin-policy-blocked",
+                    metadata: disabled
+                )
+            )
+            XCTFail("expected Goblin-signed steering followup to be rejected after steering is disabled")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .authorizationDecisionRejected)
+        }
+
+        do {
+            try await authority.authorizeSessionCollaboration(
+                sessionID: session.sessionID,
+                actor: collaborator,
+                operation: "submitTurn",
+                requestDigest: "goblin-policy-submit-blocked",
+                authorizationDecision: goblinDecision(
+                    actor: collaborator,
+                    sessionID: session.sessionID,
+                    projectID: project.projectID,
+                    operation: "submitTurn",
+                    requestDigest: "goblin-policy-submit-blocked",
+                    metadata: disabled
+                )
+            )
+            XCTFail("expected Goblin-signed submitTurn to be rejected after steering is disabled")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .authorizationDecisionRejected)
+        }
+
+        do {
+            _ = try await authority.execute(
+                command: .sendFollowup(text: "stale", expectedSessionRevision: session.revision + 2),
+                sessionID: session.sessionID,
+                externalActor: controller,
+                idempotencyKey: "goblin-policy-stale",
+                requestDigest: "goblin-policy-stale",
+                authorizationDecision: goblinDecision(
+                    actor: controller,
+                    sessionID: session.sessionID,
+                    projectID: project.projectID,
+                    operation: "sendFollowup",
+                    requestDigest: "goblin-policy-stale",
+                    metadata: collaborative
+                )
+            )
+            XCTFail("expected stale Goblin collaboration revisions to be rejected")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .authorizationDecisionRejected)
+        }
+
+        try await authority.quiesce()
+        try await store.close()
+    }
+
     func testProviderRunSupportsSteeringCompletionAndCancellation() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1096,4 +1340,38 @@ private actor RecordingInteractionDelivery: InteractionDeliveryPort {
     func deliveryCount() -> Int {
         count
     }
+}
+
+private func goblinDecision(
+    actor: ExternalActor,
+    sessionID: UUID,
+    projectID: UUID,
+    operation: String,
+    requestDigest: String,
+    metadata: CollaborationMetadataSnapshot,
+    policyRevision: Int64? = nil,
+    controllerRevision: Int64? = nil,
+    membershipRevision: Int64? = nil
+) -> GoblinAuthorizationDecision {
+    GoblinAuthorizationDecision(
+        decisionID: UUID(),
+        actor: actor,
+        sessionID: sessionID,
+        projectID: projectID,
+        operation: operation,
+        requestDigest: requestDigest,
+        policyRevision: policyRevision ?? metadata.policyRevision,
+        controllerRevision: controllerRevision ?? metadata.controllerRevision,
+        membershipRevision: membershipRevision ?? metadata.membershipRevision,
+        attributionLabels: .init(
+            controllerUserID: metadata.controllerUserID,
+            visibility: metadata.visibility
+        ),
+        issuedAt: Date().addingTimeInterval(-1),
+        expiresAt: Date().addingTimeInterval(30),
+        requestID: UUID(),
+        correlationID: UUID(),
+        keyID: "test-goblin",
+        signature: "verified-upstream"
+    )
 }

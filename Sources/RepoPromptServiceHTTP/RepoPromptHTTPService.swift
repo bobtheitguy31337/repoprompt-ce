@@ -220,6 +220,13 @@ public struct RepoPromptHTTPService: Sendable {
             let input = try await JSONDecoder.serviceDecoder.decode(CopyGlobalAgentModelsToProjectRequest.self, from: bodyData(request))
             return try await portalJSON(requireServerSettings().copyGlobalAgentModelsToProject(projectID: projectID, request: input, attribution: principal.settingsAttribution))
         } }
+        router.post("/portal/api/v1/projects/:id/settings/agent-models/copy-project") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(context: context)
+            try validatePortalMutation(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let input = try await JSONDecoder.serviceDecoder.decode(CopyProjectAgentModelsToGlobalRequest.self, from: bodyData(request))
+            return try await portalJSON(requireServerSettings().copyProjectAgentModelsToGlobal(projectID: projectID, request: input, attribution: principal.settingsAttribution))
+        } }
         router.post("/portal/api/v1/projects/:id/settings/agent-models/apply-recommendations") { request, context in await portalRespond(request) {
             let principal = try await authenticatePortal(context: context)
             try validatePortalMutation(request)
@@ -961,6 +968,7 @@ public struct RepoPromptHTTPService: Sendable {
             let input = try JSONDecoder.serviceDecoder.decode(AgentTurnSubmissionWire.self, from: data)
             let snapshot = try await authority.authoritySessionSnapshot(sessionID: sessionID)
             let requestDigest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(sessionID: sessionID, actor: actor, operation: "submitTurn", requestDigest: requestDigest, authorizationDecision: auth.decision)
             let accepted = try await requireSubmissionCoordinator().acceptFollowup(session: snapshot.session, activeRun: snapshot.activeRun, actor: actor, publicSubmissionKey: key, requestDigest: requestDigest, submission: input)
             try await requireSubmissionDispatchQueue().enqueue(accepted, actor: actor, requestDigest: requestDigest)
             return try HTTPResponses.privateJSON(accepted.receipt, status: .accepted)
@@ -981,21 +989,27 @@ public struct RepoPromptHTTPService: Sendable {
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "replaceSelection", sessionID: id)
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(SelectionMutationInput.self, from: data)
-            return try await HTTPResponses.json(authority.replaceSelection(sessionID: id, entries: input.entries, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data)))
+            let requestDigest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "replaceSelection", requestDigest: requestDigest, authorizationDecision: auth.decision)
+            return try await HTTPResponses.json(authority.replaceSelection(sessionID: id, entries: input.entries, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest))
         } }
         router.post("/internal/v1/sessions/:id/context/selection/add") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "addToSelection", sessionID: id)
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(SelectionMutationInput.self, from: data)
-            return try await HTTPResponses.json(authority.addSelection(sessionID: id, entries: input.entries, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data)))
+            let requestDigest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "addToSelection", requestDigest: requestDigest, authorizationDecision: auth.decision)
+            return try await HTTPResponses.json(authority.addSelection(sessionID: id, entries: input.entries, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest))
         } }
         router.post("/internal/v1/sessions/:id/context/selection/remove") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "removeFromSelection", sessionID: id)
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(SelectionRemovalInput.self, from: data)
-            return try await HTTPResponses.json(authority.removeSelection(sessionID: id, rootID: input.rootID, logicalPaths: input.logicalPaths, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data)))
+            let requestDigest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "removeFromSelection", requestDigest: requestDigest, authorizationDecision: auth.decision)
+            return try await HTTPResponses.json(authority.removeSelection(sessionID: id, rootID: input.rootID, logicalPaths: input.logicalPaths, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest))
         } }
         router.get("/internal/v1/sessions/:id/permissions") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             _ = try await authenticate(request, context: context, body: Data(), roles: [.goblinApp], operation: "getExecutionPermissions", sessionID: id)
@@ -1007,13 +1021,17 @@ public struct RepoPromptHTTPService: Sendable {
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "updateExecutionPermissions", sessionID: id)
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(ExecutionPermissionUpdateInput.self, from: data)
-            return try await HTTPResponses.json(authority.updatePermissions(sessionID: id, expectedRevision: input.expectedRevision, mode: input.mode, providerSettings: input.providerSettings, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data)))
+            let requestDigest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "updateExecutionPermissions", requestDigest: requestDigest, authorizationDecision: auth.decision)
+            return try await HTTPResponses.json(authority.updatePermissions(sessionID: id, expectedRevision: input.expectedRevision, mode: input.mode, providerSettings: input.providerSettings, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest))
         } }
         router.patch("/internal/v1/sessions/:id/execution-permissions") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "updateExecutionPermissions", sessionID: id)
             let input = try JSONDecoder.serviceDecoder.decode(ExecutionPermissionUpdateInput.self, from: data)
-            return try await HTTPResponses.json(authority.updatePermissions(sessionID: id, expectedRevision: input.expectedRevision, mode: input.mode, providerSettings: input.providerSettings, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data)))
+            let requestDigest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "updateExecutionPermissions", requestDigest: requestDigest, authorizationDecision: auth.decision)
+            return try await HTTPResponses.json(authority.updatePermissions(sessionID: id, expectedRevision: input.expectedRevision, mode: input.mode, providerSettings: input.providerSettings, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: requestDigest))
         } }
         router.patch("/internal/v1/sessions/:id/collaboration-metadata") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
@@ -1031,7 +1049,9 @@ public struct RepoPromptHTTPService: Sendable {
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "answerInteraction", sessionID: id)
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(InteractionAnswerInput.self, from: data)
-            return try await HTTPResponses.json(authority.answerInteraction(sessionID: id, interactionID: input.interactionID, expectedRevision: input.expectedRevision, payload: input.payload, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data)))
+            let requestDigest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "answerInteraction", requestDigest: requestDigest, authorizationDecision: auth.decision)
+            return try await HTTPResponses.json(authority.answerInteraction(sessionID: id, interactionID: input.interactionID, expectedRevision: input.expectedRevision, payload: input.payload, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest))
         } }
         router.post("/internal/v1/sessions/:id/interactions/:interactionId/answer") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let interactionID = try context.parameters.require("interactionId", as: UUID.self)
@@ -1039,14 +1059,18 @@ public struct RepoPromptHTTPService: Sendable {
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "answerInteraction", sessionID: id)
             let input = try JSONDecoder.serviceDecoder.decode(InteractionAnswerInput.self, from: data)
             guard input.interactionID == interactionID else { throw ServiceAPIError(code: .invalidRequest, message: "Interaction path and body IDs do not match") }
-            return try await HTTPResponses.json(authority.answerInteraction(sessionID: id, interactionID: interactionID, expectedRevision: input.expectedRevision, payload: input.payload, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data)))
+            let requestDigest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "answerInteraction", requestDigest: requestDigest, authorizationDecision: auth.decision)
+            return try await HTTPResponses.json(authority.answerInteraction(sessionID: id, interactionID: interactionID, expectedRevision: input.expectedRevision, payload: input.payload, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: requestDigest))
         } }
         router.post("/internal/v1/sessions/:id/worktrees") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "createWorktree", sessionID: id)
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(WorktreeCreateInput.self, from: data)
-            let snapshot = try await authority.createWorktree(sessionID: id, rootID: input.rootID, baseRef: input.baseRef, branch: input.branch, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data))
+            let requestDigest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "createWorktree", requestDigest: requestDigest, authorizationDecision: auth.decision)
+            let snapshot = try await authority.createWorktree(sessionID: id, rootID: input.rootID, baseRef: input.baseRef, branch: input.branch, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest)
             return try HTTPResponses.json(WorktreeWireSnapshot(snapshot), status: .created)
         } }
         router.post("/internal/v1/sessions/:id/worktrees/merge") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
@@ -1054,14 +1078,18 @@ public struct RepoPromptHTTPService: Sendable {
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "mergeWorktree", sessionID: id)
             let key = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(WorktreeMergeInput.self, from: data)
-            let snapshot = try await authority.mergeWorktree(sessionID: id, bindingID: input.bindingID, strategy: input.strategy, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: CanonicalSigning.bodyDigest(data))
+            let requestDigest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "mergeWorktree", requestDigest: requestDigest, authorizationDecision: auth.decision)
+            let snapshot = try await authority.mergeWorktree(sessionID: id, bindingID: input.bindingID, strategy: input.strategy, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: key, requestDigest: requestDigest)
             return try HTTPResponses.json(WorktreeWireSnapshot(snapshot))
         } }
         router.patch("/internal/v1/sessions/:id/worktree-binding") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "bindWorktree", sessionID: id)
             let input = try JSONDecoder.serviceDecoder.decode(WorktreeBindInput.self, from: data)
-            let snapshot = try await authority.bindWorktree(sessionID: id, bindingID: input.bindingID, expectedRevision: input.expectedRevision, expectedSelectionBindingRevision: input.expectedSelectionBindingRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data))
+            let requestDigest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "bindWorktree", requestDigest: requestDigest, authorizationDecision: auth.decision)
+            let snapshot = try await authority.bindWorktree(sessionID: id, bindingID: input.bindingID, expectedRevision: input.expectedRevision, expectedSelectionBindingRevision: input.expectedSelectionBindingRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: requestDigest)
             return try HTTPResponses.json(WorktreeWireSnapshot(snapshot))
         } }
         router.post("/internal/v1/sessions/:id/worktrees/:worktreeId/merge") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
@@ -1070,7 +1098,9 @@ public struct RepoPromptHTTPService: Sendable {
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "mergeWorktree", sessionID: id)
             let input = try JSONDecoder.serviceDecoder.decode(WorktreeMergeInput.self, from: data)
             guard input.bindingID == bindingID else { throw ServiceAPIError(code: .invalidRequest, message: "Worktree path and body IDs do not match") }
-            let snapshot = try await authority.mergeWorktree(sessionID: id, bindingID: bindingID, strategy: input.strategy, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: CanonicalSigning.bodyDigest(data))
+            let requestDigest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "mergeWorktree", requestDigest: requestDigest, authorizationDecision: auth.decision)
+            let snapshot = try await authority.mergeWorktree(sessionID: id, bindingID: bindingID, strategy: input.strategy, expectedRevision: input.expectedRevision, actor: requireActor(auth), idempotencyKey: requireIdempotency(request), requestDigest: requestDigest)
             return try HTTPResponses.json(WorktreeWireSnapshot(snapshot))
         } }
         router.get("/internal/v1/sessions/:id/artifacts") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
@@ -1129,7 +1159,8 @@ public struct RepoPromptHTTPService: Sendable {
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "buildContext", sessionID: id)
             _ = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(ContextBuildInput.self, from: data)
-            return try await HTTPResponses.json(authority.buildContext(sessionID: id, expectedSelectionRevision: input.expectedSelectionRevision, include: input.include, actor: requireActor(auth)), status: .created)
+            let requestDigest = CanonicalSigning.bodyDigest(data)
+            return try await HTTPResponses.json(authority.buildContext(sessionID: id, expectedSelectionRevision: input.expectedSelectionRevision, include: input.include, actor: requireActor(auth), requestDigest: requestDigest, authorizationDecision: auth.decision), status: .created)
         } }
         router.post("/internal/v1/sessions/:id/context/context-builder") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
@@ -1139,6 +1170,7 @@ public struct RepoPromptHTTPService: Sendable {
             if let budget = input.budget, !(1 ... 1_000_000).contains(budget) {
                 throw ServiceAPIError(code: .invalidRequest, message: "Context Builder budget exceeds the v1 bound")
             }
+            try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "runContextBuilder", requestDigest: CanonicalSigning.bodyDigest(data), authorizationDecision: auth.decision)
             return try await HTTPResponses.json(authority.runContextBuilder(sessionID: id, input: input, actor: requireActor(auth), origin: .internal))
         } }
         router.post("/internal/v1/sessions/:id/context/oracle") { request, context in await respond(request) { let id = try context.parameters.require("id", as: UUID.self)
@@ -1146,6 +1178,7 @@ public struct RepoPromptHTTPService: Sendable {
             let auth = try await authenticate(request, context: context, body: data, roles: [.goblinApp], operation: "askOracle", sessionID: id)
             _ = try requireIdempotency(request)
             let input = try JSONDecoder.serviceDecoder.decode(OracleInput.self, from: data)
+            try await authority.authorizeSessionCollaboration(sessionID: id, actor: requireActor(auth), operation: "askOracle", requestDigest: CanonicalSigning.bodyDigest(data), authorizationDecision: auth.decision)
             return try await HTTPResponses.json(authority.askOracle(sessionID: id, input: input, actor: requireActor(auth)))
         } }
 

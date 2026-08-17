@@ -26,15 +26,25 @@ public extension SQLiteServiceStore {
         projectID: UUID?,
         expectedRevision: Int64,
         expectedGlobalRevision: Int64? = nil,
+        expectedSourceScopeID: String? = nil,
+        expectedSourceRevision: Int64? = nil,
         audit: ServerSettingsAuditMutation
     ) async throws -> StoredSettingsDocument<AgentModelsScopeDocument> {
-        try await upsertSettingsDocument(
+        let sourceFence: (SettingsRepository, String, Int64)?
+        if let expectedGlobalRevision {
+            sourceFence = (.agentModels, "global", expectedGlobalRevision)
+        } else if let expectedSourceScopeID, let expectedSourceRevision {
+            sourceFence = (.agentModels, expectedSourceScopeID, expectedSourceRevision)
+        } else {
+            sourceFence = nil
+        }
+        return try await upsertSettingsDocument(
             document,
             repository: .agentModels,
             scopeID: scopeID,
             projectID: projectID,
             expectedRevision: expectedRevision,
-            sourceFence: expectedGlobalRevision.map { (.agentModels, "global", $0) },
+            sourceFence: sourceFence,
             audit: audit
         )
     }

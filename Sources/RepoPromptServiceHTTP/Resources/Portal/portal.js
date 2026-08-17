@@ -2705,8 +2705,8 @@
                   mode: mode.value,
                   profile:
                     mode.value === "projectOverride"
-                      ? snapshot.globalProfile
-                      : null,
+                      ? snapshot.projectProfile || snapshot.globalProfile
+                      : snapshot.projectProfile,
                 }),
               },
             ),
@@ -2718,7 +2718,7 @@
       scope.append(
         desktopRow(
           "Project routing",
-          "Project overrides are complete snapshots; inherited projects track global edits immediately.",
+          "Project overrides are complete snapshots. Inherited projects track global edits immediately and keep any unused override snapshot, matching Desktop workspace inherit/override.",
           mode,
         ),
       );
@@ -2750,6 +2750,34 @@
         ),
       );
       scope.append(copy);
+      const copyProject = element(
+        "button",
+        "secondary-button",
+        "Copy Project to Global",
+      );
+      copyProject.type = "button";
+      copyProject.dataset.action = "copy-project-agent-models";
+      copyProject.addEventListener("click", () =>
+        mutateDomain(
+          "agentModels",
+          copyProject,
+          () =>
+            api(
+              `api/v1/projects/${encodeURIComponent(projectID)}/settings/agent-models/copy-project`,
+              {
+                method: "POST",
+                body: JSON.stringify({
+                  expectedGlobalRevision: snapshot.globalRevision,
+                  expectedProjectRevision: snapshot.projectRevision,
+                }),
+              },
+            ),
+          (value) => {
+            state.typedSettings.agentModels = value;
+          },
+        ),
+      );
+      scope.append(copyProject);
     } else {
       scope.append(
         element(

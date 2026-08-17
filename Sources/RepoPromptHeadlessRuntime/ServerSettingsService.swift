@@ -64,7 +64,7 @@ public actor ServerSettingsService {
     ) async throws -> AgentModelsSettingsSnapshot {
         let catalog = try await providerCatalog.serverSettingsProviderCatalog()
         let profile = try normalize(request.profile, catalog: catalog)
-        let value = AgentModelsScopeDocument(mode: .projectOverride, profile: profile)
+        let value = AgentModelsScopeDocument(mode: .inheritGlobal, profile: profile)
         let document = StoredSettingsDocument(value: value, revision: request.expectedRevision + 1, updatedAt: now())
         _ = try await store.upsertAgentModelsDocument(
             document,
@@ -83,7 +83,15 @@ public actor ServerSettingsService {
     ) async throws -> AgentModelsSettingsSnapshot {
         _ = try await projectCatalog.serverSettingsRootIDs(projectID: projectID)
         let catalog = try await providerCatalog.serverSettingsProviderCatalog()
-        let value = try normalizeProjectAgentModels(mode: request.mode, profile: request.profile, catalog: catalog)
+        let current = try await store.agentModelsDocument(scopeID: scopeID(projectID))
+        let global = try await store.agentModelsDocument(scopeID: "global")
+        let value = try normalizeProjectAgentModels(
+            mode: request.mode,
+            profile: request.profile,
+            storedProfile: current?.value.profile,
+            globalProfile: global?.value.profile ?? .default,
+            catalog: catalog
+        )
         let document = StoredSettingsDocument(value: value, revision: request.expectedRevision + 1, updatedAt: now())
         _ = try await store.upsertAgentModelsDocument(
             document,
@@ -117,6 +125,34 @@ public actor ServerSettingsService {
             expectedRevision: request.expectedProjectRevision,
             expectedGlobalRevision: request.expectedGlobalRevision,
             audit: try audit(operation: "copyGlobal", attribution: attribution, payload: value)
+        )
+        return try await agentModels(projectID: projectID)
+    }
+
+    public func copyProjectAgentModelsToGlobal(
+        projectID: UUID,
+        request: CopyProjectAgentModelsToGlobalRequest,
+        attribution: SettingsMutationAttribution
+    ) async throws -> AgentModelsSettingsSnapshot {
+        _ = try await projectCatalog.serverSettingsRootIDs(projectID: projectID)
+        let project = try await store.agentModelsDocument(scopeID: scopeID(projectID))
+        let observedProjectRevision = project?.revision ?? 0
+        guard observedProjectRevision == request.expectedProjectRevision else {
+            throw ServiceAPIError(code: .staleRevision, message: "Project Agent Models revision is stale", currentRevision: observedProjectRevision)
+        }
+        let catalog = try await providerCatalog.serverSettingsProviderCatalog()
+        let global = try await store.agentModelsDocument(scopeID: "global")
+        let profile = try normalize(project?.value.profile ?? global?.value.profile ?? .default, catalog: catalog)
+        let value = AgentModelsScopeDocument(mode: .inheritGlobal, profile: profile)
+        let document = StoredSettingsDocument(value: value, revision: request.expectedGlobalRevision + 1, updatedAt: now())
+        _ = try await store.upsertAgentModelsDocument(
+            document,
+            scopeID: "global",
+            projectID: nil,
+            expectedRevision: request.expectedGlobalRevision,
+            expectedSourceScopeID: scopeID(projectID),
+            expectedSourceRevision: request.expectedProjectRevision,
+            audit: try audit(operation: "copyProject", attribution: attribution, payload: value)
         )
         return try await agentModels(projectID: projectID)
     }
@@ -808,15 +844,19 @@ private extension ServerSettingsService {
     func normalizeProjectAgentModels(
         mode: AgentModelsScopeMode,
         profile: AgentModelsProfile?,
+        storedProfile: AgentModelsProfile?,
+        globalProfile: AgentModelsProfile,
         catalog: ProviderSettingsCatalogResponse
     ) throws -> AgentModelsScopeDocument {
         switch mode {
         case .inheritGlobal:
-            guard profile == nil else { throw ServiceAPIError(code: .invalidRequest, message: "Inherited Agent Models settings cannot contain an override") }
+            if let leftover = profile ?? storedProfile {
+                return .init(mode: mode, profile: try normalize(leftover, catalog: catalog))
+            }
             return .init(mode: mode, profile: nil)
         case .projectOverride:
-            guard let profile else { throw ServiceAPIError(code: .invalidRequest, message: "Project Agent Models override is missing") }
-            return .init(mode: mode, profile: try normalize(profile, catalog: catalog))
+            let override = profile ?? storedProfile ?? globalProfile
+            return .init(mode: mode, profile: try normalize(override, catalog: catalog))
         }
     }
 

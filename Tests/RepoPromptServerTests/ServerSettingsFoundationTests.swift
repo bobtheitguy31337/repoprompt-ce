@@ -883,6 +883,50 @@ final class ServerSettingsFoundationTests: XCTestCase {
             XCTAssertEqual(error.currentRevision, 2)
         }
 
+        let inheritedAgain = try await service.replaceProjectAgentModels(
+            projectID: projectID,
+            request: .init(expectedRevision: 2, mode: .inheritGlobal, profile: nil),
+            attribution: attribution
+        )
+        XCTAssertEqual(inheritedAgain.projectMode, .inheritGlobal)
+        XCTAssertEqual(inheritedAgain.projectProfile, global.globalProfile)
+        XCTAssertEqual(inheritedAgain.effectiveProfile, global.globalProfile)
+
+        let restoredOverride = try await service.replaceProjectAgentModels(
+            projectID: projectID,
+            request: .init(expectedRevision: 3, mode: .projectOverride, profile: nil),
+            attribution: attribution
+        )
+        XCTAssertEqual(restoredOverride.projectMode, .projectOverride)
+        XCTAssertEqual(restoredOverride.projectProfile, global.globalProfile)
+        XCTAssertEqual(restoredOverride.effectiveProfile, global.globalProfile)
+
+        let projectOwned = try await service.replaceProjectAgentModels(
+            projectID: projectID,
+            request: .init(expectedRevision: 4, mode: .projectOverride, profile: .init(oracle: projectTarget)),
+            attribution: attribution
+        )
+        XCTAssertEqual(projectOwned.effectiveProfile.oracle, projectTarget)
+        do {
+            _ = try await service.copyProjectAgentModelsToGlobal(
+                projectID: projectID,
+                request: .init(expectedGlobalRevision: 0, expectedProjectRevision: 5),
+                attribution: attribution
+            )
+            XCTFail("expected stale global revision")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .staleRevision)
+        }
+        let published = try await service.copyProjectAgentModelsToGlobal(
+            projectID: projectID,
+            request: .init(expectedGlobalRevision: 1, expectedProjectRevision: 5),
+            attribution: attribution
+        )
+        XCTAssertEqual(published.globalRevision, 2)
+        XCTAssertEqual(published.globalProfile.oracle, projectTarget)
+        XCTAssertEqual(published.effectiveProfile.oracle, projectTarget)
+        XCTAssertEqual(published.projectMode, .projectOverride)
+
         _ = try await service.replaceGlobalContextBuilder(
             .init(expectedRevision: 0, profile: .init(budget: 100_000)),
             attribution: attribution
@@ -946,9 +990,11 @@ final class ServerSettingsFoundationTests: XCTestCase {
         service = ServerSettingsService(store: store, providerCatalog: catalogs, projectCatalog: projects, now: { timestamp })
 
         let recoveredAgentModels = try await service.agentModels(projectID: projectID)
-        XCTAssertEqual(recoveredAgentModels.globalRevision, 1)
-        XCTAssertEqual(recoveredAgentModels.projectRevision, 2)
-        XCTAssertEqual(recoveredAgentModels.effectiveProfile, global.globalProfile)
+        XCTAssertEqual(recoveredAgentModels.globalRevision, 2)
+        XCTAssertEqual(recoveredAgentModels.projectRevision, 5)
+        XCTAssertEqual(recoveredAgentModels.projectMode, .projectOverride)
+        XCTAssertEqual(recoveredAgentModels.effectiveProfile.oracle, projectTarget)
+        XCTAssertEqual(recoveredAgentModels.globalProfile.oracle, projectTarget)
         let recoveredContextBuilder = try await service.contextBuilder(projectID: projectID)
         let recoveredSubagents = await service.subagentPermissions()
         let recoveredDirectAgents = await service.directAgentPermissions()
@@ -2286,6 +2332,70 @@ final class ServerSettingsFoundationTests: XCTestCase {
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .capabilityMissing)
         }
+    }
+
+    func testAgentModelsProjectScopeInheritsAndOverridesLikeDesktop() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let projectID = UUID()
+        let rootID = UUID()
+        let catalogs = StaticProviderCatalog(response: Self.providerCatalog())
+        let projects = StaticProjectCatalog(roots: [projectID: [rootID]])
+        try await persistProject(projectID: projectID, rootID: rootID, store: store)
+        let service = ServerSettingsService(store: store, providerCatalog: catalogs, projectCatalog: projects)
+        let globalTarget = AgentModelTarget(providerID: .codex, modelID: "gpt-5.6-sol", reasoningEffort: "high", pinned: true)
+        let projectTarget = AgentModelTarget(providerID: .claudeCompatible, modelID: "claude-opus-5", pinned: false)
+
+        let global = try await service.replaceGlobalAgentModels(
+            .init(expectedRevision: 0, profile: .init(oracle: globalTarget)),
+            attribution: Self.attribution
+        )
+        let storedGlobal = try await store.agentModelsDocument(scopeID: "global")
+        XCTAssertEqual(storedGlobal?.value.mode, .inheritGlobal)
+        XCTAssertEqual(global.effectiveProfile.oracle, globalTarget)
+
+        let overridden = try await service.replaceProjectAgentModels(
+            projectID: projectID,
+            request: .init(expectedRevision: 0, mode: .projectOverride, profile: .init(oracle: projectTarget)),
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(overridden.projectMode, .projectOverride)
+        XCTAssertEqual(overridden.effectiveProfile.oracle, projectTarget)
+
+        let inherited = try await service.replaceProjectAgentModels(
+            projectID: projectID,
+            request: .init(expectedRevision: 1, mode: .inheritGlobal, profile: nil),
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(inherited.projectMode, .inheritGlobal)
+        XCTAssertEqual(inherited.projectProfile?.oracle, projectTarget)
+        XCTAssertEqual(inherited.effectiveProfile.oracle, globalTarget)
+
+        let rematerialized = try await service.replaceProjectAgentModels(
+            projectID: projectID,
+            request: .init(expectedRevision: 2, mode: .projectOverride, profile: nil),
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(rematerialized.projectMode, .projectOverride)
+        XCTAssertEqual(rematerialized.effectiveProfile.oracle, projectTarget)
+
+        let copiedToGlobal = try await service.copyProjectAgentModelsToGlobal(
+            projectID: projectID,
+            request: .init(expectedGlobalRevision: 1, expectedProjectRevision: 3),
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(copiedToGlobal.globalProfile.oracle, projectTarget)
+        XCTAssertEqual(copiedToGlobal.effectiveProfile.oracle, projectTarget)
+        let storedAfterCopy = try await store.agentModelsDocument(scopeID: "global")
+        XCTAssertEqual(storedAfterCopy?.value.mode, .inheritGlobal)
+
+        let copiedToProject = try await service.copyGlobalAgentModelsToProject(
+            projectID: projectID,
+            request: .init(expectedGlobalRevision: 2, expectedProjectRevision: 3),
+            attribution: Self.attribution
+        )
+        XCTAssertEqual(copiedToProject.projectMode, .projectOverride)
+        XCTAssertEqual(copiedToProject.effectiveProfile.oracle, projectTarget)
+        try await store.close()
     }
 
     private func assertRoundTrip<T: Codable & Equatable>(_ value: T, file: StaticString = #filePath, line: UInt = #line) throws {

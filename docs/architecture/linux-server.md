@@ -46,9 +46,11 @@ The v1 migration creates the complete E4 table inventory: service metadata, proj
 - Roles are closed: `goblin-app`, `goblin-sync`, and `repoprompt-operator`.
 - Requests use canonical method/path/timestamp/nonce/body/decision/key-ID HMAC input.
 - Nonces persist before dispatch and reject replay.
-- Human operations require a separately signed, operation/request/target-bound Goblin decision with a maximum 30-second lifetime.
+- Human operations require a separately signed, operation/request/target-bound Goblin decision with a maximum 30-second lifetime. Linux still evaluates durable collaboration policy (policy owner, controller, collaborative steering) against that decision; the signature does not bypass it.
+- Agent Models persist as a global profile plus optional per-project envelopes. The project key is the Linux multi-user substitute for Desktop’s window workspace. Inheritance still matches Desktop: inherit uses the global profile even when a leftover project snapshot exists; switching to override materializes from that leftover or from global; global writes store `inheritGlobal` rather than `projectOverride`; and copy is bidirectional (`copy-global` and `copy-project`).
 - SSE subscribes before replay, drains durable pages to a captured watermark, deduplicates the bounded live buffer by global sequence, and emits signed application-framed events; lagging subscribers are disconnected with a reconnect cursor.
 - Cursor namespace changes or replay-floor violations return the stable `cursor_expired` contract.
+- Thin-client composer surfaces stay on the internal API: `catalog/composer-suggestions`, project `composer-attachments` stage/resolve/preview/delete, and turn/start `attachmentIds` / `taggedFiles` / `resolvedSuggestionTokens`. Chat-server forwards those instead of owning a leftover composer store.
 
 Provider and Git credentials are not accepted through HTTP and are never stored in the service database. Secret values are loaded from files; the executable does not print them.
 
@@ -66,6 +68,8 @@ Project tree/search live-read `AdvancedServerSettings` with Desktop ignore mappi
 
 MCP `app_settings` get/set for `file_system.*`, `code_maps.globally_disabled`, `ui.appearance_mode` / `ui.font_scale` / `ui.show_tooltips` / `ui.enable_keyboard_shortcuts`, plus the already-wired packaging/temperature keys, write the same advanced document. `file_system.skip_symlinks` stays the inverse of `followSymbolicLinks`. Headless appearance apply is a no-op; persist still round-trips for thin clients. Font scale allowlist is Desktop’s 14 / 16 / 18. Portal Advanced live-reads/writes those same fields (history idle 0–1440, global ignore defaults, app appearance). The Portal Appearance cookie stays browser-local chrome and is not a substitute for the engine keys.
 
+Agent Models scope is a Linux multi-user extension keyed by **project**, not a Desktop window workspace. Inherit/override still matches Desktop: `inheritGlobal` tracks the global profile while keeping any leftover project snapshot; `projectOverride` uses the project snapshot and, when that snapshot is missing, copies global. Copy is bidirectional (`copy-global` and `copy-project`) with dual revision fences. Global writes store `inheritGlobal` rather than `projectOverride`.
+
 ## Image contract
 
 `Dockerfile.server` builds only `RepoPromptServer`, runs it as fixed UID/GID 65532, includes `tini` and `curl`, and retains image metadata for both fixed ports: `9443/tcp` is the mTLS internal API and `9080/tcp` is the loopback-only health listener used by the image probe. The `io.degentlemen.repoprompt.port.*` OCI labels make those scopes explicit; deployments must not publish 9080. Compose must still set read-only root, dropped capabilities, no-new-privileges, resource/PID/log bounds, persistent state/project/worktree/cache volumes, internal networks, and runtime secret mounts.
@@ -82,7 +86,9 @@ Ubuntu 24.04 runs the same build and focused tests in `.github/workflows/linux-s
 
 ## Known extraction boundary
 
-This baseline establishes the reusable target, persistence, protocol, supervision, and service boundaries. The existing macOS `AgentModeViewModel` and direct-headless MCP implementation have not yet been cut over to these targets; see the fork-delta ledger for the explicit remaining convergence work. No Goblin collaboration policy is evaluated here.
+This baseline establishes the reusable target, persistence, protocol, supervision, and service boundaries. The existing macOS `AgentModeViewModel` and direct-headless MCP implementation have not yet been cut over to these targets; see the fork-delta ledger for the explicit remaining convergence work.
+
+Goblin collaboration policy is evaluated on Linux and is additive to Desktop. Signed Goblin decisions remain operation/request/target-bound with a 30-second lifetime, and they acknowledge current collaboration revisions (or the exact next revisions for `setSessionVisibility`). A verified decision does not bypass durable policy: session creators own visibility and steering writes, the current controller owns other mutations, and `sendFollowup` / `submitTurn` / `steerSession` may be performed by non-controllers only when the session is collaborative and collaborative steering is enabled. `buildContext` stays a view operation. Dedicated HTTP session mutations evaluate that same durable policy against the signed decision; HMAC verification alone is not sufficient.
 
 
 # RepoPrompt Server web portal

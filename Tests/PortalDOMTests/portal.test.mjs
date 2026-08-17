@@ -789,6 +789,21 @@ async function createHarness({
       };
       return jsonResponse(context.typedSettings.agentModels);
     }
+    if (call.path.includes("settings/agent-models/copy-project")) {
+      const copied =
+        context.typedSettings.agentModels.projectProfile ||
+        context.typedSettings.agentModels.globalProfile;
+      context.typedSettings.agentModels = {
+        ...context.typedSettings.agentModels,
+        globalProfile: copied,
+        globalRevision: context.typedSettings.agentModels.globalRevision + 1,
+        effectiveProfile:
+          context.typedSettings.agentModels.projectMode === "projectOverride"
+            ? context.typedSettings.agentModels.projectProfile || copied
+            : copied,
+      };
+      return jsonResponse(context.typedSettings.agentModels);
+    }
     if (call.path.includes("settings/agent-models/apply-recommendations")) {
       return jsonResponse(context.typedSettings.agentModels);
     }
@@ -1614,6 +1629,16 @@ test("typed settings pages mutate revisioned server authorities", async (t) => {
   const scope = document.querySelector(
     'select[aria-label="Agent Models scope"]',
   );
+  assert.ok(
+    [...document.querySelectorAll("button")].some(
+      (button) => button.textContent === "Copy Global to Project",
+    ),
+  );
+  assert.ok(
+    [...document.querySelectorAll("button")].some(
+      (button) => button.textContent === "Copy Project to Global",
+    ),
+  );
   change(window, scope, "projectOverride");
   await waitFor(() =>
     calls.some(
@@ -1671,6 +1696,30 @@ test("typed settings pages mutate revisioned server authorities", async (t) => {
     "reasoningEffort",
   ]);
   assert.equal(savedAgentModelsPayload.profile.oracle.pinned, false);
+  await settle();
+  const copyProject = [...document.querySelectorAll("button")].find(
+    (button) => button.textContent === "Copy Project to Global",
+  );
+  assert.ok(copyProject);
+  click(window, copyProject);
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "POST" &&
+        call.path.endsWith("/settings/agent-models/copy-project"),
+    ),
+  );
+  const copyProjectPayload = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "POST" &&
+        call.path.endsWith("/settings/agent-models/copy-project"),
+    ).body,
+  );
+  assert.deepEqual(Object.keys(copyProjectPayload).sort(), [
+    "expectedGlobalRevision",
+    "expectedProjectRevision",
+  ]);
 
   window.location.hash = "#settings/agent-permissions";
   window.dispatchEvent(new window.HashChangeEvent("hashchange"));

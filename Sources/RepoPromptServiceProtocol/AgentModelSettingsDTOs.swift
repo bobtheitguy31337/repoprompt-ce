@@ -336,6 +336,16 @@ public struct CopyGlobalAgentModelsToProjectRequest: Codable, Hashable, Sendable
     }
 }
 
+public struct CopyProjectAgentModelsToGlobalRequest: Codable, Hashable, Sendable {
+    public let expectedGlobalRevision: Int64
+    public let expectedProjectRevision: Int64
+
+    public init(expectedGlobalRevision: Int64, expectedProjectRevision: Int64) {
+        self.expectedGlobalRevision = expectedGlobalRevision
+        self.expectedProjectRevision = expectedProjectRevision
+    }
+}
+
 public struct ApplyAgentModelRecommendationsRequest: Codable, Hashable, Sendable {
     public let expectedRevision: Int64
 

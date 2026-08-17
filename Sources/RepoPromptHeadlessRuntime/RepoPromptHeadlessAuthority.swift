@@ -1356,15 +1356,13 @@ public actor RepoPromptHeadlessAuthority {
         guard let session = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
         let before = await session.snapshot()
         guard before.parentSessionID == nil else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "External commands may target only root sessions") }
-        if let authorizationDecision {
-            guard authorizationDecision.sessionID == sessionID,
-                  authorizationDecision.operation == command.operation,
-                  authorizationDecision.actor.goblinUserID == externalActor.goblinUserID,
-                  authorizationDecision.requestDigest == requestDigest
-            else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Verified Goblin authorization decision is not bound to this command") }
-        } else {
-            try await authorizeExternalCommand(command, session: before, actor: externalActor)
-        }
+        try await authorizeExternalCommand(
+            command,
+            session: before,
+            actor: externalActor,
+            requestDigest: requestDigest,
+            authorizationDecision: authorizationDecision
+        )
         let eventType: EventType
         switch command {
         case let .sendFollowup(text, expectedRevision):
@@ -1453,8 +1451,12 @@ public actor RepoPromptHeadlessAuthority {
                   before.transcript.last?.content == accepted.canonicalUserTurn.text
             else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Accepted session transcript is incomplete") }
         } else {
-            let authorizationCommand = SessionCommand.sendFollowup(text: accepted.canonicalUserTurn.text, expectedSessionRevision: before.revision)
-            try await authorizeExternalCommand(authorizationCommand, session: before, actor: actor)
+            try await authorizeCollaborationPolicy(
+                session: before,
+                actor: actor,
+                operation: "submitTurn",
+                requestDigest: requestDigest
+            )
             try await session.appendHumanMessage(accepted.canonicalUserTurn.text, actor: actor, expectedRevision: before.revision)
             let cursor = try await store.nextCursor()
             let event = try await store.persistSession(replacingCursor(session.snapshot(), cursor: cursor), eventType: .transcriptMessage, actor: actor, correlationID: accepted.receipt.requestAnchorID, idempotency: nil)
@@ -2258,6 +2260,7 @@ public actor RepoPromptHeadlessAuthority {
         if let idempotency, let prior: SelectionSnapshot = try await priorResult(idempotency) { return prior }
         guard let selection = selections[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
         let session = try await sessionSnapshot(sessionID: sessionID)
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "replaceSelection")
         try await validateSelection(entries, projectID: session.projectID)
         let snapshot = try await selection.replace(entries, expectedRevision: expectedRevision)
         let event = try await store.persistSelection(snapshot, projectID: session.projectID, rootSessionID: session.rootSessionID, actor: actor, correlationID: ids.next(), idempotency: idempotency)
@@ -2286,12 +2289,36 @@ public actor RepoPromptHeadlessAuthority {
             ?? CollaborationMetadataSnapshot(sessionID: sessionID, visibility: session.visibility, collaborativeSteeringEnabled: false, controllerUserID: session.creator.goblinUserID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
     }
 
+    public func authorizeSessionCollaboration(
+        sessionID: UUID,
+        actor: ExternalActor,
+        operation: String,
+        requestDigest: String? = nil,
+        authorizationDecision: GoblinAuthorizationDecision? = nil
+    ) async throws {
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        try await authorizeCollaborationPolicy(
+            session: session,
+            actor: actor,
+            operation: operation,
+            requestDigest: requestDigest,
+            authorizationDecision: authorizationDecision
+        )
+    }
+
     public func updateCollaborationMetadata(sessionID: UUID, input: CollaborationMetadataInput, actor: ExternalActor, idempotencyKey: String, requestDigest: String, idempotencyResponse: Data? = nil, authorizationDecision: GoblinAuthorizationDecision? = nil) async throws -> CollaborationMetadataSnapshot {
         try ensureWritable()
         let idempotency = IdempotencyInput(actorID: actor.goblinUserID, operation: "setSessionVisibility", key: idempotencyKey, requestDigest: requestDigest)
         if let prior: CollaborationMetadataSnapshot = try await priorResult(idempotency) { return prior }
         guard let session = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
         let authoritySession = await session.snapshot()
+        try await authorizeCollaborationPolicy(
+            session: authoritySession,
+            actor: actor,
+            operation: "setSessionVisibility",
+            requestDigest: requestDigest,
+            authorizationDecision: authorizationDecision
+        )
         let current = try await collaborationMetadata(sessionID: sessionID)
         guard current.policyRevision == input.expectedPolicyRevision else { throw ServiceAPIError(code: .staleRevision, message: "Collaboration policy revision is stale", currentRevision: current.policyRevision) }
         if let expected = input.expectedControllerRevision, expected != current.controllerRevision { throw ServiceAPIError(code: .staleRevision, message: "Controller revision is stale", currentRevision: current.controllerRevision) }
@@ -2386,6 +2413,7 @@ public actor RepoPromptHeadlessAuthority {
         let idempotency = try mutationIdempotency(actor: actor, operation: "updateExecutionPermissions", key: idempotencyKey, digest: requestDigest)
         if let idempotency, let prior: ExecutionPermissionSnapshot = try await priorResult(idempotency) { return prior }
         let session = try await sessionSnapshot(sessionID: sessionID)
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "updateExecutionPermissions")
         guard session.parentSessionID == nil else {
             throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Child execution permissions are frozen by sub-agent policy at creation")
         }
@@ -2417,6 +2445,7 @@ public actor RepoPromptHeadlessAuthority {
         let idempotency = try mutationIdempotency(actor: actor, operation: "answerInteraction", key: idempotencyKey, digest: requestDigest)
         if let idempotency, let prior: InteractionSnapshot = try await priorResult(idempotency) { return prior }
         let session = try await sessionSnapshot(sessionID: sessionID)
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "answerInteraction")
         guard let current = try await store.interactions(sessionID: sessionID).first(where: { $0.interactionID == interactionID }) else { throw ServiceAPIError(code: .notFound, message: "Interaction not found") }
         guard current.state == .pending, current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Interaction revision is stale", currentRevision: current.revision) }
         if let expiresAt = current.expiresAt, expiresAt <= clock.now() { throw ServiceAPIError(code: .interactionSettled, message: "Interaction expired") }
@@ -2583,6 +2612,7 @@ public actor RepoPromptHeadlessAuthority {
         if let idempotency, let prior: WorktreeBindingSnapshot = try await priorResult(idempotency) { return prior }
         guard let worktreeService else { throw ServiceAPIError(code: .capabilityMissing, message: "Worktree storage is not configured") }
         let session = try await sessionSnapshot(sessionID: sessionID)
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "createWorktree")
         guard session.parentSessionID == nil else {
             throw ServiceAPIError(code: .worktreeConflict, message: "Only a root session may create project worktrees")
         }
@@ -2614,6 +2644,7 @@ public actor RepoPromptHeadlessAuthority {
         guard let sessionAuthority = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
         guard await sessionAuthority.activeBinding() == nil else { throw ServiceAPIError(code: .runAlreadyActive, message: "A worktree cannot be rebound while a run is active") }
         let session = await sessionAuthority.snapshot()
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "bindWorktree")
         guard let current = try await store.worktree(bindingID: bindingID), current.projectID == session.projectID else { throw ServiceAPIError(code: .notFound, message: "Worktree binding not found") }
         guard current.sessionID == nil || current.sessionID == sessionID else { throw ServiceAPIError(code: .worktreeConflict, message: "Worktree is owned by another session") }
         guard current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Worktree revision is stale", currentRevision: current.revision) }
@@ -2636,6 +2667,7 @@ public actor RepoPromptHeadlessAuthority {
         if let idempotency, let prior: WorktreeBindingSnapshot = try await priorResult(idempotency) { return prior }
         guard let worktreeService else { throw ServiceAPIError(code: .capabilityMissing, message: "Worktree storage is not configured") }
         let session = try await sessionSnapshot(sessionID: sessionID)
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "mergeWorktree")
         guard let initialBinding = try await store.worktree(bindingID: bindingID),
               initialBinding.projectID == session.projectID,
               initialBinding.sessionID == sessionID
@@ -2668,6 +2700,7 @@ public actor RepoPromptHeadlessAuthority {
         if let idempotency, let prior: WorktreeBindingSnapshot = try await priorResult(idempotency) { return prior }
         guard let worktreeService else { throw ServiceAPIError(code: .capabilityMissing, message: "Worktree storage is not configured") }
         let session = try await sessionSnapshot(sessionID: sessionID)
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "abortConflictedMerge")
         guard let binding = try await store.worktree(bindingID: bindingID), binding.projectID == session.projectID, binding.sessionID == sessionID else {
             throw ServiceAPIError(code: .notFound, message: "Worktree binding not found")
         }
@@ -2708,8 +2741,15 @@ public actor RepoPromptHeadlessAuthority {
         return (artifact.snapshot, Data(complete[requested]), requested)
     }
 
-    public func buildContext(sessionID: UUID, expectedSelectionRevision: Int64, include: [String], actor: ExternalActor) async throws -> ArtifactSnapshot {
+    public func buildContext(sessionID: UUID, expectedSelectionRevision: Int64, include: [String], actor: ExternalActor, requestDigest: String? = nil, authorizationDecision: GoblinAuthorizationDecision? = nil) async throws -> ArtifactSnapshot {
         let session = try await sessionSnapshot(sessionID: sessionID)
+        try await authorizeCollaborationPolicy(
+            session: session,
+            actor: actor,
+            operation: "buildContext",
+            requestDigest: requestDigest,
+            authorizationDecision: authorizationDecision
+        )
         let selection = try await selectionSnapshot(sessionID: sessionID)
         guard selection.revision == expectedSelectionRevision else { throw ServiceAPIError(code: .staleRevision, message: "Selection revision is stale", currentRevision: selection.revision) }
         let content = try await materializedContext(projectID: session.projectID, selection: selection, include: include)
@@ -2725,6 +2765,7 @@ public actor RepoPromptHeadlessAuthority {
         guard let contextBuilderRuntime else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Context Builder runtime is not configured") }
         guard artifactService != nil else { throw ServiceAPIError(code: .capabilityMissing, message: "Context Builder requires durable artifact storage") }
         let session = try await sessionSnapshot(sessionID: sessionID)
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "runContextBuilder")
         let effectiveSettings: EffectiveContextBuilderSettings
         let renderedInstructions: String
         if let serverSettings {
@@ -2929,6 +2970,7 @@ public actor RepoPromptHeadlessAuthority {
     public func askOracle(sessionID: UUID, input: OracleInput, actor: ExternalActor) async throws -> OracleSnapshot {
         guard let oracleRuntime else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Oracle runtime is not configured") }
         let session = try await sessionSnapshot(sessionID: sessionID)
+        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "askOracle")
         let project = try await projectSnapshot(projectID: session.projectID)
         let workingDirectory = try await executionLocation(session: session).workingDirectory
         let selection = try await selectionSnapshot(sessionID: sessionID)
@@ -3649,15 +3691,114 @@ public actor RepoPromptHeadlessAuthority {
         return receipt
     }
 
-    private func authorizeExternalCommand(_ command: SessionCommand, session: SessionSnapshot, actor: ExternalActor) async throws {
-        let metadata = try await collaborationMetadata(sessionID: session.sessionID)
-        if actor.goblinUserID == metadata.controllerUserID { return }
-        let collaborativelySteerable = switch command {
-        case .sendFollowup, .steerSession, .answerInteraction, .buildContext, .runContextBuilder, .askOracle: true
-        default: false
+    private enum CollaborationOperationClass {
+        case view
+        case policyOwner
+        case collaborativeSteering
+        case controller
+    }
+
+    private func collaborationOperationClass(_ operation: String) -> CollaborationOperationClass {
+        switch operation {
+        case "buildContext":
+            return .view
+        case "setSessionVisibility", "setCollaborativeSteering":
+            return .policyOwner
+        case "sendFollowup", "submitTurn", "steerSession":
+            return .collaborativeSteering
+        default:
+            return .controller
         }
-        guard session.visibility == .collaborative, metadata.collaborativeSteeringEnabled, collaborativelySteerable else {
-            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Only the current collaboration controller may perform this operation")
+    }
+
+    private func authorizeExternalCommand(
+        _ command: SessionCommand,
+        session: SessionSnapshot,
+        actor: ExternalActor,
+        requestDigest: String? = nil,
+        authorizationDecision: GoblinAuthorizationDecision? = nil
+    ) async throws {
+        try await authorizeCollaborationPolicy(
+            session: session,
+            actor: actor,
+            operation: command.operation,
+            requestDigest: requestDigest,
+            authorizationDecision: authorizationDecision
+        )
+    }
+
+    private func authorizeCollaborationPolicy(
+        session: SessionSnapshot,
+        actor: ExternalActor,
+        operation: String,
+        requestDigest: String? = nil,
+        authorizationDecision: GoblinAuthorizationDecision? = nil
+    ) async throws {
+        let metadata = try await collaborationMetadata(sessionID: session.sessionID)
+        if let authorizationDecision {
+            try evaluateGoblinCollaborationDecision(
+                authorizationDecision,
+                session: session,
+                metadata: metadata,
+                actor: actor,
+                operation: operation,
+                requestDigest: requestDigest
+            )
+        }
+        switch collaborationOperationClass(operation) {
+        case .view:
+            return
+        case .policyOwner:
+            guard actor.goblinUserID == session.creator.goblinUserID else {
+                throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Only the session policy owner may perform this operation")
+            }
+        case .collaborativeSteering:
+            if actor.goblinUserID == metadata.controllerUserID { return }
+            guard session.visibility == .collaborative, metadata.collaborativeSteeringEnabled else {
+                throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Only the current collaboration controller may perform this operation")
+            }
+        case .controller:
+            guard actor.goblinUserID == metadata.controllerUserID else {
+                throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Only the current collaboration controller may perform this operation")
+            }
+        }
+    }
+
+    private func evaluateGoblinCollaborationDecision(
+        _ decision: GoblinAuthorizationDecision,
+        session: SessionSnapshot,
+        metadata: CollaborationMetadataSnapshot,
+        actor: ExternalActor,
+        operation: String,
+        requestDigest: String?
+    ) throws {
+        guard decision.sessionID == session.sessionID,
+              decision.operation == operation,
+              decision.actor.goblinUserID == actor.goblinUserID,
+              requestDigest == nil || decision.requestDigest == requestDigest
+        else {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Verified Goblin authorization decision is not bound to this command")
+        }
+        guard decision.issuedAt <= clock.now(), decision.expiresAt > clock.now() else {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Goblin authorization decision is stale")
+        }
+        if operation == "setSessionVisibility" || operation == "setCollaborativeSteering" {
+            return
+        }
+        guard decision.policyRevision == metadata.policyRevision,
+              decision.controllerRevision == metadata.controllerRevision,
+              decision.membershipRevision == metadata.membershipRevision
+        else {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision revisions do not match durable session policy")
+        }
+        if let creator = decision.attributionLabels?.creatorUserID, creator != session.creator.goblinUserID {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Goblin attribution does not match the session creator")
+        }
+        if let controller = decision.attributionLabels?.controllerUserID, controller != metadata.controllerUserID {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Goblin attribution does not match the current controller")
+        }
+        if let visibility = decision.attributionLabels?.visibility, visibility != metadata.visibility {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Goblin attribution does not match session visibility")
         }
     }
 
