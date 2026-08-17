@@ -205,7 +205,7 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
             guard workflow.enabled else { return false }
             return workflow.visible || workflow.workflowID == selectedID
         }
-        return live.sorted(by: Self.pickerOrder).map {
+        var options = live.sorted(by: Self.pickerOrder).map {
             ComposerWorkflowOptionWire(
                 id: $0.workflowID,
                 displayName: $0.name,
@@ -217,6 +217,22 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
                 featuredOrder: $0.featuredOrder
             )
         }
+        let seen = Set(options.map(\.id))
+        for workflow in workflows where !seen.contains(workflow.id) {
+            options.append(
+                ComposerWorkflowOptionWire(
+                    id: workflow.id,
+                    displayName: workflow.displayName,
+                    description: workflow.description,
+                    guidance: workflow.guidance,
+                    providerIDs: workflow.providerIDs,
+                    enabled: true,
+                    visible: true,
+                    featuredOrder: workflow.featured ? options.count : nil
+                )
+            )
+        }
+        return options
     }
 
     private static func pickerOrder(_ lhs: ServerWorkflowDefinition, _ rhs: ServerWorkflowDefinition) -> Bool {

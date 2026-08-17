@@ -918,7 +918,7 @@ final class SQLiteServiceStoreV6CompatibilityTests: XCTestCase {
         XCTAssertTrue(Set(["advanced_server_settings", "settings_audit", "provider_direct_configurations"]).isSubset(of: Set(tables)))
         XCTAssertTrue(Set(composerTables).isSubset(of: Set(tables)))
         let digest = try await upgraded.connection.query("SELECT digest FROM schema_migrations WHERE version=6").first?.column("digest")?.string
-        XCTAssertEqual(digest, "repoprompt-service-schema-v6-typed-settings-agent-composer-semantic-acceptance")
+        XCTAssertEqual(digest, "repoprompt-service-schema-v6-typed-mcp-show-model-presets")
         try await upgraded.close()
     }
 
@@ -1502,13 +1502,14 @@ final class RepoPromptHTTPComposerContractTests: XCTestCase {
                 XCTAssertEqual(response.status, .ok)
                 let snapshot = try JSONDecoder.serviceDecoder.decode(ComposerCatalogWireSnapshot.self, from: Data(response.body.readableBytesView))
                 let group = try XCTUnwrap(snapshot.providerGroups.first { $0.providerID == .claudeCompatible })
-                XCTAssertEqual(group.models.map(\.id), [fixture.modelID])
-                XCTAssertEqual(group.models.first?.supportedEffortIDs, ["high"])
-                XCTAssertEqual(group.models.first?.defaultEffortID, "high")
+                XCTAssertEqual(Set(group.models.map(\.id)), Set([fixture.modelID, "sonnet", "opus", "haiku"]))
+                let runtimeModel = try XCTUnwrap(group.models.first { $0.id == fixture.modelID })
+                XCTAssertEqual(runtimeModel.supportedEffortIDs, ["high"])
+                XCTAssertEqual(runtimeModel.defaultEffortID, "high")
                 XCTAssertEqual(snapshot.selected?.permissionID, "claude.autoApproveEdits")
                 XCTAssertEqual(snapshot.selected?.toolValues["claude.bash"], .boolean(false))
-                XCTAssertEqual(snapshot.workflows.first?.guidance, completeWorkflowGuidance)
-                XCTAssertGreaterThan(try XCTUnwrap(snapshot.workflows.first?.guidance).utf8.count, 16_384)
+                let completeWorkflow = try XCTUnwrap(snapshot.workflows.first { $0.guidance == completeWorkflowGuidance })
+                XCTAssertGreaterThan(try XCTUnwrap(completeWorkflow.guidance).utf8.count, 16_384)
             }
         }
 

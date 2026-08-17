@@ -490,6 +490,10 @@ final class ProviderSettingsPortalTests: XCTestCase {
         let app = Application(router: service.internalRouter())
         try await app.test(.router) { client in
             try await client.execute(uri: "/portal", method: .get) { response in
+                XCTAssertEqual(response.status.code, 308)
+                XCTAssertEqual(response.headers[.location], "/portal/")
+            }
+            try await client.execute(uri: "/portal/", method: .get) { response in
                 XCTAssertEqual(response.status, .ok)
                 XCTAssertEqual(response.headers[.cacheControl], "private, no-store")
             }

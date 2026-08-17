@@ -9,6 +9,7 @@
     "claudeCustom",
     "openCodeACP",
     "cursorACP",
+    "grokBuildACP",
     "openAIAPI",
     "anthropicAPI",
     "openRouter",
@@ -479,6 +480,11 @@
         title: "Cursor CLI",
         subtitle:
           "Uses Cursor's ACP runtime for Agent Mode, headless tasks, and chat.",
+      },
+      grokBuildACP: {
+        title: "Grok Build CLI",
+        subtitle:
+          "Uses Grok Build's ACP runtime for Agent Mode, headless tasks, and chat.",
       },
     };
     return (
@@ -1355,9 +1361,10 @@
     const rounded = Math.round(percent);
     const circumference = 2 * Math.PI * 7;
     percentLabel.textContent = String(rounded);
-    progress.style.strokeDasharray = String(circumference);
-    progress.style.strokeDashoffset = String(
-      circumference * (1 - Math.min(Math.max(percent / 100, 0), 1)),
+    progress.setAttribute("stroke-dasharray", String(circumference));
+    progress.setAttribute(
+      "stroke-dashoffset",
+      String(circumference * (1 - Math.min(Math.max(percent / 100, 0), 1))),
     );
     ring.dataset.level =
       percent > 90 ? "critical" : percent > 75 ? "warn" : "";
@@ -1797,7 +1804,7 @@
     content.replaceChildren(
       pageHeader(
         "CLI Providers",
-        "Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, or Cursor to use the dedicated server account for each installed CLI.",
+        "Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, Cursor, or Grok Build to use the dedicated server account for each installed CLI.",
         "terminal",
       ),
     );
@@ -1809,6 +1816,7 @@
       byID.claudeCompatible,
       byID.openCodeACP,
       byID.cursorACP,
+      byID.grokBuildACP,
     ].filter(isConnectedProvider);
     if (connectedMainProviders.length) {
       content.append(
@@ -1835,6 +1843,7 @@
     );
     if (byID.openCodeACP) stack.append(cliProviderCard(byID.openCodeACP));
     if (byID.cursorACP) stack.append(cliProviderCard(byID.cursorACP));
+    if (byID.grokBuildACP) stack.append(cliProviderCard(byID.grokBuildACP));
     content.append(stack);
     installIcons(content);
   }
@@ -1843,6 +1852,7 @@
     claudeCompatible: "providerSpecific",
     openCodeACP: "providerSpecific",
     cursorACP: "browserLogin",
+    grokBuildACP: "providerSpecific",
   };
 
   function cliProviderCard(provider) {
@@ -1990,6 +2000,10 @@
       cursorACP: [
         "Connect the dedicated Cursor CLI account mounted for this server.",
         "If authentication is missing, an operator can complete Cursor login inside the isolated server account.",
+      ],
+      grokBuildACP: [
+        "Connect the dedicated Grok Build CLI account mounted for this server.",
+        "If authentication is missing, an operator can complete Grok Build login inside the isolated server account.",
       ],
     }[provider.providerID];
     const card = desktopCard("Connection", guidance[0]);
@@ -7533,7 +7547,13 @@
     const gate = document.getElementById("auth-gate");
     const form = document.getElementById("auth-form");
     const error = document.getElementById("auth-error");
-    const status = await api("api/v1/auth/status");
+    let status;
+    try {
+      status = await api("api/v1/auth/status");
+    } catch (failure) {
+      gate.hidden = true;
+      return true;
+    }
     if (status.authenticated) {
       gate.hidden = true;
       return true;

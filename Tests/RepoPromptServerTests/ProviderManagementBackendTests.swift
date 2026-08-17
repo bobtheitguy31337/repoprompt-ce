@@ -176,9 +176,22 @@ final class ProviderManagementBackendTests: XCTestCase {
             runner: StaticVersionRunner()
         )
         try await providerSettings.bootstrap()
-        let catalog = try await providerSettings.catalog()
-        let codexSettings = try XCTUnwrap(catalog.providers.first { $0.providerID == .codex })
+        var catalog = try await providerSettings.catalog()
+        var codexSettings = try XCTUnwrap(catalog.providers.first { $0.providerID == .codex })
         XCTAssertTrue(codexSettings.runtimePreflightVerified)
+        _ = try await providerSettings.update(
+            providerID: .codex,
+            request: .init(
+                expectedRevision: codexSettings.preference.revision,
+                enabled: true,
+                defaultModel: nil,
+                reasoningEffort: nil,
+                speedMode: nil,
+                serviceTier: nil
+            )
+        )
+        catalog = try await providerSettings.catalog()
+        codexSettings = try XCTUnwrap(catalog.providers.first { $0.providerID == .codex })
         XCTAssertEqual(codexSettings.preflight.reason, .missingCredential)
 
         let readiness = RepoPromptReadinessService(
@@ -385,8 +398,19 @@ final class ProviderManagementBackendTests: XCTestCase {
         try await service.bootstrap()
         let initialCatalog = try await service.catalog()
         let initialCodex = try XCTUnwrap(initialCatalog.providers.first { $0.providerID == .codex })
-        XCTAssertEqual(initialCodex.capabilities.authenticationMethods, [.apiKey])
-        XCTAssertTrue(initialCodex.capabilities.authFlows.isEmpty)
+        XCTAssertEqual(Set(initialCodex.capabilities.authenticationMethods), [.deviceCodeBeta, .apiKey])
+        XCTAssertTrue(initialCodex.capabilities.authFlows.contains { $0.kind == .deviceCodeBeta })
+        _ = try await service.update(
+            providerID: .codex,
+            request: .init(
+                expectedRevision: initialCodex.preference.revision,
+                enabled: true,
+                defaultModel: nil,
+                reasoningEffort: nil,
+                speedMode: nil,
+                serviceTier: nil
+            )
+        )
         let attribution = ProviderMutationAttribution(actorID: "admin-1", actorLabel: "alice", channel: "test")
         let secret = "sk-test-write-only-value"
 

@@ -1154,7 +1154,7 @@ test("filtered Desktop settings hierarchy deep-links, searches, and excludes des
     document.getElementById("settings-content").textContent,
     /Claude Code–Compatible Backends/,
   );
-  assert.equal(document.querySelectorAll(".desktop-provider-card").length, 8);
+  assert.equal(document.querySelectorAll(".desktop-provider-card").length, 9);
   assert.deepEqual(
     [
       ...document.querySelectorAll(

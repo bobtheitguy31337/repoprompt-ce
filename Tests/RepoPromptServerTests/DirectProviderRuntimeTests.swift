@@ -461,6 +461,20 @@ final class DirectProviderRuntimeTests: XCTestCase {
         )
         try await service.bootstrap()
         let attribution = ProviderMutationAttribution(actorID: "admin", actorLabel: "Admin", channel: "test")
+        let initialDirect = try await service.directConfiguration(providerID: .openAIAPI)
+        _ = try await service.updateDirectConfiguration(
+            providerID: .openAIAPI,
+            request: .init(
+                expectedRevision: initialDirect.revision,
+                baseURL: initialDirect.baseURL,
+                preferredModel: initialDirect.preferredModel,
+                maximumOutputTokens: initialDirect.maximumOutputTokens,
+                customHeaders: initialDirect.customHeaders,
+                apiVersion: initialDirect.apiVersion,
+                showServiceTierVariants: true
+            ),
+            attribution: attribution
+        )
 
         let connected = try await service.connect(
             providerID: .openAIAPI,
@@ -791,7 +805,7 @@ private actor ConflictingDirectCredentialTester: ProviderCredentialTesting {
         return .init(
             state: .valid,
             detail: "Validated",
-            models: [.init(id: "gpt-direct-test", displayName: "GPT Direct Test")]
+            models: [.init(id: "gpt-direct-test", displayName: "GPT Direct Test", reasoningEfforts: ["high"], serviceTiers: ["auto", "default", "flex", "priority", "scale"])]
         )
     }
 

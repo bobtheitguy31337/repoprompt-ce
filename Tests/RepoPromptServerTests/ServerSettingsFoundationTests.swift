@@ -2239,6 +2239,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         )
         _ = try await service.replaceGlobalAgentModels(
             .init(expectedRevision: 1, profile: .init(
+                oracle: .init(providerID: .claudeGLM, modelID: "claude-sonnet-5"),
                 contextBuilder: .init(providerID: .claudeGLM, modelID: "claude-sonnet-5")
             )),
             attribution: Self.attribution
