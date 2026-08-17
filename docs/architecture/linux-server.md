@@ -130,8 +130,10 @@ No screenshots or generated imitation artwork are part of this port.
 
 Portal pages and APIs require a client certificate mapped to either
 `repoprompt-operator` for direct standalone access or `goblin-app` for an
-authenticated Goblin reverse proxy. Browser code never receives an internal
-HMAC key or client certificate. The browser is a thin renderer over Swift-owned
+authenticated Goblin reverse proxy. Operator mTLS is sufficient on its own:
+settings and agent surfaces do not require chat-server, Goblin HMAC, or a
+reverse proxy. Browser code never receives an internal HMAC key or client
+certificate. The browser is a thin renderer over Swift-owned
 services and does not persist state in local or session storage. Assets and API
 URLs are path-relative so a same-origin gateway can preserve the complete
 RepoPrompt-owned HTML/CSS/JavaScript surface beneath `/portal/`. Mutations

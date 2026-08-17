@@ -29,6 +29,7 @@ public struct RepoPromptHTTPService: Sendable {
     private let submissionDispatchQueue: AgentSubmissionDispatchQueue?
     private let transcriptPresentation: AgentTranscriptPresentationService?
     private let portalDesktopSettings: PortalDesktopSettingsService
+    private let portalPeerCertificateDER: Data?
 
     public init(
         authority: RepoPromptHeadlessAuthority,
@@ -46,7 +47,8 @@ public struct RepoPromptHTTPService: Sendable {
         submissionCoordinator: AgentSubmissionCoordinator? = nil,
         submissionDispatchQueue: AgentSubmissionDispatchQueue? = nil,
         transcriptPresentation: AgentTranscriptPresentationService? = nil,
-        portalDesktopSettings: PortalDesktopSettingsService? = nil
+        portalDesktopSettings: PortalDesktopSettingsService? = nil,
+        portalPeerCertificateDER: Data? = nil
     ) {
         self.authority = authority
         self.store = store
@@ -65,6 +67,7 @@ public struct RepoPromptHTTPService: Sendable {
         }
         self.transcriptPresentation = transcriptPresentation
         self.portalDesktopSettings = portalDesktopSettings ?? PortalDesktopSettingsService(store: store)
+        self.portalPeerCertificateDER = portalPeerCertificateDER
         self.readiness = readiness ?? RepoPromptReadinessService(
             authority: authority,
             store: store,
@@ -1241,10 +1244,23 @@ public struct RepoPromptHTTPService: Sendable {
     }
 
     private func authenticatePortal(context: RepoPromptRequestContext) async throws -> PortalAuthenticatedPrincipal {
-        guard let certificateRoleResolver,
-              let certificate = try await context.channel.nioSSL_peerCertificate().get()
-        else {
+        guard let certificateRoleResolver else {
             throw ServiceAPIError(code: .internalAuthFailed, message: "An authorized portal client certificate is required")
+        }
+        let certificate: NIOSSLCertificate
+        if let portalPeerCertificateDER {
+            certificate = try NIOSSLCertificate(bytes: [UInt8](portalPeerCertificateDER), format: .der)
+        } else {
+            let peer: NIOSSLCertificate?
+            do {
+                peer = try await context.channel.nioSSL_peerCertificate().get()
+            } catch {
+                peer = nil
+            }
+            guard let peer else {
+                throw ServiceAPIError(code: .internalAuthFailed, message: "An authorized portal client certificate is required")
+            }
+            certificate = peer
         }
         let role = try certificateRoleResolver.role(certificate: certificate)
         guard RepoPromptPortalCertificateAuthorization.allows(role) else {

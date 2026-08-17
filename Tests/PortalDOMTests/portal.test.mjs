@@ -3346,6 +3346,43 @@ test("switching sessions starts the new transcript request without waiting for a
   );
 });
 
+test("standalone operator surfaces use relative portal APIs without chat-server", async (t) => {
+  const harness = await createHarness({ hash: "#home" });
+  t.after(() => harness.close());
+  const { document, window, calls } = harness;
+
+  assert.match(document.body.textContent, /What are we building\?/);
+  assert.ok(document.getElementById("composer-form"));
+  assert.ok(document.getElementById("composer-text"));
+
+  window.location.hash = "#settings/advanced";
+  window.dispatchEvent(new window.HashChangeEvent("hashchange"));
+  await window.RepoPromptPortalTest.whenIdle();
+  await settle();
+  assert.equal(
+    document.getElementById("settings-detail-title").textContent,
+    "Advanced",
+  );
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /Prompt Packaging/,
+  );
+
+  assert.ok(calls.length > 0);
+  for (const call of calls) {
+    assert.match(call.path, /^api\/v1\//, call.path);
+    assert.doesNotMatch(call.path, /^https?:/i);
+    assert.doesNotMatch(call.path, /\/internal\//);
+    assert.doesNotMatch(call.path, /chat\.degentlemen/);
+    assert.equal(call.headers.Authorization, undefined);
+    assert.equal(call.headers["x-internal-signature"], undefined);
+    assert.equal(call.headers["X-Internal-Signature"], undefined);
+    if (["POST", "PUT", "PATCH", "DELETE"].includes(call.method)) {
+      assert.equal(call.headers["X-RepoPrompt-Portal-CSRF"], "1");
+    }
+  }
+});
+
 test("composer creates sessions and sends revision-checked follow-ups through portal APIs", async (t) => {
   const connectedProvider = providerFixture({
     connection: connectionFixture(),
