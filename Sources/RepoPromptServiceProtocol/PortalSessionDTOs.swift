@@ -33,6 +33,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
     public let revision: Int64
     public let runGeneration: Int64
     public let lastActivityAt: Date?
+    public let contextUsage: ContextUsageWireSnapshot?
 
     public init(
         sessionID: UUID,
@@ -45,7 +46,8 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         state: SessionLifecycleState,
         revision: Int64,
         runGeneration: Int64,
-        lastActivityAt: Date?
+        lastActivityAt: Date?,
+        contextUsage: ContextUsageWireSnapshot? = nil
     ) {
         self.sessionID = sessionID
         self.projectID = projectID
@@ -58,6 +60,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         self.revision = revision
         self.runGeneration = runGeneration
         self.lastActivityAt = lastActivityAt
+        self.contextUsage = contextUsage
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -66,7 +69,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         case parentSessionID = "parentSessionId"
         case title, provider
         case providerSettingsID = "providerSettingsId"
-        case model, state, revision, runGeneration, lastActivityAt
+        case model, state, revision, runGeneration, lastActivityAt, contextUsage
     }
 }
 

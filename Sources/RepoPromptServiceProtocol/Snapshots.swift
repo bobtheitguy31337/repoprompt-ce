@@ -204,6 +204,27 @@ public struct ProviderRunSnapshot: Codable, Hashable, Sendable {
     }
 }
 
+/// Desktop `AgentContextUsage` fields for the composer context-window meter.
+public struct ContextUsageWireSnapshot: Codable, Hashable, Sendable {
+    public let modelContextWindow: Int?
+    public let lastTotalTokens: Int?
+    public let totalTotalTokens: Int?
+
+    public init(modelContextWindow: Int? = nil, lastTotalTokens: Int? = nil, totalTotalTokens: Int? = nil) {
+        self.modelContextWindow = modelContextWindow
+        self.lastTotalTokens = lastTotalTokens
+        self.totalTotalTokens = totalTotalTokens
+    }
+
+    public func merging(onto existing: ContextUsageWireSnapshot?) -> ContextUsageWireSnapshot {
+        ContextUsageWireSnapshot(
+            modelContextWindow: modelContextWindow ?? existing?.modelContextWindow,
+            lastTotalTokens: lastTotalTokens ?? existing?.lastTotalTokens,
+            totalTotalTokens: totalTotalTokens ?? existing?.totalTotalTokens
+        )
+    }
+}
+
 public struct SessionSnapshot: Codable, Hashable, Sendable {
     public let schemaVersion: Int
     public let sessionID: UUID
@@ -225,8 +246,9 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
     public let effectiveTurnConfiguration: EffectiveTurnConfigurationWireSnapshot?
     public let nextTurnDefaults: SessionNextTurnDefaultsWireSnapshot?
     public let runPresentation: RunPresentationWireSnapshot?
+    public let contextUsage: ContextUsageWireSnapshot?
 
-    public init(sessionID: UUID, projectID: UUID, parentSessionID: UUID?, rootSessionID: UUID, creator: ExternalActor, provider: ProviderKind, providerSettingsID: ProviderSettingsID? = nil, model: String?, visibility: Visibility, state: SessionLifecycleState, runGeneration: Int64, turnEpoch: Int64, revision: Int64, transcript: [TranscriptEntry], interactions: [InteractionSnapshot], cursor: ServiceCursor, effectiveTurnConfiguration: EffectiveTurnConfigurationWireSnapshot? = nil, nextTurnDefaults: SessionNextTurnDefaultsWireSnapshot? = nil, runPresentation: RunPresentationWireSnapshot? = nil) {
+    public init(sessionID: UUID, projectID: UUID, parentSessionID: UUID?, rootSessionID: UUID, creator: ExternalActor, provider: ProviderKind, providerSettingsID: ProviderSettingsID? = nil, model: String?, visibility: Visibility, state: SessionLifecycleState, runGeneration: Int64, turnEpoch: Int64, revision: Int64, transcript: [TranscriptEntry], interactions: [InteractionSnapshot], cursor: ServiceCursor, effectiveTurnConfiguration: EffectiveTurnConfigurationWireSnapshot? = nil, nextTurnDefaults: SessionNextTurnDefaultsWireSnapshot? = nil, runPresentation: RunPresentationWireSnapshot? = nil, contextUsage: ContextUsageWireSnapshot? = nil) {
         schemaVersion = 1
         self.sessionID = sessionID
         self.projectID = projectID
@@ -247,6 +269,45 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
         self.effectiveTurnConfiguration = effectiveTurnConfiguration
         self.nextTurnDefaults = nextTurnDefaults
         self.runPresentation = runPresentation
+        self.contextUsage = contextUsage
+    }
+
+    public func replacing(
+        visibility: Visibility? = nil,
+        state: SessionLifecycleState? = nil,
+        runGeneration: Int64? = nil,
+        turnEpoch: Int64? = nil,
+        revision: Int64? = nil,
+        transcript: [TranscriptEntry]? = nil,
+        interactions: [InteractionSnapshot]? = nil,
+        cursor: ServiceCursor? = nil,
+        effectiveTurnConfiguration: EffectiveTurnConfigurationWireSnapshot? = nil,
+        nextTurnDefaults: SessionNextTurnDefaultsWireSnapshot? = nil,
+        runPresentation: RunPresentationWireSnapshot? = nil,
+        contextUsage: ContextUsageWireSnapshot? = nil
+    ) -> SessionSnapshot {
+        SessionSnapshot(
+            sessionID: sessionID,
+            projectID: projectID,
+            parentSessionID: parentSessionID,
+            rootSessionID: rootSessionID,
+            creator: creator,
+            provider: provider,
+            providerSettingsID: providerSettingsID,
+            model: model,
+            visibility: visibility ?? self.visibility,
+            state: state ?? self.state,
+            runGeneration: runGeneration ?? self.runGeneration,
+            turnEpoch: turnEpoch ?? self.turnEpoch,
+            revision: revision ?? self.revision,
+            transcript: transcript ?? self.transcript,
+            interactions: interactions ?? self.interactions,
+            cursor: cursor ?? self.cursor,
+            effectiveTurnConfiguration: effectiveTurnConfiguration ?? self.effectiveTurnConfiguration,
+            nextTurnDefaults: nextTurnDefaults ?? self.nextTurnDefaults,
+            runPresentation: runPresentation ?? self.runPresentation,
+            contextUsage: contextUsage ?? self.contextUsage
+        )
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -270,6 +331,7 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
         case effectiveTurnConfiguration
         case nextTurnDefaults
         case runPresentation
+        case contextUsage
     }
 }
 

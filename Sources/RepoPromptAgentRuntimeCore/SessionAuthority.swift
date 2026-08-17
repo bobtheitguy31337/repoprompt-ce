@@ -173,8 +173,19 @@ public actor SessionAuthority {
         return gate.binding
     }
 
+    public func applyContextUsage(_ usage: ContextUsageWireSnapshot) {
+        state.snapshot = state.snapshot.replacing(contextUsage: usage.merging(onto: state.snapshot.contextUsage))
+    }
+
     private func replaceSnapshot(state lifecycle: SessionLifecycleState? = nil, generation: Int64? = nil, epoch: Int64? = nil, transcript: [TranscriptEntry]? = nil, visibility: Visibility? = nil) {
         let current = state.snapshot
-        state.snapshot = SessionSnapshot(sessionID: current.sessionID, projectID: current.projectID, parentSessionID: current.parentSessionID, rootSessionID: current.rootSessionID, creator: current.creator, provider: current.provider, providerSettingsID: current.providerSettingsID, model: current.model, visibility: visibility ?? current.visibility, state: lifecycle ?? current.state, runGeneration: generation ?? current.runGeneration, turnEpoch: epoch ?? current.turnEpoch, revision: current.revision + 1, transcript: transcript ?? current.transcript, interactions: current.interactions, cursor: current.cursor)
+        state.snapshot = current.replacing(
+            visibility: visibility,
+            state: lifecycle,
+            runGeneration: generation,
+            turnEpoch: epoch,
+            revision: current.revision + 1,
+            transcript: transcript
+        )
     }
 }

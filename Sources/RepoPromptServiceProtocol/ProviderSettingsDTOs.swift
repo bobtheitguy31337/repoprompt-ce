@@ -11,6 +11,7 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
     case claudeCustom
     case openCodeACP
     case cursorACP
+    case grokBuildACP
     case openAIAPI
     case anthropicAPI
     case openRouter
@@ -34,6 +35,7 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
         case .claudeCompatible: .claudeCompatible
         case .openCodeACP: .openCodeACP
         case .cursorACP: .cursorACP
+        case .grokBuildACP: .grokBuildACP
         case .headlessAdapter, .mcp: nil
         }
     }
@@ -44,6 +46,7 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
         case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom: .claudeCompatible
         case .openCodeACP: .openCodeACP
         case .cursorACP: .cursorACP
+        case .grokBuildACP: .grokBuildACP
         case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
              .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
             .headlessAdapter
@@ -55,7 +58,7 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
     /// backend rows select launch configuration and credentials per session.
     public var ownsRuntimeAdmission: Bool {
         switch self {
-        case .codex, .claudeCompatible, .openCodeACP, .cursorACP: true
+        case .codex, .claudeCompatible, .openCodeACP, .cursorACP, .grokBuildACP: true
         case .claudeGLM, .claudeKimi, .claudeCustom,
              .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
              .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
@@ -125,7 +128,7 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
     /// `serverDefaultExecutionMode` must not replace that profile.
     public var hasTypedDirectAgentProfile: Bool {
         switch self {
-        case .codex, .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom, .openCodeACP, .cursorACP:
+        case .codex, .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom, .openCodeACP, .cursorACP, .grokBuildACP:
             true
         case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
              .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:

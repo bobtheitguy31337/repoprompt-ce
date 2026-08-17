@@ -38,7 +38,7 @@ public struct ExternalActor: Codable, Hashable, Sendable {
 }
 
 public enum Visibility: String, Codable, Sendable { case privateSession = "private", collaborative }
-public enum ProviderKind: String, Codable, CaseIterable, Sendable { case codex, claudeCompatible, openCodeACP, cursorACP, headlessAdapter, mcp }
+public enum ProviderKind: String, Codable, CaseIterable, Sendable { case codex, claudeCompatible, openCodeACP, cursorACP, grokBuildACP, headlessAdapter, mcp }
 public enum SessionLifecycleState: String, Codable, Sendable { case preparing, idle, running, waiting, completed, failed, canceled, interrupted, archived }
 public enum ProjectLifecycleState: String, Codable, Sendable { case active, degraded, archived }
 

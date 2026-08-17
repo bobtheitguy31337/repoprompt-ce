@@ -370,24 +370,7 @@ public actor SQLiteServiceStore {
         try await transaction {
             guard let base = try await session(id: id) else { return nil }
             let currentInteractions = try await interactions(sessionID: id)
-            return SessionSnapshot(
-                sessionID: base.sessionID,
-                projectID: base.projectID,
-                parentSessionID: base.parentSessionID,
-                rootSessionID: base.rootSessionID,
-                creator: base.creator,
-                provider: base.provider,
-                providerSettingsID: base.providerSettingsID,
-                model: base.model,
-                visibility: base.visibility,
-                state: base.state,
-                runGeneration: base.runGeneration,
-                turnEpoch: base.turnEpoch,
-                revision: base.revision,
-                transcript: base.transcript,
-                interactions: currentInteractions,
-                cursor: base.cursor
-            )
+            return base.replacing(interactions: currentInteractions)
         }
     }
 
@@ -405,24 +388,7 @@ public actor SQLiteServiceStore {
             var result: [SessionSnapshot] = []
             for base in sessions {
                 let currentInteractions = try await interactions(sessionID: base.sessionID)
-                result.append(SessionSnapshot(
-                    sessionID: base.sessionID,
-                    projectID: base.projectID,
-                    parentSessionID: base.parentSessionID,
-                    rootSessionID: base.rootSessionID,
-                    creator: base.creator,
-                    provider: base.provider,
-                    providerSettingsID: base.providerSettingsID,
-                    model: base.model,
-                    visibility: base.visibility,
-                    state: base.state,
-                    runGeneration: base.runGeneration,
-                    turnEpoch: base.turnEpoch,
-                    revision: base.revision,
-                    transcript: base.transcript,
-                    interactions: currentInteractions,
-                    cursor: base.cursor
-                ))
+                result.append(base.replacing(interactions: currentInteractions))
             }
             return result
         }
@@ -580,6 +546,20 @@ public actor SQLiteServiceStore {
                 actor: actor,
                 correlationID: correlationID,
                 payload: encoder.encode(snapshot)
+            )
+        }
+    }
+
+    /// Writes the composer context-window meter without bumping session revision
+    /// or emitting a transcript event. Desktop updates this in memory on every
+    /// usage frame; Linux persists the same fields so the portal ring can poll.
+    public func upsertContextUsage(_ usage: ContextUsageWireSnapshot, sessionID: UUID) async throws {
+        try await transaction {
+            guard let base = try await session(id: sessionID) else { return }
+            let next = base.replacing(contextUsage: usage.merging(onto: base.contextUsage))
+            _ = try await connection.query(
+                "UPDATE sessions SET snapshot_json=?, updated_at=CURRENT_TIMESTAMP WHERE session_id=?",
+                [.text(try encodeText(next)), .text(sessionID.uuidString)]
             )
         }
     }
@@ -1498,6 +1478,7 @@ public actor SQLiteServiceStore {
         case .claudeCustom: [.apiKey, .authToken]
         case .cursorACP: [.apiKey, .browserLogin]
         case .openCodeACP: [.providerSpecific]
+        case .grokBuildACP: [.apiKey, .providerSpecific]
         case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
              .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI:
             [.apiKey]
@@ -1931,7 +1912,7 @@ public actor SQLiteServiceStore {
     }
 
     private func replacingCursor(_ value: SessionSnapshot, cursor: ServiceCursor) -> SessionSnapshot {
-        SessionSnapshot(sessionID: value.sessionID, projectID: value.projectID, parentSessionID: value.parentSessionID, rootSessionID: value.rootSessionID, creator: value.creator, provider: value.provider, providerSettingsID: value.providerSettingsID, model: value.model, visibility: value.visibility, state: value.state, runGeneration: value.runGeneration, turnEpoch: value.turnEpoch, revision: value.revision, transcript: value.transcript, interactions: value.interactions, cursor: cursor)
+        value.replacing(cursor: cursor)
     }
 }
 

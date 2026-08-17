@@ -3,9 +3,67 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 @testable import RepoPromptMCP
+import RepoPromptShared
 import XCTest
 
 final class DirectHeadlessCompositionTests: XCTestCase {
+    func testHeadlessAgentManageSchemaAdvertisesListWorkflows() throws {
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "agent_manage"))
+        let encoded = try JSONEncoder().encode(definition.inputSchema)
+        let schema = try XCTUnwrap(String(data: encoded, encoding: .utf8))
+        XCTAssertTrue(schema.contains("\"list_workflows\""), schema)
+    }
+
+    func testHeadlessWorkflowSelectionAppliesCanonicalPromptAndRejectsInvalidReferences() throws {
+        let message = "Implement the bounded change."
+        XCTAssertEqual(
+            try RepoPromptBuiltInAgentWorkflow.resolve(workflowID: nil, workflowName: nil)?.wrapUserText(message) ?? message,
+            message
+        )
+
+        for workflow in RepoPromptBuiltInAgentWorkflow.allCases {
+            let expected = workflow.wrapUserText(message)
+            XCTAssertEqual(
+                try RepoPromptBuiltInAgentWorkflow.resolve(workflowID: workflow.rawValue, workflowName: nil)?.wrapUserText(message),
+                expected
+            )
+            XCTAssertEqual(
+                try RepoPromptBuiltInAgentWorkflow.resolve(
+                    workflowID: "builtin-\(workflow.rawValue)",
+                    workflowName: nil
+                )?.wrapUserText(message),
+                expected
+            )
+            XCTAssertEqual(
+                try RepoPromptBuiltInAgentWorkflow.resolve(
+                    workflowID: nil,
+                    workflowName: workflow.metadata.displayName
+                )?.wrapUserText(message),
+                expected
+            )
+        }
+
+        XCTAssertThrowsError(
+            try RepoPromptBuiltInAgentWorkflow.resolve(
+                workflowID: "build",
+                workflowName: "Plan & Build"
+            )
+        ) { error in
+            XCTAssertEqual(error as? RepoPromptBuiltInAgentWorkflow.ResolutionError, .conflictingReferences)
+        }
+        XCTAssertThrowsError(
+            try RepoPromptBuiltInAgentWorkflow.resolve(
+                workflowID: nil,
+                workflowName: "missing-workflow"
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? RepoPromptBuiltInAgentWorkflow.ResolutionError,
+                .unknownReference("missing-workflow")
+            )
+        }
+    }
+
     func testManageWorktreeFencesAbsoluteSelectorsToBoundWorkspaceRoots() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("rp-headless-worktree-fence-\(UUID().uuidString)", isDirectory: true)

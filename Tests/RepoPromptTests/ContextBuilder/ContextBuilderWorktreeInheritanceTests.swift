@@ -1029,10 +1029,20 @@ import XCTest
                         files: ["Sources/Selected.swift": "let ce = 1\n"]
                     )
                     let ceFile = ceRoot.appendingPathComponent("Sources/Selected.swift")
-                    try await fixture.contextA.window.workspaceManager.addFolder(
-                        ceRoot,
-                        to: XCTUnwrap(fixture.contextA.window.workspaceManager.activeWorkspace)
+                    let workspaceManager = fixture.contextA.window.workspaceManager
+                    let workspaceIndex = try XCTUnwrap(
+                        workspaceManager.workspaces.firstIndex { $0.id == fixture.contextA.workspaceID }
                     )
+                    workspaceManager.workspaces[workspaceIndex].repoPaths.append(ceRoot.path)
+                    let ceRootRecord = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                        in: fixture.contextA.window,
+                        path: ceRoot.path
+                    )
+                    defer {
+                        Task {
+                            await fixture.contextA.window.workspaceFileContextStore.unloadRoot(id: ceRootRecord.id)
+                        }
+                    }
                     let orderedRepoPaths = try XCTUnwrap(
                         fixture.contextA.window.workspaceManager.activeWorkspace
                     ).repoPaths.map { ($0 as NSString).standardizingPath }
@@ -1889,8 +1899,12 @@ import XCTest
                 ))
                 let settings = GlobalSettingsStore.shared
                 let previousPresetSetting = settings.mcpShowModelPresets()
+                let previousBehaviorSettings = settings.contextBuilderBehaviorSettings()
                 settings.setMCPShowModelPresets(false, commit: false)
-                defer { settings.setMCPShowModelPresets(previousPresetSetting, commit: false) }
+                defer {
+                    settings.setMCPShowModelPresets(previousPresetSetting, commit: false)
+                    settings.setContextBuilderBehaviorSettings(previousBehaviorSettings, commit: false)
+                }
 
                 do {
                     try await authorityRuntime.start()
@@ -1905,6 +1919,7 @@ import XCTest
                         "inactive-workspace-authority-\(fixture.contextB.workspaceID.uuidString)",
                         isDirectory: true
                     )
+                    sourceWorkspaceB.isEphemeral = false
                     sourceWorkspaceB.customStoragePath = authorityDirectory
                     let authorityURL = authorityDirectory.appendingPathComponent("workspace.json")
                     let authorityClient = DomainWorkspaceAuthorityClient(
@@ -1976,15 +1991,25 @@ import XCTest
                             ]
                         )
                     )
+                    let globalBehavior = ContextBuilderBehaviorSettings(
+                        contextTokenBudget: 43210,
+                        analysisTokenBudget: 54321,
+                        enhancementMode: .augment,
+                        questionTimeoutSeconds: 91,
+                        allowUIClarifyingQuestions: false,
+                        allowMCPClarifyingQuestions: true,
+                        followUpAnalysisEnabled: false
+                    )
+                    settings.setContextBuilderBehaviorSettings(globalBehavior, commit: false)
                     var settingsB = settings.chatSettings(for: fixture.contextB.workspaceID)
-                    settingsB.discoveryTokenBudget = 43210
-                    settingsB.discoveryPlanTokenBudget = 54321
-                    settingsB.discoveryAllowClarifyingQuestionsForMCP = true
-                    settingsB.discoveryQuestionTimeoutSeconds = 91
+                    settingsB.discoveryTokenBudget = 11111
+                    settingsB.discoveryPlanTokenBudget = 22222
+                    settingsB.discoveryQuestionTimeoutSeconds = 7
                     settings.updateChatSettings(settingsB, commit: false)
                     var settingsA = settings.chatSettings(for: fixture.contextA.workspaceID)
-                    settingsA.discoveryAllowClarifyingQuestionsForMCP = true
-                    settingsA.discoveryQuestionTimeoutSeconds = 7
+                    settingsA.discoveryTokenBudget = 33333
+                    settingsA.discoveryPlanTokenBudget = 44444
+                    settingsA.discoveryQuestionTimeoutSeconds = 5
                     settings.updateChatSettings(settingsA, commit: false)
                     _ = await window.selectionCoordinator.persistSelection(
                         StoredSelection(
@@ -2042,7 +2067,7 @@ import XCTest
                         agent: viewModel.selectedAgent,
                         model: viewModel.selectedModelRaw,
                         instructions: viewModel.contextBuilderInstructions,
-                        tokenBudget: viewModel.tokenBudget,
+                        tokenBudget: viewModel.contextTokenBudget,
                         log: viewModel.agentLog.map(\.message),
                         busy: viewModel.isAgentBusy,
                         controlled: viewModel.isMCPControlledRun
@@ -2119,7 +2144,7 @@ import XCTest
                             agent: viewModel.selectedAgent,
                             model: viewModel.selectedModelRaw,
                             instructions: viewModel.contextBuilderInstructions,
-                            tokenBudget: viewModel.tokenBudget,
+                            tokenBudget: viewModel.contextTokenBudget,
                             log: viewModel.agentLog.map(\.message),
                             busy: viewModel.isAgentBusy,
                             controlled: viewModel.isMCPControlledRun
@@ -2148,7 +2173,7 @@ import XCTest
                         XCTAssertEqual(viewModel.selectedAgent, visibleAfterSwitch.agent)
                         XCTAssertEqual(viewModel.selectedModelRaw, visibleAfterSwitch.model)
                         XCTAssertEqual(viewModel.contextBuilderInstructions, visibleAfterSwitch.instructions)
-                        XCTAssertEqual(viewModel.tokenBudget, visibleAfterSwitch.tokenBudget)
+                        XCTAssertEqual(viewModel.contextTokenBudget, visibleAfterSwitch.tokenBudget)
                         XCTAssertEqual(viewModel.agentLog.map(\.message), visibleAfterSwitch.log)
                         XCTAssertEqual(viewModel.isAgentBusy, visibleAfterSwitch.busy)
                         XCTAssertEqual(viewModel.isMCPControlledRun, visibleAfterSwitch.controlled)
@@ -2187,7 +2212,7 @@ import XCTest
                             XCTAssertEqual(viewModel.selectedModelRaw, visibleBefore.model)
                         }
                         XCTAssertEqual(viewModel.contextBuilderInstructions, visibleBefore.instructions)
-                        XCTAssertEqual(viewModel.tokenBudget, visibleBefore.tokenBudget)
+                        XCTAssertEqual(viewModel.contextTokenBudget, visibleBefore.tokenBudget)
                         XCTAssertEqual(viewModel.agentLog.map(\.message), visibleBefore.log)
                         XCTAssertEqual(viewModel.isAgentBusy, visibleBefore.busy)
                         XCTAssertEqual(viewModel.isMCPControlledRun, visibleBefore.controlled)

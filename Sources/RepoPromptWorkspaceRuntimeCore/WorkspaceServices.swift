@@ -271,6 +271,20 @@ public actor ProjectToolAuthority {
         guard hits.count < maximumResults else { return }
         let canonical = URL(fileURLWithPath: currentPath).resolvingSymlinksInPath().standardizedFileURL.path
         guard Self.isInside(canonical, root: rootPath), visited.insert(canonical).inserted else { return }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: currentPath, isDirectory: &isDirectory) else { return }
+        if !isDirectory.boolValue {
+            try appendSearchHits(
+                from: URL(fileURLWithPath: currentPath),
+                request: request,
+                rootPath: rootPath,
+                maximumResults: maximumResults,
+                maximumFileBytes: maximumFileBytes,
+                expression: expression,
+                hits: &hits
+            )
+            return
+        }
         let urls = try FileManager.default.contentsOfDirectory(at: URL(fileURLWithPath: currentPath), includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey], options: [.skipsHiddenFiles])
         for url in urls.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
             guard hits.count < maximumResults else { return }
@@ -285,20 +299,44 @@ public actor ProjectToolAuthority {
                 try scanFiles(request: request, rootPath: rootPath, currentPath: resolvedURL.path, maximumResults: maximumResults, maximumFileBytes: maximumFileBytes, expression: expression, settings: settings, visited: &visited, hits: &hits)
                 continue
             }
-            guard resolvedValues.isRegularFile == true, (resolvedValues.fileSize ?? 0) <= maximumFileBytes else { continue }
-            let data = try Data(contentsOf: resolvedURL, options: [.mappedIfSafe])
-            guard let content = String(data: data, encoding: .utf8) else { continue }
-            for (offset, line) in content.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
-                let text = String(line)
-                let matched = if let expression {
-                    expression.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
-                } else {
-                    text.localizedCaseInsensitiveContains(request.query)
-                }
-                if matched {
-                    hits.append(ProjectSearchHit(rootID: request.rootID, logicalPath: relative, line: offset + 1, preview: String(text.prefix(1000))))
-                    if hits.count >= maximumResults { return }
-                }
+            guard resolvedValues.isRegularFile == true else { continue }
+            try appendSearchHits(
+                from: resolvedURL,
+                request: request,
+                rootPath: rootPath,
+                maximumResults: maximumResults,
+                maximumFileBytes: maximumFileBytes,
+                expression: expression,
+                hits: &hits
+            )
+        }
+    }
+
+    private func appendSearchHits(
+        from url: URL,
+        request: ProjectSearchRequest,
+        rootPath: String,
+        maximumResults: Int,
+        maximumFileBytes: Int,
+        expression: NSRegularExpression?,
+        hits: inout [ProjectSearchHit]
+    ) throws {
+        guard hits.count < maximumResults else { return }
+        let values = try url.resourceValues(forKeys: [.fileSizeKey])
+        guard (values.fileSize ?? 0) <= maximumFileBytes else { return }
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        guard let content = String(data: data, encoding: .utf8) else { return }
+        let relative = Self.relativePath(url.path, root: rootPath)
+        for (offset, line) in content.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+            let text = String(line)
+            let matched = if let expression {
+                expression.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+            } else {
+                text.localizedCaseInsensitiveContains(request.query)
+            }
+            if matched {
+                hits.append(ProjectSearchHit(rootID: request.rootID, logicalPath: relative, line: offset + 1, preview: String(text.prefix(1000))))
+                if hits.count >= maximumResults { return }
             }
         }
     }

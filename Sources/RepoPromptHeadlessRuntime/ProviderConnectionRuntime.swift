@@ -154,6 +154,7 @@ public actor VaultProviderProcessEnvironment: ProviderProcessEnvironmentProvidin
         case (.claudeCompatible, .apiKey): return ["ANTHROPIC_API_KEY": value]
         case (.claudeCompatible, .authToken): return ["ANTHROPIC_AUTH_TOKEN": value]
         case (.cursorACP, .apiKey): return ["CURSOR_API_KEY": value]
+        case (.grokBuildACP, .apiKey): return ["XAI_API_KEY": value]
         default:
             throw ServiceAPIError(code: .providerUnavailable, message: "Provider credential method is not runtime-wired")
         }
@@ -192,6 +193,7 @@ public actor VaultProviderProcessEnvironment: ProviderProcessEnvironmentProvidin
         case .claudeCompatible: .claudeCompatible
         case .openCodeACP: .openCodeACP
         case .cursorACP: .cursorACP
+        case .grokBuildACP: .grokBuildACP
         case .headlessAdapter, .mcp: nil
         }
     }
@@ -228,6 +230,8 @@ public actor ProviderAuthenticationAdapter: ProviderCredentialTesting {
                   let config = try? await backendSettings?.backendSettings(for: providerID)
             else { return [] }
             return [config.authHeader.authenticationMethod]
+        case .grokBuildACP:
+            return configuredKinds.contains(.grokBuildACP) ? Set([ProviderAuthenticationMethod.apiKey]) : []
         case .claudeCustom, .openCodeACP, .cursorACP,
              .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
              .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
@@ -259,6 +263,10 @@ public actor ProviderAuthenticationAdapter: ProviderCredentialTesting {
             request.setValue(value, forHTTPHeaderField: "x-api-key")
             request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
             acceptedDetail = "Anthropic credential validated"
+        case .grokBuildACP:
+            request = URLRequest(url: URL(string: "https://api.x.ai/v1/models")!)
+            request.setValue("Bearer \(value)", forHTTPHeaderField: "Authorization")
+            acceptedDetail = "Grok credential validated"
         case .claudeGLM, .claudeKimi:
             guard let config = try? await backendSettings?.backendSettings(for: providerID),
                   let host = URLComponents(string: config.baseURL)?.host?.lowercased(),

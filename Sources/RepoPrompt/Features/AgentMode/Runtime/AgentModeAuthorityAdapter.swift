@@ -401,6 +401,7 @@ final class AgentModeAuthorityAdapter {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible: .claudeCompatible
         case .openCode: .openCodeACP
         case .cursor: .cursorACP
+        case .grokBuild: .grokBuildACP
         }
     }
 

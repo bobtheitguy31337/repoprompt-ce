@@ -415,6 +415,34 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(events.events.count(where: { $0.eventType == .sessionCreated }), 2)
         try await store.close()
     }
+
+    func testContextUsageSurvivesInteractionRebuildAndSilentUpsert() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
+        let projectCursor = try await store.nextCursor()
+        let project = ProjectSnapshot(projectID: UUID(), name: "P", creator: actor, state: .active, roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)], revision: 1, cursor: projectCursor)
+        _ = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: nil)
+        let sessionCursor = try await store.nextCursor()
+        let sessionID = UUID()
+        let usage = ContextUsageWireSnapshot(modelContextWindow: 200_000, lastTotalTokens: 1_000, totalTotalTokens: 1_000)
+        let session = SessionSnapshot(sessionID: sessionID, projectID: project.projectID, parentSessionID: nil, rootSessionID: sessionID, creator: actor, provider: .codex, model: nil, visibility: .privateSession, state: .idle, runGeneration: 0, turnEpoch: 0, revision: 1, transcript: [], interactions: [], cursor: sessionCursor, contextUsage: usage)
+        _ = try await store.persistSession(session, eventType: .sessionCreated, actor: actor, correlationID: UUID(), idempotency: nil)
+
+        let rebuiltOptional = try await store.sessionWithInteractions(id: sessionID)
+        let rebuilt = try XCTUnwrap(rebuiltOptional)
+        XCTAssertEqual(rebuilt.revision, 1)
+        XCTAssertEqual(rebuilt.contextUsage?.lastTotalTokens, 1_000)
+        XCTAssertEqual(rebuilt.contextUsage?.modelContextWindow, 200_000)
+
+        try await store.upsertContextUsage(ContextUsageWireSnapshot(lastTotalTokens: 4_096, totalTotalTokens: 8_192), sessionID: sessionID)
+        let updatedOptional = try await store.sessionWithInteractions(id: sessionID)
+        let updated = try XCTUnwrap(updatedOptional)
+        XCTAssertEqual(updated.revision, 1)
+        XCTAssertEqual(updated.contextUsage?.lastTotalTokens, 4_096)
+        XCTAssertEqual(updated.contextUsage?.totalTotalTokens, 8_192)
+        XCTAssertEqual(updated.contextUsage?.modelContextWindow, 200_000)
+        try await store.close()
+    }
 }
 
 private actor TwoPartyIdempotencyPreflightBarrier {

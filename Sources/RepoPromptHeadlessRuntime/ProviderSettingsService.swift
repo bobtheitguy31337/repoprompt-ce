@@ -779,7 +779,7 @@ public actor ProviderSettingsService {
         case .keyHelper, .workloadIdentityFederation:
             throw ServiceAPIError(code: .capabilityMissing, message: "This authentication method is not runtime-wired")
         case .providerSpecific:
-            guard [.claudeCompatible, .openCodeACP].contains(providerID), request.credential == nil else {
+            guard [.claudeCompatible, .openCodeACP, .grokBuildACP].contains(providerID), request.credential == nil else {
                 throw ServiceAPIError(code: .invalidRequest, message: "CLI provider credentials are not proxied through the portal")
             }
             return nil
@@ -830,7 +830,7 @@ public actor ProviderSettingsService {
 
     private nonisolated static func externalAuthenticationMethod(for providerID: ProviderSettingsID) -> ProviderAuthenticationMethod? {
         switch providerID {
-        case .claudeCompatible, .openCodeACP: .providerSpecific
+        case .claudeCompatible, .openCodeACP, .grokBuildACP: .providerSpecific
         case .cursorACP: .browserLogin
         case .codex, .claudeGLM, .claudeKimi, .claudeCustom,
              .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
@@ -885,10 +885,15 @@ public actor ProviderSettingsService {
             }
         }
 
-        if providerID == .openCodeACP || providerID == .cursorACP {
+        if providerID == .openCodeACP || providerID == .cursorACP || providerID == .grokBuildACP {
             let capability = await adapter.preflight(kind: kind)
             let valid = capability.enabled && capability.reasonUnavailable == nil
-            let name = providerID == .openCodeACP ? "OpenCode" : "Cursor"
+            let name: String = switch providerID {
+            case .openCodeACP: "OpenCode"
+            case .cursorACP: "Cursor"
+            case .grokBuildACP: "Grok Build"
+            default: "ACP"
+            }
             return .init(
                 valid: valid,
                 detail: valid
@@ -1353,6 +1358,8 @@ public actor ProviderSettingsService {
             return Definition(displayName: "OpenCode", category: .cliProvider, summary: "Provider-specific ACP catalog and authentication", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
         case .cursorACP:
             return Definition(displayName: "Cursor", category: .cliProvider, summary: "Cursor ACP with externally provisioned authentication", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+        case .grokBuildACP:
+            return Definition(displayName: "Grok Build", category: .cliProvider, summary: "Grok Build ACP (`grok agent stdio`) with grok login home or XAI_API_KEY", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
         case .openAIAPI:
             return Definition(displayName: "OpenAI API", category: .apiProvider, summary: "Direct fixed-host OpenAI HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: true, authenticationMethods: [], authFlows: []))
         case .anthropicAPI:
@@ -1386,6 +1393,7 @@ public actor ProviderSettingsService {
         case .claudeCompatible: .claudeCompatible
         case .openCodeACP: .openCodeACP
         case .cursorACP: .cursorACP
+        case .grokBuildACP: .grokBuildACP
         case .headlessAdapter, .mcp: nil
         }
     }

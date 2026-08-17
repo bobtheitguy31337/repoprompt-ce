@@ -225,17 +225,20 @@ public struct DirectAgentPermissionsSettings: Codable, Hashable, Sendable {
     public var claude: DirectClaudeAgentPermissions
     public var openCode: DirectManagedAgentPermissions
     public var cursor: DirectManagedAgentPermissions
+    public var grokBuild: DirectManagedAgentPermissions
 
     public init(
         codex: DirectCodexAgentPermissions = .init(),
         claude: DirectClaudeAgentPermissions = .init(),
         openCode: DirectManagedAgentPermissions = .init(),
-        cursor: DirectManagedAgentPermissions = .init()
+        cursor: DirectManagedAgentPermissions = .init(),
+        grokBuild: DirectManagedAgentPermissions = .init()
     ) {
         self.codex = codex
         self.claude = claude
         self.openCode = openCode
         self.cursor = cursor
+        self.grokBuild = grokBuild
     }
 
     public init(from decoder: Decoder) throws {
@@ -244,6 +247,7 @@ public struct DirectAgentPermissionsSettings: Codable, Hashable, Sendable {
         claude = try container.decodeIfPresent(DirectClaudeAgentPermissions.self, forKey: .claude) ?? .init()
         openCode = try container.decodeIfPresent(DirectManagedAgentPermissions.self, forKey: .openCode) ?? .init()
         cursor = try container.decodeIfPresent(DirectManagedAgentPermissions.self, forKey: .cursor) ?? .init()
+        grokBuild = try container.decodeIfPresent(DirectManagedAgentPermissions.self, forKey: .grokBuild) ?? .init()
     }
 
     public static let `default` = DirectAgentPermissionsSettings()
@@ -267,6 +271,11 @@ public struct DirectAgentPermissionsSettings: Codable, Hashable, Sendable {
             ),
             cursor: .init(
                 permissionLevel: values[PortalDesktopSettingKey.cursorPermissionLevel.rawValue] == "fullAccess"
+                    ? .fullAccess
+                    : .managedDefault
+            ),
+            grokBuild: .init(
+                permissionLevel: values[PortalDesktopSettingKey.grokBuildPermissionLevel.rawValue] == "fullAccess"
                     ? .fullAccess
                     : .managedDefault
             )
@@ -309,6 +318,11 @@ public struct DirectAgentPermissionsSettings: Codable, Hashable, Sendable {
             return .init(
                 mode: cursor.permissionLevel == .fullAccess ? "fullAccess" : "workspaceWrite",
                 providerSettings: ["provider.permissionId": "cursor.\(cursor.permissionLevel.rawValue)"]
+            )
+        case .grokBuildACP:
+            return .init(
+                mode: grokBuild.permissionLevel == .fullAccess ? "fullAccess" : "workspaceWrite",
+                providerSettings: ["provider.permissionId": "grok.\(grokBuild.permissionLevel.rawValue)"]
             )
         case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
              .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:

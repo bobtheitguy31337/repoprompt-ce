@@ -360,7 +360,7 @@ final class AgentComposerCatalogTests: XCTestCase {
     }
 
     func testProviderMatrixAndDiscoveryPoliciesAreExact() throws {
-        XCTAssertEqual(AgentComposerProviderMatrix.entries.map(\.providerID), [.codex, .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom, .openCodeACP, .cursorACP, .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama])
+        XCTAssertEqual(AgentComposerProviderMatrix.entries.map(\.providerID), [.codex, .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom, .openCodeACP, .cursorACP, .grokBuildACP, .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama])
         XCTAssertEqual(AgentComposerProviderMatrix.liveFreshnessSeconds, 900)
         XCTAssertEqual(AgentComposerProviderMatrix.persistedFallbackMaximumAgeSeconds, 86_400)
 
@@ -583,6 +583,27 @@ final class AgentComposerCatalogTests: XCTestCase {
             XCTAssertThrowsError(try adapter.compile(.init(providerID: providerID, model: mismatched)))
         }
     }
+
+    func testGrokBuildAdapterPassesDesktopSessionSetModelEffort() throws {
+        let adapter = try XCTUnwrap(ProviderTurnConfigurationAdapters.builtIn()[.grokBuildACP])
+        let model = ProviderModelDescriptor(
+            providerID: .grokBuildACP,
+            modelID: "grok-code",
+            providerRawValue: "grok-code",
+            displayName: "Grok Code",
+            supportedEffortIDs: ["low", "high"],
+            defaultEffortID: "low"
+        )
+        let compiled = try adapter.compile(.init(providerID: .grokBuildACP, model: model, effortID: "high", permissionID: "grok.managedDefault"))
+        XCTAssertEqual(compiled.runtimeKind, .grokBuildACP)
+        XCTAssertEqual(compiled.executionPolicy.mode, .workspaceWrite)
+        XCTAssertEqual(compiled.executionPolicy.providerSettings["provider.permissionId"], "grok.managedDefault")
+        XCTAssertEqual(compiled.executionPolicy.providerSettings["provider.reasoningEffort"], "high")
+        XCTAssertThrowsError(try adapter.compile(.init(providerID: .grokBuildACP, model: model, effortID: "not-in-catalog")))
+        let fullAccess = try adapter.compile(.init(providerID: .grokBuildACP, model: model, permissionID: "grok.fullAccess"))
+        XCTAssertEqual(fullAccess.executionPolicy.mode, .fullAccess)
+        XCTAssertEqual(fullAccess.executionPolicy.providerSettings["provider.reasoningEffort"], "low")
+    }
 }
 
 final class AgentComposerWireContractTests: XCTestCase {
@@ -619,6 +640,15 @@ final class AgentComposerWireContractTests: XCTestCase {
         XCTAssertNil(legacyDecoded.effectiveTurnConfiguration)
         XCTAssertNil(legacyDecoded.nextTurnDefaults)
         XCTAssertNil(legacyDecoded.runPresentation)
+        XCTAssertNil(legacyDecoded.contextUsage)
+
+        let usage = ContextUsageWireSnapshot(modelContextWindow: 200_000, lastTotalTokens: 12_345, totalTotalTokens: 12_345)
+        let withUsage = SessionSnapshot(sessionID: sessionID, projectID: projectID, parentSessionID: nil, rootSessionID: sessionID, creator: actor, provider: .codex, model: nil, visibility: .privateSession, state: .running, runGeneration: 1, turnEpoch: 1, revision: 2, transcript: [], interactions: [], cursor: .init(storeID: UUID(), globalSequence: 2), contextUsage: usage)
+        let decodedUsage = try JSONDecoder.serviceDecoder.decode(SessionSnapshot.self, from: JSONEncoder.serviceEncoder.encode(withUsage))
+        XCTAssertEqual(decodedUsage.contextUsage?.modelContextWindow, 200_000)
+        XCTAssertEqual(decodedUsage.contextUsage?.lastTotalTokens, 12_345)
+        let reconstructed = decodedUsage.replacing(interactions: [])
+        XCTAssertEqual(reconstructed.contextUsage?.lastTotalTokens, 12_345)
     }
 }
 
@@ -1387,6 +1417,20 @@ final class NativeProviderRuntimeLifecycleTests: XCTestCase {
         let idle = try CodexAppServerProviderRuntime.normalize(Data(#"{"method":"thread/status/changed","params":{"status":{"type":"idle"}}}"#.utf8))
         XCTAssertTrue(idle.events.isEmpty)
         XCTAssertTrue(idle.completed)
+    }
+
+    func testCodexTokenUsageUpdatedProjectsDesktopContextMeter() throws {
+        let normalized = try CodexAppServerProviderRuntime.normalize(Data(#"{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"modelContextWindow":272000,"last":{"totalTokens":4096},"total":{"totalTokens":8192}}}}"#.utf8))
+        XCTAssertFalse(normalized.completed)
+        guard case let .contextUsage(usage) = normalized.events.first else {
+            return XCTFail("Codex tokenUsage must become the composer context meter")
+        }
+        XCTAssertEqual(usage.modelContextWindow, 272_000)
+        XCTAssertEqual(usage.lastTotalTokens, 4096)
+        XCTAssertEqual(usage.totalTotalTokens, 8192)
+
+        let empty = try CodexAppServerProviderRuntime.normalize(Data(#"{"method":"thread/tokenUsage/updated","params":{}}"#.utf8))
+        XCTAssertTrue(empty.events.isEmpty)
     }
 
     func testReconnectReadsEveryDurablePhaseAndTerminalSettlement() async throws {

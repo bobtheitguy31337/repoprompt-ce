@@ -136,6 +136,14 @@ public enum AgentComposerProviderMatrix {
             discoveryPolicy: .init(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: true, discoveryReplacesStaticChoices: false)
         ),
         .init(
+            providerID: .grokBuildACP,
+            displayName: "Grok Build",
+            runtimeKind: .grokBuildACP,
+            modelSource: "provider-base-model-variant-discovery,bounded-approved-fallback",
+            failurePolicy: "omit-without-fresh-permitted-source;preserve-selected-unavailable",
+            discoveryPolicy: .init(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: true, discoveryReplacesStaticChoices: true)
+        ),
+        .init(
             providerID: .openAIAPI,
             displayName: "OpenAI API",
             runtimeKind: .headlessAdapter,

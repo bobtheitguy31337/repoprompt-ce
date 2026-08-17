@@ -68,6 +68,44 @@ final class HeadlessPresentationParityTests: XCTestCase {
         XCTAssertEqual(kind, .approval)
         XCTAssertEqual(prompt, "Run tests")
         XCTAssertEqual(choices, ["allow-once"])
+
+        let usage = try HeadlessACPSessionUpdateNormalizer.normalize(
+            Data(#"{"method":"session/update","params":{"update":{"sessionUpdate":"usage_update","used":1234,"size":200000}}}"#.utf8)
+        )
+        guard case let .contextUsage(snapshot) = usage.first else {
+            return XCTFail("ACP usage_update must become the composer context meter")
+        }
+        XCTAssertEqual(snapshot.lastTotalTokens, 1234)
+        XCTAssertEqual(snapshot.totalTotalTokens, 1234)
+        XCTAssertEqual(snapshot.modelContextWindow, 200_000)
+
+        let ignored = try HeadlessACPSessionUpdateNormalizer.normalize(
+            Data(#"{"method":"session/update","params":{"update":{"sessionUpdate":"usage_update"}}}"#.utf8)
+        )
+        XCTAssertTrue(ignored.isEmpty)
+    }
+
+    func testACPPromptResultUsageMatchesDesktopGrokMetaUsage() {
+        let grok = HeadlessACPSessionUpdateNormalizer.contextUsageFromPromptResult([
+            "_meta": [
+                "usage": [
+                    "inputTokens": 800,
+                    "outputTokens": 40,
+                    "cachedReadTokens": 200,
+                    "cachedWriteTokens": 16
+                ]
+            ]
+        ])
+        XCTAssertEqual(grok?.lastTotalTokens, 1016)
+        XCTAssertEqual(grok?.totalTotalTokens, 1016)
+        XCTAssertNil(grok?.modelContextWindow)
+
+        let standard = HeadlessACPSessionUpdateNormalizer.contextUsageFromPromptResult([
+            "usage": ["inputTokens": 10, "cachedReadTokens": 5, "cachedWriteTokens": 1]
+        ])
+        XCTAssertEqual(standard?.lastTotalTokens, 16)
+
+        XCTAssertNil(HeadlessACPSessionUpdateNormalizer.contextUsageFromPromptResult(["stopReason": "end_turn"]))
     }
 
     func testPreservedReasoningTitleIsNotReplacedByToolName() {

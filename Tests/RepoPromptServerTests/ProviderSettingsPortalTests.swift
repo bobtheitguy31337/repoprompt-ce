@@ -123,7 +123,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
             PortalDesktopSettingKey.serverDefaultExecutionMode.rawValue: "readOnly"
         ]))
 
-        for providerID in [ProviderSettingsID.codex, .claudeCompatible, .openCodeACP, .cursorACP] {
+        for providerID in [ProviderSettingsID.codex, .claudeCompatible, .openCodeACP, .cursorACP, .grokBuildACP] {
             let defaults = try await service.runtimeDefaults(for: providerID)
             XCTAssertEqual(defaults.mode, "workspaceWrite", providerID.rawValue)
             XCTAssertTrue(providerID.hasTypedDirectAgentProfile)

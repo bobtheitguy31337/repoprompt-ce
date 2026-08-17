@@ -92,7 +92,7 @@ public enum ProviderComposerStableControls {
                     lockReasonCode: lockReasonCode
                 )
             ]
-        case .openCodeACP, .cursorACP,
+        case .openCodeACP, .cursorACP, .grokBuildACP,
              .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
              .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
             []
@@ -126,6 +126,11 @@ public enum ProviderComposerStableControls {
             return .init(id: "cursor.permission", selectedID: selectedID ?? "cursor.managedDefault", choices: [
                 .init(id: "cursor.managedDefault", displayName: "Require Approval", detailText: "Cursor asks before running tools that need approval. RepoPrompt MCP is injected through the ACP session."),
                 .init(id: "cursor.fullAccess", displayName: "Full Access", warning: true)
+            ], mutable: mutable, lockReasonCode: lockReasonCode)
+        case .grokBuildACP:
+            return .init(id: "grok.permission", selectedID: selectedID ?? "grok.managedDefault", choices: [
+                .init(id: "grok.managedDefault", displayName: "Require Approval", detailText: "Grok Build asks before running tools that need approval."),
+                .init(id: "grok.fullAccess", displayName: "Full Access", warning: true)
             ], mutable: mutable, lockReasonCode: lockReasonCode)
         case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
              .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
@@ -289,19 +294,51 @@ public struct TextOnlyACPTurnConfigurationAdapter: ProviderTurnConfigurationAdap
     public let supportedPermissionIDs: Set<String>
 
     public init(providerID: ProviderSettingsID) {
-        precondition([.openCodeACP, .cursorACP].contains(providerID))
+        precondition([.openCodeACP, .cursorACP, .grokBuildACP].contains(providerID))
         self.providerID = providerID
-        supportedPermissionIDs = providerID == .openCodeACP ? ["opencode.managedDefault", "opencode.fullAccess"] : ["cursor.managedDefault", "cursor.fullAccess"]
+        supportedPermissionIDs = switch providerID {
+        case .openCodeACP: ["opencode.managedDefault", "opencode.fullAccess"]
+        case .cursorACP: ["cursor.managedDefault", "cursor.fullAccess"]
+        case .grokBuildACP: ["grok.managedDefault", "grok.fullAccess"]
+        default: []
+        }
     }
 
     public func compile(_ input: ProviderTurnConfigurationInput) throws -> CompiledProviderTurnConfiguration {
         guard input.providerID == providerID, input.model.providerID == providerID, input.toolValues.isEmpty else {
             throw ServiceAPIError(code: .invalidRequest, message: "ACP turn configuration is invalid")
         }
-        let permission = input.permissionID ?? (providerID == .openCodeACP ? "opencode.managedDefault" : "cursor.managedDefault")
+        let defaultPermission: String = switch providerID {
+        case .openCodeACP: "opencode.managedDefault"
+        case .cursorACP: "cursor.managedDefault"
+        case .grokBuildACP: "grok.managedDefault"
+        default: ""
+        }
+        let permission = input.permissionID ?? defaultPermission
         guard supportedPermissionIDs.contains(permission) else { throw ServiceAPIError(code: .invalidRequest, message: "ACP permission is invalid") }
-        let runtimeKind: ProviderKind = providerID == .openCodeACP ? .openCodeACP : .cursorACP
-        return .init(runtimeKind: runtimeKind, providerRawModelValue: input.model.providerRawValue, executionPolicy: .init(mode: permission.hasSuffix("fullAccess") ? .fullAccess : .workspaceWrite, providerSettings: ["provider.permissionId": permission]), supportsNativeImages: false, normalizedToolValues: [:])
+        guard let runtimeKind = providerID.runtimeKind else {
+            throw ServiceAPIError(code: .invalidRequest, message: "ACP runtime kind is invalid")
+        }
+        var settings = ["provider.permissionId": permission]
+        if providerID == .grokBuildACP {
+            let effort = input.effortID ?? input.model.defaultEffortID
+            if let effort {
+                if !input.model.supportedEffortIDs.isEmpty, !input.model.supportedEffortIDs.contains(effort) {
+                    throw ServiceAPIError(code: .invalidRequest, message: "Grok Build effort is not supported by the selected model")
+                }
+                settings["provider.reasoningEffort"] = effort
+            }
+        }
+        return .init(
+            runtimeKind: runtimeKind,
+            providerRawModelValue: input.model.providerRawValue,
+            executionPolicy: .init(
+                mode: permission.hasSuffix("fullAccess") ? .fullAccess : .workspaceWrite,
+                providerSettings: settings
+            ),
+            supportsNativeImages: false,
+            normalizedToolValues: [:]
+        )
     }
 }
 
@@ -354,6 +391,7 @@ public enum ProviderTurnConfigurationAdapters {
             .claudeCustom: ClaudeCompatibleTurnConfigurationAdapter(providerID: .claudeCustom),
             .openCodeACP: TextOnlyACPTurnConfigurationAdapter(providerID: .openCodeACP),
             .cursorACP: TextOnlyACPTurnConfigurationAdapter(providerID: .cursorACP),
+            .grokBuildACP: TextOnlyACPTurnConfigurationAdapter(providerID: .grokBuildACP),
             .openAIAPI: DirectAPITurnConfigurationAdapter(providerID: .openAIAPI),
             .anthropicAPI: DirectAPITurnConfigurationAdapter(providerID: .anthropicAPI),
             .openRouter: DirectAPITurnConfigurationAdapter(providerID: .openRouter),

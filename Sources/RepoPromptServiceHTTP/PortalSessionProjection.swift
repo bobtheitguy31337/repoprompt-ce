@@ -40,7 +40,8 @@ enum RepoPromptPortalSessionProjection {
             state: session.state,
             revision: session.revision,
             runGeneration: session.runGeneration,
-            lastActivityAt: session.transcript.last?.timestamp
+            lastActivityAt: session.transcript.last?.timestamp,
+            contextUsage: session.contextUsage
         )
     }
 

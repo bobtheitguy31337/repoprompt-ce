@@ -318,6 +318,25 @@ function providerCatalog() {
       },
     }),
     providerFixture({
+      providerID: "grokBuildACP",
+      displayName: "Grok Build",
+      authenticationMethods: ["providerSpecific", "apiKey"],
+      authFlows: [
+        {
+          kind: "externalProvisioning",
+          displayName: "Server credential provisioning",
+          startable: false,
+          detail: "Complete authentication in the isolated account.",
+        },
+      ],
+      models: [],
+      preference: {
+        defaultModel: null,
+        reasoningEffort: null,
+        serviceTier: null,
+      },
+    }),
+    providerFixture({
       providerID: "xAI",
       displayName: "xAI",
       category: "apiProvider",
@@ -397,6 +416,7 @@ function desktopSettingsFixture(overrides = {}) {
       claudeCustomOpusModel: "",
       openCodePermissionLevel: "managedDefault",
       cursorPermissionLevel: "managedDefault",
+      grokBuildPermissionLevel: "managedDefault",
       subagentPolicy: "safeManaged",
       subagentCodexPermissionLevel: "autoReview",
       subagentClaudePermissionLevel: "requireApproval",
@@ -732,6 +752,14 @@ async function createHarness({
     if (handler) {
       const handled = await handler(call, context);
       if (handled) return handled;
+    }
+    if (call.path === "api/v1/auth/status") {
+      return jsonResponse({
+        needsSetup: false,
+        authenticated: true,
+        username: "operator",
+        passwordLoginEnabled: true,
+      });
     }
     if (call.path === "api/v1/bootstrap") {
       return jsonResponse(context.bootstrap);
@@ -1257,7 +1285,7 @@ test("unconfigured Claude Code, OpenCode, and Cursor use one mounted-account Con
   t.after(() => harness.close());
   const { calls, document, window } = harness;
 
-  for (const providerID of ["claudeCompatible", "openCodeACP", "cursorACP"]) {
+  for (const providerID of ["claudeCompatible", "openCodeACP", "cursorACP", "grokBuildACP"]) {
     const card = document.querySelector(`[data-provider-id="${providerID}"]`);
     card.open = true;
     const connectButtons = [...card.querySelectorAll("button")].filter(
@@ -3671,4 +3699,57 @@ test("portal assets retain security, API, loading, and no-placeholder contracts"
   assert.equal(scriptSource.includes('api("/portal/'), false);
   assert.ok(htmlSource.includes('href="assets/portal.css"'));
   assert.ok(htmlSource.includes('src="assets/portal.js"'));
+});
+
+test("composer context ring matches Desktop fill percent, colors, and tooltip", async (t) => {
+  const session = sessionFixture({
+    contextUsage: {
+      modelContextWindow: 200000,
+      lastTotalTokens: 160000,
+      totalTotalTokens: 160000,
+    },
+  });
+  const harness = await createHarness({
+    hash: "#home",
+    bootstrap: bootstrapFixture({ sessions: [session] }),
+    handler(call) {
+      if (call.path.includes(`/sessions/${sessionOneID}/transcript`)) {
+        return jsonResponse(transcriptPageFixture(session));
+      }
+      return null;
+    },
+  });
+  t.after(() => harness.close());
+  const { document, window } = harness;
+  await window.RepoPromptPortalTest.whenIdle();
+  await settle();
+
+  const host = document.getElementById("composer-context-usage");
+  const ring = document.getElementById("composer-context-usage-ring");
+  assert.equal(host.hidden, false);
+  assert.equal(
+    document.getElementById("composer-context-usage-percent").textContent,
+    "80",
+  );
+  assert.equal(ring.dataset.level, "warn");
+  assert.match(ring.title, /Context used: 80%/);
+  assert.match(ring.title, /160\.0K \/ 200\.0K tokens/);
+
+  window.RepoPromptPortalTest.state.bootstrap.sessions[0] = sessionFixture({
+    contextUsage: {
+      modelContextWindow: 200000,
+      lastTotalTokens: 190000,
+      totalTotalTokens: 190000,
+    },
+  });
+  window.RepoPromptPortalTest.renderRoute();
+  await settle();
+  assert.equal(
+    document.getElementById("composer-context-usage-percent").textContent,
+    "95",
+  );
+  assert.equal(
+    document.getElementById("composer-context-usage-ring").dataset.level,
+    "critical",
+  );
 });

@@ -32,7 +32,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         XCTAssertEqual(configuration.signingKeys.count, 4)
         XCTAssertEqual(configuration.signingKeys.first(where: { $0.keyID == "app-v0" })?.active, false)
         XCTAssertEqual(configuration.signingKeys.first(where: { $0.keyID == "app-v0" })?.role, .app)
-        XCTAssertEqual(Set(configuration.providerExecutables.keys), [.codex, .claudeCompatible, .openCodeACP, .cursorACP])
+        XCTAssertEqual(Set(configuration.providerExecutables.keys), [.codex, .claudeCompatible, .openCodeACP, .cursorACP, .grokBuildACP])
         XCTAssertEqual(configuration.enabledProviders, [.codex, .claudeCompatible])
 
         environment["REPOPROMPT_ENABLED_PROVIDERS"] = ""

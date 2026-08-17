@@ -743,9 +743,8 @@ private enum AppSettingsMCPRegistry {
             write: { try $0.setCustomPlanningPrompt(requiredString(from: $1)) }
         ),
 
-        // Context Builder agent/model selection. Uses the legacy persisted
-        // discover-agent slot only; workspace-scoped context builder fields are
-        // intentionally not exposed here.
+        // Context Builder agent/model selection only. Behavioral controls remain
+        // globally owned by the app Settings and panel UI.
         stringEnumSetting(
             key: "context_builder.agent",
             group: "context_builder",
@@ -1336,6 +1335,10 @@ private enum AppSettingsMCPRegistry {
             .openCode
         case .cursor:
             .cursor
+        case .grokBuild:
+            // Grok Build is an Agent Mode ACP provider only; `AIProviderType.grok` is the
+            // HTTP chat provider and does not describe Agent Mode models.
+            nil
         }
     }
 

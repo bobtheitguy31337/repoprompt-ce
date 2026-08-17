@@ -267,29 +267,36 @@ final class ProviderManagementBackendTests: XCTestCase {
         let adapter = ProviderAuthenticationAdapter(
             configurations: [
                 .init(kind: .codex, executable: "/usr/bin/true"),
-                .init(kind: .claudeCompatible, executable: "/usr/bin/true")
+                .init(kind: .claudeCompatible, executable: "/usr/bin/true"),
+                .init(kind: .grokBuildACP, executable: "/usr/bin/true")
             ],
             transport: transport
         )
         let openAISecret = "sk-test-openai-secret"
         let anthropicSecret = "sk-ant-test-secret"
+        let grokSecret = "xai-test-grok-secret"
 
         let openAI = await adapter.test(providerID: .codex, method: .apiKey, secret: Data(openAISecret.utf8))
         let anthropic = await adapter.test(providerID: .claudeCompatible, method: .apiKey, secret: Data(anthropicSecret.utf8))
+        let grok = await adapter.test(providerID: .grokBuildACP, method: .apiKey, secret: Data(grokSecret.utf8))
         let requests = await transport.requests()
 
         XCTAssertEqual(openAI.state, .valid)
         XCTAssertEqual(openAI.detail, "OpenAI credential validated")
         XCTAssertEqual(anthropic.state, .valid)
         XCTAssertEqual(anthropic.detail, "Anthropic credential validated")
+        XCTAssertEqual(grok.state, .valid)
+        XCTAssertEqual(grok.detail, "Grok credential validated")
         XCTAssertEqual(requests.map { $0.url?.absoluteString }, [
             "https://api.openai.com/v1/models",
-            "https://api.anthropic.com/v1/models?limit=1"
+            "https://api.anthropic.com/v1/models?limit=1",
+            "https://api.x.ai/v1/models"
         ])
         XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Authorization"), "Bearer \(openAISecret)")
         XCTAssertEqual(requests[1].value(forHTTPHeaderField: "x-api-key"), anthropicSecret)
         XCTAssertEqual(requests[1].value(forHTTPHeaderField: "anthropic-version"), "2023-06-01")
-        XCTAssertFalse(requests.compactMap { $0.url?.absoluteString }.contains { $0.contains(openAISecret) || $0.contains(anthropicSecret) })
+        XCTAssertEqual(requests[2].value(forHTTPHeaderField: "Authorization"), "Bearer \(grokSecret)")
+        XCTAssertFalse(requests.compactMap { $0.url?.absoluteString }.contains { $0.contains(openAISecret) || $0.contains(anthropicSecret) || $0.contains(grokSecret) })
 
         let unsupported = await adapter.test(providerID: .claudeCompatible, method: .authToken, secret: Data(anthropicSecret.utf8))
         XCTAssertEqual(unsupported.state, .unavailable)
@@ -405,6 +412,38 @@ final class ProviderManagementBackendTests: XCTestCase {
         XCTAssertTrue(remainingConnections.isEmpty)
     }
 
+    func testGrokBuildAPIKeyConnectionInjectsXAIAPIKeyWithoutCollapsingOntoDirectXAI() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let vault = try ProviderCredentialVault(fileURL: directory.appendingPathComponent("vault"), activeKey: ProviderVaultKey(keyID: "test", material: Data(repeating: 3, count: 32)))
+        let configuration = ProviderCLIConfiguration(kind: .grokBuildACP, executable: "/usr/bin/swift")
+        let adapter = ProviderCLIAdapter(configurations: [configuration], enabledProviders: [.grokBuildACP], runner: StaticVersionRunner())
+        let tester = RecordingCredentialTester(result: .init(state: .valid, detail: "Credential accepted"))
+        let service = ProviderSettingsService(store: store, adapter: adapter, configurations: [configuration], initiallyEnabled: [.grokBuildACP], vault: vault, credentialTester: tester, runner: StaticVersionRunner())
+        try await service.bootstrap()
+        let initialCatalog = try await service.catalog()
+        let initialGrok = try XCTUnwrap(initialCatalog.providers.first { $0.providerID == .grokBuildACP })
+        XCTAssertEqual(Set(initialGrok.capabilities.authenticationMethods), [.apiKey])
+        XCTAssertNotEqual(initialGrok.providerID, .xAI)
+        let attribution = ProviderMutationAttribution(actorID: "admin-1", actorLabel: "alice", channel: "test")
+        let secret = "xai-test-write-only-value"
+
+        var snapshot = try await service.connect(providerID: .grokBuildACP, request: .init(authenticationMethod: .apiKey, credential: secret, accountLabel: "grok"), attribution: attribution)
+        snapshot = try await service.testConnection(providerID: .grokBuildACP, attribution: attribution)
+        XCTAssertEqual(snapshot.connection?.testState, .valid)
+
+        let environment = try await VaultProviderProcessEnvironment(store: store, vault: vault)
+            .environment(for: .grokBuildACP, model: nil, policy: .init())
+        XCTAssertEqual(environment, ["XAI_API_KEY": secret])
+        let xAIConnection = try await store.providerConnection(providerID: .xAI)
+        XCTAssertNil(xAIConnection)
+        let encoded = try String(decoding: JSONEncoder.serviceEncoder.encode(snapshot), as: UTF8.self)
+        XCTAssertFalse(encoded.contains(secret))
+    }
+
     func testCredentialCannotBePersistedAsAccountLabel() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -445,7 +484,8 @@ final class ProviderManagementBackendTests: XCTestCase {
         let configurations: [ProviderCLIConfiguration] = try [
             (ProviderKind.claudeCompatible, "claude"),
             (.openCodeACP, "opencode"),
-            (.cursorACP, "cursor")
+            (.cursorACP, "cursor"),
+            (.grokBuildACP, "grok")
         ].map { kind, name in
             let credentialDirectory = directory.appendingPathComponent(name, isDirectory: true)
             try FileManager.default.createDirectory(at: credentialDirectory, withIntermediateDirectories: true)
@@ -483,6 +523,10 @@ final class ProviderManagementBackendTests: XCTestCase {
             catalog.providers.first { $0.providerID == .cursorACP }?.capabilities.authenticationMethods,
             [.browserLogin]
         )
+        XCTAssertEqual(
+            catalog.providers.first { $0.providerID == .grokBuildACP }?.capabilities.authenticationMethods,
+            [.providerSpecific]
+        )
         XCTAssertTrue(
             catalog.providers.first { $0.providerID == .claudeGLM }?.capabilities.authenticationMethods.isEmpty == true
         )
@@ -491,7 +535,8 @@ final class ProviderManagementBackendTests: XCTestCase {
         for (providerID, method) in [
             (ProviderSettingsID.claudeCompatible, ProviderAuthenticationMethod.providerSpecific),
             (.openCodeACP, .providerSpecific),
-            (.cursorACP, .browserLogin)
+            (.cursorACP, .browserLogin),
+            (.grokBuildACP, .providerSpecific)
         ] {
             do {
                 _ = try await service.connect(
@@ -510,7 +555,8 @@ final class ProviderManagementBackendTests: XCTestCase {
         for (providerID, method) in [
             (ProviderSettingsID.claudeCompatible, ProviderAuthenticationMethod.providerSpecific),
             (.openCodeACP, .providerSpecific),
-            (.cursorACP, .browserLogin)
+            (.cursorACP, .browserLogin),
+            (.grokBuildACP, .providerSpecific)
         ] {
             var snapshot = try await service.connect(
                 providerID: providerID,
@@ -531,7 +577,7 @@ final class ProviderManagementBackendTests: XCTestCase {
         }
 
         let stored = try await store.providerConnections()
-        XCTAssertEqual(stored.count, 3)
+        XCTAssertEqual(stored.count, 4)
         XCTAssertTrue(stored.allSatisfy { $0.credentialReference == nil })
     }
 

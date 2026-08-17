@@ -36,11 +36,28 @@ enum HeadlessACPSessionUpdateNormalizer {
             return [.runStatusChanged(phase: .thinking, statusCode: HeadlessRunStatusCopy.thinkingCode, statusText: title)]
         case "tool_call", "tool_call_update":
             return normalizeToolEvent(update, sessionUpdate: type)
-        case "plan", "available_commands_update", "user_message_chunk", "usage_update", "config_option_update":
+        case "usage_update":
+            return normalizeUsageUpdate(update)
+        case "plan", "available_commands_update", "user_message_chunk", "config_option_update":
             return []
         default:
             return []
         }
+    }
+
+    /// Desktop `ACPAgentSessionController.messageStopResult`: Grok Build carries
+    /// usage under `_meta.usage` with the same field names; top-level `usage`
+    /// remains the preferred ACP-standard location.
+    static func contextUsageFromPromptResult(_ result: [String: Any]) -> ContextUsageWireSnapshot? {
+        let usage = (result["usage"] as? [String: Any])
+            ?? ((result["_meta"] as? [String: Any])?["usage"] as? [String: Any])
+        let inputTokens = intValue(usage?["inputTokens"])
+        let cachedReadTokens = intValue(usage?["cachedReadTokens"])
+        let cachedWriteTokens = intValue(usage?["cachedWriteTokens"])
+        let hasContextBreakdown = inputTokens != nil || cachedReadTokens != nil || cachedWriteTokens != nil
+        guard hasContextBreakdown else { return nil }
+        let used = max(0, inputTokens ?? 0) + max(0, cachedReadTokens ?? 0) + max(0, cachedWriteTokens ?? 0)
+        return ContextUsageWireSnapshot(lastTotalTokens: used, totalTotalTokens: used)
     }
 
     private static func normalizeToolEvent(_ update: [String: Any], sessionUpdate: String) -> [ProviderRuntimeEvent] {
@@ -213,5 +230,37 @@ enum HeadlessACPSessionUpdateNormalizer {
             return true
         }
         return false
+    }
+
+    private static func normalizeUsageUpdate(_ payload: [String: Any]) -> [ProviderRuntimeEvent] {
+        let used = intValue(payload["used"])
+        let size = intValue(payload["size"])
+        guard used != nil || size != nil else { return [] }
+        return [
+            .contextUsage(
+                ContextUsageWireSnapshot(
+                    modelContextWindow: size,
+                    lastTotalTokens: used,
+                    totalTotalTokens: used
+                )
+            )
+        ]
+    }
+
+    private static func intValue(_ value: Any?) -> Int? {
+        switch value {
+        case let int as Int:
+            int
+        case let int64 as Int64:
+            Int(int64)
+        case let double as Double:
+            Int(double)
+        case let number as NSNumber:
+            number.intValue
+        case let string as String:
+            Int(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        default:
+            nil
+        }
     }
 }

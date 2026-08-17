@@ -2375,22 +2375,9 @@ public actor RepoPromptHeadlessAuthority {
         )
         let currentSession = authoritySession
         let cursor = try await store.nextCursor()
-        let persistedSession = SessionSnapshot(
-            sessionID: currentSession.sessionID,
-            projectID: currentSession.projectID,
-            parentSessionID: currentSession.parentSessionID,
-            rootSessionID: currentSession.rootSessionID,
-            creator: currentSession.creator,
-            provider: currentSession.provider,
-            providerSettingsID: currentSession.providerSettingsID,
-            model: currentSession.model,
+        let persistedSession = currentSession.replacing(
             visibility: input.visibility,
-            state: currentSession.state,
-            runGeneration: currentSession.runGeneration,
-            turnEpoch: currentSession.turnEpoch,
             revision: currentSession.revision + 1,
-            transcript: currentSession.transcript,
-            interactions: currentSession.interactions,
             cursor: cursor
         )
         // Commit durable collaboration/session state first. A persistence failure
@@ -3105,22 +3092,7 @@ public actor RepoPromptHeadlessAuthority {
         let effective = latestTurns.first?.effectiveConfiguration
         let defaults = try await store.nextTurnDefaults(sessionID: sessionID)
         let presentation = try await store.runPresentation(sessionID: sessionID)
-        return SessionSnapshot(
-            sessionID: session.sessionID,
-            projectID: session.projectID,
-            parentSessionID: session.parentSessionID,
-            rootSessionID: session.rootSessionID,
-            creator: session.creator,
-            provider: session.provider,
-            model: session.model,
-            visibility: session.visibility,
-            state: session.state,
-            runGeneration: session.runGeneration,
-            turnEpoch: session.turnEpoch,
-            revision: session.revision,
-            transcript: session.transcript,
-            interactions: session.interactions,
-            cursor: session.cursor,
+        return session.replacing(
             effectiveTurnConfiguration: effective.map(EffectiveTurnConfigurationWireSnapshot.init),
             nextTurnDefaults: defaults.map(SessionNextTurnDefaultsWireSnapshot.init),
             runPresentation: presentation?.wireSnapshot
@@ -4160,6 +4132,11 @@ public actor RepoPromptHeadlessAuthority {
                 _ = try await requestInteraction(sessionID: sessionID, kind: kind == .question ? .question : .approval, payload: payload)
             case .interactionCancelled:
                 break
+            case let .contextUsage(usage):
+                if let session = sessions[sessionID] {
+                    await session.applyContextUsage(usage)
+                }
+                try await store.upsertContextUsage(usage, sessionID: sessionID)
             case .completed:
                 break
             }
@@ -4449,11 +4426,11 @@ public actor RepoPromptHeadlessAuthority {
     }
 
     private func replacingCursor(_ value: SessionSnapshot, cursor: ServiceCursor) -> SessionSnapshot {
-        SessionSnapshot(sessionID: value.sessionID, projectID: value.projectID, parentSessionID: value.parentSessionID, rootSessionID: value.rootSessionID, creator: value.creator, provider: value.provider, providerSettingsID: value.providerSettingsID, model: value.model, visibility: value.visibility, state: value.state, runGeneration: value.runGeneration, turnEpoch: value.turnEpoch, revision: value.revision, transcript: value.transcript, interactions: value.interactions, cursor: cursor)
+        value.replacing(cursor: cursor)
     }
 
     private func replacingLifecycle(_ value: SessionSnapshot, state: SessionLifecycleState, cursor: ServiceCursor) -> SessionSnapshot {
-        SessionSnapshot(sessionID: value.sessionID, projectID: value.projectID, parentSessionID: value.parentSessionID, rootSessionID: value.rootSessionID, creator: value.creator, provider: value.provider, providerSettingsID: value.providerSettingsID, model: value.model, visibility: value.visibility, state: state, runGeneration: value.runGeneration, turnEpoch: value.turnEpoch, revision: value.revision + 1, transcript: value.transcript, interactions: value.interactions, cursor: cursor)
+        value.replacing(state: state, revision: value.revision + 1, cursor: cursor)
     }
 
     private static func bindingSnapshot(_ binding: RunBindingIdentity) -> RunBindingSnapshot {

@@ -200,6 +200,13 @@ actor AppAgentAuthorityComposition {
                 "cursor-agent",
                 CLIPathHints.cursor,
                 existingDirectory(home.appendingPathComponent(".cursor", isDirectory: true).path)
+            ),
+            (
+                .grokBuildACP,
+                "REPOPROMPT_GROK_EXECUTABLE",
+                "grok",
+                CLIPathHints.grokBuild,
+                existingDirectory(home.appendingPathComponent(".grok", isDirectory: true).path)
             )
         ]
         for (kind, environmentKey, command, hints, credentials) in definitions {

@@ -31,19 +31,32 @@ public struct SubagentPermissionSettings: Codable, Hashable, Sendable {
     public let claude: SubagentClaudePermissionMode
     public let openCode: SubagentManagedPermissionMode
     public let cursor: SubagentManagedPermissionMode
+    public let grokBuild: SubagentManagedPermissionMode
 
     public init(
         policy: SubagentPermissionPolicy = .safeManaged,
         codex: SubagentCodexPermissionMode = .defaultPermission,
         claude: SubagentClaudePermissionMode = .requireApproval,
         openCode: SubagentManagedPermissionMode = .managedDefault,
-        cursor: SubagentManagedPermissionMode = .managedDefault
+        cursor: SubagentManagedPermissionMode = .managedDefault,
+        grokBuild: SubagentManagedPermissionMode = .managedDefault
     ) {
         self.policy = policy
         self.codex = codex
         self.claude = claude
         self.openCode = openCode
         self.cursor = cursor
+        self.grokBuild = grokBuild
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        policy = try container.decodeIfPresent(SubagentPermissionPolicy.self, forKey: .policy) ?? .safeManaged
+        codex = try container.decodeIfPresent(SubagentCodexPermissionMode.self, forKey: .codex) ?? .defaultPermission
+        claude = try container.decodeIfPresent(SubagentClaudePermissionMode.self, forKey: .claude) ?? .requireApproval
+        openCode = try container.decodeIfPresent(SubagentManagedPermissionMode.self, forKey: .openCode) ?? .managedDefault
+        cursor = try container.decodeIfPresent(SubagentManagedPermissionMode.self, forKey: .cursor) ?? .managedDefault
+        grokBuild = try container.decodeIfPresent(SubagentManagedPermissionMode.self, forKey: .grokBuild) ?? .managedDefault
     }
 
     public static let safeManaged = SubagentPermissionSettings()

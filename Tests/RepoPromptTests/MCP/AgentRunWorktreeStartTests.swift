@@ -1577,10 +1577,20 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             sourceAgentSessionID: parentSessionID,
             routedRunID: nil
         )
-        let source = await window.mcpServer.testCaptureAgentRunOracleReviewSource(
-            snapshot: launchSnapshot,
-            targetWindow: window
-        )
+        // The capture's drift guard re-validates the canonical selection after its async work. This
+        // test deliberately keeps the active UI selection diverged from canonical so it can prove
+        // capture serves the *stored* selection rather than the UI. A debounced token recount can
+        // otherwise flush that divergent UI selection back into canonical during the capture's await
+        // window and falsely trip the guard ("launching selection changed ..."). Hold the selection
+        // mirror's flush suppression across the capture — the same suppression production applies
+        // during sensitive selection operations — so canonical stays stable while the frozen review
+        // capability is built.
+        let source = await window.selectionCoordinator.withApplyingSelectionMirror {
+            await window.mcpServer.testCaptureAgentRunOracleReviewSource(
+                snapshot: launchSnapshot,
+                targetWindow: window
+            )
+        }
         guard case let .captured(captured) = source else {
             if case let .unavailable(unavailable) = source {
                 return XCTFail(
@@ -2707,6 +2717,99 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         }
         XCTAssertEqual(session.worktreeBindings, [oldBinding])
         XCTAssertEqual(session.providerSessionID, "managed-old-identity")
+    }
+
+    func testCodexOriginatedExternalUnbindPreservesInvokingControllerUntilNextSessionPreparation() async throws {
+        let root = try makeTemporaryDirectory(named: "managed-codex-origin-root")
+        let worktree = try makeTemporaryDirectory(named: "managed-codex-origin-worktree")
+        var createdPaths: [CodexRuntimeWorkspacePaths] = []
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: root.path,
+            codexControllerFactory: { _, _, _, workspacePaths, _, _ in
+                createdPaths.append(workspacePaths)
+                return ReplacementIdentityFakeCodexController()
+            }
+        )
+        viewModel.test_initializeRunService()
+        let session = viewModel.session(for: UUID())
+        let sessionID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        session.selectedAgent = .codexExec
+        session.worktreeBindings = [makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)]
+
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+        let invokingRunID = try XCTUnwrap(session.runID)
+        let invokingController = try XCTUnwrap(
+            session.codexController as? ReplacementIdentityFakeCodexController
+        )
+        session.runState = .completed
+
+        _ = try await viewModel.transitionWorktreeBindings(
+            [],
+            forSessionID: sessionID,
+            intent: .externalManagement,
+            invocation: .init(
+                connectionID: UUID(),
+                sessionID: sessionID,
+                runID: invokingRunID,
+                provider: .codexExec
+            )
+        )
+
+        XCTAssertTrue(session.worktreeBindings.isEmpty)
+        XCTAssertEqual(controllerIdentity(in: session), ObjectIdentifier(invokingController))
+        XCTAssertEqual(invokingController.shutdownCallCount, 0)
+
+        await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
+        XCTAssertEqual(invokingController.shutdownCallCount, 1)
+        XCTAssertEqual(createdPaths.count, 2)
+        XCTAssertEqual(createdPaths.last, .uniform(root.path))
+        XCTAssertNotEqual(controllerIdentity(in: session), ObjectIdentifier(invokingController))
+        await viewModel.test_codexCoordinator.shutdownCodexSession(session)
+    }
+
+    func testCodexOriginatedExternalMutationDoesNotDeferInvalidationForUnrelatedSession() async throws {
+        let root = try makeTemporaryDirectory(named: "managed-unrelated-root")
+        let worktree = try makeTemporaryDirectory(named: "managed-unrelated-worktree")
+        let viewModel = makeViewModel(workspacePath: root.path)
+        viewModel.test_initializeRunService()
+        let invokingSession = viewModel.session(for: UUID())
+        let invokingSessionID = UUID()
+        let invokingRunID = UUID()
+        invokingSession.testInstallPersistentSessionBinding(sessionID: invokingSessionID)
+        invokingSession.selectedAgent = .codexExec
+        invokingSession.installRunID(invokingRunID)
+
+        let targetSession = viewModel.session(for: UUID())
+        let targetSessionID = UUID()
+        let targetRunID = UUID()
+        let targetController = ReplacementIdentityFakeCodexController()
+        targetSession.testInstallPersistentSessionBinding(sessionID: targetSessionID)
+        targetSession.selectedAgent = .codexExec
+        targetSession.installRunID(targetRunID)
+        targetSession.codexController = targetController
+        targetSession.codexControllerWorkspacePaths = .worktreeBound(
+            logicalRootPath: root.path,
+            validatedWorktreeRootPath: worktree.path
+        )
+        targetSession.worktreeBindings = [makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)]
+        targetSession.runState = .completed
+
+        _ = try await viewModel.transitionWorktreeBindings(
+            [],
+            forSessionID: targetSessionID,
+            intent: .externalManagement,
+            invocation: .init(
+                connectionID: UUID(),
+                sessionID: invokingSessionID,
+                runID: invokingRunID,
+                provider: .codexExec
+            )
+        )
+
+        XCTAssertTrue(targetSession.worktreeBindings.isEmpty)
+        XCTAssertNil(targetSession.codexController)
+        XCTAssertEqual(targetController.shutdownCallCount, 1)
     }
 
     func testAgentStartExplicitWorktreeIDOverridesInheritedBindingAcrossRunExploreAndExplicitTab() async throws {

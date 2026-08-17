@@ -184,6 +184,14 @@ final class AgentProviderPreferenceSnapshotStore {
                 autoApproveAllACPToolPermissions: level.autoApprovesACPToolPermissions,
                 acceptsPendingACPApprovalWhenActivated: level.autoApprovesACPToolPermissions
             )
+        case .grokBuild:
+            let level = effectiveGrokBuildPermissionLevel(profile: profile)
+            // For Grok this flag becomes a launch-time `--always-approve` argument in the
+            // provider; the controller never auto-selects ACP permission options for it.
+            return AgentProviderRuntimePermissionBinding(
+                autoApproveAllACPToolPermissions: level.launchesWithAlwaysApprove,
+                acceptsPendingACPApprovalWhenActivated: level.launchesWithAlwaysApprove
+            )
         }
     }
 
@@ -198,6 +206,8 @@ final class AgentProviderPreferenceSnapshotStore {
             OpenCodeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .cursor(level):
             CursorAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .grokBuild(level):
+            GrokBuildAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         }
         bumpRevision(for: id.providerID)
         return id.providerID
@@ -399,6 +409,26 @@ final class AgentProviderPreferenceSnapshotStore {
                     )
                 }
             )
+        case .grokBuild:
+            let effective = effectiveGrokBuildPermissionLevel(profile: profile)
+            return AgentPermissionChromeBinding(
+                providerID: providerID,
+                displayName: effective.displayName,
+                iconName: effective.iconName,
+                isWarning: effective.isWarning,
+                externallyManagedReason: externallyManagedReason,
+                options: GrokBuildAgentToolPreferences.PermissionLevel.allCases.map { level in
+                    AgentPermissionOptionBinding(
+                        id: .grokBuild(level),
+                        title: level.displayName,
+                        iconName: level.iconName,
+                        detailText: level.detailText,
+                        isWarning: level.isWarning,
+                        isSelected: level == effective,
+                        isEnabled: externallyManagedReason == nil
+                    )
+                }
+            )
         }
     }
 
@@ -577,6 +607,7 @@ final class AgentProviderPreferenceSnapshotStore {
         case .customClaudeCompatible: .claudeCustom
         case .openCode: .openCodeACP
         case .cursor: .cursorACP
+        case .grokBuild: .grokBuildACP
         }
     }
 
@@ -587,9 +618,25 @@ final class AgentProviderPreferenceSnapshotStore {
         case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom: "claude.\(raw)"
         case .openCodeACP: "opencode.\(raw)"
         case .cursorACP: "cursor.\(raw)"
+        case .grokBuildACP: "grok.\(raw)"
         case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
              .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
             raw
+        }
+    }
+
+    private func effectiveGrokBuildPermissionLevel(
+        profile: AgentProviderPermissionProfile
+    ) -> GrokBuildAgentToolPreferences.PermissionLevel {
+        switch profile {
+        case .userConfigured:
+            GrokBuildAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        case .mcpSafeDefaults:
+            .managedDefault
+        case let .providerOverride(.grokBuild(level)):
+            level
+        case .providerOverride:
+            .managedDefault
         }
     }
 
@@ -599,6 +646,7 @@ final class AgentProviderPreferenceSnapshotStore {
         case .claude: .claudeCode
         case .openCode: .openCode
         case .cursor: .cursor
+        case .grokBuild: .grokBuild
         }
     }
 

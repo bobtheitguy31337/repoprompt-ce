@@ -326,22 +326,9 @@ public actor AgentSubmissionCoordinator {
     private static func acceptedSessionSnapshot(_ session: SessionSnapshot, canonicalUserTurn: CanonicalUserTurn, actor: ExternalActor, identity: CanonicalTurnIdentity, at date: Date) -> SessionSnapshot {
         let sequence = (session.transcript.last?.sessionSequence ?? 0) + 1
         let human = TranscriptEntry(entryID: identity.turnID, sessionSequence: sequence, kind: .human, content: canonicalUserTurn.text, actor: actor, timestamp: date)
-        return SessionSnapshot(
-            sessionID: session.sessionID,
-            projectID: session.projectID,
-            parentSessionID: session.parentSessionID,
-            rootSessionID: session.rootSessionID,
-            creator: session.creator,
-            provider: session.provider,
-            model: session.model,
-            visibility: session.visibility,
-            state: session.state,
-            runGeneration: session.runGeneration,
-            turnEpoch: session.turnEpoch,
+        return session.replacing(
             revision: session.revision + 1,
-            transcript: session.transcript + [human],
-            interactions: session.interactions,
-            cursor: session.cursor
+            transcript: session.transcript + [human]
         )
     }
 
@@ -351,22 +338,7 @@ public actor AgentSubmissionCoordinator {
         nextDefaults: SessionNextTurnDefaultsRecord,
         runPresentation: RunPresentationSnapshot
     ) -> SessionSnapshot {
-        SessionSnapshot(
-            sessionID: session.sessionID,
-            projectID: session.projectID,
-            parentSessionID: session.parentSessionID,
-            rootSessionID: session.rootSessionID,
-            creator: session.creator,
-            provider: session.provider,
-            model: session.model,
-            visibility: session.visibility,
-            state: session.state,
-            runGeneration: session.runGeneration,
-            turnEpoch: session.turnEpoch,
-            revision: session.revision,
-            transcript: session.transcript,
-            interactions: session.interactions,
-            cursor: session.cursor,
+        session.replacing(
             effectiveTurnConfiguration: EffectiveTurnConfigurationWireSnapshot(effective),
             nextTurnDefaults: SessionNextTurnDefaultsWireSnapshot(nextDefaults),
             runPresentation: runPresentation.wireSnapshot

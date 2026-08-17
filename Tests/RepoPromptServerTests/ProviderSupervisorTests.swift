@@ -367,6 +367,7 @@ final class ProviderSupervisorTests: XCTestCase {
             (.claudeCompatible, Self.fakeClaudeScript()),
             (.openCodeACP, Self.fakeACPScript(requiredArguments: "acp")),
             (.cursorACP, Self.fakeACPScript(requiredArguments: "--approve-mcps acp")),
+            (.grokBuildACP, Self.fakeACPScript(requiredArguments: "agent --no-leader stdio")),
             (.headlessAdapter, Self.fakeHeadlessAdapterScript()),
             (.mcp, Self.fakeMCPServerScript())
         ]
@@ -391,6 +392,7 @@ final class ProviderSupervisorTests: XCTestCase {
             (.claudeCompatible, "claude done", "claude-session"),
             (.openCodeACP, "acp done", "acp-session"),
             (.cursorACP, "acp done", "acp-session"),
+            (.grokBuildACP, "acp done", "acp-session"),
             (.headlessAdapter, "headless done", "headless-session"),
             (.mcp, "file_search\nread_file", nil)
         ]
@@ -405,6 +407,60 @@ final class ProviderSupervisorTests: XCTestCase {
             XCTAssertTrue(observed.contains { if case .assistantFinal = $0 { true } else { false } } || observed.contains { if case .assistantDelta = $0 { true } else { false } }, kind.rawValue)
             XCTAssertTrue(observed.contains { if case .completed = $0 { true } else { false } }, kind.rawValue)
         }
+    }
+
+    func testGrokBuildFullAccessInsertsAlwaysApproveAfterAgentLikeDesktop() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let executable = directory.appendingPathComponent("grok")
+        try Data(Self.fakeACPScript(requiredArguments: "agent --always-approve --no-leader stdio").utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let adapter = try ProviderCLIAdapter(
+            configurations: [.init(kind: .grokBuildACP, executable: executable.path, expectedVersion: "fixture 1.0")],
+            processPort: PortableProcessSupervisionPort(),
+            outputDirectory: directory.appendingPathComponent("output").path,
+            ephemeralHomeRoot: directory.appendingPathComponent("homes").path
+        )
+        let result = try await adapter.executeStreaming(.init(
+            kind: .grokBuildACP,
+            model: nil,
+            prompt: "contract prompt",
+            workingDirectory: directory.path,
+            runID: UUID(),
+            policy: .init(mode: .fullAccess)
+        )) { _ in }
+        XCTAssertEqual(result.providerSessionID, "acp-session")
+    }
+
+    func testGrokBuildSelectsModelsThroughSessionSetModelNotConfigOptions() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let executable = directory.appendingPathComponent("grok")
+        try Data(Self.grokBuildModelScript().utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let adapter = try ProviderCLIAdapter(
+            configurations: [.init(kind: .grokBuildACP, executable: executable.path, expectedVersion: "fixture 1.0")],
+            processPort: PortableProcessSupervisionPort(),
+            outputDirectory: directory.appendingPathComponent("output").path,
+            ephemeralHomeRoot: directory.appendingPathComponent("homes").path
+        )
+        let result = try await adapter.executeStreaming(.init(
+            kind: .grokBuildACP,
+            model: "grok-code",
+            prompt: "contract prompt",
+            workingDirectory: directory.path,
+            runID: UUID(),
+            policy: .init(providerSettings: ["provider.reasoningEffort": "high"])
+        )) { _ in }
+        XCTAssertEqual(result.providerSessionID, "grok-session")
+        let log = try String(contentsOf: directory.appendingPathComponent("grok.log"), encoding: .utf8)
+        XCTAssertTrue(log.contains("set_model"), log)
+        XCTAssertTrue(log.contains("grok-code"), log)
+        XCTAssertTrue(log.contains("reasoningEffort"), log)
+        XCTAssertTrue(log.contains("high"), log)
+        XCTAssertFalse(log.contains("set_config_option"), log)
     }
 
     func testPortablePortCapturesAndReapsProviderOutput() async throws {
@@ -957,6 +1013,26 @@ final class ProviderSupervisorTests: XCTestCase {
               echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"acp done"}}}}'
               echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
               ;;
+          esac
+        done
+        """
+    }
+
+    private static func grokBuildModelScript() -> String {
+        """
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then echo 'fixture 1.0'; exit 0; fi
+        if [ "$*" != "agent --no-leader stdio" ]; then exit 64; fi
+        while IFS= read -r line; do
+          echo "$line" >> "$PWD/grok.log"
+          case "$line" in
+            *initialize*) echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}' ;;
+            *session*new*) echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"grok-session","models":{"currentModelId":"grok-default","availableModels":[{"modelId":"grok-code","name":"Grok Code"}]},"configOptions":[{"id":"model","category":"model","currentValue":"wrong","options":[{"value":"wrong"}]}]}}' ;;
+            *session*set_model*) echo '{"jsonrpc":"2.0","id":3,"result":{"_meta":{"model":{"Ok":"grok-code"}}}}' ;;
+            *session*set_config_option*) echo '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"model","category":"model","currentValue":"wrong","options":[{"value":"wrong"}]}]}}' ;;
+            *session*prompt*)
+              echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"grok done"}}}}'
+              echo '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}' ;;
           esac
         done
         """

@@ -146,6 +146,7 @@ public enum LegacySessionJSONImporter {
         case let value? where value.contains("claude"): .claudeCompatible
         case let value? where value.contains("open"): .openCodeACP
         case let value? where value.contains("cursor"): .cursorACP
+        case let value? where value.contains("grok"): .grokBuildACP
         case let value? where value.contains("mcp"): .mcp
         default: .codex
         }

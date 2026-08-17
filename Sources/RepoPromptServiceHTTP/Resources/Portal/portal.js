@@ -1320,6 +1320,70 @@
       (state.agent.newSessionMode
         ? "Start a private root session."
         : "Send a follow-up to this session.");
+    renderComposerContextUsage();
+  }
+
+  function renderComposerContextUsage() {
+    const host = document.getElementById("composer-context-usage");
+    const ring = document.getElementById("composer-context-usage-ring");
+    const percentLabel = document.getElementById(
+      "composer-context-usage-percent",
+    );
+    const progress = document.getElementById(
+      "composer-context-usage-progress",
+    );
+    const session = selectedSession();
+    const usage = session?.contextUsage || {};
+    const last = Number(usage.lastTotalTokens) || 0;
+    const total = Number(usage.totalTotalTokens) || 0;
+    const used = last > 0 ? last : total;
+    const windowTokens = effectiveContextWindowTokens(session, usage);
+    const show =
+      Boolean(session) &&
+      !state.agent.newSessionMode &&
+      (used > 0 || windowTokens > 0);
+    host.hidden = !show;
+    if (!show) {
+      ring.removeAttribute("title");
+      ring.removeAttribute("data-level");
+      return;
+    }
+    const percent =
+      used > 0 && windowTokens > 0
+        ? Math.min(Math.max((used / windowTokens) * 100, 0), 100)
+        : 0;
+    const rounded = Math.round(percent);
+    const circumference = 2 * Math.PI * 7;
+    percentLabel.textContent = String(rounded);
+    progress.style.strokeDasharray = String(circumference);
+    progress.style.strokeDashoffset = String(
+      circumference * (1 - Math.min(Math.max(percent / 100, 0), 1)),
+    );
+    ring.dataset.level =
+      percent > 90 ? "critical" : percent > 75 ? "warn" : "";
+    ring.setAttribute("aria-valuenow", String(rounded));
+    ring.title = contextUsageTooltip(used, windowTokens, percent);
+  }
+
+  function effectiveContextWindowTokens(session, usage) {
+    const reported = Number(usage?.modelContextWindow) || 0;
+    if (reported > 0) return reported;
+    if (!session) return 0;
+    return session.provider === "grokBuildACP" ? 500000 : 200000;
+  }
+
+  function contextUsageTooltip(used, windowTokens, percent) {
+    if (used > 0 && windowTokens > 0) {
+      return `Context used: ${Math.round(percent)}%\n${formatTokens(used)} / ${formatTokens(windowTokens)} tokens`;
+    }
+    if (used > 0) return `Used tokens: ${formatTokens(used)}`;
+    return "Context usage unavailable";
+  }
+
+  function formatTokens(count) {
+    if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+    if (count >= 1000) return `${(count / 1000).toFixed(1)}K`;
+    return String(count);
   }
 
   function operationIDFor(payload) {

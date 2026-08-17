@@ -2600,6 +2600,66 @@ input:disabled {
   box-shadow: var(--shadow-card);
 }
 
+.composer-context-usage {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 4px 4px;
+}
+
+.composer-context-usage[hidden] {
+  display: none;
+}
+
+.context-usage-ring {
+  position: relative;
+  width: 18px;
+  height: 18px;
+  color: var(--text-secondary);
+}
+
+.context-usage-ring[data-level="warn"] {
+  color: var(--warning);
+}
+
+.context-usage-ring[data-level="critical"] {
+  color: var(--danger);
+}
+
+.context-usage-ring svg {
+  display: block;
+  width: 18px;
+  height: 18px;
+  transform: rotate(-90deg);
+}
+
+.context-usage-track,
+.context-usage-progress {
+  fill: none;
+  stroke-width: 2.5;
+  stroke-linecap: round;
+}
+
+.context-usage-track {
+  stroke: color-mix(in srgb, var(--text-secondary) 20%, transparent);
+}
+
+.context-usage-progress {
+  stroke: currentColor;
+  stroke-dasharray: 43.982;
+  stroke-dashoffset: 43.982;
+}
+
+.context-usage-ring span {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 6.5px;
+  font-weight: 500;
+  line-height: 1;
+  color: currentColor;
+}
+
 .composer-shell textarea {
   width: 100%;
   min-height: 62px;

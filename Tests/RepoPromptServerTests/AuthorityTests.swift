@@ -757,7 +757,9 @@ final class AuthorityTests: XCTestCase {
     }
 
     func testEmbeddedMacOSAndDirectHeadlessUseOneDurableSessionAuthority() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .resolvingSymlinksInPath()
+            .appendingPathComponent(".test-authority-parity-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let database = root.appendingPathComponent("authority.sqlite")

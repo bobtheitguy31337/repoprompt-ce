@@ -77,6 +77,7 @@ protocol CodexSessionControlling: AnyObject {
         includeTurns: Bool,
         timeout: TimeInterval?
     ) async throws -> CodexNativeSessionController.ThreadSnapshot
+    func outstandingBlockingNativeToolCallNames() async -> [String]
     func setThreadName(_ name: String, threadID: String?) async throws
     func startUserTurn(
         text: String,
@@ -113,6 +114,10 @@ protocol CodexSessionControlling: AnyObject {
 }
 
 extension CodexSessionControlling {
+    func outstandingBlockingNativeToolCallNames() async -> [String] {
+        []
+    }
+
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome {
         .unsupported(message: "Codex runtime has no local API for \(action.rawValue) cleanup of conversations.")
     }
@@ -567,6 +572,7 @@ final class CodexNativeSessionController {
         var reasoningSummariesEnabledProvider: @MainActor () -> Bool = { false }
         var memoriesEnabledProvider: (@MainActor () -> Bool)?
         var computerUseEnabledProvider: @MainActor () -> Bool = { false }
+        var skillExtraRootsProvider: () -> [URL] = { [] }
 
         /// Fail-closed RepoPrompt MCP provisioning validator, applied by `startOrResume` only for a
         /// child that expects RepoPrompt MCP tools; throwing aborts the start before any process
@@ -626,7 +632,10 @@ final class CodexNativeSessionController {
                 goalSupportEnabledProvider: goalSupportEnabledProvider,
                 reasoningSummariesEnabledProvider: reasoningSummariesEnabledProvider,
                 memoriesEnabledProvider: memoriesEnabledProvider,
-                computerUseEnabledProvider: computerUseEnabledProvider
+                computerUseEnabledProvider: computerUseEnabledProvider,
+                skillExtraRootsProvider: {
+                    [AgentSupportDirectoryCatalog.globalRootURLs().agentsSkills]
+                }
             )
         }
     }
@@ -1289,6 +1298,15 @@ final class CodexNativeSessionController {
             }
             await ensureInboundStreamsStarted()
 
+            let skillExtraRoots = options.skillExtraRootsProvider().map(\.standardizedFileURL.path)
+            if !skillExtraRoots.isEmpty {
+                _ = try await performRequest(
+                    method: "skills/extraRoots/set",
+                    params: ["extraRoots": skillExtraRoots],
+                    timeout: options.requestTimeout
+                )
+            }
+
             if let resumeThreadID {
                 let desiredMemoryMode: ThreadMemoryMode? = await MainActor.run {
                     guard let memoriesEnabledProvider = options.memoriesEnabledProvider else { return nil }
@@ -1435,6 +1453,17 @@ final class CodexNativeSessionController {
             timeout: timeout
         )
         return Self.parseThreadSnapshot(from: result, fallbackEffort: nil)
+    }
+
+    func outstandingBlockingNativeToolCallNames() async -> [String] {
+        guard let path = threadPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !path.isEmpty
+        else {
+            return []
+        }
+        return await Task.detached(priority: .utility) {
+            Self.persistedOutstandingBlockingNativeToolCallNames(fromRolloutPath: path)
+        }.value
     }
 
     func setThreadName(_ name: String, threadID explicitThreadID: String?) async throws {
@@ -3713,6 +3742,12 @@ final class CodexNativeSessionController {
             parseThreadSnapshot(from: result, fallbackEffort: fallbackEffort)
         }
 
+        static func test_persistedOutstandingBlockingNativeToolCallNames(
+            fromRolloutPath path: String
+        ) -> [String] {
+            persistedOutstandingBlockingNativeToolCallNames(fromRolloutPath: path)
+        }
+
         static func test_toolItemCandidatesCount(from params: [String: Any]) -> Int {
             toolItemCandidates(fromParams: params).count
         }
@@ -5250,7 +5285,10 @@ final class CodexNativeSessionController {
         var terminalCallIDs: Set<String> = []
         var outputByProcessID: [String: String] = [:]
         var outputByCallID: [String: String] = [:]
+        var outstandingBlockingNativeToolNameByCallID: [String: String] = [:]
     }
+
+    private static let blockingNativeToolNames: Set<String> = ["wait_agent"]
 
     static func commandExecutionRunningUpdate(
         fromToolName toolName: String,
@@ -6771,6 +6809,10 @@ final class CodexNativeSessionController {
                 continue
             }
 
+            if root["type"] as? String == "session_meta" {
+                signals.outstandingBlockingNativeToolNameByCallID.removeAll()
+            }
+
             if let type = root["type"] as? String,
                type == "response_item",
                let payload = root["payload"] as? [String: Any],
@@ -6782,6 +6824,9 @@ final class CodexNativeSessionController {
                     let normalizedName = normalizedExternalToolName(dictString(payload, key: "name"))
                     if let normalizedName {
                         toolNameByCallID[callID] = normalizedName
+                        if blockingNativeToolNames.contains(normalizedName) {
+                            signals.outstandingBlockingNativeToolNameByCallID[callID] = normalizedName
+                        }
                     }
                     if normalizedName == "write_stdin",
                        let argsJSON = dictString(payload, key: "arguments"),
@@ -6792,6 +6837,7 @@ final class CodexNativeSessionController {
 
                 case "function_call_output":
                     guard let callID = dictString(payload, key: "call_id"), !callID.isEmpty else { continue }
+                    signals.outstandingBlockingNativeToolNameByCallID.removeValue(forKey: callID)
                     guard let output = dictString(payload, key: "output"), !output.isEmpty else { continue }
                     guard let normalizedName = toolNameByCallID[callID] else { continue }
 
@@ -7138,6 +7184,13 @@ final class CodexNativeSessionController {
             }
         }
         return signals
+    }
+
+    private static func persistedOutstandingBlockingNativeToolCallNames(
+        fromRolloutPath path: String
+    ) -> [String] {
+        let signals = loadPersistedCommandSignals(fromRolloutPath: path)
+        return Array(Set(signals.outstandingBlockingNativeToolNameByCallID.values)).sorted()
     }
 
     private static func appendPersistedCommandOutput(

@@ -458,6 +458,7 @@ private actor CommandCompatibilityProviderRuntime: AgentProviderRuntime {
             ["--print", "--output-format", "stream-json", "--verbose"] + (request.resumeProviderSessionID.map { ["--resume", $0] } ?? []) + (request.model.map { ["--model", $0] } ?? []) + [request.prompt]
         case .openCodeACP: ["run", request.prompt]
         case .cursorACP: ["--print", request.prompt]
+        case .grokBuildACP: ["agent", "--no-leader", request.prompt]
         case .headlessAdapter, .mcp: [request.prompt]
         }
     }

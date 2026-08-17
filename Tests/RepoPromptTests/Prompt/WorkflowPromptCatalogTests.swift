@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+@testable import RepoPromptShared
 import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
@@ -77,7 +78,8 @@ final class WorkflowPromptCatalogTests: XCTestCase {
 
     func testAgentWorkflowTemplatesRenderFromProviderNeutralCatalog() {
         for workflow in AgentWorkflow.allCases {
-            let rendered = RepoPromptWorkflowPrompts.render(id: workflow.workflowPromptID, variant: .agent)
+            let shared = RepoPromptBuiltInAgentWorkflow(rawValue: workflow.rawValue)
+            let rendered = shared?.template ?? ""
             XCTAssertFalse(rendered.isEmpty, workflow.rawValue)
             XCTAssertEqual(workflow.template, rendered, workflow.rawValue)
         }
@@ -85,10 +87,30 @@ final class WorkflowPromptCatalogTests: XCTestCase {
 
     func testPortableServerCatalogMatchesCanonicalRenderedMCPPrompts() throws {
         let portable = try BuiltinWorkflowCatalog().workflows()
-        let canonical = RepoPromptWorkflowID.installOrder.map { id in
-            (id.commandName, RepoPromptWorkflowPrompts.render(id: id, variant: .mcp))
-        }
+        // rp-reminder remains a skill on the portable server catalog, not a
+        // workflow row. Desktop installOrder still includes it.
+        let canonical = RepoPromptWorkflowID.installOrder
+            .filter { $0 != .reminder }
+            .map { id in
+                (id.commandName, RepoPromptWorkflowPrompts.render(id: id, variant: .mcp))
+            }
         XCTAssertEqual(portable.map(\.workflowID), canonical.map(\.0))
         XCTAssertEqual(portable.map(\.definition), canonical.map(\.1))
+    }
+
+    func testBuiltInAgentWorkflowMetadataAndOrderAreProviderNeutral() {
+        XCTAssertEqual(
+            RepoPromptBuiltInAgentWorkflow.displayOrder.map(\.rawValue),
+            ["orchestrate", "deepPlan", "optimize", "build", "review", "refactor", "investigate", "oracleExport"]
+        )
+        XCTAssertEqual(RepoPromptBuiltInAgentWorkflow.allCases.count, 8)
+
+        for workflow in AgentWorkflow.allCases {
+            let shared = RepoPromptBuiltInAgentWorkflow(rawValue: workflow.rawValue)
+            XCTAssertEqual(workflow.displayName, shared?.metadata.displayName)
+            XCTAssertEqual(workflow.iconName, shared?.metadata.iconName)
+            XCTAssertEqual(workflow.tooltipText, shared?.metadata.tooltipText)
+            XCTAssertEqual(workflow.descriptionText, shared?.metadata.descriptionText)
+        }
     }
 }

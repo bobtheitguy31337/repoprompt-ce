@@ -13,7 +13,7 @@ public enum DesktopProviderModelFallbackCatalog {
             claudeCandidates
         case .cursorACP:
             cursorCandidates
-        case .claudeGLM, .claudeKimi, .claudeCustom, .openCodeACP,
+        case .claudeGLM, .claudeKimi, .claudeCustom, .openCodeACP, .grokBuildACP,
              .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
              .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
             []

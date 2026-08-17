@@ -121,11 +121,13 @@ public enum PortalDesktopSettingKey: String, CaseIterable, Codable, Sendable {
     case claudeCustomOpusModel
     case openCodePermissionLevel
     case cursorPermissionLevel
+    case grokBuildPermissionLevel
     case subagentPolicy
     case subagentCodexPermissionLevel
     case subagentClaudePermissionLevel
     case subagentOpenCodePermissionLevel
     case subagentCursorPermissionLevel
+    case subagentGrokBuildPermissionLevel
 
     // Agent workflows and Context Builder
     case includeWorkflowCleanupGuidance
@@ -209,11 +211,13 @@ public enum PortalDesktopSettingKey: String, CaseIterable, Codable, Sendable {
              .claudeStrictMCPEnabled,
              .openCodePermissionLevel,
              .cursorPermissionLevel,
+             .grokBuildPermissionLevel,
              .subagentPolicy,
              .subagentCodexPermissionLevel,
              .subagentClaudePermissionLevel,
              .subagentOpenCodePermissionLevel,
              .subagentCursorPermissionLevel,
+             .subagentGrokBuildPermissionLevel,
              .contextBuilderBudget,
              .contextBuilderEnhancementMode,
              .contextBuilderQuestionTimeout,
@@ -297,7 +301,8 @@ public enum PortalDesktopSettingKey: String, CaseIterable, Codable, Sendable {
         case .codexPermissionLevel, .subagentCodexPermissionLevel: "autoReview"
         case .claudePermissionLevel, .subagentClaudePermissionLevel: "requireApproval"
         case .openCodePermissionLevel, .subagentOpenCodePermissionLevel,
-             .cursorPermissionLevel, .subagentCursorPermissionLevel:
+             .cursorPermissionLevel, .subagentCursorPermissionLevel,
+             .grokBuildPermissionLevel, .subagentGrokBuildPermissionLevel:
             "managedDefault"
         case .codexEnabledMCPServers:
             "[\"RepoPromptCE\"]"
@@ -352,13 +357,14 @@ public enum PortalDesktopSettingKey: String, CaseIterable, Codable, Sendable {
         case .providerConversationCleanupAction:
             try Self.require(value, in: ["archive", "delete"])
         case .contextBuilderAgent:
-            try Self.require(value, in: ["claudeCode", "codexExec", "openCode", "cursor"])
+            try Self.require(value, in: ["claudeCode", "codexExec", "openCode", "cursor", "grokBuild"])
         case .codexPermissionLevel, .subagentCodexPermissionLevel:
             try Self.require(value, in: ["readOnly", "defaultPermission", "autoReview", "fullAccess"])
         case .claudePermissionLevel, .subagentClaudePermissionLevel:
             try Self.require(value, in: ["requireApproval", "autoApproveEdits", "auto", "fullAccess"])
         case .openCodePermissionLevel, .subagentOpenCodePermissionLevel,
-             .cursorPermissionLevel, .subagentCursorPermissionLevel:
+             .cursorPermissionLevel, .subagentCursorPermissionLevel,
+             .grokBuildPermissionLevel, .subagentGrokBuildPermissionLevel:
             try Self.require(value, in: ["managedDefault", "fullAccess"])
         case .subagentPolicy:
             try Self.require(value, in: ["safeManaged", "inheritProviderSettings", "custom"])

@@ -73,6 +73,7 @@ public enum ProviderRuntimeEvent: Sendable, Equatable {
     case toolCompleted(providerToolID: String, name: String, output: String?, status: AgentPresentationToolStatus)
     case interactionRequested(providerRequestID: String, kind: ProviderInteractionKind, prompt: String, choices: [String])
     case interactionCancelled(providerRequestID: String)
+    case contextUsage(ContextUsageWireSnapshot)
     case completed(providerSessionID: String?)
 }
 

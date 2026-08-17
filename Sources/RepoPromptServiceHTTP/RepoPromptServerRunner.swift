@@ -149,7 +149,8 @@ public struct RepoPromptServerConfiguration: Sendable {
             .codex: environment["REPOPROMPT_CODEX_EXECUTABLE"] ?? "/opt/repoprompt/providers/codex",
             .claudeCompatible: environment["REPOPROMPT_CLAUDE_EXECUTABLE"] ?? "/opt/repoprompt/providers/claude",
             .openCodeACP: environment["REPOPROMPT_OPENCODE_EXECUTABLE"] ?? "/opt/repoprompt/providers/opencode",
-            .cursorACP: environment["REPOPROMPT_CURSOR_EXECUTABLE"] ?? "/opt/repoprompt/providers/cursor-agent"
+            .cursorACP: environment["REPOPROMPT_CURSOR_EXECUTABLE"] ?? "/opt/repoprompt/providers/cursor-agent",
+            .grokBuildACP: environment["REPOPROMPT_GROK_EXECUTABLE"] ?? "/opt/repoprompt/providers/grok"
         ]
         let enabledProviderNames = if let configured = environment["REPOPROMPT_ENABLED_PROVIDERS"] {
             configured
@@ -176,8 +177,8 @@ public struct RepoPromptServerConfiguration: Sendable {
             }
             enabledDirectProviders.insert(providerID)
         }
-        let versions: [ProviderKind: String] = [.codex: CodexCLIContract.pinnedVersion, .claudeCompatible: "2.1.226", .openCodeACP: "1.15.11", .cursorACP: "2026.08.04-aaa8809"]
-        let protocols: [ProviderKind: String] = [.codex: "app-server-v2", .claudeCompatible: "stream-json-v1", .openCodeACP: "acp-v1", .cursorACP: "acp-v1-beta"]
+        let versions: [ProviderKind: String] = [.codex: CodexCLIContract.pinnedVersion, .claudeCompatible: "2.1.226", .openCodeACP: "1.15.11", .cursorACP: "2026.08.04-aaa8809", .grokBuildACP: "1.0.4"]
+        let protocols: [ProviderKind: String] = [.codex: "app-server-v2", .claudeCompatible: "stream-json-v1", .openCodeACP: "acp-v1", .cursorACP: "acp-v1-beta", .grokBuildACP: "acp-v1"]
         if environment["REPOPROMPT_CODEX_CREDENTIAL_HOME"].map({ !$0.isEmpty }) == true
             || environment["REPOPROMPT_CODEX_AUTH_STATUS_FILE"].map({ !$0.isEmpty }) == true
         {
@@ -186,7 +187,8 @@ public struct RepoPromptServerConfiguration: Sendable {
         let credentialSources = [
             (ProviderKind.claudeCompatible, environment["REPOPROMPT_CLAUDE_CREDENTIAL_HOME"]),
             (.openCodeACP, environment["REPOPROMPT_OPENCODE_CREDENTIAL_HOME"]),
-            (.cursorACP, environment["REPOPROMPT_CURSOR_CREDENTIAL_HOME"])
+            (.cursorACP, environment["REPOPROMPT_CURSOR_CREDENTIAL_HOME"]),
+            (.grokBuildACP, environment["REPOPROMPT_GROK_CREDENTIAL_HOME"])
         ].reduce(into: [ProviderKind: String]()) { result, value in if let path = value.1, !path.isEmpty { result[value.0] = path } }
         func optionalAbsoluteFiles(_ values: [(ProviderSettingsID, String?)], label: String) throws -> [ProviderSettingsID: String] {
             try values.reduce(into: [:]) { result, value in
@@ -199,6 +201,7 @@ public struct RepoPromptServerConfiguration: Sendable {
             (.claudeCompatible, environment["REPOPROMPT_CLAUDE_AUTH_STATUS_FILE"]),
             (.openCodeACP, environment["REPOPROMPT_OPENCODE_AUTH_STATUS_FILE"]),
             (.cursorACP, environment["REPOPROMPT_CURSOR_AUTH_STATUS_FILE"]),
+            (.grokBuildACP, environment["REPOPROMPT_GROK_AUTH_STATUS_FILE"]),
             (.xAI, environment["REPOPROMPT_XAI_AUTH_STATUS_FILE"])
         ], label: "Provider authentication status")
         let modelCatalogFiles = try optionalAbsoluteFiles([
@@ -206,6 +209,7 @@ public struct RepoPromptServerConfiguration: Sendable {
             (.claudeCompatible, environment["REPOPROMPT_CLAUDE_MODEL_CATALOG_FILE"]),
             (.openCodeACP, environment["REPOPROMPT_OPENCODE_MODEL_CATALOG_FILE"]),
             (.cursorACP, environment["REPOPROMPT_CURSOR_MODEL_CATALOG_FILE"]),
+            (.grokBuildACP, environment["REPOPROMPT_GROK_MODEL_CATALOG_FILE"]),
             (.xAI, environment["REPOPROMPT_XAI_MODEL_CATALOG_FILE"])
         ], label: "Provider model catalog")
         let vaultKey: ProviderVaultKey?

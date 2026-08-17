@@ -32,6 +32,12 @@ enum NativeProviderRuntimeFactory {
             return ACPProviderRuntime(kind: .openCodeACP, arguments: ["acp"], support: support)
         case .cursorACP:
             return ACPProviderRuntime(kind: .cursorACP, arguments: ["--approve-mcps", "acp"], support: support)
+        case .grokBuildACP:
+            return ACPProviderRuntime(
+                kind: .grokBuildACP,
+                arguments: ["agent", "--no-leader", "stdio"],
+                support: support
+            )
         case .headlessAdapter:
             return NormalizedHeadlessProviderRuntime(kind: .headlessAdapter, support: support)
         case .mcp:
@@ -234,7 +240,7 @@ private struct NativeProviderProcessSupport {
         records.append(homeRecord)
         do {
             try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            for child in [".config", ".cache", ".codex", ".codex-sqlite", ".claude"] {
+            for child in [".config", ".cache", ".codex", ".codex-sqlite", ".claude", ".grok"] {
                 try FileManager.default.createDirectory(at: home.appendingPathComponent(child, isDirectory: true), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             }
         } catch {
@@ -253,6 +259,7 @@ private struct NativeProviderProcessSupport {
             case .codex: home.appendingPathComponent(".codex", isDirectory: true)
             case .claudeCompatible: home.appendingPathComponent(".claude", isDirectory: true)
             case .openCodeACP, .cursorACP: home.appendingPathComponent(".config", isDirectory: true)
+            case .grokBuildACP: home.appendingPathComponent(".grok", isDirectory: true)
             case .headlessAdapter, .mcp: home.appendingPathComponent(".credentials", isDirectory: true)
             }
             let credentialRecord = OwnedResourceRecord(
@@ -875,6 +882,11 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             return ([], true)
         case "thread/status/changed":
             return ([], string(in: params, paths: [["status", "type"], ["status"]]) == "idle")
+        case "thread/tokenUsage/updated", "thread/token_usage/updated", "codex/event/thread_tokenUsage_updated", "codex/event/thread_token_usage_updated":
+            if let usage = parseTokenUsagePayload(from: params) {
+                return ([.contextUsage(usage)], false)
+            }
+            return ([], false)
         default:
             return ([], false)
         }
@@ -896,6 +908,84 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             if let string = value as? String, !string.isEmpty { return string }
         }
         return nil
+    }
+
+    /// Desktop `CodexNativeSessionController.parseTokenUsagePayload`.
+    nonisolated static func parseTokenUsagePayload(from params: [String: Any]) -> ContextUsageWireSnapshot? {
+        let tokenUsage = tokenUsageObject(from: params)
+        guard let tokenUsage else { return nil }
+
+        let last = usageBreakdown(in: tokenUsage, keys: ["last", "lastTokenUsage", "last_token_usage"])
+        let total = usageBreakdown(in: tokenUsage, keys: ["total", "totalTokenUsage", "total_token_usage"])
+        let lastTotal = usageTotalTokens(from: last)
+        let totalTotal = usageTotalTokens(from: total)
+        let contextWindow =
+            intValue(tokenUsage["modelContextWindow"])
+                ?? intValue(tokenUsage["model_context_window"])
+                ?? intValue(tokenUsage["contextWindow"])
+                ?? intValue(tokenUsage["context_window"])
+
+        guard contextWindow != nil || lastTotal != nil || totalTotal != nil else {
+            return nil
+        }
+        return ContextUsageWireSnapshot(
+            modelContextWindow: contextWindow,
+            lastTotalTokens: lastTotal,
+            totalTotalTokens: totalTotal
+        )
+    }
+
+    private nonisolated static func tokenUsageObject(from params: [String: Any]) -> [String: Any]? {
+        if let tokenUsage = params["tokenUsage"] as? [String: Any] {
+            return tokenUsage
+        }
+        if let tokenUsage = params["token_usage"] as? [String: Any] {
+            return tokenUsage
+        }
+        let hasTokenUsageShape =
+            params["last"] != nil
+                || params["total"] != nil
+                || params["lastTokenUsage"] != nil
+                || params["last_token_usage"] != nil
+                || params["totalTokenUsage"] != nil
+                || params["total_token_usage"] != nil
+                || params["modelContextWindow"] != nil
+                || params["model_context_window"] != nil
+        return hasTokenUsageShape ? params : nil
+    }
+
+    private nonisolated static func usageBreakdown(in tokenUsage: [String: Any], keys: [String]) -> [String: Any]? {
+        for key in keys {
+            if let value = tokenUsage[key] as? [String: Any] {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private nonisolated static func usageTotalTokens(from usage: [String: Any]?) -> Int? {
+        guard let usage else { return nil }
+
+        if let explicit =
+            intValue(usage["totalTokens"])
+                ?? intValue(usage["total_tokens"])
+                ?? intValue(usage["tokenCount"])
+                ?? intValue(usage["token_count"])
+        {
+            return explicit
+        }
+
+        let input = intValue(usage["inputTokens"]) ?? intValue(usage["input_tokens"])
+        let cachedInput = intValue(usage["cachedInputTokens"]) ?? intValue(usage["cached_input_tokens"])
+        let output = intValue(usage["outputTokens"]) ?? intValue(usage["output_tokens"])
+        let reasoningOutput =
+            intValue(usage["reasoningOutputTokens"])
+                ?? intValue(usage["reasoning_output_tokens"])
+
+        if input == nil, cachedInput == nil, output == nil, reasoningOutput == nil {
+            return nil
+        }
+        return (input ?? 0) + (cachedInput ?? 0) + (output ?? 0) + (reasoningOutput ?? 0)
     }
 
     private nonisolated static let visibleToolItemTypes: Set<String> = [
@@ -1205,8 +1295,19 @@ private actor ACPProviderRuntime: AgentProviderRuntime {
         sessions[runID] != nil
     }
 
+    private func launchArguments(for request: ProviderExecutionRequest) -> [String] {
+        guard kind == .grokBuildACP, request.policy.mode == .fullAccess else {
+            return arguments
+        }
+        var launched = arguments
+        if let agentIndex = launched.firstIndex(of: "agent"), !launched.contains("--always-approve") {
+            launched.insert("--always-approve", at: agentIndex + 1)
+        }
+        return launched
+    }
+
     func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
-        let process = try await support.makeSession(runID: request.runID, arguments: arguments, workingDirectory: request.workingDirectory, launchValidation: { try request.validateLaunch() })
+        let process = try await support.makeSession(runID: request.runID, arguments: launchArguments(for: request), workingDirectory: request.workingDirectory, launchValidation: { try request.validateLaunch() })
         sessions[request.runID] = process
         defer { sessions[request.runID] = nil
             providerSessionIDs[request.runID] = nil
@@ -1229,7 +1330,15 @@ private actor ACPProviderRuntime: AgentProviderRuntime {
                 sessionID = id
             }
             try await Self.configureExecutionMode(request.policy, sessionID: sessionID, sessionOpenResult: sessionOpenResult, process: process, output: onEvent)
-            try await Self.configureModel(request.model, sessionID: sessionID, sessionOpenResult: sessionOpenResult, process: process, output: onEvent)
+            try await Self.configureModel(
+                request.model,
+                kind: kind,
+                policy: request.policy,
+                sessionID: sessionID,
+                sessionOpenResult: sessionOpenResult,
+                process: process,
+                output: onEvent
+            )
             providerSessionIDs[request.runID] = sessionID
             await onEvent(.providerIdentity(sessionID))
             let output = ProviderOutputAccumulator()
@@ -1246,6 +1355,11 @@ private actor ACPProviderRuntime: AgentProviderRuntime {
                 else { continue }
                 if let error = frame["error"] as? [String: Any] {
                     throw ServiceAPIError(code: .dependencyUnavailable, message: "ACP session/prompt failed: \(error["message"] as? String ?? "unknown error")")
+                }
+                if let result = frame["result"] as? [String: Any],
+                   let usage = HeadlessACPSessionUpdateNormalizer.contextUsageFromPromptResult(result)
+                {
+                    await onEvent(.contextUsage(usage))
                 }
                 break
             }
@@ -1320,12 +1434,25 @@ private actor ACPProviderRuntime: AgentProviderRuntime {
 
     private nonisolated static func configureModel(
         _ requestedModel: String?,
+        kind: ProviderKind,
+        policy: ProviderExecutionPolicy,
         sessionID: String,
         sessionOpenResult: [String: Any],
         process: NativeJSONLineProcess,
         output: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
     ) async throws {
         guard let requestedModel = requestedModel?.trimmingCharacters(in: .whitespacesAndNewlines), !requestedModel.isEmpty else { return }
+        if kind == .grokBuildACP {
+            try await configureGrokBuildModel(
+                requestedModel,
+                policy: policy,
+                sessionID: sessionID,
+                sessionOpenResult: sessionOpenResult,
+                process: process,
+                output: output
+            )
+            return
+        }
         let options = sessionOpenResult["configOptions"] as? [[String: Any]] ?? []
         guard let model = options.first(where: { ($0["category"] as? String)?.caseInsensitiveCompare("model") == .orderedSame }),
               let configID = model["id"] as? String
@@ -1343,6 +1470,69 @@ private actor ACPProviderRuntime: AgentProviderRuntime {
         let updated = try CodexAppServerProviderRuntime.object(response)["configOptions"] as? [[String: Any]] ?? []
         guard updated.contains(where: { ($0["id"] as? String) == configID && (($0["currentValue"] as? String)?.caseInsensitiveCompare(canonical) == .orderedSame) }) else {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "ACP provider did not acknowledge the selected model")
+        }
+    }
+
+    /// Desktop Grok Build advertises `SessionModelState` on `session/new`/`session/load`
+    /// and selects with `session/set_model` `{sessionId, modelId, _meta.reasoningEffort?}`.
+    /// Do not fall back to modern `configOptions`.
+    private nonisolated static func configureGrokBuildModel(
+        _ requestedModel: String,
+        policy: ProviderExecutionPolicy,
+        sessionID: String,
+        sessionOpenResult: [String: Any],
+        process: NativeJSONLineProcess,
+        output: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
+    ) async throws {
+        guard let models = sessionOpenResult["models"] as? [String: Any],
+              let available = models["availableModels"] as? [[String: Any]]
+        else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Grok Build does not advertise SessionModelState model selection")
+        }
+        let advertised = available.compactMap { entry -> String? in
+            guard let modelID = (entry["modelId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !modelID.isEmpty
+            else { return nil }
+            return modelID
+        }
+        guard let canonical = advertised.first(where: { $0.caseInsensitiveCompare(requestedModel) == .orderedSame }) else {
+            throw ServiceAPIError(code: .providerUnavailable, message: "Requested Grok Build model is not advertised by the provider")
+        }
+        let effort = policy.providerSettings["provider.reasoningEffort"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let current = (models["currentModelId"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let effortRequested = !(effort?.isEmpty ?? true)
+        if current?.caseInsensitiveCompare(canonical) == .orderedSame, !effortRequested {
+            return
+        }
+        var params: [String: Any] = ["sessionId": sessionID, "modelId": canonical]
+        if let effort, !effort.isEmpty {
+            params["_meta"] = ["reasoningEffort": effort]
+        }
+        let response = try await process.request(
+            method: "session/set_model",
+            params: params,
+            onFrame: { line in try await forward(line, output: output) }
+        )
+        let result = try CodexAppServerProviderRuntime.object(response)
+        let modelOutcome = (result["_meta"] as? [String: Any])?["model"] as? [String: Any]
+        let hasOk = modelOutcome?.keys.contains("Ok") == true
+        let hasErr = modelOutcome?.keys.contains("Err") == true
+        if hasErr, !hasOk {
+            let modelError = modelOutcome?["Err"] ?? "unknown"
+            throw ServiceAPIError(code: .providerUnavailable, message: "Grok Build rejected model '\(canonical)': \(modelError)")
+        }
+        guard !hasErr,
+              hasOk,
+              let confirmedModel = modelOutcome?["Ok"] as? String,
+              confirmedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+              .caseInsensitiveCompare(canonical) == .orderedSame
+        else {
+            throw ServiceAPIError(
+                code: .dependencyUnavailable,
+                message: "Grok Build did not confirm model '\(canonical)': unexpected session/set_model acknowledgement"
+            )
         }
     }
 

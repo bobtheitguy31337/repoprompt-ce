@@ -62,6 +62,10 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
             permissionID = typed.cursor.permissionLevel == .fullAccess
                 ? "cursor.fullAccess"
                 : "cursor.managedDefault"
+        case .grokBuildACP:
+            permissionID = typed.grokBuild.permissionLevel == .fullAccess
+                ? "grok.fullAccess"
+                : "grok.managedDefault"
         case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
              .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
             permissionID = nil
@@ -121,7 +125,7 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
                 }
             }
             return .init(mode: projection.mode, providerSettings: providerSettings)
-        case .openCodeACP, .cursorACP:
+        case .openCodeACP, .cursorACP, .grokBuildACP:
             return .init(mode: projection.mode, providerSettings: projection.providerSettings)
         case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
              .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:

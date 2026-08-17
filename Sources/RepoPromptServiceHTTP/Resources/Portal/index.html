@@ -215,6 +215,33 @@
           </div>
 
           <form id="composer-form" class="composer-shell" data-agent-composer>
+            <div
+              id="composer-context-usage"
+              class="composer-context-usage"
+              hidden
+            >
+              <div
+                id="composer-context-usage-ring"
+                class="context-usage-ring"
+                role="meter"
+                aria-label="Context usage"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow="0"
+              >
+                <svg viewBox="0 0 18 18" aria-hidden="true">
+                  <circle class="context-usage-track" cx="9" cy="9" r="7"></circle>
+                  <circle
+                    id="composer-context-usage-progress"
+                    class="context-usage-progress"
+                    cx="9"
+                    cy="9"
+                    r="7"
+                  ></circle>
+                </svg>
+                <span id="composer-context-usage-percent">0</span>
+              </div>
+            </div>
             <div id="new-session-options" class="new-session-options" hidden>
               <label>
                 Provider

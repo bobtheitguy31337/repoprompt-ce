@@ -1215,6 +1215,7 @@ private actor AuthorityToolBackend {
             case "claudeCode": .claudeCompatible
             case "openCode": .openCodeACP
             case "cursor": .cursorACP
+            case "grokBuild": .grokBuildACP
             default: nil
             }
         }()
@@ -1430,6 +1431,7 @@ private actor AuthorityToolBackend {
         switch operation {
         case "get": break
         case "set":
+            try await MCPDomainMutationCommitContext.willCommit()
             context = try await authority.updateSessionPrompt(
                 sessionID: binding.sessionID,
                 prompt: arguments["text"]?.stringValue ?? "",
@@ -1437,6 +1439,7 @@ private actor AuthorityToolBackend {
                 actor: binding.actor
             )
         case "append":
+            try await MCPDomainMutationCommitContext.willCommit()
             context = try await authority.updateSessionPrompt(
                 sessionID: binding.sessionID,
                 prompt: context.prompt + (arguments["text"]?.stringValue ?? ""),
@@ -1444,6 +1447,7 @@ private actor AuthorityToolBackend {
                 actor: binding.actor
             )
         case "clear":
+            try await MCPDomainMutationCommitContext.willCommit()
             context = try await authority.updateSessionPrompt(
                 sessionID: binding.sessionID,
                 prompt: "",
@@ -1749,12 +1753,17 @@ private actor AuthorityToolBackend {
             _ = try await authority.startChildAgentRun(sessionID: child.sessionID)
             return try await value(authority.sessionSnapshot(sessionID: child.sessionID))
         case "poll":
-            return try await value(authority.sessionSnapshot(sessionID: agentSessionID(arguments)))
+            return try await agentSnapshotOrExpired(sessionID: agentSessionID(arguments))
         case "wait":
-            return try await value(waitForTerminal(
-                sessionID: agentSessionID(arguments),
-                timeout: arguments["timeout"]?.doubleValue ?? 120
-            ))
+            let sessionID = try agentSessionID(arguments)
+            do {
+                return try await value(waitForTerminal(
+                    sessionID: sessionID,
+                    timeout: arguments["timeout"]?.doubleValue ?? 120
+                ))
+            } catch let error as ServiceAPIError where error.code == .notFound {
+                return DomainAgentRunSnapshot.expired(sessionID: sessionID).toValue()
+            }
         case "cancel":
             let sessionID = try agentSessionID(arguments)
             _ = try await authority.cancelChildAgentRun(sessionID: sessionID)
@@ -1961,6 +1970,14 @@ private actor AuthorityToolBackend {
         return sessionID
     }
 
+    private func agentSnapshotOrExpired(sessionID: UUID) async throws -> Value {
+        do {
+            return try await value(authority.sessionSnapshot(sessionID: sessionID))
+        } catch let error as ServiceAPIError where error.code == .notFound {
+            return DomainAgentRunSnapshot.expired(sessionID: sessionID).toValue()
+        }
+    }
+
     private func waitForTerminal(sessionID: UUID, timeout: Double) async throws -> SessionSnapshot {
         let deadline = ContinuousClock().now.advanced(by: .seconds(min(max(timeout, 0), 3600)))
         while true {
@@ -2072,6 +2089,7 @@ public struct MCPAgentStartTarget: Sendable {
         case "claudeCode": .claudeCompatible
         case "openCode": .openCodeACP
         case "cursor": .cursorACP
+        case "grokBuild": .grokBuildACP
         default: nil
         }
     }

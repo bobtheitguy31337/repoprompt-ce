@@ -16,10 +16,11 @@ final class ServerSettingsFoundationTests: XCTestCase {
             restrictDiscoveryToRoleModels: true,
             contextBuilderModelsByAgent: [ProviderSettingsID.codex.rawValue: "gpt-5.6-sol"]
         ))
-        try assertRoundTrip(SubagentPermissionSettings(policy: .custom, codex: .readOnly, claude: .autoApproveEdits, openCode: .fullAccess, cursor: .managedDefault))
+        try assertRoundTrip(SubagentPermissionSettings(policy: .custom, codex: .readOnly, claude: .autoApproveEdits, openCode: .fullAccess, cursor: .managedDefault, grokBuild: .fullAccess))
         try assertRoundTrip(DirectAgentPermissionsSettings(
             codex: .init(sandboxMode: .readOnly, approvalPolicy: .unlessTrusted, approvalReviewer: .user, bashEnabled: false),
-            claude: .init(permissionMode: .autoApproveEdits, bashEnabled: false, mcpStrictModeEnabled: true, promptDelivery: .userMessageXML)
+            claude: .init(permissionMode: .autoApproveEdits, bashEnabled: false, mcpStrictModeEnabled: true, promptDelivery: .userMessageXML),
+            grokBuild: .init(permissionLevel: .fullAccess)
         ))
         try assertRoundTrip(ContextBuilderSettingsProfile(
             budget: 100_000,
@@ -49,6 +50,27 @@ final class ServerSettingsFoundationTests: XCTestCase {
             order: 0,
             rowRevision: 1
         ))
+    }
+
+    func testGrokBuildACPIsFirstClassCLIIdentityNotDirectAPI() throws {
+        XCTAssertEqual(ProviderSettingsID.defaultSettingsID(for: .grokBuildACP), .grokBuildACP)
+        XCTAssertEqual(ProviderSettingsID.grokBuildACP.runtimeKind, .grokBuildACP)
+        XCTAssertTrue(ProviderSettingsID.grokBuildACP.ownsRuntimeAdmission)
+        XCTAssertTrue(ProviderSettingsID.grokBuildACP.hasTypedDirectAgentProfile)
+        XCTAssertFalse(ProviderSettingsID.grokBuildACP.isDirectAPI)
+        XCTAssertNotEqual(ProviderSettingsID.grokBuildACP, .xAI)
+
+        let subagent = try JSONDecoder().decode(
+            SubagentPermissionSettings.self,
+            from: Data(#"{"policy":"custom","codex":"readOnly","claude":"auto","openCode":"fullAccess","cursor":"managedDefault"}"#.utf8)
+        )
+        XCTAssertEqual(subagent.grokBuild, .managedDefault)
+
+        let direct = try JSONDecoder().decode(
+            DirectAgentPermissionsSettings.self,
+            from: Data(#"{"codex":{},"claude":{},"openCode":{},"cursor":{}}"#.utf8)
+        )
+        XCTAssertEqual(direct.grokBuild.permissionLevel, .managedDefault)
     }
 
     func testDirectAgentsPersistTypedSandboxApprovalReviewerBashAndMCPStrictAndRootLaunchLiveReadsThem() async throws {
@@ -2090,7 +2112,8 @@ final class ServerSettingsFoundationTests: XCTestCase {
             .codex: .init(mode: "fullAccess", providerSettings: ["test.marker": "codex", "codex.approvalPolicy": "never"]),
             .claudeGLM: .init(mode: "workspaceWrite", providerSettings: ["test.marker": "claude", "claude.backendID": ProviderSettingsID.claudeGLM.rawValue, "claude.permissionMode": "acceptEdits"]),
             .openCodeACP: .init(mode: "fullAccess", providerSettings: ["test.marker": "opencode"]),
-            .cursorACP: .init(mode: "fullAccess", providerSettings: ["test.marker": "cursor"])
+            .cursorACP: .init(mode: "fullAccess", providerSettings: ["test.marker": "cursor"]),
+            .grokBuildACP: .init(mode: "fullAccess", providerSettings: ["test.marker": "grok"])
         ])
         let authority = RepoPromptHeadlessAuthority(
             store: store,
@@ -2124,7 +2147,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertEqual(safePermissions.providerSettings["claude.bashEnabled"], "false")
         XCTAssertEqual(safePermissions.providerSettings["claude.strictMCPEnabled"], "true")
         XCTAssertNil(safePermissions.providerSettings["test.marker"])
-        for providerID in [ProviderSettingsID.codex, .openCodeACP, .cursorACP] {
+        for providerID in [ProviderSettingsID.codex, .openCodeACP, .cursorACP, .grokBuildACP] {
             let child = try await authority.spawnChildSession(parentSessionID: parent.sessionID, providerSettingsID: providerID, initialPrompt: "safe-\(providerID.rawValue)")
             let permissions = try await authority.authoritySessionSnapshot(sessionID: child.sessionID).permissions
             XCTAssertNotEqual(permissions.mode, "fullAccess")
@@ -2143,14 +2166,14 @@ final class ServerSettingsFoundationTests: XCTestCase {
         let inherited = try await authority.spawnChildSession(parentSessionID: parent.sessionID, providerSettingsID: .claudeGLM, initialPrompt: "inherit")
         let inheritedPermissions = try await authority.authoritySessionSnapshot(sessionID: inherited.sessionID).permissions
         XCTAssertEqual(inheritedPermissions.providerSettings["claude.permissionMode"], "acceptEdits")
-        for providerID in [ProviderSettingsID.codex, .openCodeACP, .cursorACP] {
+        for providerID in [ProviderSettingsID.codex, .openCodeACP, .cursorACP, .grokBuildACP] {
             let child = try await authority.spawnChildSession(parentSessionID: parent.sessionID, providerSettingsID: providerID, initialPrompt: "inherit-\(providerID.rawValue)")
             let permissions = try await authority.authoritySessionSnapshot(sessionID: child.sessionID).permissions
             XCTAssertEqual(permissions.mode, "fullAccess")
         }
 
         _ = try await service.replaceSubagentPermissions(
-            .init(expectedRevision: 1, settings: .init(policy: .custom, codex: .readOnly, claude: .fullAccess, openCode: .fullAccess, cursor: .fullAccess)),
+            .init(expectedRevision: 1, settings: .init(policy: .custom, codex: .readOnly, claude: .fullAccess, openCode: .fullAccess, cursor: .fullAccess, grokBuild: .fullAccess)),
             attribution: Self.attribution
         )
         let custom = try await authority.spawnChildSession(parentSessionID: parent.sessionID, providerSettingsID: .claudeGLM, initialPrompt: "custom")
@@ -2161,7 +2184,8 @@ final class ServerSettingsFoundationTests: XCTestCase {
         for (providerID, expectedMode) in [
             (ProviderSettingsID.codex, "readOnly"),
             (.openCodeACP, "fullAccess"),
-            (.cursorACP, "fullAccess")
+            (.cursorACP, "fullAccess"),
+            (.grokBuildACP, "fullAccess")
         ] {
             let child = try await authority.spawnChildSession(parentSessionID: parent.sessionID, providerSettingsID: providerID, initialPrompt: "custom-\(providerID.rawValue)")
             let permissions = try await authority.authoritySessionSnapshot(sessionID: child.sessionID).permissions
@@ -2454,6 +2478,10 @@ final class ServerSettingsFoundationTests: XCTestCase {
                     .init(id: "auto", displayName: "Auto"),
                     .init(id: "composer-2", displayName: "Composer 2")
                 ]
+            ),
+            provider(
+                .grokBuildACP,
+                models: [.init(id: "grok-code", displayName: "Grok Code")]
             )
         ])
     }

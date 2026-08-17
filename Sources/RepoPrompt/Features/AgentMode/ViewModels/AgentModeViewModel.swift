@@ -49,7 +49,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) -> any CodexSessionControlling
     typealias CodexControllerFactoryWithComputerUse = CodexAgentModeCoordinator.CodexControllerFactory
     typealias HeadlessProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) -> HeadlessAgentProvider
-    typealias ACPProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) -> (any ACPAgentProvider)?
+    typealias ACPProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) async throws -> (any ACPAgentProvider)?
     typealias ACPControllerFactory = (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController
     typealias ConnectionPolicyInstaller = (
         _ clientName: String,
@@ -476,6 +476,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
+    private var provisionalParentSessionIDBySessionID: [UUID: UUID] = [:]
+
     private struct AgentRunOracleReviewKey: Hashable {
         let sessionID: UUID
         let runID: UUID
@@ -511,6 +513,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     static let sessionSidebarPageSize = 15
+    static let sessionSidebarArchivedPageSize = 20
     @Published var sessionSidebarSearchText: String = "" {
         didSet {
             guard sessionSidebarSearchText != oldValue else { return }
@@ -525,6 +528,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     @Published var sessionSidebarVisibleSessionCount: Int = AgentModeViewModel.sessionSidebarPageSize {
         didSet {
             guard sessionSidebarVisibleSessionCount != oldValue else { return }
+            syncSidebarUIState()
+        }
+    }
+
+    @Published var sessionSidebarArchivedVisibleSessionCount: Int = AgentModeViewModel.sessionSidebarArchivedPageSize {
+        didSet {
+            guard sessionSidebarArchivedVisibleSessionCount != oldValue else { return }
             syncSidebarUIState()
         }
     }
@@ -609,6 +619,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var uiRefreshTask: Task<Void, Never>?
     private var openCodeModelsSubscriptionTask: Task<Void, Never>?
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
+    private var grokBuildModelsSubscriptionTask: Task<Void, Never>?
     private var skillCatalogDeltaObservationTask: Task<Void, Never>?
     private var skillCatalogRefreshDebounceTask: Task<Void, Never>?
     let sessionIndexStore = AgentWorkspaceSessionIndexStore()
@@ -647,6 +658,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ canonicalItemCount: Int
     ) async throws -> URL
     typealias AgentSessionsDeleter = @MainActor (_ tabID: UUID, _ workspace: WorkspaceModel) async throws -> Void
+    typealias AgentSessionsBatchDeleter = @MainActor (
+        _ tabIDs: Set<UUID>,
+        _ workspace: WorkspaceModel
+    ) async -> [UUID: Error]
 
     private var saveInFlightSessionIDs: Set<UUID> = []
     private var saveRequestedWhileInFlightSessionIDs: Set<UUID> = []
@@ -661,8 +676,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private var agentSessionsDeleter: AgentSessionsDeleter = { tabID, workspace in
-        try await AgentSessionDataService.shared.deleteAgentSessions(forComposeTabID: tabID, for: workspace)
+    private var agentSessionsBatchDeleter: AgentSessionsBatchDeleter = { tabIDs, workspace in
+        await AgentSessionDataService.shared.deleteAgentSessions(forComposeTabIDs: tabIDs, for: workspace)
     }
 
     let sidebarAutoArchivePolicy = AgentModeSidebarAutoArchivePolicy()
@@ -677,6 +692,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var agentChatsSidebarRowsCache: (key: SidebarSessionRowsCacheKey, rows: [SidebarSession])?
     var sidebarListProjectionCache: (key: SidebarListProjectionCacheKey, projection: SidebarListProjection)?
     private var lastKnownWorkspaceSnapshot: WorkspaceModel?
+    var sidebarRuntimeWorkspaceID: UUID? {
+        lastKnownWorkspaceSnapshot?.id
+    }
+
     var tabDraftText: [UUID: String] = [:]
     private var cancellables = Set<AnyCancellable>()
     private let listeners = ListenerRegistry()
@@ -689,6 +708,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_sidebarSessionRowsBuildCount = 0
         var test_sidebarListProjectionBuildCount = 0
         private var test_afterMCPStoreEpochBegan: (@MainActor () async -> Void)?
+        private var test_afterDurableChildTabCreation: (@MainActor () async -> Void)?
         private var test_composeTabRemovalTeardownObserver: (@MainActor (UUID) -> Void)?
         private var test_terminalPublicationOverride: ((
             AgentRunTerminalCommitRevision,
@@ -726,7 +746,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         func test_setAgentSessionsDeleter(_ deleter: @escaping AgentSessionsDeleter) {
-            agentSessionsDeleter = deleter
+            agentSessionsBatchDeleter = { tabIDs, workspace in
+                var failures: [UUID: Error] = [:]
+                for tabID in tabIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
+                    do {
+                        try await deleter(tabID, workspace)
+                    } catch {
+                        failures[tabID] = error
+                    }
+                }
+                return failures
+            }
         }
 
         func test_setComposeTabRemovalTeardownObserver(_ observer: @escaping @MainActor (UUID) -> Void) {
@@ -776,6 +806,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         ) {
             self.promptManager = promptManager
             self.workspaceManager = workspaceManager
+            installPromptManagerCascadeResolvers(promptManager)
             installAgentSessionLifecycleProjectionAuthority()
         }
 
@@ -785,6 +816,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         func test_setAfterMCPStoreEpochBegan(_ hook: (@MainActor () async -> Void)?) {
             test_afterMCPStoreEpochBegan = hook
+        }
+
+        func test_setAfterDurableChildTabCreation(_ hook: (@MainActor () async -> Void)?) {
+            test_afterDurableChildTabCreation = hook
         }
 
         func test_setTerminalPublicationOverride(
@@ -1375,6 +1410,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         codexCoordinator.updateCodexModelPolling()
         updateOpenCodeModelPolling()
         updateCursorModelPolling(startPolling: startCursorPolling)
+        updateGrokBuildModelPolling(startPolling: startCursorPolling)
     }
 
     private func updateOpenCodeModelPolling() {
@@ -1442,7 +1478,45 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         cursorModelsSubscriptionTask = nil
     }
 
+    private func updateGrokBuildModelPolling(startPolling: Bool = true) {
+        guard selectedAgent == .grokBuild else {
+            stopGrokBuildModelsSubscription()
+            return
+        }
+        guard startPolling,
+              AgentModelCatalog.isAgentAvailable(.grokBuild, availability: agentAvailabilityContext)
+        else {
+            return
+        }
+        startGrokBuildModelsSubscriptionIfNeeded()
+    }
+
+    private func startGrokBuildModelsSubscriptionIfNeeded() {
+        guard grokBuildModelsSubscriptionTask == nil else { return }
+        let workspacePath = workspacePathProvider()
+        grokBuildModelsSubscriptionTask = Task { [weak self, workspacePath] in
+            let stream = await GrokBuildACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
+            for await _ in stream {
+                guard !Task.isCancelled else { return }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    acpDynamicModelRevision &+= 1
+                    syncSelectedACPModelFromRegistryIfNeeded(for: .grokBuild)
+                    syncComposerUIState()
+                }
+            }
+        }
+    }
+
+    private func stopGrokBuildModelsSubscription() {
+        grokBuildModelsSubscriptionTask?.cancel()
+        grokBuildModelsSubscriptionTask = nil
+    }
+
     private func syncSelectedACPModelFromRegistryIfNeeded(for agent: AgentProviderKind) {
+        // Grok's "default" selection must stick: a discovered session's current model is
+        // never auto-adopted as an explicit selection (default sends no model mutation).
+        guard agent != .grokBuild else { return }
         guard selectedAgent == agent,
               let providerID = agent.acpProviderID,
               let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID),
@@ -1603,7 +1677,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         headlessProviderFactory = Self.defaultHeadlessProviderFactory
         acpProviderFactory = { agent, modelString in
-            ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
+            try await ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
         }
         acpControllerFactory = { provider, runRequest in
             try ACPAgentSessionController(provider: provider, runRequest: runRequest)
@@ -1752,7 +1826,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 AgentModeViewModel.defaultHeadlessProviderFactory(agent: agent, modelString: modelString)
             },
             acpProviderFactory: @escaping ACPProviderFactory = { agent, modelString in
-                ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
+                try await ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
             },
             acpControllerFactory: @escaping ACPControllerFactory = { provider, runRequest in
                 try ACPAgentSessionController(provider: provider, runRequest: runRequest)
@@ -2540,8 +2614,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         listeners.addToken(
             promptManager.addComposeTabsDidRemoveListener { [weak self] tabIDs, reason, workspaceID in
-                guard let self else { return }
-                await handleComposeTabsDidRemove(tabIDs, reason: reason, workspaceID: workspaceID)
+                guard let self else { return [] }
+                return await handleComposeTabsDidRemove(tabIDs, reason: reason, workspaceID: workspaceID)
             }
         ) { [weak promptManager] token in
             promptManager?.removeComposeTabsDidRemoveListener(token)
@@ -2871,6 +2945,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 self.sessionTreeCascadePlan(forStashedTabIDs: stashedTabIDs)
             }
         }
+        promptManager.agentSessionCascadeSnapshotResolver = makeAgentSessionCascadeSnapshotResolver()
+    }
+
+    private func makeAgentSessionCascadeSnapshotResolver() -> PromptViewModel.AgentSessionCascadeSnapshotResolver {
+        { [weak self] composeTabIDs, archivedTargets, reason in
+            guard let self else { return .init() }
+            var plan = sessionTreeCascadePlan(forComposeTabIDs: composeTabIDs, reason: reason)
+            let archivedPlan = sessionTreeCascadePlan(
+                forStashedTabIDs: Set(archivedTargets.map(\.stashedTabID))
+            )
+            plan.composeTabIDs.formUnion(archivedPlan.composeTabIDs)
+            plan.archivedTargets.formUnion(archivedPlan.archivedTargets)
+            return plan
+        }
     }
 
     func isComposeTabProtectedFromSidebarArchiveSuggestion(_ tabID: UUID) -> Bool {
@@ -2911,7 +2999,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         composeDescendantTabIDs.subtract(tabIDs)
         return .init(
             composeTabIDs: composeDescendantTabIDs,
-            stashedTabIDs: stashedDescendantTabIDs
+            archivedTargets: archivedMutationTargets(for: stashedDescendantTabIDs)
         )
     }
 
@@ -2934,8 +3022,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         stashedDescendantTabIDs.subtract(stashedTabIDs)
         return .init(
             composeTabIDs: composeDescendantTabIDs,
-            stashedTabIDs: stashedDescendantTabIDs
+            archivedTargets: archivedMutationTargets(for: stashedDescendantTabIDs)
         )
+    }
+
+    private func archivedMutationTargets(
+        for stashedTabIDs: Set<UUID>
+    ) -> Set<PromptViewModel.ArchivedTabMutationTarget> {
+        let stashedTabs = workspaceManager?.activeWorkspace?.stashedTabs ?? []
+        return Set(stashedTabs.compactMap { stashedTab -> PromptViewModel.ArchivedTabMutationTarget? in
+            guard stashedTabIDs.contains(stashedTab.id) else { return nil }
+            return .init(stashedTabID: stashedTab.id, tabID: stashedTab.tab.id)
+        })
     }
 
     private func sessionTreeRootSessionIDs(
@@ -3009,6 +3107,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             nodes[sessionID] = node
         }
 
+        for (sessionID, parentSessionID) in provisionalParentSessionIDBySessionID {
+            merge(sessionID: sessionID, parentSessionID: parentSessionID)
+        }
         for session in sessions.values where validComposeTabIDs.contains(session.tabID) {
             guard let sessionID = session.activeAgentSessionID else { continue }
             if let explicitSessionID = explicitSessionIDByTabID[session.tabID],
@@ -3194,7 +3295,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         refreshSessionListCache(for: workspace, owner: owner)
     }
 
-    func toggleComposeInspectorIfActive() {
+    func toggleContextComposerIfActive() {
         guard isAgentModeActive else { return }
         ui.contextDrawer.toggle()
     }
@@ -4759,7 +4860,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     modelContextWindow: session.codexContextUsage?.modelContextWindow
                 )
             }
-        case .codexExec, .openCode, .cursor:
+        case .codexExec, .openCode, .cursor, .grokBuild:
             break
         }
         session.contextUsageSnapshot = ContextUsageSnapshot.fromAgentContextUsage(
@@ -6604,6 +6705,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ desiredBindings: [AgentSessionWorktreeBinding],
         forSessionID sessionID: UUID,
         intent: WorktreeBindingTransitionIntent,
+        invocation: WorktreeBindingMutationInvocationIdentity? = nil,
         startupContext: WorktreeStartupContext? = nil,
         initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = [:]
     ) async throws -> [AgentSessionWorktreeBinding] {
@@ -6622,6 +6724,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let previousDestination = executionDestinationIdentity(in: previousBindings)
         let nextDestination = executionDestinationIdentity(in: desiredBindings)
         let changedDuringActiveRun = session.runState.isActive
+        let preservesInvokingCodexController = shouldPreserveInvokingCodexController(
+            for: session,
+            intent: intent,
+            invocation: invocation,
+            destinationChanged: previousDestination != nextDestination
+        )
 
         if changedDuringActiveRun, previousDestination != nextDestination {
             switch intent {
@@ -6696,7 +6804,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 if !changedDuringActiveRun {
                     await stageResumeRecoveryHandoffIfNeeded(for: session)
                 }
-                await invalidateProviderContextForExecutionLocationChange(session)
+                if !preservesInvokingCodexController {
+                    await invalidateProviderContextForExecutionLocationChange(session)
+                }
                 guard sessions[session.tabID] === session,
                       session.activeAgentSessionID == sessionID,
                       session.worktreeBindings == previousBindings,
@@ -6856,6 +6966,29 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
+    /// Preserves only the exact Codex process currently executing an externally routed
+    /// binding mutation. The existing controller workspace-path key forces replacement
+    /// before the next turn can run at the newly committed execution destination.
+    private func shouldPreserveInvokingCodexController(
+        for session: TabSession,
+        intent: WorktreeBindingTransitionIntent,
+        invocation: WorktreeBindingMutationInvocationIdentity?,
+        destinationChanged: Bool
+    ) -> Bool {
+        guard destinationChanged,
+              case .externalManagement = intent,
+              let invocation,
+              invocation.provider == .codexExec,
+              invocation.sessionID == session.activeAgentSessionID,
+              invocation.runID == session.runID,
+              session.selectedAgent == .codexExec,
+              session.codexController != nil
+        else {
+            return false
+        }
+        return true
+    }
+
     private func invalidateProviderContextForExecutionLocationChange(_ session: TabSession) async {
         await session.disposeProviderIfPresent()
         if let controller = session.acpController {
@@ -6969,14 +7102,28 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard createIfNeeded else {
                 throw MCPError.invalidParams("The requested agent session is not currently available.")
             }
+            let effectiveParentSessionID = indexedParentSessionID ?? parentSessionID
+            let parentWasLocallyRepresentedAtAdmissionStart = effectiveParentSessionID.map {
+                sessionTreeNodes()[$0] != nil
+            } ?? false
             let createdTabID = try await mcpCreateBackgroundSessionTab(
                 name: sessionName,
-                sessionID: sessionID
+                sessionID: sessionID,
+                parentSessionID: effectiveParentSessionID
+            )
+            defer { provisionalParentSessionIDBySessionID.removeValue(forKey: sessionID) }
+            #if DEBUG
+                await test_afterDurableChildTabCreation?()
+            #endif
+            try requireSpawnAdmissionStillCurrent(
+                childTabID: createdTabID,
+                parentSessionID: effectiveParentSessionID,
+                parentWasLocallyRepresentedAtAdmissionStart: parentWasLocallyRepresentedAtAdmissionStart
             )
             let hydrated = await ensureSessionReady(tabID: createdTabID)
             await loadSessionFromDisk(for: hydrated)
             applySpawnParentSessionID(
-                indexedParentSessionID ?? parentSessionID,
+                effectiveParentSessionID,
                 to: hydrated,
                 inheritWorktreeBindings: inheritWorktreeBindings
             )
@@ -7023,9 +7170,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams("No target agent session was specified.")
         }
         let intendedSessionID = UUID()
+        let parentWasLocallyRepresentedAtAdmissionStart = parentSessionID.map {
+            sessionTreeNodes()[$0] != nil
+        } ?? false
         let createdTabID = try await mcpCreateBackgroundSessionTab(
             name: sessionName,
-            sessionID: intendedSessionID
+            sessionID: intendedSessionID,
+            parentSessionID: parentSessionID
+        )
+        defer { provisionalParentSessionIDBySessionID.removeValue(forKey: intendedSessionID) }
+        #if DEBUG
+            await test_afterDurableChildTabCreation?()
+        #endif
+        try requireSpawnAdmissionStillCurrent(
+            childTabID: createdTabID,
+            parentSessionID: parentSessionID,
+            parentWasLocallyRepresentedAtAdmissionStart: parentWasLocallyRepresentedAtAdmissionStart
         )
         let hydrated = await ensureSessionReady(tabID: createdTabID)
         guard hydrated.activeAgentSessionID == intendedSessionID else {
@@ -7108,7 +7268,45 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    private func requireSpawnAdmissionStillCurrent(
+        childTabID: UUID,
+        parentSessionID: UUID?,
+        parentWasLocallyRepresentedAtAdmissionStart: Bool
+    ) throws {
+        guard workspaceManager?.composeTab(with: childTabID) != nil else {
+            throw MCPError.invalidParams("The new child Agent session was removed before admission completed.")
+        }
+        if parentWasLocallyRepresentedAtAdmissionStart,
+           let parentSessionID,
+           sessionTreeNodes()[parentSessionID] == nil
+        {
+            throw MCPError.invalidParams("The parent Agent session was removed before child admission completed.")
+        }
+    }
+
     private func mcpCreateBackgroundSessionTab(
+        name: String?,
+        sessionID: UUID,
+        parentSessionID: UUID?
+    ) async throws -> UUID {
+        guard let promptManager else {
+            throw MCPError.internalError("Prompt manager unavailable.")
+        }
+        if let parentSessionID, parentSessionID != sessionID {
+            provisionalParentSessionIDBySessionID[sessionID] = parentSessionID
+        }
+        do {
+            return try await createBackgroundSessionTab(
+                name: name,
+                sessionID: sessionID
+            )
+        } catch {
+            provisionalParentSessionIDBySessionID.removeValue(forKey: sessionID)
+            throw error
+        }
+    }
+
+    private func createBackgroundSessionTab(
         name: String?,
         sessionID: UUID
     ) async throws -> UUID {
@@ -11334,6 +11532,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         owner: SessionIndexOwner
     ) async {
         guard sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace) else { return }
+        ui.sessionSidebar.invalidateSelectionForWorkspaceChange()
+        sessionSidebarArchivedVisibleSessionCount = Self.sessionSidebarArchivedPageSize
         lastKnownWorkspaceSnapshot = workspace
         installSessionIndexOwner(owner, workspace: workspace)
         guard sessionIndexStore.isOwnerCurrent(owner) else { return }
@@ -12019,10 +12219,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 message: "The owning workspace changed before required session persistence."
             ))
         }
+        var flushedSessionClaims: [RemovalPreflightSessionClaim] = []
         for tabID in tabIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
             switch await flushSaveRequired(for: tabID, workspaceID: workspaceID) {
             case .success:
-                continue
+                flushedSessionClaims.append(removalPreflightSessionClaim(for: tabID))
             case let .failure(failure):
                 return .abort(.init(
                     stage: .requiredSessionFlush,
@@ -12031,29 +12232,111 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 ))
             }
         }
+        guard flushedSessionClaims.allSatisfy({ removalPreflightSessionClaim(for: $0.tabID) == $0 }) else {
+            return .abort(.init(
+                stage: .requiredSessionFlush,
+                tabID: nil,
+                message: "A target session changed after required persistence completed."
+            ))
+        }
         return .proceed
     }
 
     func handleComposeTabsDidRemove(
         _ tabIDs: Set<UUID>,
         reason: PromptViewModel.ComposeTabRemovalReason,
-        workspaceID: UUID? = nil
-    ) async {
-        let removalWorkspace = workspaceID.flatMap { workspaceID in
-            workspaceManager?.workspaces.first(where: { $0.id == workspaceID })
-        } ?? workspaceManager?.activeWorkspace
-
+        workspaceID: UUID
+    ) async -> [PromptViewModel.ComposeTabPostRemovalIssue] {
+        let removalWorkspace = workspaceManager?.workspaces.first(where: { $0.id == workspaceID })
+        var issues: [PromptViewModel.ComposeTabPostRemovalIssue] = []
         let orderedTabIDs = tabIDs.sorted(by: { $0.uuidString < $1.uuidString })
+
+        func tabIsRemoved(_ tabID: UUID, from workspace: WorkspaceModel) -> Bool {
+            !workspace.composeTabs.contains(where: { $0.id == tabID })
+                && !workspace.stashedTabs.contains(where: { $0.tab.id == tabID })
+        }
+
+        let runtimeCleanupTabIDs: Set<UUID> = if workspaceManager == nil {
+            tabIDs
+        } else if let removalWorkspace {
+            Set(tabIDs.filter { tabID in
+                switch reason {
+                case .stash:
+                    !removalWorkspace.composeTabs.contains(where: { $0.id == tabID })
+                case .close, .deleteStashed:
+                    tabIsRemoved(tabID, from: removalWorkspace)
+                }
+            })
+        } else {
+            []
+        }
+        if removalWorkspace != nil {
+            issues.append(contentsOf: tabIDs.subtracting(runtimeCleanupTabIDs).map { tabID in
+                .init(
+                    tabID: tabID,
+                    reason: reason,
+                    message: "The chat was recreated before runtime cleanup."
+                )
+            })
+        }
+
+        if workspaceManager != nil, workspaceManager?.activeWorkspaceID != workspaceID {
+            if reason != .stash {
+                if let removalWorkspace {
+                    let durableTabIDs = Set(tabIDs.filter { tabIsRemoved($0, from: removalWorkspace) })
+                    let reintroducedTabIDs = tabIDs.subtracting(durableTabIDs)
+                    issues.append(contentsOf: reintroducedTabIDs.map { tabID in
+                        .init(
+                            tabID: tabID,
+                            reason: reason,
+                            message: "The chat was recreated before durable cleanup."
+                        )
+                    })
+                    let failures = await agentSessionsBatchDeleter(durableTabIDs, removalWorkspace)
+                    issues.append(contentsOf: failures.map { tabID, failure in
+                        .init(tabID: tabID, reason: reason, message: failure.localizedDescription)
+                    })
+                } else {
+                    issues.append(contentsOf: orderedTabIDs.map { tabID in
+                        .init(
+                            tabID: tabID,
+                            reason: reason,
+                            message: "The owning workspace is no longer available for durable cleanup."
+                        )
+                    })
+                }
+            }
+            return issues
+        }
+        let orderedRuntimeCleanupTabIDs = orderedTabIDs.filter(runtimeCleanupTabIDs.contains)
+        let capturedSessionsByTabID = Dictionary(
+            uniqueKeysWithValues: orderedRuntimeCleanupTabIDs.map { ($0, sessions[$0]) }
+        )
+        let capturedBoundSessionIDByTabID = Dictionary(
+            uniqueKeysWithValues: orderedRuntimeCleanupTabIDs.map { ($0, boundSessionID(for: $0)) }
+        )
+        for tabID in orderedRuntimeCleanupTabIDs {
+            if let capturedSession = capturedSessionsByTabID[tabID] ?? nil,
+               sessions[tabID] === capturedSession
+            {
+                sessions.removeValue(forKey: tabID)
+            }
+        }
         // Drop any sidebar attention / observed run-state for tabs that are
         // going away so we don't leave dangling entries referring to dead IDs.
-        cleanupSidebarRunAttention(tabIDs: tabIDs)
-        for tabID in orderedTabIDs {
+        if workspaceManager == nil || workspaceManager?.activeWorkspaceID == workspaceID {
+            cleanupSidebarRunAttention(tabIDs: runtimeCleanupTabIDs)
+        }
+        for tabID in orderedRuntimeCleanupTabIDs {
             #if DEBUG
                 test_composeTabRemovalTeardownObserver?(tabID)
             #endif
-            let boundID = boundSessionID(for: tabID)
-            if let session = sessions[tabID] {
-                removePendingUIRefresh(for: tabID)
+            let capturedSession = capturedSessionsByTabID[tabID] ?? nil
+            let boundID = capturedBoundSessionIDByTabID[tabID] ?? nil
+            if let session = capturedSession {
+                if sessions[tabID] == nil {
+                    removePendingUIRefresh(for: tabID)
+                }
                 cancelPersistedLoad(for: session)
                 session.cancelEphemeralRuntimeState()
                 // Cancel pending question
@@ -12066,7 +12349,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
                 // Cancel agent run
                 if session.runState.isActive {
-                    await cancelAgentRun(tabID: tabID)
+                    await runService.cancelRun(tabID: tabID, session: session)
                 }
 
                 // All compose-tab removal reasons detach the live TabSession owner from `sessions`.
@@ -12075,43 +12358,36 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 await codexCoordinator.shutdownCodexSession(session)
                 await claudeCoordinator.shutdownClaudeSession(session)
             }
-            await cleanupMCPRunRoutingIfPresent(
-                boundSessionID: boundID,
-                liveSession: sessions[tabID],
-                reason: "compose_tab_close"
-            )
-            await releaseSessionWorktreeOwnership(sessionID: boundID)
-
-            switch reason {
-            case .stash:
-                sessions.removeValue(forKey: tabID)
-                tabsWithActiveAgentRun.remove(tabID)
-            case .close:
-                if let workspace = removalWorkspace {
-                    do {
-                        try await agentSessionsDeleter(tabID, workspace)
-                    } catch {
-                        print("[AgentModeVM] Failed to delete removed tab session data for \(tabID): \(error)")
-                    }
+            if sessions[tabID] == nil {
+                await cleanupMCPRunRoutingIfPresent(
+                    boundSessionID: boundID,
+                    liveSession: capturedSession,
+                    reason: "compose_tab_close"
+                )
+            }
+            if sessions[tabID] == nil {
+                await releaseSessionWorktreeOwnership(sessionID: boundID)
+            }
+            let currentRemovalWorkspace = workspaceManager?.workspaces.first(where: { $0.id == workspaceID })
+            let projectionStillRemoved = currentRemovalWorkspace.map { workspace in
+                switch reason {
+                case .stash:
+                    !workspace.composeTabs.contains(where: { $0.id == tabID })
+                case .close, .deleteStashed:
+                    tabIsRemoved(tabID, from: workspace)
                 }
+            } ?? false
+            let tabCleanupIsStillOwned = sessions[tabID] == nil && (workspaceManager == nil || projectionStillRemoved)
+            if tabCleanupIsStillOwned {
+                tabsWithActiveAgentRun.remove(tabID)
+            }
+            if reason != .stash,
+               workspaceManager == nil || workspaceManager?.activeWorkspaceID == workspaceID,
+               tabCleanupIsStillOwned
+            {
                 removeSessionIndex(forTabID: tabID)
                 tabDraftText.removeValue(forKey: tabID)
                 sessionIndexStore.removeSortDate(forTabID: tabID)
-                sessions.removeValue(forKey: tabID)
-                tabsWithActiveAgentRun.remove(tabID)
-            case .deleteStashed:
-                if let workspace = removalWorkspace {
-                    do {
-                        try await agentSessionsDeleter(tabID, workspace)
-                    } catch {
-                        print("[AgentModeVM] Failed to delete removed stashed session data for \(tabID): \(error)")
-                    }
-                }
-                removeSessionIndex(forTabID: tabID)
-                tabDraftText.removeValue(forKey: tabID)
-                sessionIndexStore.removeSortDate(forTabID: tabID)
-                sessions.removeValue(forKey: tabID)
-                tabsWithActiveAgentRun.remove(tabID)
             }
             #if DEBUG
                 AgentModePerfDiagnostics.markSidebarDeleteAgentCleanupComplete(
@@ -12121,12 +12397,72 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
             #endif
         }
+        if reason != .stash {
+            let durableWorkspace = workspaceManager?.workspaces.first(where: { $0.id == workspaceID }) ?? removalWorkspace
+            if let durableWorkspace {
+                let durableTabIDs = Set(tabIDs.filter { tabID in
+                    tabIsRemoved(tabID, from: durableWorkspace) && sessions[tabID] == nil
+                })
+                let unsettledTabIDs = tabIDs.subtracting(durableTabIDs)
+                issues.append(contentsOf: unsettledTabIDs.map { tabID in
+                    .init(
+                        tabID: tabID,
+                        reason: reason,
+                        message: "The chat was recreated before durable cleanup."
+                    )
+                })
+                let failures = await agentSessionsBatchDeleter(durableTabIDs, durableWorkspace)
+                for tabID in failures.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
+                    guard let failure = failures[tabID] else { continue }
+                    print("[AgentModeVM] Failed to delete removed session data for \(tabID): \(failure)")
+                    issues.append(.init(
+                        tabID: tabID,
+                        reason: reason,
+                        message: failure.localizedDescription
+                    ))
+                }
+            } else {
+                issues.append(contentsOf: orderedTabIDs.map { tabID in
+                    .init(
+                        tabID: tabID,
+                        reason: reason,
+                        message: "The owning workspace is no longer available for durable cleanup."
+                    )
+                })
+            }
+        }
         #if DEBUG
             AgentTranscriptDebugInstrumentation.removeRefreshInputSignatures(for: tabIDs)
         #endif
+        return issues
     }
 
     // MARK: - Persistence
+
+    private func removalPreflightSessionClaim(for tabID: UUID) -> RemovalPreflightSessionClaim {
+        guard let session = sessions[tabID] else {
+            return RemovalPreflightSessionClaim(
+                tabID: tabID,
+                sessionIdentity: nil,
+                activeAgentSessionID: nil,
+                binding: nil,
+                bindingTransitionGeneration: 0,
+                sourceItemsRevision: 0,
+                persistenceMutationGeneration: 0,
+                saveRequestGeneration: 0
+            )
+        }
+        return RemovalPreflightSessionClaim(
+            tabID: tabID,
+            sessionIdentity: ObjectIdentifier(session),
+            activeAgentSessionID: session.activeAgentSessionID,
+            binding: session.persistentSessionBindingIdentity,
+            bindingTransitionGeneration: session.bindingTransitionGeneration,
+            sourceItemsRevision: session.sourceItemsRevision,
+            persistenceMutationGeneration: session.persistenceMutationGeneration,
+            saveRequestGeneration: session.saveRequestGeneration
+        )
+    }
 
     private func makeSaveCommitToken(
         for session: TabSession,
@@ -14418,7 +14754,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         switch agent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor:
             return renderAtPathAttachmentMessage(text: text, attachments: attachments)
-        case .codexExec:
+        case .codexExec, .grokBuild:
             return text
         }
     }
@@ -14603,9 +14939,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         for taggedPath in taggedPaths {
             guard orderedFiles.count < maxFiles else { break }
             let translatedPath = lookupContext.translateInputPath(taggedPath)
-            guard let readable = await readableService.resolveReadableFile(
+            guard let readable = try? await readableService.resolveReadableFile(
                 translatedPath,
-                profile: .mcpRead,
                 rootScope: lookupContext.rootScope
             ) else { continue }
             switch readable {
