@@ -739,6 +739,7 @@ public actor ServerSettingsService {
         guard (0 ... 2).contains(request.settings.modelTemperature) else {
             throw ServiceAPIError(code: .invalidRequest, message: "Model temperature is outside its supported range")
         }
+        try validateModelOverrides(request.settings.modelOverrides)
         let document = StoredSettingsDocument(value: request.settings, revision: request.expectedRevision + 1, updatedAt: now())
         let stored = try await store.upsertAdvancedServerSettingsDocument(
             document,
@@ -1183,6 +1184,31 @@ private extension ServerSettingsService {
         case .full, .codeMap:
             guard entry.ranges.isEmpty else {
                 throw ServiceAPIError(code: .invalidRequest, message: "Selection preset ranges require slice mode")
+            }
+        }
+    }
+
+    private func validateModelOverrides(_ maps: ModelOverrideMaps) throws {
+        let boolMaps = [maps.diffOverrides, maps.streamOverrides, maps.responsesOverrides]
+        for map in boolMaps {
+            guard map.count <= 256 else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Model override map exceeds its bound")
+            }
+            for key in map.keys {
+                guard let normalized = try normalizedText(key, maximumBytes: 256), !normalized.isEmpty else {
+                    throw ServiceAPIError(code: .invalidRequest, message: "Model override key is invalid")
+                }
+            }
+        }
+        guard maps.temperatureOverrides.count <= 256 else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Model override map exceeds its bound")
+        }
+        for (key, value) in maps.temperatureOverrides {
+            guard let normalized = try normalizedText(key, maximumBytes: 256), !normalized.isEmpty else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Model override key is invalid")
+            }
+            guard (0 ... 2).contains(value) else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Model temperature override is outside its supported range")
             }
         }
     }

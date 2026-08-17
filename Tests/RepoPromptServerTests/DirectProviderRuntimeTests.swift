@@ -247,7 +247,8 @@ final class DirectProviderRuntimeTests: XCTestCase {
             XCTAssertTrue(providerID.isDirectAPI)
             XCTAssertEqual(providerID.runtimeKind, .headlessAdapter)
         }
-        XCTAssertFalse(ProviderSettingsID.xAI.isDirectAPI)
+        XCTAssertTrue(ProviderSettingsID.xAI.isDirectAPI)
+        XCTAssertEqual(ProviderSettingsID.xAI.runtimeKind, .headlessAdapter)
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
@@ -261,14 +262,15 @@ final class DirectProviderRuntimeTests: XCTestCase {
         let anthropicAdmitted = await registry.isDeploymentAllowed(.anthropicAPI)
         let routerAdmitted = await registry.isDeploymentAllowed(.openRouter)
         let customAdmitted = await registry.isDeploymentAllowed(.customOpenAICompatible)
-        let legacyAdmitted = await registry.isDeploymentAllowed(.xAI)
+        let xaiAdmitted = await registry.isDeploymentAllowed(.xAI)
         XCTAssertTrue(admitted)
         XCTAssertFalse(anthropicAdmitted)
         XCTAssertFalse(routerAdmitted)
         XCTAssertFalse(customAdmitted)
-        XCTAssertFalse(legacyAdmitted)
+        XCTAssertTrue(xaiAdmitted)
         XCTAssertThrowsError(try ProviderEndpointPolicy.fixed(providerID: .customOpenAICompatible))
-        XCTAssertThrowsError(try ProviderEndpointPolicy.fixed(providerID: .xAI))
+        XCTAssertThrowsError(try ProviderEndpointPolicy.fixed(providerID: .azure))
+        XCTAssertThrowsError(try ProviderEndpointPolicy.fixed(providerID: .ollama))
     }
 
     func testCatalogEndpointsAndAuthenticationAreProviderExact() throws {

@@ -631,11 +631,19 @@ function directConfigurationFixture(providerID, overrides = {}) {
     baseURL:
       providerID === "customOpenAICompatible"
         ? "https://models.example/v1"
-        : null,
+        : providerID === "ollama"
+          ? "http://localhost:11434"
+          : null,
     preferredModel: null,
     maximumOutputTokens: 4096,
     customHeaders: {},
     contentTypePolicy: "applicationJSON",
+    apiVersion: null,
+    enabledModels: [],
+    includeDefaultModels: true,
+    useCustomSettings: true,
+    includeContentTypeHeader: false,
+    showServiceTierVariants: false,
     revision: 1,
     updatedAt: "2026-08-11T20:00:00Z",
     ...overrides,
@@ -2539,6 +2547,36 @@ test("direct provider forms appear only for deployment-admitted complete runtime
       models: [model("openai/gpt-5.6")],
       preference: { enabled: false },
     }),
+    providerFixture({
+      providerID: "gemini",
+      displayName: "Gemini",
+      category: "apiProvider",
+      deploymentAllowed: true,
+      authenticationMethods: ["apiKey"],
+      authFlows: [],
+      models: [model("gemini-2.5-pro")],
+      preference: { enabled: false },
+    }),
+    providerFixture({
+      providerID: "azure",
+      displayName: "Azure OpenAI",
+      category: "apiProvider",
+      deploymentAllowed: true,
+      authenticationMethods: ["apiKey"],
+      authFlows: [],
+      models: [model("gpt-4o")],
+      preference: { enabled: false },
+    }),
+    providerFixture({
+      providerID: "ollama",
+      displayName: "Ollama",
+      category: "apiProvider",
+      deploymentAllowed: true,
+      authenticationMethods: [],
+      authFlows: [],
+      models: [model("llama3.2")],
+      preference: { enabled: false },
+    }),
   );
   const harness = await createHarness({
     hash: "#settings/api-providers",
@@ -2549,27 +2587,50 @@ test("direct provider forms appear only for deployment-admitted complete runtime
 
   const openAI = document.querySelector('[data-provider-id="openAIAPI"]');
   assert.ok(openAI);
+  assert.ok(document.querySelector('[data-provider-id="gemini"]'));
+  assert.ok(document.querySelector('[data-provider-id="azure"]'));
+  assert.ok(document.querySelector('[data-provider-id="ollama"]'));
   assert.equal(
     document.querySelector('[data-provider-id="anthropicAPI"]'),
     null,
   );
+  assert.equal(document.querySelector('[data-provider-id="xAI"]'), null);
+  assert.equal(document.querySelector('[data-provider-id="openRouter"]'), null);
   assert.match(
     document.getElementById("settings-content").textContent,
     /Save Runtime Configuration/,
+  );
+  assert.match(
+    document.getElementById("settings-content").textContent,
+    /LM Studio/,
+  );
+  assert.doesNotMatch(
+    document.getElementById("settings-content").textContent,
+    /Intentionally omitted protocol/,
   );
   const maximum = openAI.querySelector(
     'input[aria-label="OpenAI API maximum output tokens"]',
   );
   assert.deepEqual(
     [maximum.min, maximum.max, maximum.step],
-    ["1", "65536", "1"],
+    ["0", "65536", "1"],
   );
   assert.equal(
     openAI.querySelector('input[aria-label="OpenAI API preferred model"]')
       .maxLength,
     256,
   );
-  maximum.value = "65536";
+  assert.ok(
+    openAI.querySelector(
+      'input[aria-label="OpenAI API show service-tier variants"]',
+    ),
+  );
+  maximum.value = "0";
+  openAI.querySelector('input[aria-label="OpenAI API API version"]').value =
+    "v1-beta";
+  openAI.querySelector(
+    'input[aria-label="OpenAI API show service-tier variants"]',
+  ).checked = true;
   submit(window, openAI.querySelector(".direct-provider-form"));
   await waitFor(() =>
     calls.some(
@@ -2586,17 +2647,32 @@ test("direct provider forms appear only for deployment-admitted complete runtime
     ).body,
   );
   assert.deepEqual(Object.keys(directPayload).sort(), [
+    "apiVersion",
     "baseURL",
     "contentTypePolicy",
     "customHeaders",
+    "enabledModels",
     "expectedRevision",
+    "includeContentTypeHeader",
+    "includeDefaultModels",
     "maximumOutputTokens",
     "preferredModel",
+    "showServiceTierVariants",
+    "useCustomSettings",
   ]);
-  assert.equal(directPayload.maximumOutputTokens, 65536);
+  assert.equal(directPayload.maximumOutputTokens, 0);
+  assert.equal(directPayload.apiVersion, "v1-beta");
+  assert.equal(directPayload.showServiceTierVariants, true);
   assert.equal(directPayload.contentTypePolicy, "applicationJSON");
   assert.deepEqual(directPayload.customHeaders, {});
   assert.equal("credential" in directPayload, false);
+  assert.equal(
+    calls.some(
+      (call) =>
+        call.method === "PATCH" && call.path === "api/v1/desktop-settings",
+    ),
+    false,
+  );
   await window.RepoPromptPortalTest.whenIdle();
   assert.equal(
     document.getElementById("settings-save-status").textContent,
@@ -2616,9 +2692,16 @@ test("direct provider forms appear only for deployment-admitted complete runtime
     'input[aria-label="OpenRouter maximum output tokens"]',
   );
   assert.equal(routerMaximum.max, "65536");
+  assert.equal(routerMaximum.min, "0");
   openRouter.querySelector(
     'textarea[aria-label="OpenRouter custom headers"]',
   ).value = '{"X-Title":"Portal"}';
+  openRouter.querySelector(
+    'textarea[aria-label="OpenRouter enabled models"]',
+  ).value = "openai/gpt-5.6";
+  openRouter.querySelector(
+    'input[aria-label="OpenRouter include default models"]',
+  ).checked = false;
   submit(window, openRouter.querySelector(".direct-provider-form"));
   await waitFor(() =>
     calls.some(
@@ -2637,6 +2720,37 @@ test("direct provider forms appear only for deployment-admitted complete runtime
     ).body,
   );
   assert.deepEqual(routerPayload.customHeaders, { "X-Title": "Portal" });
+  assert.deepEqual(routerPayload.enabledModels, ["openai/gpt-5.6"]);
+  assert.equal(routerPayload.includeDefaultModels, false);
+  assert.equal("credential" in routerPayload, false);
+  assert.equal("openRouterMaxTokens" in routerPayload, false);
+
+  window.location.hash = "#settings/api-providers";
+  window.dispatchEvent(new window.HashChangeEvent("hashchange"));
+  await settle();
+  const azure = document.querySelector('[data-provider-id="azure"]');
+  azure.querySelector('input[aria-label="Azure OpenAI base URL"]').value =
+    "https://example.openai.azure.com";
+  azure.querySelector('input[aria-label="Azure OpenAI API version"]').value =
+    "2024-10-21";
+  submit(window, azure.querySelector(".direct-provider-form"));
+  await waitFor(() =>
+    calls.some(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/provider-settings/azure/direct-configuration",
+    ),
+  );
+  const azurePayload = JSON.parse(
+    calls.find(
+      (call) =>
+        call.method === "PATCH" &&
+        call.path === "api/v1/provider-settings/azure/direct-configuration",
+    ).body,
+  );
+  assert.equal(azurePayload.baseURL, "https://example.openai.azure.com");
+  assert.equal(azurePayload.apiVersion, "2024-10-21");
+  assert.equal("credential" in azurePayload, false);
 });
 
 test("portal appearance is browser-local and uses a strict versioned cookie", async (t) => {

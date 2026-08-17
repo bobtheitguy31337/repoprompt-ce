@@ -172,12 +172,76 @@ public enum AgentComposerProviderMatrix {
             nativeImageSupportRequiresAdapter: false
         ),
         .init(
+            providerID: .gemini,
+            displayName: "Gemini",
+            runtimeKind: .headlessAdapter,
+            modelSource: "bounded-authenticated-discovery,persisted-dynamic-cache",
+            failurePolicy: "omit-without-fresh-authoritative-catalog;preserve-selected-unavailable",
+            discoveryPolicy: .init(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: false, discoveryReplacesStaticChoices: true),
+            nativeImageSupportRequiresAdapter: false
+        ),
+        .init(
+            providerID: .azure,
+            displayName: "Azure",
+            runtimeKind: .headlessAdapter,
+            modelSource: "bounded-authenticated-discovery,persisted-dynamic-cache",
+            failurePolicy: "omit-without-fresh-authoritative-catalog;preserve-selected-unavailable",
+            discoveryPolicy: .init(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: false, discoveryReplacesStaticChoices: true),
+            nativeImageSupportRequiresAdapter: false
+        ),
+        .init(
+            providerID: .deepseek,
+            displayName: "DeepSeek",
+            runtimeKind: .headlessAdapter,
+            modelSource: "bounded-authenticated-discovery,persisted-dynamic-cache",
+            failurePolicy: "omit-without-fresh-authoritative-catalog;preserve-selected-unavailable",
+            discoveryPolicy: .init(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: false, discoveryReplacesStaticChoices: true),
+            nativeImageSupportRequiresAdapter: false
+        ),
+        .init(
+            providerID: .fireworks,
+            displayName: "Fireworks",
+            runtimeKind: .headlessAdapter,
+            modelSource: "bounded-authenticated-discovery,persisted-dynamic-cache",
+            failurePolicy: "omit-without-fresh-authoritative-catalog;preserve-selected-unavailable",
+            discoveryPolicy: .init(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: false, discoveryReplacesStaticChoices: true),
+            nativeImageSupportRequiresAdapter: false
+        ),
+        .init(
             providerID: .xAI,
             displayName: "xAI",
-            runtimeKind: nil,
-            modelSource: "none-until-explicit-adapter",
-            failurePolicy: "omit",
-            discoveryPolicy: .init(allowsPersistedFallback: false, allowsStaticFallbackAfterSuccessfulPreflight: false, discoveryReplacesStaticChoices: true)
+            runtimeKind: .headlessAdapter,
+            modelSource: "bounded-authenticated-discovery,persisted-dynamic-cache",
+            failurePolicy: "omit-without-fresh-authoritative-catalog;preserve-selected-unavailable",
+            discoveryPolicy: .init(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: false, discoveryReplacesStaticChoices: true),
+            nativeImageSupportRequiresAdapter: false
+        ),
+        .init(
+            providerID: .groq,
+            displayName: "Groq",
+            runtimeKind: .headlessAdapter,
+            modelSource: "bounded-authenticated-discovery,persisted-dynamic-cache",
+            failurePolicy: "omit-without-fresh-authoritative-catalog;preserve-selected-unavailable",
+            discoveryPolicy: .init(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: false, discoveryReplacesStaticChoices: true),
+            nativeImageSupportRequiresAdapter: false
+        ),
+        .init(
+            providerID: .zAI,
+            displayName: "Z.AI",
+            runtimeKind: .headlessAdapter,
+            modelSource: "bounded-authenticated-discovery,persisted-dynamic-cache",
+            failurePolicy: "omit-without-fresh-authoritative-catalog;preserve-selected-unavailable",
+            discoveryPolicy: .init(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: false, discoveryReplacesStaticChoices: true),
+            nativeImageSupportRequiresAdapter: false
+        ),
+        .init(
+            providerID: .ollama,
+            displayName: "Ollama",
+            runtimeKind: .headlessAdapter,
+            modelSource: "bounded-authenticated-discovery,persisted-dynamic-cache",
+            failurePolicy: "omit-without-fresh-authoritative-catalog;preserve-selected-unavailable",
+            discoveryPolicy: .init(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: false, discoveryReplacesStaticChoices: true),
+            nativeImageSupportRequiresAdapter: false
         )
     ]
 

@@ -53,6 +53,10 @@ Provider and Git credentials are not accepted through HTTP and are never stored 
 
 Provider executable settings define the server-side catalog, not execution enablement. `REPOPROMPT_ENABLED_PROVIDERS` is the closed comma-separated allowlist of catalogued provider IDs (`codex`, `claudeCompatible`, `openCodeACP`, and `cursorACP`); unset or empty means no provider is enabled. Only allowlisted providers are preflighted for readiness and accepted for runs; disabled provider controllers perform startup cleanup only. Credential-home presence or contents never enable a provider implicitly, while catalogued disabled providers remain visible as unavailable and reject execution with `provider_unavailable`.
 
+`REPOPROMPT_ENABLED_DIRECT_PROVIDERS` is the matching closed allowlist for direct HTTPS adapters (`openAIAPI`, `anthropicAPI`, `openRouter`, `customOpenAICompatible`, `gemini`, `azure`, `deepseek`, `fireworks`, `xAI`, `groq`, `zAI`, `ollama`). Unset or empty admits none. Deployment admission and the per-provider enabled bit stay Linux extensions; they do not replace Desktop’s key/URL fail-closed contract.
+
+Direct-provider egress stays a public-HTTPS SSRF gate: custom/OpenAI/Azure URLs must be `https` on 443 to a public hostname, and every resolved address must be public. Desktop’s local URLs (Ollama default `http://localhost:11434`, custom or OpenAI loopback bases) persist, but execute remains fail-closed unless the operator sets `REPOPROMPT_ALLOW_LOCAL_PROVIDER_URLS=1`. That escape unlocks only `localhost` / `127.0.0.0/8` / `::1` (HTTP or HTTPS, any port). RFC1918, link-local, metadata, and DNS answers that are not entirely loopback stay rejected. TLS verification is not relaxed.
+
 ## Image contract
 
 `Dockerfile.server` builds only `RepoPromptServer`, runs it as fixed UID/GID 65532, includes `tini` and `curl`, and retains image metadata for both fixed ports: `9443/tcp` is the mTLS internal API and `9080/tcp` is the loopback-only health listener used by the image probe. The `io.degentlemen.repoprompt.port.*` OCI labels make those scopes explicit; deployments must not publish 9080. Compose must still set read-only root, dropped capabilities, no-new-privileges, resource/PID/log bounds, persistent state/project/worktree/cache volumes, internal networks, and runtime secret mounts.
@@ -137,6 +141,9 @@ Current endpoints:
   executable health/version, model catalogs, and capabilities.
 - `PATCH /portal/api/v1/provider-settings/:id` — revisioned replacement of
   non-secret enabled/default/effort/speed/tier preferences.
+- `GET` / `PATCH /portal/api/v1/provider-settings/:id/direct-configuration` —
+  revisioned non-secret `DirectProviderConfiguration` (URL, tokens, allowlist,
+  headers, API version). Credentials stay on the connection APIs.
 - `POST /portal/api/v1/provider-settings/:id/auth-flows` — narrow server-side
   auth-flow seam. A device code, if an adapter is installed later, is returned
   only in the initiating operator response with `no-store` and is held only in
@@ -164,8 +171,9 @@ Provider homes remain isolated through the native runtime configuration:
 Codex uses a separate `CODEX_HOME`, Claude Code uses a separate
 `CLAUDE_CONFIG_DIR`, and ACP providers retain their isolated process homes.
 OpenCode models and optional variants/effort/tier are admitted only from the
-sanitized capability catalog; the portal does not proxy OpenCode auth. xAI is
-catalogued as API-key-only and cannot be enabled until its Swift runtime exists.
+sanitized capability catalog; the portal does not proxy OpenCode auth. Direct
+API providers, including xAI, persist non-secret configuration through
+`DirectProviderConfiguration`; API keys stay in the vault and connection APIs.
 Deployment configuration is an immutable provider ceiling. Effective admission
 requires deployment permission, the operator's revisioned enablement, and a
 successful runtime preflight; the browser displays those states separately.
@@ -179,8 +187,7 @@ the deployment did not approve.
   UI describes unavailable flows until a server adapter is installed.
 - Codex defaults and ACP model selection are applied by the Swift provider
   dispatcher. Claude effort is passed through its isolated environment.
-- Claude fast-mode wiring, live provider model discovery, and the xAI execution
-  runtime remain open.
+- Claude fast-mode wiring and live provider model discovery remain open.
 - Project/workspace creation, live transcript streaming, context selection,
   workflow execution, MCP settings, and the remaining settings detail pages are
   represented in navigation but are not yet editable.

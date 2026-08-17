@@ -15,8 +15,18 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
     case anthropicAPI
     case openRouter
     case customOpenAICompatible
-    /// Decode-only compatibility boundary. It is never deployment-admitted.
+    case gemini
+    case azure
+    case deepseek
+    case fireworks
     case xAI
+    case groq
+    case zAI
+    case ollama
+
+    public static var directAPIProviders: [ProviderSettingsID] {
+        allCases.filter(\.isDirectAPI)
+    }
 
     public static func defaultSettingsID(for runtimeKind: ProviderKind) -> ProviderSettingsID? {
         switch runtimeKind {
@@ -34,8 +44,9 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
         case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom: .claudeCompatible
         case .openCodeACP: .openCodeACP
         case .cursorACP: .cursorACP
-        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible: .headlessAdapter
-        case .xAI: nil
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
+            .headlessAdapter
         }
     }
 
@@ -46,7 +57,9 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
         switch self {
         case .codex, .claudeCompatible, .openCodeACP, .cursorACP: true
         case .claudeGLM, .claudeKimi, .claudeCustom,
-             .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI: false
+             .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
+            false
         }
     }
 
@@ -59,10 +72,54 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
 
     public var isDirectAPI: Bool {
         switch self {
-        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible: true
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
+            true
         default: false
         }
     }
+
+    /// Desktop OpenAI, Azure, Ollama, and custom OpenAI-compatible persist an
+    /// operator URL. Other vendors keep `baseURL == nil`.
+    public var acceptsPersistedBaseURL: Bool {
+        switch self {
+        case .openAIAPI, .customOpenAICompatible, .azure, .ollama: true
+        default: false
+        }
+    }
+
+    /// Desktop OpenAI and Azure persist an API-version override. Custom
+    /// OpenAI-compatible persists `apiVersion` as a path segment.
+    public var acceptsPersistedAPIVersion: Bool {
+        switch self {
+        case .openAIAPI, .customOpenAICompatible, .azure: true
+        default: false
+        }
+    }
+
+    /// Desktop bootstrap token contract. `0` means omit / use the model default.
+    public var desktopBootstrapMaxTokens: Int {
+        switch self {
+        case .groq: 16_384
+        case .anthropicAPI, .openRouter: 8192
+        case .openAIAPI, .customOpenAICompatible: 0
+        default: 4096
+        }
+    }
+
+    public var acceptsCustomHeaders: Bool {
+        switch self {
+        case .openRouter, .customOpenAICompatible, .azure: true
+        default: false
+        }
+    }
+
+    /// Ollama's Desktop store is a URL, not a Keychain API key.
+    public var requiresVaultCredential: Bool {
+        isDirectAPI && self != .ollama
+    }
+
+    public static let desktopOllamaDefaultURL = "http://localhost:11434"
 
     /// Desktop Direct Agents persist a typed profile for these CLI families.
     /// `serverDefaultExecutionMode` must not replace that profile.
@@ -70,7 +127,8 @@ public enum ProviderSettingsID: String, Codable, CaseIterable, Sendable {
         switch self {
         case .codex, .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom, .openCodeACP, .cursorACP:
             true
-        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
             false
         }
     }

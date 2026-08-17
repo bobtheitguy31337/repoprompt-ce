@@ -130,7 +130,8 @@ public struct SubagentPermissionResolver: Sendable {
             return DirectAgentPermissionsSettings(
                 claude: .init(permissionMode: .requireApproval, bashEnabled: false, mcpStrictModeEnabled: true)
             ).projection(for: providerID).asRuntimeDefaults
-        case .openCodeACP, .cursorACP, .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
+        case .openCodeACP, .cursorACP, .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
             return DirectAgentPermissionsSettings.default.projection(for: providerID).asRuntimeDefaults
         }
     }
@@ -163,7 +164,8 @@ public struct SubagentPermissionResolver: Sendable {
             return DirectAgentPermissionsSettings(
                 cursor: .init(permissionLevel: settings.cursor == .fullAccess ? .fullAccess : .managedDefault)
             ).projection(for: .cursorACP).asRuntimeDefaults
-        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
             return DirectAgentPermissionsSettings.default.projection(for: providerID).asRuntimeDefaults
         }
     }

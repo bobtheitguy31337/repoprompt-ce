@@ -360,7 +360,7 @@ final class AgentComposerCatalogTests: XCTestCase {
     }
 
     func testProviderMatrixAndDiscoveryPoliciesAreExact() throws {
-        XCTAssertEqual(AgentComposerProviderMatrix.entries.map(\.providerID), [.codex, .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom, .openCodeACP, .cursorACP, .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI])
+        XCTAssertEqual(AgentComposerProviderMatrix.entries.map(\.providerID), [.codex, .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom, .openCodeACP, .cursorACP, .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama])
         XCTAssertEqual(AgentComposerProviderMatrix.liveFreshnessSeconds, 900)
         XCTAssertEqual(AgentComposerProviderMatrix.persistedFallbackMaximumAgeSeconds, 86_400)
 

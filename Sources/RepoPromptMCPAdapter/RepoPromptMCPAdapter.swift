@@ -362,6 +362,9 @@ private actor AuthorityToolBackend {
              "claude.kimi.opus_model":
             return try await backendAppSetting(key: key)
         default:
+            if Self.directProviderAppSettingKey(key) != nil {
+                return try await directProviderAppSetting(key: key)
+            }
             if Self.looksLikeCredentialKey(key) {
                 throw ServiceAPIError(
                     code: .invalidRequest,
@@ -404,6 +407,9 @@ private actor AuthorityToolBackend {
              "claude.kimi.opus_model":
             return try await replaceBackendAppSetting(key: key, value: value)
         default:
+            if Self.directProviderAppSettingKey(key) != nil {
+                return try await replaceDirectProviderAppSetting(key: key, value: value)
+            }
             if Self.looksLikeCredentialKey(key) {
                 throw ServiceAPIError(
                     code: .invalidRequest,
@@ -589,6 +595,186 @@ private actor AuthorityToolBackend {
             .init(expectedRevision: current.revision, changes: [settingKey.rawValue: encoded])
         )
         return try await backendAppSetting(key: key)
+    }
+
+    private struct DirectProviderAppSettingKey {
+        let providerID: ProviderSettingsID
+        let field: Field
+
+        enum Field: String {
+            case preferredModel = "preferred_model"
+            case baseURL = "base_url"
+            case maximumOutputTokens = "maximum_output_tokens"
+            case apiVersion = "api_version"
+            case enabledModels = "enabled_models"
+            case includeDefaultModels = "include_default_models"
+            case useCustomSettings = "use_custom_settings"
+            case includeContentTypeHeader = "include_content_type_header"
+            case showServiceTierVariants = "show_service_tier_variants"
+            case customHeaders = "custom_headers"
+        }
+    }
+
+    private static func directProviderAppSettingKey(_ key: String) -> DirectProviderAppSettingKey? {
+        let parts = key.split(separator: ".").map(String.init)
+        guard parts.count == 3,
+              parts[0] == "direct_providers",
+              let providerID = ProviderSettingsID(rawValue: parts[1]),
+              providerID.isDirectAPI,
+              let field = DirectProviderAppSettingKey.Field(rawValue: parts[2])
+        else { return nil }
+        return DirectProviderAppSettingKey(providerID: providerID, field: field)
+    }
+
+    private func directProviderAppSetting(key: String) async throws -> Value {
+        guard let parsed = Self.directProviderAppSettingKey(key) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
+        }
+        let configuration = try await authority.directConfiguration(providerID: parsed.providerID)
+        let value: Value
+        switch parsed.field {
+        case .preferredModel:
+            value = configuration.preferredModel.map(Value.string) ?? .null
+        case .baseURL:
+            value = configuration.baseURL.map(Value.string) ?? .null
+        case .maximumOutputTokens:
+            value = .int(configuration.maximumOutputTokens)
+        case .apiVersion:
+            value = configuration.apiVersion.map(Value.string) ?? .null
+        case .enabledModels:
+            value = .array(configuration.enabledModels.map(Value.string))
+        case .includeDefaultModels:
+            value = .bool(configuration.includeDefaultModels)
+        case .useCustomSettings:
+            value = .bool(configuration.useCustomSettings)
+        case .includeContentTypeHeader:
+            value = .bool(configuration.includeContentTypeHeader)
+        case .showServiceTierVariants:
+            value = .bool(configuration.showServiceTierVariants)
+        case .customHeaders:
+            value = .object(configuration.customHeaders.mapValues(Value.string))
+        }
+        return .object(["key": .string(key), "value": value])
+    }
+
+    private func replaceDirectProviderAppSetting(key: String, value: Value?) async throws -> Value {
+        guard let parsed = Self.directProviderAppSettingKey(key) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Unsupported app_settings key '\(key)'")
+        }
+        switch parsed.field {
+        case .baseURL:
+            guard parsed.providerID.acceptsPersistedBaseURL else {
+                throw ServiceAPIError(code: .invalidRequest, message: "\(key) is not persisted for this provider")
+            }
+        case .apiVersion:
+            guard parsed.providerID.acceptsPersistedAPIVersion else {
+                throw ServiceAPIError(code: .invalidRequest, message: "\(key) is not persisted for this provider")
+            }
+        case .customHeaders:
+            guard parsed.providerID.acceptsCustomHeaders else {
+                throw ServiceAPIError(code: .invalidRequest, message: "\(key) is not persisted for this provider")
+            }
+        default:
+            break
+        }
+        let current = try await authority.directConfiguration(providerID: parsed.providerID)
+        let request = UpdateDirectProviderConfigurationRequest(
+            expectedRevision: current.revision,
+            baseURL: parsed.field == .baseURL ? Self.optionalString(value, key: key) : current.baseURL,
+            preferredModel: parsed.field == .preferredModel ? Self.optionalString(value, key: key) : current.preferredModel,
+            maximumOutputTokens: parsed.field == .maximumOutputTokens
+                ? try Self.maximumOutputTokensValue(value, key: key)
+                : current.maximumOutputTokens,
+            customHeaders: parsed.field == .customHeaders
+                ? try Self.stringMapValue(value, key: key)
+                : current.customHeaders,
+            contentTypePolicy: current.contentTypePolicy,
+            apiVersion: parsed.field == .apiVersion ? Self.optionalString(value, key: key) : current.apiVersion,
+            enabledModels: parsed.field == .enabledModels
+                ? try Self.stringArrayValue(value, key: key)
+                : current.enabledModels,
+            includeDefaultModels: parsed.field == .includeDefaultModels
+                ? try Self.boolValue(value, key: key)
+                : current.includeDefaultModels,
+            useCustomSettings: parsed.field == .useCustomSettings
+                ? try Self.boolValue(value, key: key)
+                : current.useCustomSettings,
+            includeContentTypeHeader: parsed.field == .includeContentTypeHeader
+                ? try Self.boolValue(value, key: key)
+                : current.includeContentTypeHeader,
+            showServiceTierVariants: parsed.field == .showServiceTierVariants
+                ? try Self.boolValue(value, key: key)
+                : current.showServiceTierVariants
+        )
+        _ = try await authority.updateDirectConfiguration(
+            providerID: parsed.providerID,
+            request: request,
+            attribution: settingsAttribution
+        )
+        return try await directProviderAppSetting(key: key)
+    }
+
+    private static func optionalString(_ value: Value?, key: String) -> String? {
+        let raw = value?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return raw.isEmpty ? nil : raw
+    }
+
+    private static func maximumOutputTokensValue(_ value: Value?, key: String) throws -> Int {
+        let parsed: Int?
+        if let integer = value?.intValue {
+            parsed = integer
+        } else if let raw = value?.stringValue {
+            parsed = Int(raw)
+        } else {
+            parsed = nil
+        }
+        guard let tokens = parsed, (0 ... 65_536).contains(tokens) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "\(key) must be an integer from 0 through 65536")
+        }
+        return tokens
+    }
+
+    private static func stringArrayValue(_ value: Value?, key: String) throws -> [String] {
+        if let items = value?.arrayValue {
+            let strings = items.compactMap(\.stringValue).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            guard strings.count == items.count else {
+                throw ServiceAPIError(code: .invalidRequest, message: "\(key) must be an array of strings")
+            }
+            return strings
+        }
+        if let raw = value?.stringValue {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { return [] }
+            if let data = trimmed.data(using: .utf8),
+               let decoded = try? JSONDecoder().decode([String].self, from: data)
+            {
+                return decoded.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            }
+        }
+        throw ServiceAPIError(code: .invalidRequest, message: "\(key) must be an array of strings")
+    }
+
+    private static func stringMapValue(_ value: Value?, key: String) throws -> [String: String] {
+        if let object = value?.objectValue {
+            var mapped: [String: String] = [:]
+            for (header, raw) in object {
+                guard let string = raw.stringValue else {
+                    throw ServiceAPIError(code: .invalidRequest, message: "\(key) values must be strings")
+                }
+                mapped[header] = string
+            }
+            return mapped
+        }
+        if let raw = value?.stringValue {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { return [:] }
+            if let data = trimmed.data(using: .utf8),
+               let decoded = try? JSONDecoder().decode([String: String].self, from: data)
+            {
+                return decoded
+            }
+        }
+        throw ServiceAPIError(code: .invalidRequest, message: "\(key) must be a JSON object of strings")
     }
 
     private static func looksLikeCredentialKey(_ key: String) -> Bool {

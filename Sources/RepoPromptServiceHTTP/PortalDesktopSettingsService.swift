@@ -62,7 +62,8 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
             permissionID = typed.cursor.permissionLevel == .fullAccess
                 ? "cursor.fullAccess"
                 : "cursor.managedDefault"
-        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
             permissionID = nil
         }
 
@@ -122,7 +123,8 @@ public actor PortalDesktopSettingsService: ClaudeCompatibleBackendSettingsProvid
             return .init(mode: projection.mode, providerSettings: providerSettings)
         case .openCodeACP, .cursorACP:
             return .init(mode: projection.mode, providerSettings: projection.providerSettings)
-        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
             return .init(mode: fallbackMode, providerSettings: [:])
         }
     }

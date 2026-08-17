@@ -587,7 +587,9 @@ final class AgentProviderPreferenceSnapshotStore {
         case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom: "claude.\(raw)"
         case .openCodeACP: "opencode.\(raw)"
         case .cursorACP: "cursor.\(raw)"
-        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI: raw
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
+            raw
         }
     }
 

@@ -13,7 +13,14 @@
     "anthropicAPI",
     "openRouter",
     "customOpenAICompatible",
+    "gemini",
+    "azure",
+    "deepseek",
+    "fireworks",
     "xAI",
+    "groq",
+    "zAI",
+    "ollama",
   ];
   const supportedRoutes = new Set([
     "overview",
@@ -637,8 +644,7 @@
             .filter(
               (provider) =>
                 provider.category === "apiProvider" &&
-                provider.deploymentAllowed &&
-                provider.providerID !== "xAI",
+                provider.deploymentAllowed,
             )
             .map(async (provider) => {
               configurations[provider.providerID] = await api(
@@ -4828,6 +4834,85 @@
     );
   }
 
+  function acceptsPersistedBaseURL(providerID) {
+    return ["openAIAPI", "customOpenAICompatible", "azure", "ollama"].includes(
+      providerID,
+    );
+  }
+
+  function acceptsPersistedAPIVersion(providerID) {
+    return ["openAIAPI", "customOpenAICompatible", "azure"].includes(providerID);
+  }
+
+  function acceptsCustomHeaders(providerID) {
+    return ["openRouter", "customOpenAICompatible", "azure"].includes(
+      providerID,
+    );
+  }
+
+  function dedicatedDirectProviderPage(providerID) {
+    return ["openRouter", "customOpenAICompatible"].includes(providerID);
+  }
+
+  function parseJSONStringMap(raw, label) {
+    const parsed = JSON.parse(raw || "{}");
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+      throw new Error(`${label} must be a JSON object.`);
+    }
+    const entries = Object.entries(parsed);
+    if (entries.length > 16) {
+      throw new Error(`At most 16 ${label.toLowerCase()} entries are allowed.`);
+    }
+    if (entries.some(([, value]) => typeof value !== "string")) {
+      throw new Error(`Every ${label.toLowerCase()} value must be a string.`);
+    }
+    return parsed;
+  }
+
+  function parseEnabledModels(raw) {
+    const text = String(raw || "").trim();
+    if (!text) return [];
+    if (text.startsWith("[")) {
+      const parsed = JSON.parse(text);
+      if (
+        !Array.isArray(parsed) ||
+        parsed.some((value) => typeof value !== "string")
+      ) {
+        throw new Error("Enabled models must be a JSON array of strings.");
+      }
+      return parsed.map((value) => value.trim()).filter(Boolean);
+    }
+    return text
+      .split(/[\n,]/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+  }
+
+  function baseURLCopy(providerID) {
+    switch (providerID) {
+      case "openAIAPI":
+        return [
+          "Optional Public HTTPS Base URL",
+          "Empty keeps api.openai.com. HTTPS only; private, metadata, and credential-bearing URLs fail closed unless the local-URL escape is enabled.",
+        ];
+      case "azure":
+        return [
+          "Azure Resource URL",
+          "Public HTTPS Azure resource endpoint. The API key stays in the vault; this field is not a credential bag.",
+        ];
+      case "ollama":
+        return [
+          "Ollama URL",
+          "Desktop default is http://localhost:11434. Persist is allowed; execute still requires REPOPROMPT_ALLOW_LOCAL_PROVIDER_URLS=1.",
+        ];
+      default:
+        return [
+          "Public HTTPS Base URL",
+          "HTTPS port 443 only; DNS is re-resolved and pinned for every request. Private, local, metadata, mixed, redirecting, and credential-bearing endpoints fail closed.",
+        ];
+    }
+  }
+
   function directProviderCard(provider) {
     const configuration =
       state.typedSettings.directConfigurations[provider.providerID];
@@ -4842,11 +4927,30 @@
     );
     if (configuration) {
       const form = element("form", "typed-settings-form direct-provider-form");
+      const persistBaseURL = acceptsPersistedBaseURL(provider.providerID);
+      const persistAPIVersion = acceptsPersistedAPIVersion(provider.providerID);
+      const persistHeaders = acceptsCustomHeaders(provider.providerID);
+      const persistAllowlist = [
+        "openRouter",
+        "customOpenAICompatible",
+      ].includes(provider.providerID);
       const baseURL = document.createElement("input");
-      baseURL.type = "url";
+      baseURL.type = provider.providerID === "ollama" ? "text" : "url";
       baseURL.value = configuration.baseURL || "";
-      baseURL.placeholder = "https://provider.example/v1";
+      baseURL.placeholder =
+        provider.providerID === "ollama"
+          ? "http://localhost:11434"
+          : "https://provider.example/v1";
       baseURL.setAttribute("aria-label", `${provider.displayName} base URL`);
+      const apiVersion = document.createElement("input");
+      apiVersion.type = "text";
+      apiVersion.maxLength = 64;
+      apiVersion.value = configuration.apiVersion || "";
+      apiVersion.placeholder = "Optional API version";
+      apiVersion.setAttribute(
+        "aria-label",
+        `${provider.displayName} API version`,
+      );
       const preferredModel = document.createElement("input");
       preferredModel.type = "text";
       preferredModel.maxLength = 256;
@@ -4858,10 +4962,10 @@
       );
       const maximum = document.createElement("input");
       maximum.type = "number";
-      maximum.min = "1";
+      maximum.min = "0";
       maximum.max = "65536";
       maximum.step = "1";
-      maximum.value = String(configuration.maximumOutputTokens);
+      maximum.value = String(configuration.maximumOutputTokens ?? 0);
       maximum.setAttribute(
         "aria-label",
         `${provider.displayName} maximum output tokens`,
@@ -4877,12 +4981,40 @@
         "aria-label",
         `${provider.displayName} custom headers`,
       );
-      if (provider.providerID === "customOpenAICompatible") {
+      const enabledModels = document.createElement("textarea");
+      enabledModels.rows = 3;
+      enabledModels.value = (configuration.enabledModels || []).join("\n");
+      enabledModels.placeholder = "One model ID per line";
+      enabledModels.setAttribute(
+        "aria-label",
+        `${provider.displayName} enabled models`,
+      );
+      const includeDefaultModels = typedToggle(
+        `${provider.displayName} include default models`,
+        configuration.includeDefaultModels !== false,
+      );
+      const useCustomSettings = typedToggle(
+        `${provider.displayName} use custom settings`,
+        configuration.useCustomSettings !== false,
+      );
+      const includeContentTypeHeader = typedToggle(
+        `${provider.displayName} persist Content-Type header`,
+        Boolean(configuration.includeContentTypeHeader),
+      );
+      const showServiceTierVariants = typedToggle(
+        `${provider.displayName} show service-tier variants`,
+        Boolean(configuration.showServiceTierVariants),
+      );
+      if (persistBaseURL) {
+        const [label, detail] = baseURLCopy(provider.providerID);
+        form.append(desktopRow(label, detail, baseURL));
+      }
+      if (persistAPIVersion) {
         form.append(
           desktopRow(
-            "Public HTTPS Base URL",
-            "HTTPS port 443 only; DNS is re-resolved and pinned for every request. Private, local, metadata, mixed, redirecting, and credential-bearing endpoints fail closed.",
-            baseURL,
+            "API Version",
+            "Optional path or query version. Empty uses the provider default.",
+            apiVersion,
           ),
         );
       }
@@ -4894,13 +5026,52 @@
         ),
         desktopRow(
           "Maximum Output Tokens",
-          "Bounded direct-runtime output limit.",
+          "0 omits the stored limit and uses the Desktop model default. Range is 0 through 65,536.",
           maximum,
         ),
       );
-      if (
-        ["openRouter", "customOpenAICompatible"].includes(provider.providerID)
-      ) {
+      if (provider.providerID === "openAIAPI") {
+        form.append(
+          desktopRow(
+            "Show Service-Tier Variants",
+            "When on, the live catalog keeps Desktop service-tier variants. This is not the leftover openAIServiceTier string bag.",
+            showServiceTierVariants.toggle,
+          ),
+        );
+      }
+      if (provider.providerID === "openRouter") {
+        form.append(
+          desktopRow(
+            "Use Custom Settings",
+            "When off, OpenRouter still sends HTTP-Referer / X-Title and ignores stored tokens and extra headers.",
+            useCustomSettings.toggle,
+          ),
+          desktopRow(
+            "Include Default Models",
+            "When off, picker and launch are limited to the enabled-model allowlist plus preferred.",
+            includeDefaultModels.toggle,
+          ),
+        );
+      }
+      if (persistAllowlist) {
+        form.append(
+          desktopRow(
+            "Enabled Models",
+            "Allowlist IDs, one per line. Preferred is always included. Custom picker/launch is this set only.",
+            enabledModels,
+          ),
+        );
+      }
+      if (provider.providerID === "customOpenAICompatible") {
+        form.append(
+          desktopRow(
+            "Persist Content-Type Header Flag",
+            "Stored only. Live requests stay application/json unless a custom header overrides Content-Type.",
+            includeContentTypeHeader.toggle,
+          ),
+        );
+      }
+      if (persistHeaders) {
         form.append(
           desktopRow(
             "Custom Headers (JSON)",
@@ -4922,8 +5093,20 @@
         "Save Runtime Configuration",
       );
       save.type = "submit";
+      const editable = [
+        baseURL,
+        apiVersion,
+        preferredModel,
+        maximum,
+        headers,
+        enabledModels,
+        includeDefaultModels.input,
+        useCustomSettings.input,
+        includeContentTypeHeader.input,
+        showServiceTierVariants.input,
+      ];
       if (provider.connection) {
-        [baseURL, preferredModel, maximum, headers].forEach((control) =>
+        editable.forEach((control) =>
           setDisabledReason(
             control,
             true,
@@ -4940,19 +5123,14 @@
       form.addEventListener("submit", (event) => {
         event.preventDefault();
         let customHeaders = {};
+        let allowlisted = [];
         try {
-          customHeaders = JSON.parse(headers.value || "{}");
-          if (
-            !customHeaders ||
-            Array.isArray(customHeaders) ||
-            typeof customHeaders !== "object"
-          )
-            throw new Error("Headers must be a JSON object.");
-          const headerEntries = Object.entries(customHeaders);
-          if (headerEntries.length > 16)
-            throw new Error("At most 16 custom headers are allowed.");
-          if (headerEntries.some(([, value]) => typeof value !== "string"))
-            throw new Error("Every custom header value must be a string.");
+          customHeaders = persistHeaders
+            ? parseJSONStringMap(headers.value, "Headers")
+            : {};
+          allowlisted = persistAllowlist
+            ? parseEnabledModels(enabledModels.value)
+            : [];
         } catch (error) {
           toast(error.message, true);
           return;
@@ -4960,11 +5138,11 @@
         const maximumOutputTokens = Number(maximum.value);
         if (
           !Number.isInteger(maximumOutputTokens) ||
-          maximumOutputTokens < 1 ||
+          maximumOutputTokens < 0 ||
           maximumOutputTokens > 65536
         ) {
           toast(
-            "Maximum output tokens must be an integer from 1 through 65,536.",
+            "Maximum output tokens must be an integer from 0 through 65,536.",
             true,
           );
           return;
@@ -4979,19 +5157,21 @@
                 method: "PATCH",
                 body: JSON.stringify({
                   expectedRevision: configuration.revision,
-                  baseURL:
-                    provider.providerID === "customOpenAICompatible"
-                      ? baseURL.value.trim() || null
-                      : null,
+                  baseURL: persistBaseURL ? baseURL.value.trim() || null : null,
                   preferredModel: preferredModel.value.trim() || null,
                   maximumOutputTokens,
-                  customHeaders: [
-                    "openRouter",
-                    "customOpenAICompatible",
-                  ].includes(provider.providerID)
-                    ? customHeaders
-                    : {},
+                  customHeaders,
                   contentTypePolicy: "applicationJSON",
+                  apiVersion: persistAPIVersion
+                    ? apiVersion.value.trim() || null
+                    : null,
+                  enabledModels: allowlisted,
+                  includeDefaultModels: includeDefaultModels.input.checked,
+                  useCustomSettings: useCustomSettings.input.checked,
+                  includeContentTypeHeader:
+                    includeContentTypeHeader.input.checked,
+                  showServiceTierVariants:
+                    showServiceTierVariants.input.checked,
                 }),
               },
             ),
@@ -5025,29 +5205,21 @@
   function renderTypedAPIProviders() {
     const providers = orderedProviders().filter(
       (provider) =>
-        ["openAIAPI", "anthropicAPI"].includes(provider.providerID) &&
         provider.category === "apiProvider" &&
-        provider.deploymentAllowed,
+        provider.deploymentAllowed &&
+        !dedicatedDirectProviderPage(provider.providerID),
     );
     const cards = providers.map(directProviderCard);
     cards.push(
       informationalCard(
         "Unsupported Provider Boundaries",
-        "No inert credential or endpoint controls are rendered for protocols and network trust models outside the completed backend truth contract.",
-        [
-          [
-            "DeepSeek / Fireworks / xAI / Groq / Z.AI",
-            "Use hardened custom OpenAI-compatible when standards-compatible",
-          ],
-          ["Gemini", "Intentionally omitted protocol"],
-          ["Azure OpenAI", "Deployment / enterprise identity boundary"],
-          ["Ollama / LM Studio", "Deployment / local-network boundary"],
-        ],
+        "No inert credential or endpoint controls are rendered for protocols outside the completed backend truth contract.",
+        [["LM Studio", "Intentionally omitted local-network protocol"]],
       ),
     );
     settingsPage(
       "API Providers",
-      "Configure OpenAI and Anthropic only when their complete direct HTTPS runtimes are deployment-admitted.",
+      "Configure every deployment-admitted direct HTTPS runtime. OpenRouter and custom OpenAI-compatible keep their dedicated pages. Credentials stay on the connection APIs.",
       "cloud",
       cards,
     );

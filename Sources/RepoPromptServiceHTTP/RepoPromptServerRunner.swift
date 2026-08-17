@@ -94,12 +94,7 @@ public struct RepoPromptServerConfiguration: Sendable {
             }
             enabledProviders.insert(kind)
         }
-        let allowedDirectProviders = Set([
-            ProviderSettingsID.openAIAPI,
-            .anthropicAPI,
-            .openRouter,
-            .customOpenAICompatible
-        ])
+        let allowedDirectProviders = Set(ProviderSettingsID.directAPIProviders)
         let enabledDirectProviderNames = environment["REPOPROMPT_ENABLED_DIRECT_PROVIDERS"]?
             .split(separator: ",")
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) } ?? []
@@ -469,6 +464,8 @@ public enum RepoPromptServerRunner {
             providerAdapter: providers,
             projectSourceService: projectSources,
             serverSettings: serverSettings,
+            providerSettings: providerSettings,
+            directProviderRegistry: directProviderRegistry,
             directProviderDefaults: portalDesktopSettings
         )
         try await authority.recover()

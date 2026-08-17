@@ -23,7 +23,13 @@ public actor VaultDirectProviderCredentialAccessor: DirectProviderCredentialAcce
     }
 
     public func credential(for providerID: ProviderSettingsID) async throws -> Data {
-        guard providerID.isDirectAPI,
+        if providerID == .ollama {
+            guard providerID.isDirectAPI else {
+                throw ServiceAPIError(code: .providerUnavailable, message: "Direct provider credential is unavailable")
+            }
+            return Data()
+        }
+        guard providerID.requiresVaultCredential,
               let connection = try await store.providerConnection(providerID: providerID),
               connection.record.state == .connected,
               connection.record.testState == .valid,
@@ -45,31 +51,36 @@ public actor DirectProviderRegistry: DirectProviderConfigurationProviding {
     private let store: SQLiteServiceStore
     private let transport: any ValidatedProviderEgressTransporting
     private let deploymentAllowlist: Set<ProviderSettingsID>
+    private let allowLocalURLs: Bool
     private var configurations: [ProviderSettingsID: DirectProviderConfiguration] = [:]
 
     public init(
         store: SQLiteServiceStore,
         transport: any ValidatedProviderEgressTransporting,
-        deploymentAllowlist: Set<ProviderSettingsID>
+        deploymentAllowlist: Set<ProviderSettingsID>,
+        allowLocalURLs: Bool = ProviderLocalURLEscape.isEnabled()
     ) {
         self.store = store
         self.transport = transport
         self.deploymentAllowlist = Set(deploymentAllowlist.filter(\.isDirectAPI))
+        self.allowLocalURLs = allowLocalURLs
     }
 
     public func bootstrap() async throws {
         configurations = try await Dictionary(uniqueKeysWithValues: store.directProviderConfigurations().map { ($0.providerID, $0) })
-        for providerID in [ProviderSettingsID.openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible] {
+        for providerID in ProviderSettingsID.directAPIProviders {
             if configurations[providerID] == nil {
                 let initial = try Self.validateConfiguration(
                     providerID: providerID,
-                    baseURL: nil,
+                    baseURL: providerID == .ollama ? ProviderSettingsID.desktopOllamaDefaultURL : nil,
                     preferredModel: nil,
-                    maximumOutputTokens: 4096,
+                    maximumOutputTokens: providerID.desktopBootstrapMaxTokens,
                     customHeaders: [:],
                     contentTypePolicy: .applicationJSON,
                     revision: 1,
-                    updatedAt: Date()
+                    updatedAt: Date(),
+                    apiVersion: nil,
+                    allowLocalURLs: allowLocalURLs
                 )
                 configurations[providerID] = try await store.upsertDirectProviderConfiguration(initial, expectedRevision: 0)
             }
@@ -89,11 +100,25 @@ public actor DirectProviderRegistry: DirectProviderConfigurationProviding {
 
     public func endpoint(for providerID: ProviderSettingsID) async throws -> DirectProviderEndpoint {
         let configuration = try configuration(for: providerID)
-        if providerID == .customOpenAICompatible {
-            guard let baseURL = configuration.baseURL else {
-                throw ServiceAPIError(code: .providerUnavailable, message: "Custom provider endpoint is not configured")
+        if providerID == .customOpenAICompatible || providerID == .azure {
+            guard let baseURL = configuration.baseURL, !baseURL.isEmpty else {
+                throw ServiceAPIError(
+                    code: .providerUnavailable,
+                    message: providerID == .azure
+                        ? "Azure OpenAI configuration is missing"
+                        : "Custom provider endpoint is not configured"
+                )
             }
             return try await transport.validateEndpoint(baseURL)
+        }
+        if providerID == .openAIAPI, let baseURL = configuration.baseURL, !baseURL.isEmpty {
+            return try await transport.validateEndpoint(baseURL)
+        }
+        if providerID == .ollama {
+            guard let baseURL = configuration.baseURL, !baseURL.isEmpty else {
+                throw ServiceAPIError(code: .providerUnavailable, message: "Missing Ollama URL.")
+            }
+            return try ProviderEndpointPolicy.parseOllamaBaseURL(baseURL)
         }
         return try ProviderEndpointPolicy.fixed(providerID: providerID)
     }
@@ -117,9 +142,16 @@ public actor DirectProviderRegistry: DirectProviderConfigurationProviding {
             customHeaders: request.customHeaders,
             contentTypePolicy: request.contentTypePolicy,
             revision: current.revision + 1,
-            updatedAt: Date()
+            updatedAt: Date(),
+            apiVersion: request.apiVersion,
+            enabledModels: request.enabledModels,
+            includeDefaultModels: request.includeDefaultModels,
+            useCustomSettings: request.useCustomSettings,
+            includeContentTypeHeader: request.includeContentTypeHeader,
+            showServiceTierVariants: request.showServiceTierVariants,
+            allowLocalURLs: allowLocalURLs
         )
-        if providerID == .customOpenAICompatible, let baseURL = next.baseURL {
+        if providerID.acceptsPersistedBaseURL, providerID != .ollama, let baseURL = next.baseURL {
             _ = try await transport.validateEndpoint(baseURL)
         }
         configurations[providerID] = try await store.upsertDirectProviderConfiguration(
@@ -138,25 +170,54 @@ public actor DirectProviderRegistry: DirectProviderConfigurationProviding {
         customHeaders: [String: String],
         contentTypePolicy: DirectProviderContentTypePolicy,
         revision: Int64,
-        updatedAt: Date
+        updatedAt: Date,
+        apiVersion: String? = nil,
+        enabledModels: [String] = [],
+        includeDefaultModels: Bool = true,
+        useCustomSettings: Bool = true,
+        includeContentTypeHeader: Bool = false,
+        showServiceTierVariants: Bool = false,
+        allowLocalURLs: Bool = ProviderLocalURLEscape.isEnabled()
     ) throws -> DirectProviderConfiguration {
         guard providerID.isDirectAPI,
               revision > 0,
-              (1 ... 65_536).contains(maximumOutputTokens),
-              customHeaders.count <= 16
+              (0 ... 65_536).contains(maximumOutputTokens),
+              customHeaders.count <= 16,
+              enabledModels.count <= 256
         else { throw ServiceAPIError(code: .invalidRequest, message: "Direct provider configuration is invalid") }
         let normalizedBaseURL = baseURL?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if providerID == .customOpenAICompatible {
+        if providerID == .customOpenAICompatible || providerID == .azure || providerID == .openAIAPI {
             if let normalizedBaseURL, !normalizedBaseURL.isEmpty {
-                _ = try ProviderEndpointPolicy.parseCustomBaseURL(normalizedBaseURL)
+                let allowLocal = allowLocalURLs && providerID != .azure
+                _ = try ProviderEndpointPolicy.parseCustomBaseURL(normalizedBaseURL, allowLocalURLs: allowLocal)
+            }
+        } else if providerID == .ollama {
+            if let normalizedBaseURL, !normalizedBaseURL.isEmpty {
+                _ = try ProviderEndpointPolicy.parseOllamaBaseURL(normalizedBaseURL)
             }
         } else if normalizedBaseURL?.isEmpty == false {
             throw ServiceAPIError(code: .invalidRequest, message: "Fixed-host providers do not accept a base URL")
         }
-        if !customHeaders.isEmpty, ![ProviderSettingsID.openRouter, .customOpenAICompatible].contains(providerID) {
+        if !customHeaders.isEmpty, !providerID.acceptsCustomHeaders {
             throw ServiceAPIError(code: .invalidRequest, message: "This provider does not accept custom headers")
         }
+        let normalizedAPIVersion: String?
+        if providerID.acceptsPersistedAPIVersion {
+            normalizedAPIVersion = try safeText(apiVersion, maximumBytes: 64)
+        } else if apiVersion?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            throw ServiceAPIError(code: .invalidRequest, message: "This provider does not persist an API version")
+        } else {
+            normalizedAPIVersion = nil
+        }
         let normalizedModel = try safeText(preferredModel, maximumBytes: 256)
+        var normalizedEnabled: [String] = []
+        var seenEnabled = Set<String>()
+        for raw in enabledModels {
+            guard let model = try safeText(raw, maximumBytes: 256), seenEnabled.insert(model).inserted else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Direct provider allowlist is invalid")
+            }
+            normalizedEnabled.append(model)
+        }
         var normalizedHeaders: [String: String] = [:]
         var totalBytes = 0
         for (rawName, rawValue) in customHeaders {
@@ -188,13 +249,25 @@ public actor DirectProviderRegistry: DirectProviderConfigurationProviding {
         guard totalBytes <= 8192 else {
             throw ServiceAPIError(code: .invalidRequest, message: "Direct provider headers exceed their bound")
         }
+        let persistedBaseURL: String?
+        if providerID.acceptsPersistedBaseURL {
+            persistedBaseURL = (normalizedBaseURL?.isEmpty == false) ? normalizedBaseURL : (providerID == .ollama ? ProviderSettingsID.desktopOllamaDefaultURL : nil)
+        } else {
+            persistedBaseURL = nil
+        }
         return DirectProviderConfiguration(
             providerID: providerID,
-            baseURL: providerID == .customOpenAICompatible ? normalizedBaseURL : nil,
+            baseURL: persistedBaseURL,
             preferredModel: normalizedModel,
             maximumOutputTokens: maximumOutputTokens,
             customHeaders: normalizedHeaders,
             contentTypePolicy: contentTypePolicy,
+            apiVersion: normalizedAPIVersion,
+            enabledModels: normalizedEnabled,
+            includeDefaultModels: includeDefaultModels,
+            useCustomSettings: useCustomSettings,
+            includeContentTypeHeader: includeContentTypeHeader,
+            showServiceTierVariants: showServiceTierVariants,
             revision: revision,
             updatedAt: updatedAt
         )
@@ -220,7 +293,7 @@ public actor DirectProviderCredentialTester: ProviderCredentialTesting {
     }
 
     public func supportedAuthenticationMethods(for providerID: ProviderSettingsID) async -> Set<ProviderAuthenticationMethod> {
-        guard providerID.isDirectAPI, await registry.isDeploymentAllowed(providerID) else { return [] }
+        guard providerID.requiresVaultCredential, await registry.isDeploymentAllowed(providerID) else { return [] }
         return [.apiKey]
     }
 
@@ -234,18 +307,22 @@ public actor DirectProviderCredentialTester: ProviderCredentialTesting {
               !credential.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
         else { return .init(state: .invalid, detail: "Provider credential is invalid") }
         do {
+            let configuration = try await registry.configuration(for: providerID)
             let endpoint = try await registry.endpoint(for: providerID)
             let response = try await transport.execute(.init(
                 endpoint: endpoint,
                 method: "GET",
-                pathAndQuery: Self.catalogPath(providerID: providerID, endpoint: endpoint),
+                pathAndQuery: Self.catalogPath(providerID: providerID, endpoint: endpoint, configuration: configuration),
                 headers: Self.authenticationHeaders(providerID: providerID, credential: credential),
                 maximumResponseBodyBytes: 2 * 1024 * 1024,
                 totalTimeout: .seconds(15)
             ))
             switch response.statusCode {
             case 200 ..< 300:
-                let models = try Self.parseCatalog(response: response, providerID: providerID)
+                let models = Self.mergingPreferredModel(
+                    try Self.parseCatalog(response: response, providerID: providerID),
+                    preferredModel: configuration.preferredModel
+                )
                 return .init(state: .valid, detail: "Provider credential and model catalog validated", models: models)
             case 401, 403:
                 return .init(state: .invalid, detail: "Provider rejected the configured credential")
@@ -265,14 +342,32 @@ public actor DirectProviderCredentialTester: ProviderCredentialTesting {
         switch providerID {
         case .anthropicAPI:
             ["x-api-key": credential, "anthropic-version": "2023-06-01"]
+        case .azure:
+            ["api-key": credential]
+        case .ollama:
+            [:]
         default:
             ["Authorization": "Bearer \(credential)"]
         }
     }
 
-    static func catalogPath(providerID: ProviderSettingsID, endpoint: DirectProviderEndpoint) -> String {
+    static func catalogPath(
+        providerID: ProviderSettingsID,
+        endpoint: DirectProviderEndpoint,
+        configuration: DirectProviderConfiguration? = nil
+    ) -> String {
         let base = endpoint.basePath
-        if providerID == .customOpenAICompatible {
+        if providerID == .azure {
+            let version = configuration?.apiVersion?.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+            return "\(base)/openai/models?api-version=\(version)"
+        }
+        if let apiVersion = configuration?.apiVersion, !apiVersion.isEmpty,
+           providerID == .openAIAPI || providerID == .customOpenAICompatible
+        {
+            let stripped = DirectAPIProviderRuntime.strippingTrailingVersion(base)
+            return stripped.isEmpty ? "/\(apiVersion)/models" : "\(stripped)/\(apiVersion)/models"
+        }
+        if providerID == .customOpenAICompatible || providerID == .ollama {
             return base.hasSuffix("/v1") ? "\(base)/models" : "\(base)/v1/models"
         }
         return "\(base)/models"
@@ -283,14 +378,25 @@ public actor DirectProviderCredentialTester: ProviderCredentialTesting {
               response.contentType?.lowercased().contains("json") == true,
               let catalogText = String(data: response.body, encoding: .utf8),
               !ProviderSecretRedaction.containsLikelySecret(catalogText),
-              let payload = try JSONSerialization.jsonObject(with: response.body) as? [String: Any],
-              let data = payload["data"] as? [[String: Any]],
-              data.count <= 500
+              let payload = try JSONSerialization.jsonObject(with: response.body) as? [String: Any]
         else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider model catalog is invalid") }
+        let data: [[String: Any]]
+        if let openAI = payload["data"] as? [[String: Any]] {
+            data = openAI
+        } else if providerID == .gemini, let gemini = payload["models"] as? [[String: Any]] {
+            data = gemini
+        } else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider model catalog is invalid")
+        }
+        guard data.count <= 500 else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider model catalog is invalid")
+        }
         var seen = Set<String>()
         var models: [ProviderModelCatalogEntry] = []
         for item in data {
-            guard let rawID = item["id"] as? String,
+            let rawID = (item["id"] as? String)
+                ?? (item["name"] as? String)?.replacingOccurrences(of: "models/", with: "")
+            guard let rawID,
                   let id = try? safeCatalogText(rawID, maximumBytes: 256),
                   seen.insert(id).inserted
             else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider model catalog is invalid") }
@@ -323,6 +429,16 @@ public actor DirectProviderCredentialTester: ProviderCredentialTesting {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider model catalog is empty")
         }
         return models.sorted { $0.id < $1.id }
+    }
+
+    static func mergingPreferredModel(
+        _ models: [ProviderModelCatalogEntry],
+        preferredModel: String?
+    ) -> [ProviderModelCatalogEntry] {
+        guard let preferredModel, !preferredModel.isEmpty, !models.contains(where: { $0.id == preferredModel }) else {
+            return models
+        }
+        return (models + [.init(id: preferredModel, displayName: preferredModel)]).sorted { $0.id < $1.id }
     }
 
     private static func safeCatalogText(_ value: String, maximumBytes: Int) throws -> String {
@@ -406,14 +522,24 @@ public actor DirectAPIProviderRuntime: AgentProviderRuntime {
             throw ServiceAPIError(code: .providerUnavailable, message: "Exact direct provider identity is missing")
         }
         let configuration = try await registry.configuration(for: providerID)
+        if providerID == .azure, configuration.baseURL == nil || configuration.apiVersion == nil {
+            throw ServiceAPIError(code: .providerUnavailable, message: "Azure OpenAI configuration is missing")
+        }
+        if providerID == .ollama, configuration.baseURL?.isEmpty != false {
+            throw ServiceAPIError(code: .providerUnavailable, message: "Missing Ollama URL.")
+        }
         let endpoint = try await registry.endpoint(for: providerID)
         let credentialData = try await credentials.credential(for: providerID)
-        guard let credential = String(data: credentialData, encoding: .utf8) else {
+        let credential = String(data: credentialData, encoding: .utf8) ?? ""
+        if providerID.requiresVaultCredential, credential.isEmpty {
             throw ServiceAPIError(code: .providerUnavailable, message: "Direct provider credential is unavailable")
         }
         let model = request.model ?? configuration.preferredModel
         guard let model, !model.isEmpty else {
             throw ServiceAPIError(code: .invalidRequest, message: "A direct provider model is required")
+        }
+        guard configuration.allowsLaunchModel(model) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Model is not in the provider allowlist")
         }
         activeRuns.insert(request.runID)
         defer { activeRuns.remove(request.runID) }
@@ -470,34 +596,74 @@ public actor DirectAPIProviderRuntime: AgentProviderRuntime {
         settings: [String: String]
     ) throws -> ValidatedProviderHTTPRequest {
         var headers = DirectProviderCredentialTester.authenticationHeaders(providerID: providerID, credential: credential)
-        configuration.customHeaders.forEach { headers[$0.key] = $0.value }
+        if providerID == .openRouter {
+            headers["HTTP-Referer"] = "https://repoprompt.com/"
+            headers["X-Title"] = "Repo Prompt"
+        }
+        if providerID != .openRouter || configuration.useCustomSettings {
+            configuration.customHeaders.forEach { headers[$0.key] = $0.value }
+        }
         switch configuration.contentTypePolicy {
         case .applicationJSON:
-            headers["Content-Type"] = "application/json"
+            if headers.keys.contains(where: { $0.lowercased() == "content-type" }) == false {
+                headers["Content-Type"] = "application/json"
+            }
         }
+        let stream = settings["models.stream"] != "false"
+        let useResponses = providerID == .customOpenAICompatible && settings["models.responses"] == "true"
+        let maxTokens = Self.resolvedMaxTokens(providerID: providerID, configuration: configuration, model: model, stream: stream)
         let payload: [String: Any]
         let path: String
         if providerID == .anthropicAPI {
             path = "\(endpoint.basePath)/messages"
             var body: [String: Any] = [
                 "model": model,
-                "max_tokens": configuration.maximumOutputTokens,
-                "stream": true,
+                "stream": stream,
                 "messages": [["role": "user", "content": prompt]]
             ]
+            if let maxTokens { body["max_tokens"] = maxTokens }
+            Self.attachTemperature(from: settings, to: &body)
+            payload = body
+        } else if providerID == .azure {
+            guard let apiVersion = configuration.apiVersion, !apiVersion.isEmpty else {
+                throw ServiceAPIError(code: .providerUnavailable, message: "Azure OpenAI configuration is missing")
+            }
+            let encodedModel = model.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? model
+            let encodedVersion = apiVersion.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? apiVersion
+            path = "\(endpoint.basePath)/openai/deployments/\(encodedModel)/chat/completions?api-version=\(encodedVersion)"
+            var body: [String: Any] = [
+                "model": model,
+                "stream": stream,
+                "messages": [["role": "user", "content": prompt]]
+            ]
+            if let maxTokens { body["max_tokens"] = maxTokens }
             Self.attachTemperature(from: settings, to: &body)
             payload = body
         } else {
-            path = providerID == .customOpenAICompatible
-                ? (endpoint.basePath.hasSuffix("/v1") ? "\(endpoint.basePath)/chat/completions" : "\(endpoint.basePath)/v1/chat/completions")
-                : "\(endpoint.basePath)/chat/completions"
-            var body: [String: Any] = [
-                "model": model,
-                "max_tokens": configuration.maximumOutputTokens,
-                "stream": true,
-                "messages": [["role": "user", "content": prompt]]
-            ]
-            if providerID == .openAIAPI, let tier = settings["provider.serviceTier"] {
+            path = Self.versionedRequestPath(
+                providerID: providerID,
+                endpoint: endpoint,
+                apiVersion: configuration.apiVersion,
+                useResponses: useResponses
+            )
+            var body: [String: Any]
+            if useResponses {
+                body = [
+                    "model": model,
+                    "stream": stream,
+                    "input": prompt
+                ]
+                if let maxTokens { body["max_output_tokens"] = maxTokens }
+            } else {
+                body = [
+                    "model": model,
+                    "stream": stream,
+                    "messages": [["role": "user", "content": prompt]]
+                ]
+                if let maxTokens { body["max_tokens"] = maxTokens }
+            }
+            if providerID == .openAIAPI {
+                let tier = settings["provider.serviceTier"] ?? "auto"
                 guard ["auto", "default", "flex", "priority", "scale"].contains(tier) else {
                     throw ServiceAPIError(code: .invalidRequest, message: "OpenAI service tier is invalid")
                 }
@@ -515,15 +681,79 @@ public actor DirectAPIProviderRuntime: AgentProviderRuntime {
             pathAndQuery: path,
             headers: headers,
             body: try JSONSerialization.data(withJSONObject: payload),
-            maximumResponseBodyBytes: min(8 * 1024 * 1024, max(64 * 1024, configuration.maximumOutputTokens * 32)),
+            maximumResponseBodyBytes: min(8 * 1024 * 1024, max(64 * 1024, (maxTokens ?? 4_096) * 32)),
             totalTimeout: .seconds(120)
         )
     }
 
-    /// Desktop `effectiveTemperature`: attach only a non-zero global when the enable flag left it in the bag.
+    /// Desktop `effectiveTemperature`: a stamped value is attached, including an explicit 0.0 override.
+    /// Global 0.0 is omitted before stamp, so a present key is always sent.
     static func attachTemperature(from settings: [String: String], to body: inout [String: Any]) {
-        guard let raw = settings["models.temperature"], let temperature = Double(raw), temperature != 0 else { return }
+        guard let raw = settings["models.temperature"], let temperature = Double(raw) else { return }
         body["temperature"] = temperature
+    }
+
+    /// Desktop token contract: custom 0/2048 omits; OpenRouter 8192 unless custom settings;
+    /// Anthropic stream 8192 / complete 4096; OpenAI uses model defaults when stored is 0.
+    static func resolvedMaxTokens(
+        providerID: ProviderSettingsID,
+        configuration: DirectProviderConfiguration,
+        model: String,
+        stream: Bool
+    ) -> Int? {
+        let stored = configuration.maximumOutputTokens
+        switch providerID {
+        case .customOpenAICompatible:
+            return (stored == 0 || stored == 2048) ? nil : stored
+        case .openRouter:
+            if !configuration.useCustomSettings { return 8192 }
+            return stored == 0 ? 8192 : stored
+        case .anthropicAPI:
+            return stored == 0 ? (stream ? 8192 : 4096) : stored
+        case .openAIAPI:
+            return stored == 0 ? desktopOpenAIDefaultMaxTokens(model) : stored
+        default:
+            return stored == 0 ? 4096 : stored
+        }
+    }
+
+    static func desktopOpenAIDefaultMaxTokens(_ model: String) -> Int {
+        if model.hasPrefix("gpt-4.1") { return 16_384 }
+        if model == "o3" || model.hasPrefix("o3-") { return 100_000 }
+        if model.hasPrefix("o1-mini") { return 65_536 }
+        if model.hasPrefix("o1-preview") { return 32_768 }
+        if model.hasPrefix("gpt-5"), model.contains("-pro") { return 100_000 }
+        if model.hasPrefix("gpt-5") { return 128_000 }
+        return 2048
+    }
+
+    static func versionedRequestPath(
+        providerID: ProviderSettingsID,
+        endpoint: DirectProviderEndpoint,
+        apiVersion: String?,
+        useResponses: Bool
+    ) -> String {
+        let leaf = useResponses ? "responses" : "chat/completions"
+        if let apiVersion, !apiVersion.isEmpty, providerID == .openAIAPI || providerID == .customOpenAICompatible {
+            let base = strippingTrailingVersion(endpoint.basePath)
+            return base.isEmpty ? "/\(apiVersion)/\(leaf)" : "\(base)/\(apiVersion)/\(leaf)"
+        }
+        if providerID == .customOpenAICompatible || providerID == .ollama {
+            return endpoint.basePath.hasSuffix("/v1")
+                ? "\(endpoint.basePath)/\(leaf)"
+                : "\(endpoint.basePath)/v1/\(leaf)"
+        }
+        return "\(endpoint.basePath)/\(leaf)"
+    }
+
+    static func strippingTrailingVersion(_ path: String) -> String {
+        guard let last = path.split(separator: "/").last,
+              String(last).range(of: #"^v\d+([A-Za-z0-9._-]+)?$"#, options: .regularExpression) != nil
+        else { return path }
+        var parts = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        if parts.last == String(last) { parts.removeLast() }
+        let joined = parts.joined(separator: "/")
+        return joined == "/" ? "" : joined
     }
 
     static func parseOutput(
@@ -548,6 +778,8 @@ public actor DirectAPIProviderRuntime: AgentProviderRuntime {
                 let delta: String?
                 if providerID == .anthropicAPI {
                     delta = (payload["delta"] as? [String: Any])?["text"] as? String
+                } else if payload["type"] as? String == "response.output_text.delta" {
+                    delta = payload["delta"] as? String
                 } else {
                     delta = ((payload["choices"] as? [[String: Any]])?.first?["delta"] as? [String: Any])?["content"] as? String
                 }
@@ -566,6 +798,8 @@ public actor DirectAPIProviderRuntime: AgentProviderRuntime {
             if providerID == .anthropicAPI {
                 let blocks = payload["content"] as? [[String: Any]] ?? []
                 output = blocks.compactMap { $0["text"] as? String }.joined()
+            } else if let text = payload["output_text"] as? String, !text.isEmpty {
+                output = text
             } else {
                 output = (((payload["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any])?["content"] as? String) ?? ""
             }

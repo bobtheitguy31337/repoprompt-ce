@@ -31,6 +31,78 @@ public enum PromptSection: String, CaseIterable, Codable, Sendable {
     }
 }
 
+/// Desktop `GlobalScalarPreferences.ModelOverrideSettingsData`. Empty maps are valid.
+public struct ModelOverrideMaps: Codable, Hashable, Sendable {
+    public var diffOverrides: [String: Bool]
+    public var streamOverrides: [String: Bool]
+    public var temperatureOverrides: [String: Double]
+    public var responsesOverrides: [String: Bool]
+
+    public static let empty = ModelOverrideMaps()
+
+    private enum CodingKeys: String, CodingKey {
+        case diffOverrides, streamOverrides, temperatureOverrides, responsesOverrides
+    }
+
+    public init(
+        diffOverrides: [String: Bool] = [:],
+        streamOverrides: [String: Bool] = [:],
+        temperatureOverrides: [String: Double] = [:],
+        responsesOverrides: [String: Bool] = [:]
+    ) {
+        self.diffOverrides = diffOverrides
+        self.streamOverrides = streamOverrides
+        self.temperatureOverrides = temperatureOverrides
+        self.responsesOverrides = responsesOverrides
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        diffOverrides = try container.decodeIfPresent([String: Bool].self, forKey: .diffOverrides) ?? [:]
+        streamOverrides = try container.decodeIfPresent([String: Bool].self, forKey: .streamOverrides) ?? [:]
+        temperatureOverrides = try container.decodeIfPresent([String: Double].self, forKey: .temperatureOverrides) ?? [:]
+        responsesOverrides = try container.decodeIfPresent([String: Bool].self, forKey: .responsesOverrides) ?? [:]
+    }
+
+    public func streamOverride(for modelRaw: String) -> Bool? {
+        streamOverrides[modelRaw]
+    }
+
+    public func responsesOverride(for modelRaw: String) -> Bool? {
+        responsesOverrides[modelRaw]
+    }
+
+    public func temperatureOverride(for modelRaw: String) -> Double? {
+        temperatureOverrides[modelRaw]
+    }
+
+    /// Desktop built-in Pro variants default to non-streaming unless overridden.
+    public static let desktopNonStreamingBuiltins: Set<String> = [
+        "gpt-5.2-pro",
+        "gpt-5.2-pro-xhigh",
+        "gpt-5.4-pro",
+        "gpt-5.4-pro-xhigh",
+    ]
+
+    /// Desktop `canStream`: override wins, otherwise stream except built-in Pro variants.
+    public func resolvedStream(for modelRaw: String) -> Bool {
+        if let override = streamOverride(for: modelRaw) { return override }
+        return !Self.desktopNonStreamingBuiltins.contains(modelRaw)
+    }
+
+    /// Desktop `usesResponsesAPI` step 2: custom-provider models only.
+    public func resolvedUsesResponses(for modelRaw: String, isCustomProvider: Bool) -> Bool {
+        guard isCustomProvider, let override = responsesOverride(for: modelRaw) else { return false }
+        return override
+    }
+
+    /// Desktop `effectiveTemperature`: per-model override wins, including 0.0.
+    public func resolvedTemperature(for modelRaw: String, globalAttached: Double?) -> Double? {
+        if let override = temperatureOverride(for: modelRaw) { return override }
+        return globalAttached
+    }
+}
+
 public struct AdvancedServerSettings: Codable, Hashable, Sendable {
     public let respectRepoIgnore: Bool
     public let respectCursorIgnore: Bool
@@ -52,6 +124,7 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
     public let includeSavedPromptsInClipboard: Bool
     public let filePathDisplayOption: String
     public let includeDatetimeInUserInstructions: Bool
+    public let modelOverrides: ModelOverrideMaps
 
     public init(
         respectRepoIgnore: Bool = true,
@@ -73,7 +146,8 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
         savedPrompts: [SavedPromptRecord] = [],
         includeSavedPromptsInClipboard: Bool = true,
         filePathDisplayOption: String = FilePathDisplay.defaultRaw,
-        includeDatetimeInUserInstructions: Bool = false
+        includeDatetimeInUserInstructions: Bool = false,
+        modelOverrides: ModelOverrideMaps = .empty
     ) {
         self.respectRepoIgnore = respectRepoIgnore
         self.respectCursorIgnore = respectCursorIgnore
@@ -95,6 +169,7 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
         self.includeSavedPromptsInClipboard = includeSavedPromptsInClipboard
         self.filePathDisplayOption = filePathDisplayOption
         self.includeDatetimeInUserInstructions = includeDatetimeInUserInstructions
+        self.modelOverrides = modelOverrides
     }
 
     public static let `default` = AdvancedServerSettings()
@@ -120,6 +195,7 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
         case includeSavedPromptsInClipboard
         case filePathDisplayOption
         case includeDatetimeInUserInstructions
+        case modelOverrides
     }
 
     public init(from decoder: Decoder) throws {
@@ -144,6 +220,7 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
         includeSavedPromptsInClipboard = try container.decodeIfPresent(Bool.self, forKey: .includeSavedPromptsInClipboard) ?? true
         filePathDisplayOption = try container.decodeIfPresent(String.self, forKey: .filePathDisplayOption) ?? FilePathDisplay.defaultRaw
         includeDatetimeInUserInstructions = try container.decodeIfPresent(Bool.self, forKey: .includeDatetimeInUserInstructions) ?? false
+        modelOverrides = try container.decodeIfPresent(ModelOverrideMaps.self, forKey: .modelOverrides) ?? .empty
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -168,6 +245,7 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
         try container.encode(includeSavedPromptsInClipboard, forKey: .includeSavedPromptsInClipboard)
         try container.encode(filePathDisplayOption, forKey: .filePathDisplayOption)
         try container.encode(includeDatetimeInUserInstructions, forKey: .includeDatetimeInUserInstructions)
+        try container.encode(modelOverrides, forKey: .modelOverrides)
     }
 
     /// Desktop `PromptViewModel.FileEditFormat`: Diff / Whole / None. Missing or invalid raw → Diff.
@@ -334,7 +412,8 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
         savedPrompts: [SavedPromptRecord]? = nil,
         includeSavedPromptsInClipboard: Bool? = nil,
         filePathDisplayOption: String? = nil,
-        includeDatetimeInUserInstructions: Bool? = nil
+        includeDatetimeInUserInstructions: Bool? = nil,
+        modelOverrides: ModelOverrideMaps? = nil
     ) -> AdvancedServerSettings {
         AdvancedServerSettings(
             respectRepoIgnore: respectRepoIgnore,
@@ -356,7 +435,8 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
             savedPrompts: savedPrompts ?? self.savedPrompts,
             includeSavedPromptsInClipboard: includeSavedPromptsInClipboard ?? self.includeSavedPromptsInClipboard,
             filePathDisplayOption: filePathDisplayOption ?? self.filePathDisplayOption,
-            includeDatetimeInUserInstructions: includeDatetimeInUserInstructions ?? self.includeDatetimeInUserInstructions
+            includeDatetimeInUserInstructions: includeDatetimeInUserInstructions ?? self.includeDatetimeInUserInstructions,
+            modelOverrides: modelOverrides ?? self.modelOverrides
         )
     }
 
@@ -364,6 +444,32 @@ public struct AdvancedServerSettings: Codable, Hashable, Sendable {
     public func resolvedAttachedTemperature() -> Double? {
         guard setModelTemperature, modelTemperature != 0.0 else { return nil }
         return modelTemperature
+    }
+
+    /// Stamps live-read stream / Responses / temperature keys for a direct-provider launch.
+    /// Diff overrides persist only; Desktop `canApplyDiff` stays unconditional true.
+    public func stampedProviderSettings(_ settings: [String: String], modelRaw: String?) -> [String: String] {
+        var next = settings
+        let providerID = settings["provider.settingsID"].flatMap(ProviderSettingsID.init(rawValue:))
+        let temperature: Double?
+        if let modelRaw {
+            temperature = modelOverrides.resolvedTemperature(for: modelRaw, globalAttached: resolvedAttachedTemperature())
+        } else {
+            temperature = resolvedAttachedTemperature()
+        }
+        if let temperature {
+            next["models.temperature"] = String(temperature)
+        } else {
+            next.removeValue(forKey: "models.temperature")
+        }
+        if let modelRaw {
+            next["models.stream"] = modelOverrides.resolvedStream(for: modelRaw) ? "true" : "false"
+            next["models.responses"] = modelOverrides.resolvedUsesResponses(
+                for: modelRaw,
+                isCustomProvider: providerID == .customOpenAICompatible
+            ) ? "true" : "false"
+        }
+        return next
     }
 
     public func resolvedPlanningPrompt() -> String {

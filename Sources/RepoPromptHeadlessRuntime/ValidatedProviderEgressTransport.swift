@@ -141,6 +141,23 @@ struct SystemProviderHostResolver: ProviderHostResolving {
     }
 }
 
+/// Desktop accepts local provider URLs (Ollama default `http://localhost:11434`,
+/// custom / OpenAI base URLs). Linux keeps the public-HTTPS SSRF gate and
+/// unlocks loopback only when the operator sets this escape.
+public enum ProviderLocalURLEscape {
+    public static let environmentKey = "REPOPROMPT_ALLOW_LOCAL_PROVIDER_URLS"
+
+    public static func isEnabled(_ environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+        ["1", "true", "yes"].contains((environment[environmentKey] ?? "").lowercased())
+    }
+
+    public static func isLoopbackHost(_ host: String) -> Bool {
+        let normalized = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized == "localhost" { return true }
+        return ProviderEgressAddressPolicy.isLoopbackAddress(normalized)
+    }
+}
+
 public enum ProviderEgressAddressPolicy {
     public static func isIPAddress(_ value: String) -> Bool {
         var ipv4 = in_addr()
@@ -159,6 +176,28 @@ public enum ProviderEgressAddressPolicy {
         if value.withCString({ inet_pton(AF_INET6, $0, &ipv6) }) == 1 {
             let bytes = withUnsafeBytes(of: &ipv6) { Array($0) }
             return isPublicIPv6(bytes)
+        }
+        return false
+    }
+
+    public static func isLoopbackAddress(_ value: String) -> Bool {
+        var ipv4 = in_addr()
+        if value.withCString({ inet_pton(AF_INET, $0, &ipv4) }) == 1 {
+            let bytes = withUnsafeBytes(of: &ipv4.s_addr) { Array($0) }
+            return bytes.count == 4 && bytes[0] == 127
+        }
+        var ipv6 = in6_addr()
+        if value.withCString({ inet_pton(AF_INET6, $0, &ipv6) }) == 1 {
+            let bytes = withUnsafeBytes(of: &ipv6) { Array($0) }
+            guard bytes.count == 16 else { return false }
+            if bytes.dropLast().allSatisfy({ $0 == 0 }), bytes[15] == 1 { return true }
+            if bytes[0] == 0, bytes[1] == 0, bytes[2] == 0, bytes[3] == 0,
+               bytes[4] == 0, bytes[5] == 0, bytes[6] == 0, bytes[7] == 0,
+               bytes[8] == 0, bytes[9] == 0, bytes[10] == 0xFF, bytes[11] == 0xFF,
+               bytes[12] == 127
+            {
+                return true
+            }
         }
         return false
     }
@@ -200,22 +239,32 @@ public enum ProviderEgressAddressPolicy {
 }
 
 public struct ProviderEndpointPolicy {
-    public static func parseCustomBaseURL(_ value: String) throws -> DirectProviderEndpoint {
+    public static func parseCustomBaseURL(_ value: String, allowLocalURLs: Bool = false) throws -> DirectProviderEndpoint {
         guard value.utf8.count <= 2048,
               let url = URL(string: value),
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              components.scheme?.lowercased() == "https",
+              let scheme = components.scheme?.lowercased(),
               components.user == nil,
               components.password == nil,
               components.query == nil,
               components.fragment == nil,
-              components.port == nil || components.port == 443,
               let host = url.host?.lowercased(),
               !host.isEmpty,
-              host.utf8.count <= 253,
-              host.range(of: "^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", options: .regularExpression) != nil,
-              !ProviderEgressAddressPolicy.isIPAddress(host)
+              host.utf8.count <= 253
         else { throw ValidatedProviderEgressError.invalidEndpoint }
+
+        let local = allowLocalURLs && ProviderLocalURLEscape.isLoopbackHost(host)
+        if local {
+            guard ["http", "https"].contains(scheme) else { throw ValidatedProviderEgressError.invalidEndpoint }
+        } else {
+            guard scheme == "https",
+                  components.port == nil || components.port == 443,
+                  host.range(of: "^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", options: .regularExpression) != nil,
+                  !ProviderEgressAddressPolicy.isIPAddress(host)
+            else { throw ValidatedProviderEgressError.invalidEndpoint }
+        }
+        let port = local ? (components.port ?? (scheme == "https" ? 443 : 80)) : 443
+        guard (1 ... 65_535).contains(port) else { throw ValidatedProviderEgressError.invalidEndpoint }
 
         let path = components.percentEncodedPath.isEmpty ? "" : components.percentEncodedPath
         let lowercasePath = path.lowercased()
@@ -227,7 +276,12 @@ public struct ProviderEndpointPolicy {
               !path.split(separator: "/", omittingEmptySubsequences: false).contains("..")
         else { throw ValidatedProviderEgressError.invalidEndpoint }
         let normalizedPath = path == "/" ? "" : path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        return DirectProviderEndpoint(scheme: "https", host: host, port: 443, basePath: normalizedPath.isEmpty ? "" : "/\(normalizedPath)")
+        return DirectProviderEndpoint(
+            scheme: scheme,
+            host: host,
+            port: port,
+            basePath: normalizedPath.isEmpty ? "" : "/\(normalizedPath)"
+        )
     }
 
     public static func fixed(providerID: ProviderSettingsID) throws -> DirectProviderEndpoint {
@@ -238,9 +292,59 @@ public struct ProviderEndpointPolicy {
             .init(scheme: "https", host: "api.anthropic.com", port: 443, basePath: "/v1")
         case .openRouter:
             .init(scheme: "https", host: "openrouter.ai", port: 443, basePath: "/api/v1")
+        case .gemini:
+            .init(scheme: "https", host: "generativelanguage.googleapis.com", port: 443, basePath: "/v1beta")
+        case .deepseek:
+            .init(scheme: "https", host: "api.deepseek.com", port: 443, basePath: "/v1")
+        case .fireworks:
+            .init(scheme: "https", host: "api.fireworks.ai", port: 443, basePath: "/inference/v1")
+        case .xAI:
+            .init(scheme: "https", host: "api.x.ai", port: 443, basePath: "/v1")
+        case .groq:
+            .init(scheme: "https", host: "api.groq.com", port: 443, basePath: "/openai/v1")
+        case .zAI:
+            .init(scheme: "https", host: "api.z.ai", port: 443, basePath: "/api/paas/v4")
         default:
             throw ValidatedProviderEgressError.invalidEndpoint
         }
+    }
+
+    /// Desktop Ollama persists any local or remote URL (default
+    /// `http://localhost:11434`). Persist accepts that contract. Execute still
+    /// uses the public-HTTPS SSRF gate unless `REPOPROMPT_ALLOW_LOCAL_PROVIDER_URLS`
+    /// unlocks loopback.
+    public static func parseOllamaBaseURL(_ value: String) throws -> DirectProviderEndpoint {
+        guard value.utf8.count <= 2048,
+              let url = URL(string: value),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil,
+              let host = url.host?.lowercased(),
+              !host.isEmpty,
+              host.utf8.count <= 253
+        else { throw ValidatedProviderEgressError.invalidEndpoint }
+        let port = components.port ?? (scheme == "https" ? 443 : 80)
+        guard (1 ... 65_535).contains(port) else { throw ValidatedProviderEgressError.invalidEndpoint }
+        let path = components.percentEncodedPath.isEmpty ? "" : components.percentEncodedPath
+        let lowercasePath = path.lowercased()
+        guard path.utf8.count <= 1024,
+              !lowercasePath.contains("%2e"),
+              !lowercasePath.contains("%2f"),
+              !lowercasePath.contains("%5c"),
+              !lowercasePath.contains("%00"),
+              !path.split(separator: "/", omittingEmptySubsequences: false).contains("..")
+        else { throw ValidatedProviderEgressError.invalidEndpoint }
+        let normalizedPath = path == "/" ? "" : path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return DirectProviderEndpoint(
+            scheme: scheme,
+            host: host,
+            port: port,
+            basePath: normalizedPath.isEmpty ? "" : "/\(normalizedPath)"
+        )
     }
 }
 
@@ -248,14 +352,20 @@ public final class ValidatedProviderEgressTransport: ValidatedProviderEgressTran
     private let resolver: any ProviderHostResolving
     private let eventLoopGroup: EventLoopGroup
     private let tlsContext: NIOSSLContext
+    private let allowLocalURLs: Bool
 
-    public convenience init() throws {
-        try self.init(resolver: SystemProviderHostResolver())
+    public convenience init(allowLocalURLs: Bool = ProviderLocalURLEscape.isEnabled()) throws {
+        try self.init(resolver: SystemProviderHostResolver(), allowLocalURLs: allowLocalURLs)
     }
 
-    init(resolver: any ProviderHostResolving, eventLoopGroup: EventLoopGroup = NIOSingletons.posixEventLoopGroup) throws {
+    init(
+        resolver: any ProviderHostResolving,
+        eventLoopGroup: EventLoopGroup = NIOSingletons.posixEventLoopGroup,
+        allowLocalURLs: Bool = ProviderLocalURLEscape.isEnabled()
+    ) throws {
         self.resolver = resolver
         self.eventLoopGroup = eventLoopGroup
+        self.allowLocalURLs = allowLocalURLs
         var configuration = TLSConfiguration.makeClientConfiguration()
         configuration.certificateVerification = .fullVerification
         configuration.minimumTLSVersion = .tlsv12
@@ -264,7 +374,7 @@ public final class ValidatedProviderEgressTransport: ValidatedProviderEgressTran
     }
 
     public func validateEndpoint(_ baseURL: String) async throws -> DirectProviderEndpoint {
-        let endpoint = try ProviderEndpointPolicy.parseCustomBaseURL(baseURL)
+        let endpoint = try ProviderEndpointPolicy.parseCustomBaseURL(baseURL, allowLocalURLs: allowLocalURLs)
         _ = try await validatedAddresses(for: endpoint)
         return endpoint
     }
@@ -294,21 +404,37 @@ public final class ValidatedProviderEgressTransport: ValidatedProviderEgressTran
     }
 
     private func validatedAddresses(for endpoint: DirectProviderEndpoint) async throws -> [ResolvedProviderAddress] {
-        guard endpoint.scheme == "https", endpoint.port == 443 else {
+        let local = allowLocalURLs && ProviderLocalURLEscape.isLoopbackHost(endpoint.host)
+        if local {
+            guard ["http", "https"].contains(endpoint.scheme), (1 ... 65_535).contains(endpoint.port) else {
+                throw ValidatedProviderEgressError.unsupportedPort
+            }
+        } else if endpoint.scheme != "https" || endpoint.port != 443 {
             throw ValidatedProviderEgressError.unsupportedPort
         }
         let addresses = try await resolver.resolve(host: endpoint.host, port: endpoint.port)
         // Reject a mixed public/private answer rather than choosing the public
         // member; every retry and every request receives a fresh all-record check.
-        guard addresses.allSatisfy({ ProviderEgressAddressPolicy.isPublicAddress($0.ipAddress) }) else {
+        if local {
+            guard addresses.allSatisfy({ ProviderEgressAddressPolicy.isLoopbackAddress($0.ipAddress) }) else {
+                throw ValidatedProviderEgressError.nonPublicAddress
+            }
+        } else if !addresses.allSatisfy({ ProviderEgressAddressPolicy.isPublicAddress($0.ipAddress) }) {
             throw ValidatedProviderEgressError.nonPublicAddress
         }
         return addresses
     }
 
     func validateRequest(_ request: ValidatedProviderHTTPRequest) throws {
-        guard request.endpoint.scheme == "https",
-              request.endpoint.port == 443,
+        let local = allowLocalURLs && ProviderLocalURLEscape.isLoopbackHost(request.endpoint.host)
+        let schemeOK = local
+            ? ["http", "https"].contains(request.endpoint.scheme)
+            : request.endpoint.scheme == "https"
+        let portOK = local
+            ? (1 ... 65_535).contains(request.endpoint.port)
+            : request.endpoint.port == 443
+        guard schemeOK,
+              portOK,
               ["GET", "POST"].contains(request.method),
               request.pathAndQuery.hasPrefix("/"),
               request.pathAndQuery.utf8.count <= 4096,
@@ -329,7 +455,13 @@ public final class ValidatedProviderEgressTransport: ValidatedProviderEgressTran
     }
 
     private func execute(_ request: ValidatedProviderHTTPRequest, address: SocketAddress) async throws -> ValidatedProviderHTTPResponse {
-        let connectionPlan = try ProviderPinnedTLSConnectionPlan(endpoint: request.endpoint, address: address)
+        let useTLS = request.endpoint.scheme == "https"
+        let connectionPlan = useTLS ? try ProviderPinnedTLSConnectionPlan(endpoint: request.endpoint, address: address) : nil
+        if !useTLS {
+            guard allowLocalURLs, ProviderLocalURLEscape.isLoopbackHost(request.endpoint.host) else {
+                throw ValidatedProviderEgressError.unsupportedPort
+            }
+        }
         let responsePromise = eventLoopGroup.next().makePromise(of: ValidatedProviderHTTPResponse.self)
         let tlsContext = tlsContext
         let handler = BoundedProviderHTTPResponseHandler(
@@ -341,8 +473,10 @@ public final class ValidatedProviderEgressTransport: ValidatedProviderEgressTran
             .connectTimeout(.nanoseconds(request.connectTimeout.nanosecondsClamped))
             .channelInitializer { channel in
                 do {
-                    let tls = try NIOSSLClientHandler(context: tlsContext, serverHostname: connectionPlan.serverHostname)
-                    try channel.pipeline.syncOperations.addHandler(tls)
+                    if useTLS, let connectionPlan {
+                        let tls = try NIOSSLClientHandler(context: tlsContext, serverHostname: connectionPlan.serverHostname)
+                        try channel.pipeline.syncOperations.addHandler(tls)
+                    }
                     try channel.pipeline.syncOperations.addHTTPClientHandlers()
                     try channel.pipeline.syncOperations.addHandler(handler)
                     return channel.eventLoop.makeSucceededVoidFuture()
@@ -352,14 +486,18 @@ public final class ValidatedProviderEgressTransport: ValidatedProviderEgressTran
             }
         let channel: Channel
         do {
-            channel = try await bootstrap.connect(to: connectionPlan.address).get()
+            channel = try await bootstrap.connect(to: connectionPlan?.address ?? address).get()
         } catch {
-            throw ValidatedProviderEgressError.tlsValidationFailed
+            throw useTLS ? ValidatedProviderEgressError.tlsValidationFailed : ValidatedProviderEgressError.transportUnavailable
         }
         defer { channel.close(promise: nil) }
 
         var headers = HTTPHeaders()
-        headers.add(name: "Host", value: request.endpoint.host)
+        let defaultPort = request.endpoint.scheme == "https" ? 443 : 80
+        let hostHeader = request.endpoint.port == defaultPort
+            ? request.endpoint.host
+            : "\(request.endpoint.host):\(request.endpoint.port)"
+        headers.add(name: "Host", value: hostHeader)
         headers.add(name: "Accept", value: "application/json, text/event-stream")
         headers.add(name: "Connection", value: "close")
         for (name, value) in request.headers { headers.replaceOrAdd(name: name, value: value) }
@@ -397,7 +535,8 @@ struct ProviderPinnedTLSConnectionPlan {
     let serverHostname: String
 
     init(endpoint: DirectProviderEndpoint, address: SocketAddress) throws {
-        guard endpoint.scheme == "https", endpoint.port == 443,
+        guard endpoint.scheme == "https",
+              (1 ... 65_535).contains(endpoint.port),
               !endpoint.host.isEmpty, !ProviderEgressAddressPolicy.isIPAddress(endpoint.host)
         else { throw ValidatedProviderEgressError.invalidEndpoint }
         self.address = address

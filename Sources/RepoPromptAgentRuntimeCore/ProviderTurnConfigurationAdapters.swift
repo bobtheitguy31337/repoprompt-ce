@@ -94,7 +94,7 @@ public enum ProviderComposerStableControls {
             ]
         case .openCodeACP, .cursorACP,
              .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
-             .xAI:
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
             []
         }
     }
@@ -127,7 +127,8 @@ public enum ProviderComposerStableControls {
                 .init(id: "cursor.managedDefault", displayName: "Require Approval", detailText: "Cursor asks before running tools that need approval. RepoPrompt MCP is injected through the ACP session."),
                 .init(id: "cursor.fullAccess", displayName: "Full Access", warning: true)
             ], mutable: mutable, lockReasonCode: lockReasonCode)
-        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
             return nil
         }
     }
@@ -356,7 +357,15 @@ public enum ProviderTurnConfigurationAdapters {
             .openAIAPI: DirectAPITurnConfigurationAdapter(providerID: .openAIAPI),
             .anthropicAPI: DirectAPITurnConfigurationAdapter(providerID: .anthropicAPI),
             .openRouter: DirectAPITurnConfigurationAdapter(providerID: .openRouter),
-            .customOpenAICompatible: DirectAPITurnConfigurationAdapter(providerID: .customOpenAICompatible)
+            .customOpenAICompatible: DirectAPITurnConfigurationAdapter(providerID: .customOpenAICompatible),
+            .gemini: DirectAPITurnConfigurationAdapter(providerID: .gemini),
+            .azure: DirectAPITurnConfigurationAdapter(providerID: .azure),
+            .deepseek: DirectAPITurnConfigurationAdapter(providerID: .deepseek),
+            .fireworks: DirectAPITurnConfigurationAdapter(providerID: .fireworks),
+            .xAI: DirectAPITurnConfigurationAdapter(providerID: .xAI),
+            .groq: DirectAPITurnConfigurationAdapter(providerID: .groq),
+            .zAI: DirectAPITurnConfigurationAdapter(providerID: .zAI),
+            .ollama: DirectAPITurnConfigurationAdapter(providerID: .ollama)
         ]
     }
 }

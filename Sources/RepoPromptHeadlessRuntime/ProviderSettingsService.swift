@@ -72,6 +72,7 @@ public actor ProviderSettingsService {
     private var runtimePreflight: [ProviderSettingsID: Bool] = [:]
     private var supportedAuthenticationMethods: [ProviderSettingsID: Set<ProviderAuthenticationMethod>] = [:]
     private var modelCatalogs: [ProviderSettingsID: [ProviderModelCatalogEntry]] = [:]
+    private var directConfigurations: [ProviderSettingsID: DirectProviderConfiguration] = [:]
     private var connections: [ProviderSettingsID: SQLiteServiceStore.StoredProviderConnection] = [:]
     private var managedAuthFlowDescriptors: [ProviderSettingsID: [ProviderAuthFlowDescriptor]] = [:]
     private var managedAccountSummaries: [ProviderSettingsID: ProviderManagedAccountSummary] = [:]
@@ -113,6 +114,13 @@ public actor ProviderSettingsService {
 
     public func bootstrap() async throws {
         modelCatalogs = try loadModelCatalogs()
+        if let directProviderRegistry {
+            for providerID in ProviderSettingsID.directAPIProviders {
+                if let configuration = try? await directProviderRegistry.configuration(for: providerID) {
+                    directConfigurations[providerID] = configuration
+                }
+            }
+        }
         for persistedCatalog in try await store.providerModelCatalogs() {
             guard persistedCatalog.models.count <= 500,
                   Set(persistedCatalog.models.map(\.id)).count == persistedCatalog.models.count,
@@ -321,7 +329,9 @@ public actor ProviderSettingsService {
         guard let directProviderRegistry else {
             throw ServiceAPIError(code: .capabilityMissing, message: "Direct provider configuration is unavailable")
         }
-        return try await directProviderRegistry.update(providerID: providerID, request: request, attribution: attribution)
+        let updated = try await directProviderRegistry.update(providerID: providerID, request: request, attribution: attribution)
+        directConfigurations[providerID] = updated
+        return updated
     }
 
     public func setEnabled(
@@ -823,7 +833,9 @@ public actor ProviderSettingsService {
         case .claudeCompatible, .openCodeACP: .providerSpecific
         case .cursorACP: .browserLogin
         case .codex, .claudeGLM, .claudeKimi, .claudeCustom,
-             .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI: nil
+             .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
+            nil
         }
     }
 
@@ -1028,6 +1040,11 @@ public actor ProviderSettingsService {
         runtimePreflight[providerID] = capability.enabled && capability.reasonUnavailable == nil
     }
 
+    private func resolvedModels(for providerID: ProviderSettingsID) -> [ProviderModelCatalogEntry] {
+        let discovered = modelCatalogs[providerID] ?? []
+        return directConfigurations[providerID]?.resolvedCatalog(discovered: discovered) ?? discovered
+    }
+
     private func snapshot(for providerID: ProviderSettingsID) throws -> ProviderSettingsSnapshot {
         guard let preference = preferences[providerID] else {
             throw ServiceAPIError(code: .notFound, message: "Provider settings are not initialized")
@@ -1038,7 +1055,7 @@ public actor ProviderSettingsService {
             ? directProviderAllowlist.contains(providerID)
             : (providerID.runtimeKind.map(initiallyEnabled.contains) ?? false)
         let preflightVerified = runtimePreflight[runtimeSettingsID] ?? false
-        let models = modelCatalogs[providerID] ?? []
+        let models = resolvedModels(for: providerID)
         let connection = connections[providerID]?.record
         let preflight = preflightStatus(
             providerID: providerID,
@@ -1135,7 +1152,7 @@ public actor ProviderSettingsService {
     }
 
     private func validateSelection(_ request: UpdateProviderSettingsRequest, providerID: ProviderSettingsID, definition: Definition) throws {
-        let models = modelCatalogs[providerID] ?? []
+        let models = resolvedModels(for: providerID)
         let selectedModel: ProviderModelCatalogEntry?
         if let modelID = try normalized(request.defaultModel) {
             guard definition.capabilities.supportsModelSelection,
@@ -1208,7 +1225,7 @@ public actor ProviderSettingsService {
         let normalizedReasoning = try normalized(reasoningEffort)
         let normalizedSpeed = try normalized(speedMode)
         let normalizedTier = try normalized(serviceTier)
-        let models = modelCatalogs[providerID] ?? []
+        let models = resolvedModels(for: providerID)
         let selectedModel: ProviderModelCatalogEntry? = if definition.capabilities.supportsModelSelection {
             if let normalizedModel, let exact = models.first(where: { $0.id == normalizedModel }) {
                 exact
@@ -1344,8 +1361,22 @@ public actor ProviderSettingsService {
             return Definition(displayName: "OpenRouter", category: .apiProvider, summary: "Direct fixed-host OpenRouter HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
         case .customOpenAICompatible:
             return Definition(displayName: "Custom OpenAI-Compatible", category: .apiProvider, summary: "Public HTTPS OpenAI-compatible runtime with pinned-address egress", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+        case .gemini:
+            return Definition(displayName: "Gemini", category: .apiProvider, summary: "Direct fixed-host Gemini HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+        case .azure:
+            return Definition(displayName: "Azure", category: .apiProvider, summary: "Direct Azure OpenAI HTTPS runtime with persisted resource URL and API version", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+        case .deepseek:
+            return Definition(displayName: "DeepSeek", category: .apiProvider, summary: "Direct fixed-host DeepSeek HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+        case .fireworks:
+            return Definition(displayName: "Fireworks", category: .apiProvider, summary: "Direct fixed-host Fireworks HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
         case .xAI:
-            return Definition(displayName: "xAI", category: .apiProvider, summary: "Provider runtime is not available on the server", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: true, authenticationMethods: [], authFlows: []))
+            return Definition(displayName: "xAI", category: .apiProvider, summary: "Direct fixed-host xAI HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+        case .groq:
+            return Definition(displayName: "Groq", category: .apiProvider, summary: "Direct fixed-host Groq HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+        case .zAI:
+            return Definition(displayName: "Z.AI", category: .apiProvider, summary: "Direct fixed-host Z.AI HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+        case .ollama:
+            return Definition(displayName: "Ollama", category: .apiProvider, summary: "Persisted Ollama URL runtime; loopback requires REPOPROMPT_ALLOW_LOCAL_PROVIDER_URLS", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
         }
     }
 

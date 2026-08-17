@@ -35,6 +35,8 @@ public actor RepoPromptHeadlessAuthority {
     private let oracleRuntime: (any OracleRuntimeService)?
     private let projectSourceService: ProjectSourceProvisioningService?
     private let serverSettings: ServerSettingsService?
+    private let providerSettings: ProviderSettingsService?
+    private let directProviderRegistry: DirectProviderRegistry?
     private let directProviderDefaults: (any DirectProviderRuntimeDefaultsProviding)?
     private let subagentPermissions: SubagentPermissionResolver
     private let workflowRepository: WorkflowRepository
@@ -66,6 +68,8 @@ public actor RepoPromptHeadlessAuthority {
         oracleRuntime: (any OracleRuntimeService)? = nil,
         projectSourceService: ProjectSourceProvisioningService? = nil,
         serverSettings: ServerSettingsService? = nil,
+        providerSettings: ProviderSettingsService? = nil,
+        directProviderRegistry: DirectProviderRegistry? = nil,
         directProviderDefaults: (any DirectProviderRuntimeDefaultsProviding)? = nil
     ) {
         self.store = store
@@ -81,6 +85,8 @@ public actor RepoPromptHeadlessAuthority {
         self.oracleRuntime = oracleRuntime ?? providerAdapter.map { ProviderOracleRuntimeService(providers: $0) }
         self.projectSourceService = projectSourceService
         self.serverSettings = serverSettings
+        self.providerSettings = providerSettings
+        self.directProviderRegistry = directProviderRegistry
         self.directProviderDefaults = directProviderDefaults
         workflowRepository = WorkflowRepository(store: store)
         subagentPermissions = SubagentPermissionResolver(
@@ -1578,6 +1584,44 @@ public actor RepoPromptHeadlessAuthority {
 
     public func portalDesktopSettings() async throws -> PortalDesktopSettingsSnapshot {
         try PortalDesktopSettingsSnapshot.liveRead(stored: try await store.portalDesktopSettings())
+    }
+
+    public func directConfiguration(providerID: ProviderSettingsID) async throws -> DirectProviderConfiguration {
+        if let providerSettings {
+            return try await providerSettings.directConfiguration(providerID: providerID)
+        }
+        guard let directProviderRegistry else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Direct provider configuration is unavailable")
+        }
+        return try await directProviderRegistry.configuration(for: providerID)
+    }
+
+    public func updateDirectConfiguration(
+        providerID: ProviderSettingsID,
+        request: UpdateDirectProviderConfigurationRequest,
+        attribution: SettingsMutationAttribution
+    ) async throws -> DirectProviderConfiguration {
+        try ensureWritable()
+        let providerAttribution = ProviderMutationAttribution(
+            actorID: attribution.actorID,
+            actorLabel: attribution.actorLabel,
+            channel: attribution.channel
+        )
+        if let providerSettings {
+            return try await providerSettings.updateDirectConfiguration(
+                providerID: providerID,
+                request: request,
+                attribution: providerAttribution
+            )
+        }
+        guard let directProviderRegistry else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Direct provider configuration is unavailable")
+        }
+        return try await directProviderRegistry.update(
+            providerID: providerID,
+            request: request,
+            attribution: providerAttribution
+        )
     }
 
     public func replacePortalDesktopSettings(
@@ -3151,14 +3195,13 @@ public actor RepoPromptHeadlessAuthority {
         await attachingResolvedTemperature(liveDirectAgentDefaults(providerID: providerID)?.providerSettings ?? [:])
     }
 
-    private func attachingResolvedTemperature(_ settings: [String: String]) async -> [String: String] {
+    private func attachingResolvedTemperature(_ settings: [String: String], modelRaw: String? = nil) async -> [String: String] {
         var next = settings
-        if let temperature = (try? await advancedSettings())?.settings.resolvedAttachedTemperature() {
-            next["models.temperature"] = String(temperature)
-        } else {
+        guard let advanced = try? await advancedSettings() else {
             next.removeValue(forKey: "models.temperature")
+            return next
         }
-        return next
+        return advanced.settings.stampedProviderSettings(next, modelRaw: modelRaw)
     }
 
     private func liveDirectAgentDefaults(providerID: ProviderSettingsID?) async -> DirectProviderRuntimeDefaults? {
@@ -3730,7 +3773,10 @@ public actor RepoPromptHeadlessAuthority {
             if FileManager.default.isExecutableFile(atPath: CodexRepoPromptMCPConfig.command()) {
                 providerSettings[CodexRepoPromptMCPConfig.provisionedSettingsKey] = "true"
             }
-            providerSettings = await attachingResolvedTemperature(providerSettings)
+            providerSettings = await attachingResolvedTemperature(
+                providerSettings,
+                modelRaw: acceptedSubmission?.providerModel ?? initial.model
+            )
             let resumeFallbackPrompt: String?
             if run.providerSessionID == nil {
                 resumeFallbackPrompt = nil

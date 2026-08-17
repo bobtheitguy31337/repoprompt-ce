@@ -310,7 +310,8 @@ public struct DirectAgentPermissionsSettings: Codable, Hashable, Sendable {
                 mode: cursor.permissionLevel == .fullAccess ? "fullAccess" : "workspaceWrite",
                 providerSettings: ["provider.permissionId": "cursor.\(cursor.permissionLevel.rawValue)"]
             )
-        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
             return .init(mode: "workspaceWrite", providerSettings: [:])
         }
     }

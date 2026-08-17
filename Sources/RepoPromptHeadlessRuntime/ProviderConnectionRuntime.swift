@@ -229,7 +229,8 @@ public actor ProviderAuthenticationAdapter: ProviderCredentialTesting {
             else { return [] }
             return [config.authHeader.authenticationMethod]
         case .claudeCustom, .openCodeACP, .cursorACP,
-             .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
+             .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
             return []
         }
     }
@@ -280,7 +281,8 @@ public actor ProviderAuthenticationAdapter: ProviderCredentialTesting {
             ])
             acceptedDetail = providerID == .claudeGLM ? "Z.ai credential validated" : "Kimi credential validated"
         case .claudeCustom, .openCodeACP, .cursorACP,
-             .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI:
+             .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
             return .init(state: .unavailable, detail: "Provider credential validation is unavailable")
         }
         if request.httpMethod == nil { request.httpMethod = "GET" }

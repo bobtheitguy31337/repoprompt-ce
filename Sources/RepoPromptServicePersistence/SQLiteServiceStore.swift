@@ -1498,7 +1498,11 @@ public actor SQLiteServiceStore {
         case .claudeCustom: [.apiKey, .authToken]
         case .cursorACP: [.apiKey, .browserLogin]
         case .openCodeACP: [.providerSpecific]
-        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible, .xAI: [.apiKey]
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI:
+            [.apiKey]
+        case .ollama:
+            []
         }
         let vaultMethods: Set<ProviderAuthenticationMethod> = [.apiKey, .enterpriseAccessToken, .authToken]
         guard allowedMethods.contains(record.authenticationMethod),
