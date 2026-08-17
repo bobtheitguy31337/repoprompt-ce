@@ -6,7 +6,6 @@
 
 Headless Agent Mode for Linux. SQLite-backed projects and sessions, an operator
 portal, and MCP over the same `RepoPromptHeadlessAuthority` as the macOS app.
-Chat collaboration is optional.
 
 ## Run
 
