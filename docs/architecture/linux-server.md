@@ -27,6 +27,7 @@ Linux, and macOS builds with `REPOPROMPT_SERVER_ONLY=1`, resolve only this graph
 
 - `RepoPromptHeadlessAuthority` is actor isolated and routes by persisted project and session UUIDs.
 - `ProjectRuntimeSupervisor` owns one `ProjectAuthority` per project. A child session cannot cross the parent's project.
+- Concurrent projects keep distinct tool authorities, worktrees, selection templates, and project-filtered events. Tree/search/file and worktree lookup fail closed on a foreign root or binding ID instead of falling back to another active project.
 - `SessionAuthority` serializes commands and retains generation, turn-epoch, connection-generation, and exactly-once terminal gates.
 - `LocalFilesystemAuthority` resolves symlinks and verifies every logical path remains inside an authorized root.
 - External commands are root-session only. Child creation remains an internal runtime operation.
