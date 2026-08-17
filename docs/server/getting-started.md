@@ -34,7 +34,7 @@ After setup, the same page is a password sign-in. The browser will warn about th
 
 ## Optional mutual TLS
 
-Production deployments can still require operator client certificates. Set `REPOPROMPT_TLS_CERT_FILE`, `REPOPROMPT_TLS_KEY_FILE`, `REPOPROMPT_TLS_CLIENT_CA_FILE`, and `REPOPROMPT_OPERATOR_CERT_IDENTITY` together. In that mode the portal does not use a password.
+Production deployments can still require client certificates for chat and other signed HTTP callers. Set `REPOPROMPT_TLS_CERT_FILE`, `REPOPROMPT_TLS_KEY_FILE`, `REPOPROMPT_TLS_CLIENT_CA_FILE`, and `REPOPROMPT_OPERATOR_CERT_IDENTITY` together. The operator portal still uses a password. When those TLS files are set, the process also listens on `9081` for the password portal so a reverse proxy can serve `/portal/` without a browser client certificate.
 
 | Optional integration | Purpose |
 | --- | --- |

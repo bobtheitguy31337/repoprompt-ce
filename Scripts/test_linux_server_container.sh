@@ -116,9 +116,10 @@ wait_ready() {
 # The image contract is part of the runtime API.
 test "$(docker image inspect "$image" --format '{{.Config.User}}')" = '65532:65532'
 test "$(docker image inspect "$image" --format '{{index .Config.Labels "io.repoprompt.schema-version"}}')" = '6'
-test "$(docker image inspect "$image" --format '{{json .Config.ExposedPorts}}')" = '{"9080/tcp":{},"9443/tcp":{}}'
+test "$(docker image inspect "$image" --format '{{json .Config.ExposedPorts}}')" = '{"9080/tcp":{},"9081/tcp":{},"9443/tcp":{}}'
 test "$(docker image inspect "$image" --format '{{index .Config.Labels "io.repoprompt.port.internal-api"}}')" = '9443/tcp;mtls'
 test "$(docker image inspect "$image" --format '{{index .Config.Labels "io.repoprompt.port.health"}}')" = '9080/tcp;loopback-only'
+test "$(docker image inspect "$image" --format '{{index .Config.Labels "io.repoprompt.port.portal"}}')" = '9081/tcp;http-password'
 
 # Portal resources must be readable and their directory traversable by the
 # image's non-root runtime user. SwiftPM build output may otherwise preserve
@@ -146,6 +147,11 @@ docker run --rm --init --entrypoint /usr/local/bin/RepoPromptServer "$image" pro
 run_operator_only_container
 wait_ready
 test "$(docker exec "$container" curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --resolve repoprompt:9443:127.0.0.1 --cacert /run/repoprompt/trust/ca.crt --cert /run/repoprompt/trust/operator.crt --key /run/repoprompt/trust/operator.key https://repoprompt:9443/portal/)" = '200'
+test "$(docker exec "$container" curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:9081/portal/)" = '200'
+auth_status="$(docker exec "$container" curl --noproxy '*' -sS http://127.0.0.1:9081/portal/api/v1/auth/status")"
+printf '%s' "$auth_status" | grep -F '"needsSetup":true' >/dev/null
+printf '%s' "$auth_status" | grep -F '"authenticated":false' >/dev/null
+printf '%s' "$auth_status" | grep -F '"passwordLoginEnabled":true' >/dev/null
 docker rm -f "$container" >/dev/null
 
 run_container

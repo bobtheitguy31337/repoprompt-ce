@@ -42,6 +42,7 @@ The v1 migration creates the complete E4 table inventory: service metadata, proj
 ## Internal service
 
 - Mutual TLS 1.3 listener: `0.0.0.0:9443` by default.
+- Password portal HTTP listener: `0.0.0.0:9081` when mutual TLS is configured for signed callers.
 - Content-free loopback health listener: `127.0.0.1:9080`.
 - Roles encode as `app`, `sync`, and `repoprompt-operator`. First-run portal login is an operator password. Mutual TLS and integration HMAC files are optional; omit them for a local password-mode boot.
 - Requests use canonical method/path/timestamp/nonce/body/decision/key-ID HMAC input.
@@ -72,7 +73,7 @@ Agent Models scope is a Linux multi-user extension keyed by **project**, not a D
 
 ## Image contract
 
-`Dockerfile.server` builds only `RepoPromptServer`, runs it as fixed UID/GID 65532, includes `tini` and `curl`, and retains image metadata for both fixed ports: `9443/tcp` is the mTLS internal API and `9080/tcp` is the loopback-only health listener used by the image probe. OCI labels use `io.repoprompt.*` (`schema-version=6`). Deployments must not publish 9080. Compose must still set read-only root, dropped capabilities, no-new-privileges, resource/PID/log bounds, persistent state/project/worktree/cache volumes, internal networks, and runtime secret mounts.
+`Dockerfile.server` builds only `RepoPromptServer`, runs it as fixed UID/GID 65532, includes `tini` and `curl`, and retains image metadata for the fixed ports: `9443/tcp` is the mTLS internal API, `9081/tcp` is the password portal when mutual TLS is enabled for integration callers, and `9080/tcp` is the loopback-only health listener used by the image probe. OCI labels use `io.repoprompt.*` (`schema-version=6`). Deployments must not publish 9080. Compose must still set read-only root, dropped capabilities, no-new-privileges, resource/PID/log bounds, persistent state/project/worktree/cache volumes, internal networks, and runtime secret mounts.
 
 ## Validation
 
@@ -94,8 +95,7 @@ Collaboration eligibility for signed HTTP callers is owned by the authorization 
 # RepoPrompt Server web portal
 
 The standalone portal is a RepoPrompt-owned operator surface served by
-`RepoPromptServer` at `/portal` on the existing operator-mTLS listener. It is
-independently usable. Chat integration can use API, SSO, or deep links
+`RepoPromptServer` at `/portal`. It is independently usable. Chat integration can use API, SSO, or deep links
 without becoming the portal's UI or orchestration authority.
 
 ## Desktop-to-web product map
@@ -135,10 +135,9 @@ No screenshots or generated imitation artwork are part of this port.
 
 ## Runtime and browser contract
 
-Portal pages load without a client certificate. APIs require either an
-operator password session or a client certificate mapped to
-`repoprompt-operator` / `app`. First-run setup creates the operator password
-on `/portal/`. Operator mTLS remains optional for production:
+Portal pages load without a client certificate. APIs require an
+operator password session. First-run setup creates the operator password
+on `/portal/`. Mutual TLS remains optional for signed HTTP callers:
 settings and agent surfaces do not require a chat peer, integration HMAC, or a
 reverse proxy. Browser code never receives an internal HMAC key or client
 certificate. The browser is a thin renderer over Swift-owned

@@ -20,6 +20,8 @@ public struct RepoPromptServerConfiguration: Sendable {
     public let bindPort: Int
     public let healthHost: String
     public let healthPort: Int
+    public let portalHost: String
+    public let portalPort: Int?
     public let certificatePath: String
     public let privateKeyPath: String
     public let clientCAPath: String?
@@ -260,6 +262,21 @@ public struct RepoPromptServerConfiguration: Sendable {
         if (clientCAPath == nil) != (operatorCertIdentity == nil) {
             throw ConfigurationError.invalid("TLS client CA and operator certificate identity must be configured together")
         }
+        let bindHost = environment["REPOPROMPT_BIND_HOST"] ?? "0.0.0.0"
+        let bindPort = Int(environment["REPOPROMPT_BIND_PORT"] ?? "9443") ?? 9443
+        let portalHost = environment["REPOPROMPT_PORTAL_HOST"] ?? bindHost
+        let portalPort: Int?
+        if let raw = environment["REPOPROMPT_PORTAL_PORT"] {
+            if raw.isEmpty || raw == "off" {
+                portalPort = nil
+            } else {
+                portalPort = Int(raw) ?? 9081
+            }
+        } else if clientCAPath != nil {
+            portalPort = 9081
+        } else {
+            portalPort = nil
+        }
         return Self(
             stateDatabasePath: stateDatabase,
             worktreeDirectory: environment["REPOPROMPT_WORKTREE_DIR"] ?? "/srv/repoprompt/worktrees",
@@ -267,8 +284,10 @@ public struct RepoPromptServerConfiguration: Sendable {
             projectDirectory: environment["REPOPROMPT_PROJECT_DIR"] ?? "/srv/repoprompt/projects",
             cacheDirectory: environment["REPOPROMPT_CACHE_DIR"] ?? "/var/cache/repoprompt",
             providerHomeDirectory: environment["REPOPROMPT_PROVIDER_HOME_DIR"] ?? URL(fileURLWithPath: stateDatabase).deletingLastPathComponent().appendingPathComponent("provider-homes").path,
-            bindHost: environment["REPOPROMPT_BIND_HOST"] ?? "0.0.0.0", bindPort: Int(environment["REPOPROMPT_BIND_PORT"] ?? "9443") ?? 9443,
+            bindHost: bindHost, bindPort: bindPort,
             healthHost: "127.0.0.1", healthPort: Int(environment["REPOPROMPT_HEALTH_PORT"] ?? "9080") ?? 9080,
+            portalHost: portalHost,
+            portalPort: portalPort,
             certificatePath: tlsCert ?? trustDirectory.appendingPathComponent("server.crt").path,
             privateKeyPath: tlsKey ?? trustDirectory.appendingPathComponent("server.key").path,
             clientCAPath: clientCAPath,
@@ -305,13 +324,28 @@ public enum ConfigurationError: Error, CustomStringConvertible { case missing(St
     }
 }
 
-private func operatorOnboardingBanner(bindHost: String, bindPort: Int, needsSetup: Bool, setupToken: String?) -> String {
-    let host = bindHost == "0.0.0.0" || bindHost == "::" ? "127.0.0.1" : bindHost
+private func operatorOnboardingBanner(
+    bindHost: String,
+    bindPort: Int,
+    portalHost: String,
+    portalPort: Int?,
+    usesMutualTLS: Bool,
+    needsSetup: Bool,
+    setupToken: String?
+) -> String {
+    let httpsHost = bindHost == "0.0.0.0" || bindHost == "::" ? "127.0.0.1" : bindHost
+    let httpHost = portalHost == "0.0.0.0" || portalHost == "::" ? "127.0.0.1" : portalHost
     var lines = [
         "",
-        "RepoPrompt Server is ready.",
-        "Open https://\(host):\(bindPort)/portal/"
+        "RepoPrompt Server is ready."
     ]
+    if let portalPort {
+        lines.append("Open http://\(httpHost):\(portalPort)/portal/")
+    } else if !usesMutualTLS {
+        lines.append("Open https://\(httpsHost):\(bindPort)/portal/")
+    } else {
+        lines.append("Open /portal/ and create or enter the operator password.")
+    }
     if needsSetup, let setupToken {
         lines.append("Create the operator password on first visit.")
         lines.append("Setup token (required unless you are on this machine): \(setupToken)")
@@ -664,7 +698,7 @@ public enum RepoPromptServerRunner {
             submissionCoordinator: submissionCoordinator,
             transcriptPresentation: transcriptPresentation,
             portalDesktopSettings: portalDesktopSettings,
-            portalPasswordLoginEnabled: !configuration.usesMutualTLS
+            portalPasswordLoginEnabled: true
         )
         let internalApplication = try Application(
             router: service.internalRouter(),
@@ -682,16 +716,17 @@ public enum RepoPromptServerRunner {
             )
         )
         await durabilityOperations.start()
-        if !configuration.usesMutualTLS {
-            let needsSetup = try await store.hasOperatorAccount() == false
-            let setupToken = needsSetup ? try await store.issueOperatorSetupToken() : nil
-            FileHandle.standardError.write(Data(operatorOnboardingBanner(
-                bindHost: configuration.bindHost,
-                bindPort: configuration.bindPort,
-                needsSetup: needsSetup,
-                setupToken: setupToken
-            ).utf8))
-        }
+        let needsSetup = try await store.hasOperatorAccount() == false
+        let setupToken = needsSetup ? try await store.issueOperatorSetupToken() : nil
+        FileHandle.standardError.write(Data(operatorOnboardingBanner(
+            bindHost: configuration.bindHost,
+            bindPort: configuration.bindPort,
+            portalHost: configuration.portalHost,
+            portalPort: configuration.portalPort,
+            usesMutualTLS: configuration.usesMutualTLS,
+            needsSetup: needsSetup,
+            setupToken: setupToken
+        ).utf8))
         let mcpAdapter = RepoPromptMCPAdapter(authority: authority)
         let mcpSocketURL = URL(
             fileURLWithPath: CodexRepoPromptMCPConfig.socketPath(),
@@ -712,6 +747,16 @@ public enum RepoPromptServerRunner {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask { try await internalApplication.runService() }
                 group.addTask { try await healthApplication.runService() }
+                if let portalPort = configuration.portalPort {
+                    let portalApplication = Application(
+                        router: service.internalRouter(),
+                        configuration: .init(
+                            address: .hostname(configuration.portalHost, port: portalPort),
+                            serverName: "RepoPromptServer"
+                        )
+                    )
+                    group.addTask { try await portalApplication.runService() }
+                }
                 _ = try await group.next()
                 let drain = await drainController.drain(timeout: 15)
                 await mcpSocketServer.stop()

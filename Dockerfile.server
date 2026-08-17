@@ -70,7 +70,7 @@ LABEL org.opencontainers.image.title="RepoPromptServer" \
       io.repoprompt.schema-version="6" \
       io.repoprompt.runtime-uid="65532" \
       io.repoprompt.port.internal-api="9443/tcp;mtls" \
-      io.repoprompt.port.portal="9443/tcp;mtls-operator" \
+      io.repoprompt.port.portal="9081/tcp;http-password" \
       io.repoprompt.port.health="9080/tcp;loopback-only" \
       io.repoprompt.provider.codex="0.147.0;app-server-v2" \
       io.repoprompt.provider.claude-compatible="2.1.226;stream-json-v1" \
@@ -88,7 +88,7 @@ ENV PATH="/opt/repoprompt/providers:${PATH}" \
     REPOPROMPT_WORKTREE_DIR="/srv/repoprompt/worktrees" \
     REPOPROMPT_CACHE_DIR="/var/cache/repoprompt"
 USER 65532:65532
-EXPOSE 9443 9080
+EXPOSE 9443 9081 9080
 VOLUME ["/var/lib/repoprompt/state", "/var/lib/repoprompt/artifacts", "/srv/repoprompt/projects", "/srv/repoprompt/worktrees", "/var/cache/repoprompt"]
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=6 CMD ["curl", "-fsS", "--max-time", "3", "http://127.0.0.1:9080/health/ready"]
 ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/usr/local/bin/RepoPromptServer"]

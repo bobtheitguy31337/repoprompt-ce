@@ -1394,6 +1394,9 @@ public struct RepoPromptHTTPService: Sendable {
                 externalActor: ExternalActor(userID: actorID, username: username, displayName: actorLabel)
             )
         }
+        if portalPasswordLoginEnabled {
+            throw ServiceAPIError(code: .internalAuthFailed, message: "Sign in to the operator portal")
+        }
         guard let certificateRoleResolver else {
             throw ServiceAPIError(code: .internalAuthFailed, message: "Sign in to the operator portal")
         }

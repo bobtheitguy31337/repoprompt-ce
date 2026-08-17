@@ -75,6 +75,26 @@ final class PortalStandaloneMTLSTests: XCTestCase {
                 XCTAssertTrue(html.contains("portal.js") || html.contains("RepoPrompt"))
             }
             try await client.execute(uri: "/portal/api/v1/bootstrap", method: .get) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+            let token = try await store.issueOperatorSetupToken()
+            var cookie = ""
+            try await client.execute(
+                uri: "/portal/api/v1/setup",
+                method: .post,
+                headers: Self.portalMutationHeaders(),
+                body: ByteBuffer(data: try JSONEncoder.serviceEncoder.encode(SetupBody(
+                    password: "operator-password",
+                    passwordConfirmation: "operator-password",
+                    setupToken: token
+                )))
+            ) { response in
+                XCTAssertEqual(response.status, .created)
+                cookie = try XCTUnwrap(response.headers[.setCookie])
+            }
+            var headers = Self.portalMutationHeaders()
+            headers[.cookie] = cookie.split(separator: ";").first.map(String.init)
+            try await client.execute(uri: "/portal/api/v1/bootstrap", method: .get, headers: headers) { response in
                 XCTAssertEqual(response.status, .ok)
                 let bootstrap = try JSONDecoder.serviceDecoder.decode(
                     PortalBootstrapResponse.self,
@@ -84,7 +104,7 @@ final class PortalStandaloneMTLSTests: XCTestCase {
                 XCTAssertFalse(bootstrap.tools.isEmpty)
             }
             var advanced: AdvancedServerSettingsSnapshot?
-            try await client.execute(uri: "/portal/api/v1/settings/advanced", method: .get) { response in
+            try await client.execute(uri: "/portal/api/v1/settings/advanced", method: .get, headers: headers) { response in
                 XCTAssertEqual(response.status, .ok)
                 advanced = try JSONDecoder.serviceDecoder.decode(
                     AdvancedServerSettingsSnapshot.self,
@@ -101,7 +121,7 @@ final class PortalStandaloneMTLSTests: XCTestCase {
             try await client.execute(
                 uri: "/portal/api/v1/settings/advanced",
                 method: .patch,
-                headers: Self.portalMutationHeaders(),
+                headers: headers,
                 body: ByteBuffer(data: body)
             ) { response in
                 XCTAssertEqual(response.status, .ok)
@@ -122,7 +142,7 @@ final class PortalStandaloneMTLSTests: XCTestCase {
             try await client.execute(
                 uri: "/portal/api/v1/sessions",
                 method: .post,
-                headers: Self.portalMutationHeaders(),
+                headers: headers,
                 body: ByteBuffer(data: try JSONEncoder.serviceEncoder.encode(create))
             ) { response in
                 XCTAssertEqual(response.status, .serviceUnavailable)
@@ -186,6 +206,12 @@ final class PortalStandaloneMTLSTests: XCTestCase {
                 XCTAssertEqual(response.status, .unauthorized)
             }
         }
+    }
+
+    private struct SetupBody: Encodable {
+        let password: String
+        let passwordConfirmation: String
+        let setupToken: String
     }
 
     private static func portalMutationHeaders() -> HTTPFields {

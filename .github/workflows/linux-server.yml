@@ -66,7 +66,7 @@ jobs:
           test "$(docker image inspect repoprompt-server:test --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
           test "$(docker image inspect repoprompt-server:test --format '{{index .Config.Labels "io.repoprompt.protocol-version"}}')" = "1"
           test "$(docker image inspect repoprompt-server:test --format '{{index .Config.Labels "io.repoprompt.schema-version"}}')" = "6"
-          test "$(docker image inspect repoprompt-server:test --format '{{json .Config.ExposedPorts}}')" = '{"9080/tcp":{},"9443/tcp":{}}'
+          test "$(docker image inspect repoprompt-server:test --format '{{json .Config.ExposedPorts}}')" = '{"9080/tcp":{},"9081/tcp":{},"9443/tcp":{}}'
           docker run --rm --entrypoint /bin/sh repoprompt-server:test -c '
             test "$(id -u)" = 65532 &&
             test -x /usr/local/bin/RepoPromptServer &&

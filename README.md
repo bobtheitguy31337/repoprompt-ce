@@ -137,7 +137,7 @@ is unchanged and does not use the generated workspace.
 - **MCP server and CLI integration**: Connect external MCP-compatible tools and
   CLI agents to RepoPrompt CE's repository context and agent harness.
 - **RepoPrompt Server**: Run the same Agent Mode authority on Linux with an
-  operator mTLS portal. Chat collaboration is optional. See
+  operator password portal. Chat collaboration is optional. See
   [`docs/server/getting-started.md`](docs/server/getting-started.md).
 - **Multi-root workspaces**: Work across related repositories, packages, and
   documentation folders in one workspace.
