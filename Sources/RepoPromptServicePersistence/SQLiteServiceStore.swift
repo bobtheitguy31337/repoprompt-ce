@@ -1633,6 +1633,7 @@ public actor SQLiteServiceStore {
         try await addColumnIfMissing(table: "service_metadata", column: "activation_token_digest", definition: "TEXT")
         try await addColumnIfMissing(table: "service_metadata", column: "activation_instance_id", definition: "TEXT")
         try await addColumnIfMissing(table: "collaboration_metadata", column: "collaboration_acknowledgement_json", definition: "TEXT")
+        try await rewriteLegacyPersistedJSONKeys()
         try await addColumnIfMissing(table: "owned_resources", column: "external_id", definition: "TEXT")
         try await addColumnIfMissing(table: "owned_resources", column: "temporary_path_identity", definition: "TEXT")
         try await addColumnIfMissing(table: "owned_resources", column: "content_digest", definition: "TEXT")
@@ -1730,6 +1731,38 @@ public actor SQLiteServiceStore {
         let columns = try await connection.query("PRAGMA table_info(\(table))")
         guard !columns.contains(where: { $0.column("name")?.string == column }) else { return }
         _ = try await connection.query("ALTER TABLE \(table) ADD COLUMN \(column) \(definition)")
+    }
+
+    private func rewriteLegacyPersistedJSONKeys() async throws {
+        let replacements = [
+            (#""goblinUserId""#, #""userId""#),
+            (#""goblin-explicit-selection""#, #""explicit-selection""#),
+        ]
+        let columns = [
+            ("projects", ["creator_json", "snapshot_json"]),
+            ("sessions", ["snapshot_json"]),
+            ("events", ["actor_json", "payload_json", "envelope_json"]),
+            ("interactions", ["payload_json", "settled_actor_json"]),
+            ("execution_permissions", ["updated_actor_json"]),
+            ("collaboration_metadata", ["collaboration_acknowledgement_json"]),
+        ]
+        for (table, names) in columns {
+            let existing = Set((try await connection.query("PRAGMA table_info(\(table))")).compactMap { $0.column("name")?.string })
+            for name in names where existing.contains(name) {
+                for (from, to) in replacements {
+                    _ = try await connection.query("UPDATE \(table) SET \(name) = REPLACE(\(name), ?, ?) WHERE \(name) LIKE '%' || ? || '%'", [.text(from), .text(to), .text(from)])
+                }
+            }
+        }
+        let collaborationColumns = Set((try await connection.query("PRAGMA table_info(collaboration_metadata)")).compactMap { $0.column("name")?.string })
+        if collaborationColumns.contains("goblin_acknowledgement_json") {
+            if collaborationColumns.contains("collaboration_acknowledgement_json") {
+                _ = try await connection.query(
+                    "UPDATE collaboration_metadata SET collaboration_acknowledgement_json = goblin_acknowledgement_json WHERE collaboration_acknowledgement_json IS NULL AND goblin_acknowledgement_json IS NOT NULL"
+                )
+            }
+            _ = try await connection.query("ALTER TABLE collaboration_metadata DROP COLUMN goblin_acknowledgement_json")
+        }
     }
 
     private func integrityCheck() async throws {
