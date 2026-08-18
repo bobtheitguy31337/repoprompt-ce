@@ -5,7 +5,27 @@
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux-black)
 
 Headless Agent Mode for Linux. SQLite-backed projects and sessions, an operator
-portal, and MCP over the same `RepoPromptHeadlessAuthority` as the macOS app.
+portal, and MCP over `RepoPromptHeadlessAuthority`.
+
+## vs upstream `main`
+
+This branch is current [`RepoPrompt/repoprompt-ce`](https://github.com/RepoPrompt/repoprompt-ce) `main` plus a Linux product that does not exist there. Last absorb: `059d35a1` (`#833`).
+
+| | upstream `main` | this branch |
+|---|---|---|
+| Product | macOS app + `repoprompt-mcp` | `RepoPromptServer` on Linux / `REPOPROMPT_SERVER_ONLY=1` (no AppKit) |
+| UI | AppKit | `/portal` (operator password; mTLS optional) |
+| State | app persistence + Keychain | SQLiteNIO (`RepoPromptServicePersistence`, schema v6) |
+| Authority | `AgentModeViewModel` / direct-headless MCP | `RepoPromptHeadlessAuthority` (macOS app is not cut over) |
+| Providers | settings + credential homes | closed env allowlists; credentials never enable a provider |
+| Models scope | window workspace | project |
+| CI / ship | macOS CI, Homebrew, Sparkle | Ubuntu CI, `Dockerfile.server` |
+
+Shared `DomainRuntime`, MCP, Agent Mode, and CodeMap files have Linux and server-authority edits. The AppKit graph still builds on macOS without `REPOPROMPT_SERVER_ONLY`; it is not the Linux product. Remote/Iroh is not on this line.
+
+Loopback provider URLs fail closed unless `REPOPROMPT_ALLOW_LOCAL_PROVIDER_URLS=1`. Secrets stay in files/vault — never the service DB or portal JSON.
+
+Treat Desktop Agent Mode as the semantic source of truth. Absorb `upstream/main`; do not reimplement Desktop behavior as a second authority.
 
 ## Run
 
