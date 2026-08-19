@@ -31,23 +31,6 @@ public protocol ResourceAuthorityManaging: ResourceAuthorizing {
     ) async throws
 }
 
-public protocol RepoPromptAuthorityStore: Sendable {
-    func loadAuthoritySnapshot() async throws -> AuthoritySnapshot
-    func commit(
-        _ command: AuthorityTransitionCommand,
-        expectedRevision: Int64,
-        operationID: UUID
-    ) async throws -> AuthorityTransitionReceipt
-}
-
-public protocol RepoPromptAuthorityServing: Sendable {
-    func snapshot() async -> AuthoritySnapshot
-    func apply(
-        _ command: AuthorityTransitionCommand,
-        operationID: UUID
-    ) async throws -> AuthorityTransitionReceipt
-}
-
 public struct AuthorityEvent: Codable, Hashable, Sendable {
     public let cursor: ServiceCursor
     public let name: String
@@ -71,7 +54,6 @@ public protocol RepoPromptProviderDispatching: Sendable {
 }
 
 public protocol RepoPromptHostCapabilityProviding: Sendable {
-    var authority: any RepoPromptAuthorityServing { get }
     var events: any RepoPromptEventServing { get }
     var resources: any ResourceAuthorizing { get }
 }

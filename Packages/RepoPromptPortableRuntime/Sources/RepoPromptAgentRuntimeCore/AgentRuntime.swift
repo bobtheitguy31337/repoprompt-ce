@@ -33,25 +33,3 @@ public actor AgentRuntime {
         }
     }
 }
-
-public protocol RuntimeClock: Sendable {
-    func now() -> ContinuousClock.Instant
-}
-
-public struct SystemRuntimeClock: RuntimeClock {
-    public init() {}
-    public func now() -> ContinuousClock.Instant {
-        .now
-    }
-}
-
-public protocol RuntimeIDGenerator: Sendable {
-    func makeID() -> UUID
-}
-
-public struct SystemRuntimeIDGenerator: RuntimeIDGenerator {
-    public init() {}
-    public func makeID() -> UUID {
-        UUID()
-    }
-}

@@ -45,6 +45,7 @@ let package = Package(
     targets: [
         .target(
             name: "RepoPromptRuntimeModel",
+            dependencies: [.product(name: "Crypto", package: "swift-crypto")],
             swiftSettings: swift6LanguageMode
         ),
         .target(
@@ -188,6 +189,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RepoPromptPortableFixtureTests",
+            dependencies: ["RepoPromptAgentRuntimeCore", "RepoPromptRuntimeModel"],
             path: "Tests/Fixtures",
             sources: ["RepoPromptPortableFixtureTests.swift"],
             resources: [.copy("AgentParity")],

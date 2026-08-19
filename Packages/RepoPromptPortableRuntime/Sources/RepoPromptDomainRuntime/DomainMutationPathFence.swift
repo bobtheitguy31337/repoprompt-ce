@@ -14,6 +14,20 @@ public struct DomainMutationPathIdentity: Codable, Hashable, Sendable {
     /// Optional for compatibility with journals admitted before birth-time
     /// fencing was available.
     public let birthTimeBits: UInt64?
+
+    public init(
+        originalPath: String,
+        resolvedPath: String,
+        device: UInt64,
+        inode: UInt64,
+        birthTimeBits: UInt64? = nil
+    ) {
+        self.originalPath = originalPath
+        self.resolvedPath = resolvedPath
+        self.device = device
+        self.inode = inode
+        self.birthTimeBits = birthTimeBits
+    }
 }
 
 public struct DomainMutationPathFenceEntry: Codable, Hashable, Sendable {

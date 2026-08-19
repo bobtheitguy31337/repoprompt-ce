@@ -39,14 +39,14 @@ public struct AgentTurnRequest: Sendable {
 
 public struct PreparedProviderTurn: Sendable {
     public let turnID: UUID
-    public let preparedAt: ContinuousClock.Instant
+    public let preparedAt: Date
     public let ownerID: RuntimeOwnerID
     public let workflow: WorkflowDefinition
     public let configuration: CompiledProviderTurnConfiguration
 
     public init(
         turnID: UUID,
-        preparedAt: ContinuousClock.Instant,
+        preparedAt: Date,
         ownerID: RuntimeOwnerID,
         workflow: WorkflowDefinition,
         configuration: CompiledProviderTurnConfiguration
@@ -86,14 +86,17 @@ public actor AgentTurnRuntime {
         try Task.checkCancellation()
         let snapshot = try await settingsProvider.settings(for: request.model.providerID)
         let configuration = try ProviderTurnConfigurationAdapters.compile(.init(
+            providerID: request.model.providerID,
             model: request.model,
             effortID: snapshot.effortID,
-            permissionID: snapshot.permissionID,
+            permissionID: snapshot.permissionID.rawValue,
             settings: snapshot.settings,
-            scopedResources: Set(request.workflow.resources)
+            toolValues: Self.toolValues(from: snapshot.settings),
+            scopedResources: Set(request.workflow.resources),
+            workflowID: nil
         ))
         let turn = PreparedProviderTurn(
-            turnID: idGenerator.makeID(),
+            turnID: idGenerator.next(),
             preparedAt: clock.now(),
             ownerID: request.ownerID,
             workflow: request.workflow,
@@ -102,5 +105,30 @@ public actor AgentTurnRuntime {
         try Task.checkCancellation()
         try await provider.execute(turn)
         return turn
+    }
+
+    private nonisolated static func toolValues(
+        from settings: ProviderTurnSettings
+    ) -> [String: AgentControlValue] {
+        switch settings {
+        case let .codex(value):
+            [
+                "codex.bash": .boolean(value.bashEnabled),
+                "codex.search": .boolean(value.searchEnabled),
+                "codex.goals": .boolean(value.goalsEnabled),
+                "codex.reasoningSummaries": .boolean(value.reasoningSummariesEnabled),
+                "codex.memories": .boolean(value.memoriesEnabled),
+                "codex.mcpServers": .choices(value.mcpServerIDs.sorted())
+            ]
+        case let .claudeCompatible(value):
+            [
+                "claude.bash": .boolean(value.bashEnabled),
+                "claude.mcpStrictMode": .boolean(value.strictMCPEnabled),
+                "claude.toolSearch": .boolean(value.toolSearchEnabled),
+                "claude.promptDelivery": .choice(value.promptDelivery.rawValue)
+            ]
+        case .acp, .directAPI:
+            [:]
+        }
     }
 }

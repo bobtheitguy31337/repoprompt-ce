@@ -3,60 +3,148 @@ import RepoPromptRuntimeModel
 import XCTest
 
 final class ProviderTurnConfigurationTests: XCTestCase {
-    func testBuiltInProviderFamiliesCompileStablePermissions() throws {
-        let codex = try ProviderTurnConfigurationAdapters.compile(.init(
-            model: model(.codex, rawValue: "gpt-5", efforts: ["high"]),
-            effortID: "high",
-            permissionID: .init(rawValue: "codex.autoReview"),
-            settings: .codex(.init())
-        ))
-        XCTAssertEqual(codex.runtimeKind, .codex)
-        XCTAssertEqual(codex.permissions.executionMode, .workspaceWrite)
-        XCTAssertEqual(codex.providerSettings["codex.approvalsReviewer"], "auto_review")
-        XCTAssertEqual(codex.providerSettings["codex.mcpServers"], "repoprompt")
-
-        let claude = try ProviderTurnConfigurationAdapters.compile(.init(
-            model: model(.claudeGLM, rawValue: "glm"),
-            permissionID: .init(rawValue: "claude.fullAccess"),
-            settings: .claudeCompatible(.init())
-        ))
-        XCTAssertEqual(claude.runtimeKind, .claudeCompatible)
-        XCTAssertEqual(claude.permissions.executionMode, .fullAccess)
-        XCTAssertEqual(claude.providerSettings["claude.permissionMode"], "bypassPermissions")
-
-        let acp = try ProviderTurnConfigurationAdapters.compile(.init(
-            model: model(.cursorACP, rawValue: "cursor"),
-            permissionID: .init(rawValue: "cursor.managedDefault"),
-            settings: .acp
-        ))
-        XCTAssertEqual(acp.runtimeKind, .cursorACP)
-        XCTAssertEqual(acp.permissions.executionMode, .workspaceWrite)
-
-        let direct = try ProviderTurnConfigurationAdapters.compile(.init(
-            model: model(.openRouter, rawValue: "openrouter/model"),
-            permissionID: .init(rawValue: "provider.readOnly"),
-            settings: .directAPI
-        ))
-        XCTAssertEqual(direct.runtimeKind, .headlessAdapter)
-        XCTAssertEqual(direct.permissions.executionMode, .readOnly)
-        XCTAssertFalse(direct.permissions.filesystemWrite)
-    }
-
-    func testMisconfiguredFamilyAdapterThrowsInsteadOfTrapping() throws {
-        let adapter = ClaudeCompatibleTurnConfigurationAdapter(providerID: .codex)
-        let input = try ProviderTurnConfigurationInput(
-            model: model(.codex, rawValue: "gpt-5"),
-            permissionID: .init(rawValue: "claude.requireApproval"),
-            settings: .claudeCompatible(.init())
+    func testEveryProviderHasAvailabilityAndTurnAdapters() throws {
+        let adapters = ProviderTurnConfigurationAdapters.builtIn()
+        XCTAssertEqual(Set(adapters.keys), Set(ProviderSettingsID.allCases))
+        XCTAssertEqual(
+            Set(AgentComposerProviderMatrix.entries.map(\.providerID)),
+            Set(ProviderSettingsID.allCases)
         )
 
-        XCTAssertThrowsError(try adapter.compile(input)) { error in
-            XCTAssertEqual(error as? ProviderTurnConfigurationError, .providerModelMismatch)
+        let resource = OwnedResourceReference(
+            ownerID: .init(rawValue: "fixture-owner"),
+            resourceID: .init(rawValue: "fixture-resource")
+        )
+        for providerID in ProviderSettingsID.allCases {
+            let model = model(providerID)
+            let descriptor = try XCTUnwrap(ProviderComposerStableControls.permissionDescriptor(
+                providerID: providerID,
+                selectedID: nil,
+                mutable: true,
+                lockReasonCode: nil
+            ), providerID.rawValue)
+            XCTAssertEqual(Set(descriptor.choices.map(\.id)), adapters[providerID]?.supportedPermissionIDs)
+            for choice in descriptor.choices {
+                let compiled = try ProviderTurnConfigurationAdapters.compile(.init(
+                    providerID: providerID,
+                    model: model,
+                    permissionID: choice.id,
+                    settings: settings(for: providerID),
+                    scopedResources: [resource]
+                ))
+                XCTAssertEqual(compiled.runtimeKind, providerID.runtimeKind)
+                XCTAssertEqual(compiled.effortID, model.defaultEffortID)
+                XCTAssertEqual(compiled.permissions.executionMode, expectedMode(for: choice.id))
+                XCTAssertEqual(compiled.permissions.scopedResources, [resource])
+                XCTAssertEqual(compiled.executionPolicy.mode, compiled.permissions.executionMode)
+                XCTAssertEqual(
+                    compiled.executionPolicy.providerSettings["provider.permissionId"],
+                    choice.id
+                )
+                if providerID.isDirectAPI {
+                    XCTAssertEqual(
+                        compiled.executionPolicy.providerSettings["provider.settingsId"],
+                        providerID.rawValue
+                    )
+                }
+            }
         }
+    }
+
+    func testStableControlDefaultsAndRequiredRepoPromptMCP() throws {
+        let compiled = try ProviderTurnConfigurationAdapters.compile(.init(
+            providerID: .codex,
+            model: model(.codex, efforts: ["high"]),
+            effortID: "high",
+            permissionID: "codex.autoReview",
+            settings: .codex(.init()),
+            toolValues: ["codex.mcpServers": .choices([])]
+        ))
+        XCTAssertEqual(compiled.executionPolicy.mode, .workspaceWrite)
+        XCTAssertEqual(compiled.executionPolicy.providerSettings["codex.approvalsReviewer"], "auto_review")
+        XCTAssertEqual(compiled.executionPolicy.providerSettings["codex.mcpServers"], "repoprompt")
+        XCTAssertEqual(compiled.normalizedToolValues["codex.mcpServers"], .choices(["repoprompt"]))
+        XCTAssertEqual(Set(compiled.normalizedToolValues.keys), ProviderComposerStableControls.codex)
+    }
+
+    func testEveryClaudePromptDeliveryAndCodexSettingIsPreserved() throws {
+        for providerID in [ProviderSettingsID.claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom] {
+            for delivery in ["nativeSystemPrompt", "userMessageXMLWithEmptySystemPrompt", "userMessageXML"] {
+                let compiled = try ProviderTurnConfigurationAdapters.compile(.init(
+                    providerID: providerID,
+                    model: model(providerID, efforts: ["high"]),
+                    effortID: "high",
+                    permissionID: "claude.autoApproveEdits",
+                    settings: .claudeCompatible(.init()),
+                    toolValues: [
+                        "claude.bash": .boolean(false),
+                        "claude.mcpStrictMode": .boolean(false),
+                        "claude.toolSearch": .boolean(true),
+                        "claude.promptDelivery": .choice(delivery)
+                    ]
+                ))
+                XCTAssertEqual(compiled.effortID, "high")
+                XCTAssertEqual(compiled.providerSettings["claude.bashEnabled"], "false")
+                XCTAssertEqual(compiled.providerSettings["claude.strictMCPEnabled"], "false")
+                XCTAssertEqual(compiled.providerSettings["claude.toolSearchEnabled"], "true")
+                XCTAssertEqual(compiled.providerSettings["claude.promptDelivery"], delivery)
+                XCTAssertEqual(compiled.providerSettings["provider.reasoningEffort"], "high")
+            }
+        }
+
+        let codex = try ProviderTurnConfigurationAdapters.compile(.init(
+            providerID: .codex,
+            model: model(.codex, efforts: ["medium"], defaultEffortID: "medium", serviceTier: "flex"),
+            permissionID: "codex.defaultPermission",
+            settings: .codex(.init()),
+            toolValues: [
+                "codex.bash": .boolean(false),
+                "codex.search": .boolean(false),
+                "codex.goals": .boolean(false),
+                "codex.reasoningSummaries": .boolean(true),
+                "codex.memories": .boolean(true)
+            ]
+        ))
+        XCTAssertEqual(codex.providerSettings["provider.reasoningEffort"], "medium")
+        XCTAssertEqual(codex.providerSettings["provider.serviceTier"], "flex")
+        XCTAssertEqual(codex.providerSettings["codex.bashEnabled"], "false")
+        XCTAssertEqual(codex.providerSettings["codex.searchEnabled"], "false")
+        XCTAssertEqual(codex.providerSettings["codex.goalsEnabled"], "false")
+        XCTAssertEqual(codex.providerSettings["codex.reasoningSummariesEnabled"], "true")
+        XCTAssertEqual(codex.providerSettings["codex.memoriesEnabled"], "true")
+    }
+
+    func testMalformedSettingsEffortPermissionAndControlValuesAreRejected() throws {
+        XCTAssertThrowsError(try ProviderTurnConfigurationAdapters.compile(.init(
+            providerID: .codex,
+            model: model(.codex),
+            permissionID: "codex.unknown",
+            settings: .codex(.init())
+        )))
+        XCTAssertThrowsError(try ProviderTurnConfigurationAdapters.compile(.init(
+            providerID: .codex,
+            model: model(.codex, efforts: ["low"]),
+            effortID: "high",
+            permissionID: "codex.readOnly",
+            settings: .codex(.init())
+        )))
+        XCTAssertThrowsError(try ProviderTurnConfigurationAdapters.compile(.init(
+            providerID: .claudeCompatible,
+            model: model(.claudeCompatible),
+            permissionID: "claude.requireApproval",
+            settings: .claudeCompatible(.init()),
+            toolValues: ["claude.promptDelivery": .choice("invalid")]
+        )))
+        XCTAssertThrowsError(try ProviderTurnConfigurationAdapters.compile(.init(
+            providerID: .openAIAPI,
+            model: model(.openAIAPI),
+            settings: .directAPI
+        )))
     }
 
     func testTurnRuntimeUsesInjectedSettingsClockIDAndProvider() async throws {
         let turnID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000123"))
+        let instant = Date(timeIntervalSince1970: 1_700_000_000)
         let provider = RecordingProvider()
         let runtime = AgentTurnRuntime(
             settingsProvider: FixedSettingsProvider(snapshot: .init(
@@ -64,33 +152,60 @@ final class ProviderTurnConfigurationTests: XCTestCase {
                 settings: .codex(.init(searchEnabled: false))
             )),
             provider: provider,
-            clock: FixedClock(instant: .now),
+            clock: FixedClock(instant: instant),
             idGenerator: FixedIDGenerator(id: turnID)
         )
         let owner = RuntimeOwnerID(rawValue: "owner")
+        let resource = OwnedResourceReference(
+            ownerID: owner,
+            resourceID: .init(rawValue: "workflow-resource")
+        )
         let prepared = try await runtime.prepareAndExecute(.init(
             ownerID: owner,
-            model: model(.codex, rawValue: "gpt-5"),
-            workflow: WorkflowDefinition()
+            model: model(.codex),
+            workflow: WorkflowDefinition(resources: [resource])
         ))
 
         XCTAssertEqual(prepared.turnID, turnID)
+        XCTAssertEqual(prepared.preparedAt, instant)
         XCTAssertEqual(prepared.ownerID, owner)
-        XCTAssertEqual(prepared.configuration.permissions.executionMode, .readOnly)
-        XCTAssertEqual(prepared.configuration.providerSettings["codex.searchEnabled"], "false")
+        XCTAssertEqual(prepared.configuration.executionPolicy.mode, .readOnly)
+        XCTAssertEqual(prepared.configuration.permissions.scopedResources, [resource])
+        XCTAssertEqual(prepared.configuration.executionPolicy.providerSettings["codex.searchEnabled"], "false")
         let executedTurnID = await provider.executedTurnID()
         XCTAssertEqual(executedTurnID, turnID)
     }
 
+    private func expectedMode(for permissionID: String) -> ProviderExecutionMode {
+        if permissionID.hasSuffix("readOnly") { return .readOnly }
+        if permissionID.hasSuffix("fullAccess") { return .fullAccess }
+        return .workspaceWrite
+    }
+
+    private func settings(for providerID: ProviderSettingsID) -> ProviderTurnSettings {
+        switch providerID {
+        case .codex: .codex(.init())
+        case .claudeCompatible, .claudeGLM, .claudeKimi, .claudeCustom: .claudeCompatible(.init())
+        case .openCodeACP, .cursorACP, .grokBuildACP: .acp
+        case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
+             .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama: .directAPI
+        }
+    }
+
     private func model(
         _ providerID: ProviderSettingsID,
-        rawValue: String,
-        efforts: Set<String> = []
-    ) throws -> ProviderModelDescriptor {
-        try ProviderModelDescriptor(
+        efforts: [String] = [],
+        defaultEffortID: String? = nil,
+        serviceTier: String? = nil
+    ) -> ProviderModelDescriptor {
+        ProviderModelDescriptor(
             providerID: providerID,
-            providerRawValue: rawValue,
-            supportedEffortIDs: efforts
+            modelID: "test-model",
+            providerRawValue: "test-model",
+            displayName: "Test Model",
+            supportedEffortIDs: efforts,
+            defaultEffortID: defaultEffortID,
+            serviceTier: serviceTier
         )
     }
 }
@@ -116,17 +231,18 @@ private actor RecordingProvider: ProviderTurnExecuting {
 }
 
 private struct FixedClock: RuntimeClock {
-    let instant: ContinuousClock.Instant
+    let instant: Date
 
-    func now() -> ContinuousClock.Instant {
+    func now() -> Date {
         instant
     }
+
+    func sleep(for _: Duration) async throws {}
 }
 
 private struct FixedIDGenerator: RuntimeIDGenerator {
     let id: UUID
-
-    func makeID() -> UUID {
+    func next() -> UUID {
         id
     }
 }

@@ -4,6 +4,43 @@ import MCP
 import XCTest
 
 final class DomainProtectedMutationJournalTests: XCTestCase {
+    func testPersistedPathIdentityEncodingKeepsPreExtractionDeviceInodeSchema() throws {
+        let identity = DomainMutationPathIdentity(
+            originalPath: "/repo",
+            resolvedPath: "/repo",
+            device: 17,
+            inode: 42
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(identity)
+        XCTAssertEqual(
+            String(decoding: data, as: UTF8.self),
+            #"{"device":17,"inode":42,"originalPath":"\/repo","resolvedPath":"\/repo"}"#
+        )
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("birthTimeBits"))
+        XCTAssertEqual(try JSONDecoder().decode(DomainMutationPathIdentity.self, from: data), identity)
+
+        let legacy = Data(#"{"device":17,"inode":42,"originalPath":"/repo","resolvedPath":"/repo"}"#.utf8)
+        XCTAssertNil(try JSONDecoder().decode(DomainMutationPathIdentity.self, from: legacy).birthTimeBits)
+    }
+
+    func testPersistedPathIdentityAdditivelySnapshotsBirthTimeWhenAvailable() throws {
+        let identity = DomainMutationPathIdentity(
+            originalPath: "/repo",
+            resolvedPath: "/repo",
+            device: 17,
+            inode: 42,
+            birthTimeBits: 1_725_000_000_123_456_789
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        XCTAssertEqual(
+            String(decoding: try encoder.encode(identity), as: UTF8.self),
+            #"{"birthTimeBits":1725000000123456789,"device":17,"inode":42,"originalPath":"/repo","resolvedPath":"/repo"}"#
+        )
+    }
+
     func testFailedBeforeWriteStatusDecodesAndReencodesCanonically() throws {
         let decoder = JSONDecoder()
         let status = try decoder.decode(

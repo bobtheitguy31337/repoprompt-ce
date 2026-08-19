@@ -3,7 +3,8 @@
 This inventory is the PR 2 review surface for identity-sensitive semantics after
 `RepoPromptPortableRuntime` extraction. The portable package owns values shared
 between products; Desktop keeps only UI policy and persistence adapters in the
-narrow owners that already held them. A catch-all Desktop bridge is prohibited.
+narrow owners that already held them. A catch-all Desktop bridge is prohibited. The prototype-by-prototype disposition is
+recorded in [`portable-runtime-prototype-extraction.md`](portable-runtime-prototype-extraction.md).
 
 | Semantic surface | Canonical portable owner | Desktop/root mapping owner |
 | --- | --- | --- |

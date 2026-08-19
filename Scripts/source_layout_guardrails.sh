@@ -30,6 +30,8 @@ portable_import_guard() {
   [[ -f "$portable_manifest" ]] || fail "portable manifest missing: $portable_manifest"
   [[ -f "docs/architecture/portable-runtime-semantic-owners.md" ]] || \
     fail "portable semantic-owner inventory missing"
+  [[ -f "docs/architecture/portable-runtime-prototype-extraction.md" ]] || \
+    fail "portable prototype extraction ledger missing"
 
   for required_adapter in \
     Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentModel.swift \
@@ -45,7 +47,12 @@ portable_import_guard() {
     grep -R -n -E "$forbidden_imports" "$portable_sources"
   print_matches \
     "portable manifest/source resurrects the temporary Server graph" \
-    grep -R -n -E 'makeServerPackage|REPOPROMPT_SERVER_ONLY' Package.swift "$portable_manifest" "$portable_sources"
+    grep -R -n -E 'makeServerPackage|REPOPROMPT_SERVER_ONLY|RepoPromptHeadlessLaunchBridge' Package.swift "$portable_manifest" "$portable_sources"
+  [[ ! -e "Packages/RepoPromptServer" ]] || fail "PR 2 must not introduce the Server package graph"
+  print_matches \
+    "PR 2 contains premature proposal/application authority behavior" \
+    grep -R -n -E 'InMemoryAuthorityStore|AuthorityTransitionCommand|AuthorityTransitionReceipt|func[[:space:]]+apply\(' \
+      "$portable_sources/RepoPromptHeadlessRuntime" "$portable_sources/RepoPromptAuthorityAPI"
   print_matches \
     "portable source uses Bundle.module; package-owned semantics must be compiled Swift" \
     grep -R -n -E 'Bundle\.module' "$portable_sources"
@@ -65,6 +72,30 @@ portable_import_guard() {
   if [[ "$fixture_roots" != "./Packages/RepoPromptPortableRuntime/Tests/Fixtures/AgentParity/v1" ]]; then
     fail "AgentParity/v1 must have exactly one portable package owner"
     printf '%s\n' "$fixture_roots" >&2
+  fi
+  if ! python3 - <<'PY'
+import json
+from pathlib import Path
+
+root = Path("Packages/RepoPromptPortableRuntime/Tests/Fixtures/AgentParity/v1")
+expected = {
+    "model-normalization.json",
+    "provider-matrix.json",
+    "provider-turn-semantics.json",
+    "transcript-presentation.json",
+    "turn-compilation.json",
+}
+assert {path.name for path in root.glob("*.json")} == expected
+for path in root.glob("*.json"):
+    value = json.loads(path.read_text())
+    assert value["schemaVersion"] == 2, path
+    assert value["prototypeCommit"] == "45c42d65e444884d1681f4504c10d25dcb7d858a", path
+    assert value["generatedFrom"].startswith("Packages/RepoPromptPortableRuntime/Sources/"), path
+assert json.loads((root / "provider-turn-semantics.json").read_text())["generatedFrom"] == \
+    "Packages/RepoPromptPortableRuntime/Sources/RepoPromptAgentRuntimeCore/ProviderTurnConfigurationAdapters.swift"
+PY
+  then
+    fail "AgentParity fixtures must carry exact prototype and nested source provenance"
   fi
 
   local agent_model_definitions provider_kind_definitions
@@ -96,12 +127,26 @@ portable_import_guard() {
   local portable_workflow=".github/workflows/portable-runtime.yml"
   if [[ ! -f "$portable_workflow" ]] || \
      ! grep -q 'Packages/RepoPromptPortableRuntime/\*\*' "$portable_workflow" || \
-     ! grep -q 'Packages/RepoPromptServer/\*\*' "$portable_workflow"; then
-    fail "portable CI path ownership must cover both Portable and future Server package changes"
+     ! grep -q 'AgentWorkflow\.swift' "$portable_workflow" || \
+     ! grep -q 'Runtime/ProviderBindings/\*\*' "$portable_workflow" || \
+     ! grep -q 'Runtime/Providers/\*\*' "$portable_workflow" || \
+     ! grep -q 'Infrastructure/AI/Providers/\*\*' "$portable_workflow" || \
+     ! grep -q 'GlobalSettingsDocument\.swift' "$portable_workflow" || \
+     ! grep -q 'AgentRunSessionStore\.swift' "$portable_workflow" || \
+     ! grep -q 'test_contribution_preflight\.py' "$portable_workflow" || \
+     ! grep -q 'validate_portable_dependency_graph\.py' "$portable_workflow"; then
+    fail "portable CI path ownership must cover Portable and every documented Desktop mapping owner"
+  fi
+  if grep -q 'Packages/RepoPromptServer/\*\*' "$portable_workflow"; then
+    fail "PR 2 portable CI must not claim a Server package graph that does not exist yet"
   fi
   if [[ -f "Packages/RepoPromptServer/Package.swift" ]] && \
      ! grep -qF '.package(path: "../RepoPromptPortableRuntime")' "Packages/RepoPromptServer/Package.swift"; then
     fail "RepoPromptServer must consume the sibling portable package through ../RepoPromptPortableRuntime"
+  fi
+
+  if ! python3 Scripts/validate_portable_dependency_graph.py; then
+    fail "portable package exact dependency graph drifted"
   fi
 
   if [[ "$failures" -ne 0 ]]; then
@@ -222,10 +267,10 @@ portable_manifest = (portable_root / "Package.swift").read_text()
 portable_resolved = json.loads((portable_root / "Package.resolved").read_text())
 portable_pins = {pin["identity"]: pin for pin in portable_resolved["pins"]}
 portable = json.loads(subprocess.check_output(
-    ["swift", "package", "--package-path", str(portable_root), "dump-package"],
+    ["swift", "package", "--disable-sandbox", "--package-path", str(portable_root), "dump-package"],
     text=True,
 ))
-root = json.loads(subprocess.check_output(["swift", "package", "dump-package"], text=True))
+root = json.loads(subprocess.check_output(["swift", "package", "--disable-sandbox", "dump-package"], text=True))
 portable_targets = {target["name"]: target for target in portable["targets"]}
 root_targets = {target["name"]: target for target in root["targets"]}
 errors = []
@@ -292,7 +337,7 @@ if workspace_tests is None or workspace_tests.get("path") != "Tests/RepoPromptWo
     errors.append("RepoPromptWorkspaceCoreTests root target contract drifted")
 
 allowed_edges = {
-    "RepoPromptRuntimeModel": set(),
+    "RepoPromptRuntimeModel": {"Crypto"},
     "RepoPromptAuthorityAPI": {"RepoPromptRuntimeModel"},
     "RepoPromptShared": {"Crypto"},
     "RepoPromptAgentRuntimeCore": {"RepoPromptRuntimeModel"},
@@ -801,6 +846,7 @@ allowed_tracked_docs=(
   "docs/architecture/desktop-agent-authority.md"
     "docs/architecture/headless-mcp-runtime.md"
     "docs/architecture/portable-runtime-semantic-owners.md"
+    "docs/architecture/portable-runtime-prototype-extraction.md"
     "docs/architecture/provider-plugins.md"
   "docs/architecture/settings-persistence.md"
   "docs/architecture/source-layout.md"

@@ -1,5 +1,7 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "prototypeCommit": "45c42d65e444884d1681f4504c10d25dcb7d858a",
+  "generatedFrom": "Packages/RepoPromptPortableRuntime/Sources/RepoPromptAgentRuntimeCore/AgentCatalogAuthority.swift",
   "liveDiscoveryFreshnessSeconds": 900,
   "persistedDiscoveryMaximumAgeSeconds": 86400,
   "providers": [

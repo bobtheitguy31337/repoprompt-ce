@@ -493,22 +493,31 @@ class ContributionPreflightTests(unittest.TestCase):
 
     def test_pr_ready_runs_conductor_selftest_for_preflight_control_plane_changes(self) -> None:
         cases = [
-            ("preflight tests", "Scripts/test_contribution_preflight.py"),
+            (
+                "preflight tests",
+                "Scripts/test_contribution_preflight.py",
+                [GUARDRAILS_TARGET, CONDUCTOR_SELFTEST_TARGET, PORTABLE_TEST_TARGET],
+            ),
             (
                 "preflight timing helper",
                 ".agents/skills/rpce-contribution-check/scripts/preflight_timing.py",
+                [GUARDRAILS_TARGET, CONDUCTOR_SELFTEST_TARGET],
             ),
-            ("guardrails aggregator", "Scripts/guardrails.sh"),
+            (
+                "guardrails aggregator",
+                "Scripts/guardrails.sh",
+                [GUARDRAILS_TARGET, CONDUCTOR_SELFTEST_TARGET],
+            ),
         ]
 
-        for name, outgoing_path in cases:
+        for name, outgoing_path, expected in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 repo, preflight, env = self.create_repo(Path(tmp), outgoing_path=outgoing_path)
 
                 result = self.run_preflight(repo, preflight, env, "pr-ready")
 
                 self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-                self.assert_make_lines_equal(env, [GUARDRAILS_TARGET, CONDUCTOR_SELFTEST_TARGET])
+                self.assert_make_lines_equal(env, expected)
 
     def test_pr_ready_runs_ci_app_test_runner_selftest_for_hosted_ci_runner_changes(self) -> None:
         cases = [
@@ -636,6 +645,44 @@ class ContributionPreflightTests(unittest.TestCase):
                     REPOPROMPT_BUILD_TARGET,
                     MCP_BUILD_TARGET,
                 ],
+            ),
+            (
+                "portable Desktop mapping owner",
+                "Sources/RepoPrompt/Features/AgentMode/Runtime/ProviderBindings/AgentProviderPreferenceSnapshotStore.swift",
+                [
+                    GUARDRAILS_TARGET,
+                    SWIFT_LINT_TARGET,
+                    ROOT_TEST_TARGET,
+                    PORTABLE_TEST_TARGET,
+                    REPOPROMPT_BUILD_TARGET,
+                ],
+            ),
+            (
+                "portable Desktop runtime provider owner",
+                "Sources/RepoPrompt/Features/AgentMode/Runtime/Providers/AgentRuntimeProviderService.swift",
+                [
+                    GUARDRAILS_TARGET,
+                    SWIFT_LINT_TARGET,
+                    ROOT_TEST_TARGET,
+                    PORTABLE_TEST_TARGET,
+                    REPOPROMPT_BUILD_TARGET,
+                ],
+            ),
+            (
+                "portable Desktop infrastructure provider owner",
+                "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/Example.swift",
+                [
+                    GUARDRAILS_TARGET,
+                    SWIFT_LINT_TARGET,
+                    ROOT_TEST_TARGET,
+                    PORTABLE_TEST_TARGET,
+                    REPOPROMPT_BUILD_TARGET,
+                ],
+            ),
+            (
+                "portable dependency guard",
+                "Scripts/validate_portable_dependency_graph.py",
+                [GUARDRAILS_TARGET, PORTABLE_TEST_TARGET],
             ),
             (
                 "non-selected docs path",

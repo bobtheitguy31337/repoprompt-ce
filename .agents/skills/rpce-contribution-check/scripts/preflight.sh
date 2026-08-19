@@ -204,6 +204,7 @@ run_pr_ready_path_validations() {
   local root_test_paths_pattern='^(Sources/RepoPrompt/|Tests/RepoPrompt[^/]*Tests/|Packages/RepoPromptPortableRuntime/)'
   local provider_package_paths_pattern='^Packages/RepoPromptAgentProviders/'
   local portable_package_paths_pattern='^Packages/RepoPromptPortableRuntime/'
+  local portable_mapping_owner_paths_pattern='^(Sources/RepoPrompt/Features/AgentMode/Models/AgentWorkflow\.swift|Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentModel(Catalog)?\.swift|Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/ClaudeCompatible(ModelCatalogAdapter|PluginBridge)\.swift|Sources/RepoPrompt/Features/AgentMode/Runtime/ProviderBindings/|Sources/RepoPrompt/Features/AgentMode/Runtime/Providers/|Sources/RepoPrompt/Infrastructure/AI/Providers/|Sources/RepoPrompt/Features/Settings/Models/GlobalSettings(Document|Manager)\.swift|Sources/RepoPrompt/Infrastructure/MCP/Agent/Agent(ManageMCPToolService|RunSessionStore)\.swift|Tests/RepoPromptTests/AgentMode/PortableProviderMappingTests\.swift|Scripts/source_layout_guardrails\.sh|Scripts/validate_portable_dependency_graph\.py|Scripts/test_contribution_preflight\.py|\.github/workflows/portable-runtime\.yml)'
   local repoprompt_product_paths_pattern='^(Sources/RepoPrompt/|Packages/RepoPromptPortableRuntime/)'
   local mcp_product_paths_pattern='^(Sources/RepoPromptMCP/|Packages/RepoPromptPortableRuntime/)'
   local xcode_full_validation_paths_pattern='^(Package\.swift|Package\.resolved|Packages/RepoPromptPortableRuntime/Package\.(swift|resolved)|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|\.github/workflows/xcode-workspace\.yml)$'
@@ -230,6 +231,7 @@ run_pr_ready_path_validations() {
     [[ "$file" =~ $root_test_paths_pattern ]] && has_root_test_changes=1
     [[ "$file" =~ $provider_package_paths_pattern ]] && has_provider_package_changes=1
     [[ "$file" =~ $portable_package_paths_pattern ]] && has_portable_package_changes=1
+    [[ "$file" =~ $portable_mapping_owner_paths_pattern ]] && has_portable_package_changes=1
     [[ "$file" =~ $repoprompt_product_paths_pattern ]] && has_repoprompt_product_changes=1
     [[ "$file" =~ $mcp_product_paths_pattern ]] && has_mcp_product_changes=1
     [[ "$file" =~ $xcode_generator_test_paths_pattern ]] && has_xcode_generator_test_changes=1

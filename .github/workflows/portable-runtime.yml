@@ -4,29 +4,57 @@ on:
   pull_request:
     paths:
       - "Packages/RepoPromptPortableRuntime/**"
-      - "Packages/RepoPromptServer/**"
       - "Package.swift"
       - "Package.resolved"
       - "Makefile"
       - "Scripts/conductor.py"
       - "Scripts/source_layout_guardrails.sh"
+      - "Scripts/validate_portable_dependency_graph.py"
+      - "Scripts/test_contribution_preflight.py"
       - "Scripts/test_conductor_lifecycle.py"
+      - ".agents/skills/rpce-contribution-check/scripts/preflight.sh"
+      - "Sources/RepoPrompt/Features/AgentMode/Models/AgentWorkflow.swift"
+      - "Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentModel.swift"
+      - "Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentModelCatalog.swift"
+      - "Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/ClaudeCompatibleModelCatalogAdapter.swift"
+      - "Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/ClaudeCompatiblePluginBridge.swift"
+      - "Sources/RepoPrompt/Features/AgentMode/Runtime/ProviderBindings/**"
+      - "Sources/RepoPrompt/Features/AgentMode/Runtime/Providers/**"
+      - "Sources/RepoPrompt/Infrastructure/AI/Providers/**"
+      - "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsDocument.swift"
+      - "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsManager.swift"
+      - "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentManageMCPToolService.swift"
+      - "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentRunSessionStore.swift"
+      - "Tests/RepoPromptTests/AgentMode/PortableProviderMappingTests.swift"
       - ".github/workflows/portable-runtime.yml"
-      - ".github/workflows/linux-server.yml"
   push:
     branches:
       - main
     paths:
       - "Packages/RepoPromptPortableRuntime/**"
-      - "Packages/RepoPromptServer/**"
       - "Package.swift"
       - "Package.resolved"
       - "Makefile"
       - "Scripts/conductor.py"
       - "Scripts/source_layout_guardrails.sh"
+      - "Scripts/validate_portable_dependency_graph.py"
+      - "Scripts/test_contribution_preflight.py"
       - "Scripts/test_conductor_lifecycle.py"
+      - ".agents/skills/rpce-contribution-check/scripts/preflight.sh"
+      - "Sources/RepoPrompt/Features/AgentMode/Models/AgentWorkflow.swift"
+      - "Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentModel.swift"
+      - "Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentModelCatalog.swift"
+      - "Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/ClaudeCompatibleModelCatalogAdapter.swift"
+      - "Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/ClaudeCompatiblePluginBridge.swift"
+      - "Sources/RepoPrompt/Features/AgentMode/Runtime/ProviderBindings/**"
+      - "Sources/RepoPrompt/Features/AgentMode/Runtime/Providers/**"
+      - "Sources/RepoPrompt/Infrastructure/AI/Providers/**"
+      - "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsDocument.swift"
+      - "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsManager.swift"
+      - "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentManageMCPToolService.swift"
+      - "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentRunSessionStore.swift"
+      - "Tests/RepoPromptTests/AgentMode/PortableProviderMappingTests.swift"
       - ".github/workflows/portable-runtime.yml"
-      - ".github/workflows/linux-server.yml"
 
 concurrency:
   group: portable-runtime-${{ github.event.pull_request.number || github.run_id }}
@@ -57,7 +85,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-portable-
 
-      - name: Validate portable imports
+      - name: Validate portable imports and exact dependency graph
         run: Scripts/source_layout_guardrails.sh portable-imports
 
       - name: Build portable package

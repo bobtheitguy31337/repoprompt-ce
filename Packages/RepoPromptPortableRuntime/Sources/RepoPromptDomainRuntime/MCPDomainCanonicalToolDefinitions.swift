@@ -31,7 +31,7 @@ public enum MCPDomainCanonicalToolDefinitions {
             provenance: Provenance(
                 formatVersion: 1,
                 authority: "generated-review-projection-only",
-                generatedFrom: "Sources/RepoPromptDomainRuntime/MCPDomainCanonicalToolDefinitions.swift",
+                generatedFrom: "Packages/RepoPromptPortableRuntime/Sources/RepoPromptDomainRuntime/MCPDomainCanonicalToolDefinitions.swift",
                 regeneration: "mkdir -p .build && touch .build/update-mcp-domain-schema-review-snapshot && make dev-test FILTER=ToolCatalogSnapshotTests/testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot"
             ),
             tools: definitions
