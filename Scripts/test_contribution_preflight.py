@@ -647,8 +647,8 @@ class ContributionPreflightTests(unittest.TestCase):
                 ],
             ),
             (
-                "portable Desktop mapping owner",
-                "Sources/RepoPrompt/Features/AgentMode/Runtime/ProviderBindings/AgentProviderPreferenceSnapshotStore.swift",
+                "portable Desktop workflow mapping owner",
+                "Sources/RepoPrompt/Features/AgentMode/Models/AgentWorkflow.swift",
                 [
                     GUARDRAILS_TARGET,
                     SWIFT_LINT_TARGET,
@@ -658,8 +658,8 @@ class ContributionPreflightTests(unittest.TestCase):
                 ],
             ),
             (
-                "portable Desktop runtime provider owner",
-                "Sources/RepoPrompt/Features/AgentMode/Runtime/Providers/AgentRuntimeProviderService.swift",
+                "portable Desktop settings mapping owner",
+                "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsDocument.swift",
                 [
                     GUARDRAILS_TARGET,
                     SWIFT_LINT_TARGET,
@@ -669,8 +669,8 @@ class ContributionPreflightTests(unittest.TestCase):
                 ],
             ),
             (
-                "portable Desktop infrastructure provider owner",
-                "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/Example.swift",
+                "portable Desktop MCP projection owner",
+                "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentRunSessionStore.swift",
                 [
                     GUARDRAILS_TARGET,
                     SWIFT_LINT_TARGET,

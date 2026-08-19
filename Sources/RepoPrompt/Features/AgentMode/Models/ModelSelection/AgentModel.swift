@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptRuntimeModel
 
 /// Structured tags for model discovery. Helps callers programmatically
 /// choose the right model for their task without parsing descriptions.
@@ -311,12 +310,6 @@ enum AgentModel: String, CaseIterable, Codable {
             [.customClaudeCompatible]
         }
         return models.filter(\.isAvailable)
-    }
-
-    /// Stable portable identity used at the provider-runtime boundary. Desktop display,
-    /// availability, and recommendation policy remain owned by `AgentModel`.
-    var portableModelIdentifier: ProviderModelIdentifier {
-        ProviderModelIdentifier(rawValue: rawValue)
     }
 
     /// Check if this model is valid for the given agent

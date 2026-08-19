@@ -17,12 +17,32 @@ final class ProviderTurnConfigurationTests: XCTestCase {
         )
         for providerID in ProviderSettingsID.allCases {
             let model = model(providerID)
-            let descriptor = try XCTUnwrap(ProviderComposerStableControls.permissionDescriptor(
+            let optionalDescriptor = ProviderComposerStableControls.permissionDescriptor(
                 providerID: providerID,
                 selectedID: nil,
                 mutable: true,
                 lockReasonCode: nil
-            ), providerID.rawValue)
+            )
+            if providerID.isDirectAPI {
+                XCTAssertNil(optionalDescriptor, providerID.rawValue)
+                XCTAssertEqual(adapters[providerID]?.supportedPermissionIDs, Set<String>())
+                let compiled = try ProviderTurnConfigurationAdapters.compile(.init(
+                    providerID: providerID,
+                    model: model,
+                    settings: settings(for: providerID),
+                    scopedResources: [resource]
+                ))
+                XCTAssertEqual(compiled.runtimeKind, .headlessAdapter)
+                XCTAssertEqual(compiled.effortID, model.defaultEffortID)
+                XCTAssertEqual(compiled.permissions.executionMode, .workspaceWrite)
+                XCTAssertEqual(compiled.permissions.scopedResources, [resource])
+                XCTAssertEqual(compiled.executionPolicy.mode, .workspaceWrite)
+                XCTAssertEqual(compiled.providerSettings["provider.settingsID"], providerID.rawValue)
+                XCTAssertNil(compiled.providerSettings["provider.settingsId"])
+                XCTAssertNil(compiled.providerSettings["provider.permissionId"])
+                continue
+            }
+            let descriptor = try XCTUnwrap(optionalDescriptor, providerID.rawValue)
             XCTAssertEqual(Set(descriptor.choices.map(\.id)), adapters[providerID]?.supportedPermissionIDs)
             for choice in descriptor.choices {
                 let compiled = try ProviderTurnConfigurationAdapters.compile(.init(
@@ -37,16 +57,7 @@ final class ProviderTurnConfigurationTests: XCTestCase {
                 XCTAssertEqual(compiled.permissions.executionMode, expectedMode(for: choice.id))
                 XCTAssertEqual(compiled.permissions.scopedResources, [resource])
                 XCTAssertEqual(compiled.executionPolicy.mode, compiled.permissions.executionMode)
-                XCTAssertEqual(
-                    compiled.executionPolicy.providerSettings["provider.permissionId"],
-                    choice.id
-                )
-                if providerID.isDirectAPI {
-                    XCTAssertEqual(
-                        compiled.executionPolicy.providerSettings["provider.settingsId"],
-                        providerID.rawValue
-                    )
-                }
+                XCTAssertEqual(compiled.providerSettings["provider.permissionId"], choice.id)
             }
         }
     }
@@ -138,6 +149,7 @@ final class ProviderTurnConfigurationTests: XCTestCase {
         XCTAssertThrowsError(try ProviderTurnConfigurationAdapters.compile(.init(
             providerID: .openAIAPI,
             model: model(.openAIAPI),
+            permissionID: "provider.workspaceWrite",
             settings: .directAPI
         )))
     }

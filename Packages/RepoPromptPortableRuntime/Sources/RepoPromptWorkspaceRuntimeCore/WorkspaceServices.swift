@@ -204,7 +204,7 @@ public actor ProjectToolAuthority {
         let start = max(0, (request.startLine ?? 1) - 1)
         let end = min(lines.count, start + max(1, min(request.lineCount ?? lines.count, 20000)))
         let content = start < end ? lines[start ..< end].joined(separator: "\n") : ""
-        return ProjectFileSnapshot(rootID: request.rootID, logicalPath: request.logicalPath, content: content, contentDigest: CanonicalSigning.bodyDigest(data), truncated: data.count > maximumBytes || end < lines.count)
+        return ProjectFileSnapshot(rootID: request.rootID, logicalPath: request.logicalPath, content: content, contentDigest: PortableContentDigest.sha256Hex(data), truncated: data.count > maximumBytes || end < lines.count)
     }
 
     public func codeMap(_ request: ProjectCodeMapRequest, settings: AdvancedServerSettings = .default) async throws -> ProjectCodeMapSnapshot {
@@ -219,7 +219,7 @@ public actor ProjectToolAuthority {
         let maximumBytes = max(1, min(request.maximumBytes, 5_242_880))
         let data = try Data(contentsOf: URL(fileURLWithPath: path), options: [.mappedIfSafe])
         guard data.count <= maximumBytes else {
-            return ProjectCodeMapSnapshot(rootID: request.rootID, logicalPath: request.logicalPath, status: "oversize", language: nil, content: "", contentDigest: CanonicalSigning.bodyDigest(data))
+            return ProjectCodeMapSnapshot(rootID: request.rootID, logicalPath: request.logicalPath, status: "oversize", language: nil, content: "", contentDigest: PortableContentDigest.sha256Hex(data))
         }
         guard let source = String(data: data, encoding: .utf8) else {
             throw ServiceAPIError(code: .invalidRequest, message: "File is not UTF-8 text")
@@ -238,7 +238,7 @@ public actor ProjectToolAuthority {
         let arguments = ["-C", root.snapshot.canonicalPath, "diff", "--no-ext-diff", "--no-textconv", "--color=never", request.comparison, "--"] + request.logicalPaths
         let patch = try await commandRunner.run(executable: gitExecutable, arguments: arguments, workingDirectory: root.snapshot.canonicalPath, maximumBytes: maximumBytes)
         let data = Data(patch.utf8)
-        return ProjectDiffSnapshot(rootID: request.rootID, comparison: request.comparison, patch: patch, truncated: data.count >= maximumBytes, contentDigest: CanonicalSigning.bodyDigest(data))
+        return ProjectDiffSnapshot(rootID: request.rootID, comparison: request.comparison, patch: patch, truncated: data.count >= maximumBytes, contentDigest: PortableContentDigest.sha256Hex(data))
     }
 
     @discardableResult
@@ -494,7 +494,7 @@ enum WorktreeRuntimeIdentity {
             fileURLWithPath: rawCommonDirectory,
             relativeTo: URL(fileURLWithPath: path, isDirectory: true)
         ).standardizedFileURL.resolvingSymlinksInPath().path
-        return CanonicalSigning.bodyDigest(Data("\(filesystemIdentity)\u{0}\(commonDirectory)".utf8))
+        return PortableContentDigest.sha256Hex(Data("\(filesystemIdentity)\u{0}\(commonDirectory)".utf8))
     }
 }
 
@@ -982,7 +982,7 @@ public actor WorktreeRuntimeService {
             internalPathIdentity: destination.path,
             lifecycleState: .active,
             observedBytes: Int64(payload.count),
-            contentDigest: CanonicalSigning.bodyDigest(payload),
+            contentDigest: PortableContentDigest.sha256Hex(payload),
             metadata: ["bindingId": binding.bindingID.uuidString]
         )
         try await resources?.reserveOwnedResource(record)
@@ -1041,7 +1041,7 @@ public actor ArtifactRuntimeService {
         let temporary = projectDirectory.appendingPathComponent(".\(artifactID.uuidString).tmp")
         let finalPath = try DurableFilesystem.standardizedContainedPath(root: baseDirectory, candidate: destination.path)
         let temporaryPath = try DurableFilesystem.standardizedContainedPath(root: baseDirectory, candidate: temporary.path)
-        let digest = CanonicalSigning.bodyDigest(content)
+        let digest = PortableContentDigest.sha256Hex(content)
         let reservation = OwnedResourceRecord(
             kind: .artifact,
             projectID: projectID,
@@ -1059,7 +1059,7 @@ public actor ArtifactRuntimeService {
         do {
             try DurableFilesystem.publish(data: content, temporary: URL(fileURLWithPath: temporaryPath), destination: URL(fileURLWithPath: finalPath))
             let persisted = try Data(contentsOf: URL(fileURLWithPath: finalPath), options: [.mappedIfSafe])
-            guard persisted.count == content.count, CanonicalSigning.bodyDigest(persisted) == digest else {
+            guard persisted.count == content.count, PortableContentDigest.sha256Hex(persisted) == digest else {
                 throw ServiceAPIError(code: .persistenceUnavailable, message: "Published artifact failed durability verification")
             }
             _ = try await resources?.transitionOwnedResource(
@@ -1118,7 +1118,7 @@ public struct BuiltinWorkflowCatalog: Sendable {
                 source: "builtin",
                 name: workflow.metadata.displayName,
                 definition: definition,
-                contentDigest: CanonicalSigning.bodyDigest(Data(definition.utf8)),
+                contentDigest: PortableContentDigest.sha256Hex(Data(definition.utf8)),
                 enabled: true
             )
         }

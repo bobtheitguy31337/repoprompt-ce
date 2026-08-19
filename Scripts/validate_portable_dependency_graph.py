@@ -48,7 +48,7 @@ def main() -> int:
     errors: list[str] = []
 
     exact_edges = {
-        "RepoPromptRuntimeModel": {"Crypto"},
+        "RepoPromptRuntimeModel": set(),
         "RepoPromptAuthorityAPI": {"RepoPromptRuntimeModel"},
         "RepoPromptShared": {"Crypto"},
         "RepoPromptAgentRuntimeCore": {"RepoPromptRuntimeModel"},
@@ -58,7 +58,7 @@ def main() -> int:
             "RepoPromptCodeMapCore", "Crypto", "Logging", "MCP",
         },
         "RepoPromptHeadlessRuntime": {
-            "RepoPromptRuntimeModel", "RepoPromptAuthorityAPI",
+            "RepoPromptRuntimeModel", "RepoPromptAuthorityAPI", "RepoPromptShared",
             "RepoPromptAgentRuntimeCore", "RepoPromptWorkspaceRuntimeCore",
             "RepoPromptDomainRuntime",
         },

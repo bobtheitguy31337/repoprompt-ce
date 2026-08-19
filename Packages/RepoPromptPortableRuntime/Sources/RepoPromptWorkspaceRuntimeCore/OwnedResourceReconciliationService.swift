@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptRuntimeModel
+import RepoPromptShared
 
 public struct OwnedResourceReconciliationReport: Codable, Hashable, Sendable {
     public let inspected: Int
@@ -279,7 +280,7 @@ public actor OwnedResourceReconciliationService {
               let data = try? Data(contentsOf: URL(fileURLWithPath: record.internalPathIdentity), options: [.mappedIfSafe])
         else { return false }
         return (record.observedBytes == nil || record.observedBytes == Int64(data.count))
-            && (record.contentDigest == nil || record.contentDigest == CanonicalSigning.bodyDigest(data))
+            && (record.contentDigest == nil || record.contentDigest == PortableContentDigest.sha256Hex(data))
     }
 
     private func worktreeMatches(_ record: OwnedResourceRecord, allowLegacyBackfill: Bool) async throws -> Bool {
@@ -442,6 +443,6 @@ public actor OwnedResourceReconciliationService {
         guard record.kind == .artifact,
               let data = try? Data(contentsOf: URL(fileURLWithPath: record.internalPathIdentity), options: [.mappedIfSafe])
         else { return record.contentDigest }
-        return CanonicalSigning.bodyDigest(data)
+        return PortableContentDigest.sha256Hex(data)
     }
 }

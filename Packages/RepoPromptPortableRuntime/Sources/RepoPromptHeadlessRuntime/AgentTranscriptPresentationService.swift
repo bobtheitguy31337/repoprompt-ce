@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptAgentRuntimeCore
 import RepoPromptAuthorityAPI
 import RepoPromptRuntimeModel
+import RepoPromptShared
 
 public actor AgentTranscriptPresentationService {
     private struct PageToken: Codable {
@@ -130,7 +131,7 @@ public actor AgentTranscriptPresentationService {
         let revision = watermark?.presentationRevision ?? 0
         let cursorSeed = "\(sessionID.uuidString.lowercased()):\(revision):\(legacyTranscript.last?.sessionSequence ?? 0)"
         let pending = interactions.filter(Self.isActionable).map { Self.interactionWire($0, turnID: "live-tail", mutable: mutableInteractions) }
-        return .init(presentationRevision: revision, presentationCursor: CanonicalSigning.bodyDigest(Data(cursorSeed.utf8)), turns: pageUnits.map(\.turn), nextPageToken: next, pendingInteractions: pending)
+        return .init(presentationRevision: revision, presentationCursor: PortableContentDigest.sha256Hex(Data(cursorSeed.utf8)), turns: pageUnits.map(\.turn), nextPageToken: next, pendingInteractions: pending)
     }
 
     nonisolated static func isActionable(_ interaction: InteractionSnapshot) -> Bool {
@@ -266,7 +267,7 @@ public actor AgentTranscriptPresentationService {
 
     private func encodePageToken(actorID: String, sessionID: UUID, beforeSequence: Int64) throws -> String {
         let binding = "\(actorID)\u{0}\(sessionID.uuidString.lowercased())\u{0}\(beforeSequence)"
-        let token = PageToken(actorID: actorID, sessionID: sessionID, beforeSequence: beforeSequence, digest: CanonicalSigning.bodyDigest(Data(binding.utf8)))
+        let token = PageToken(actorID: actorID, sessionID: sessionID, beforeSequence: beforeSequence, digest: PortableContentDigest.sha256Hex(Data(binding.utf8)))
         return try JSONEncoder.serviceEncoder.encode(token).base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
@@ -286,7 +287,7 @@ public actor AgentTranscriptPresentationService {
               token.sessionID == sessionID
         else { throw ServiceAPIError(code: .cursorExpired, message: "Presentation page token is invalid") }
         let binding = "\(actorID)\u{0}\(sessionID.uuidString.lowercased())\u{0}\(token.beforeSequence)"
-        guard token.digest == CanonicalSigning.bodyDigest(Data(binding.utf8)) else {
+        guard token.digest == PortableContentDigest.sha256Hex(Data(binding.utf8)) else {
             throw ServiceAPIError(code: .cursorExpired, message: "Presentation page token is invalid")
         }
         return token.beforeSequence

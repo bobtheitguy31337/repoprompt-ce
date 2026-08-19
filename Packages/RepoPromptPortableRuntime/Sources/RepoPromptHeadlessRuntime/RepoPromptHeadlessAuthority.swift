@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptAgentRuntimeCore
 import RepoPromptAuthorityAPI
 import RepoPromptRuntimeModel
+import RepoPromptShared
 import RepoPromptWorkspaceRuntimeCore
 
 public actor RepoPromptHeadlessAuthority {
@@ -834,7 +835,7 @@ public actor RepoPromptHeadlessAuthority {
                 actorID: seed.creator.userID,
                 operation: "embeddedSessionImport",
                 key: key,
-                requestDigest: CanonicalSigning.bodyDigest(Data(key.utf8))
+                requestDigest: PortableContentDigest.sha256Hex(Data(key.utf8))
             )
             let events = try await store.persistNewSession(
                 snapshot,
@@ -1265,7 +1266,7 @@ public actor RepoPromptHeadlessAuthority {
             ),
             externalActor: parent.creator,
             idempotencyKey: "agent-manage:\(ids.next().uuidString)",
-            requestDigest: CanonicalSigning.bodyDigest(Data(initialPrompt.utf8))
+            requestDigest: PortableContentDigest.sha256Hex(Data(initialPrompt.utf8))
         )
         if var agent = agents[child.sessionID] {
             agent = AgentSnapshot(agentID: agent.agentID, sessionID: agent.sessionID, rootSessionID: agent.rootSessionID, parentAgentID: agent.parentAgentID, providerNativeIdentity: agent.providerNativeIdentity, role: role, label: label, state: agent.state, revision: agent.revision + 1)
@@ -1296,7 +1297,7 @@ public actor RepoPromptHeadlessAuthority {
             actorID: snapshot.creator.userID,
             operation: "agentRun",
             key: "agent-run:\(ids.next().uuidString)",
-            requestDigest: CanonicalSigning.bodyDigest(Data(sessionID.uuidString.utf8))
+            requestDigest: PortableContentDigest.sha256Hex(Data(sessionID.uuidString.utf8))
         )
         return try await startProviderRun(
             command: command,
@@ -1328,7 +1329,7 @@ public actor RepoPromptHeadlessAuthority {
             actorID: snapshot.creator.userID,
             operation: "agentCancel",
             key: "agent-cancel:\(ids.next().uuidString)",
-            requestDigest: CanonicalSigning.bodyDigest(Data(sessionID.uuidString.utf8))
+            requestDigest: PortableContentDigest.sha256Hex(Data(sessionID.uuidString.utf8))
         )
         return try await cancelProviderRun(
             command: command,
@@ -1581,10 +1582,6 @@ public actor RepoPromptHeadlessAuthority {
         return await serverSettings.directAgentPermissions()
     }
 
-    public func portalDesktopSettings() async throws -> PortalDesktopSettingsSnapshot {
-        try await PortalDesktopSettingsSnapshot.liveRead(stored: store.portalDesktopSettings())
-    }
-
     public func directConfiguration(providerID: ProviderSettingsID) async throws -> DirectProviderConfiguration {
         if let providerSettings {
             return try await providerSettings.directConfiguration(providerID: providerID)
@@ -1621,15 +1618,6 @@ public actor RepoPromptHeadlessAuthority {
             request: request,
             attribution: providerAttribution
         )
-    }
-
-    public func replacePortalDesktopSettings(
-        _ request: UpdatePortalDesktopSettingsRequest
-    ) async throws -> PortalDesktopSettingsSnapshot {
-        try ensureWritable()
-        let current = try await portalDesktopSettings()
-        let updated = try current.applying(request)
-        return try await store.upsertPortalDesktopSettings(updated, expectedRevision: current.revision)
     }
 
     public func workspaceApprovals() async throws -> WorkspaceApprovalSettingsSnapshot {
@@ -4087,7 +4075,7 @@ public actor RepoPromptHeadlessAuthority {
                 if !text.isEmpty {
                     let preserved = try await HeadlessRunStatusCopy.preservedOrThinking(current: store.runPresentation(sessionID: sessionID))
                     try await transitionRunPresentation(sessionID: sessionID, runID: run.runID, phase: .working, statusCode: preserved.code, statusText: preserved.text)
-                    try await recordSemanticActivity(runID: run.runID, channel: "progress:\(CanonicalSigning.bodyDigest(Data(text.utf8)))", kind: .progress, content: text, replace: true)
+                    try await recordSemanticActivity(runID: run.runID, channel: "progress:\(PortableContentDigest.sha256Hex(Data(text.utf8)))", kind: .progress, content: text, replace: true)
                     try await publishProviderTranscript(sessionID: sessionID, binding: binding, kind: .progress, content: text, mutation: .appendEntry, eventType: .transcriptProgress)
                 }
             case let .runStatusChanged(phase, statusCode, statusText):
@@ -4096,14 +4084,14 @@ public actor RepoPromptHeadlessAuthority {
                 guard let snapshot = try? await sessionSnapshot(sessionID: sessionID) else { return }
                 let preserved = try await HeadlessRunStatusCopy.preservedOrThinking(current: store.runPresentation(sessionID: sessionID))
                 try await transitionRunPresentation(sessionID: sessionID, runID: run.runID, phase: .working, statusCode: preserved.code, statusText: preserved.text)
-                let invocation = ToolInvocationSnapshot(invocationID: ids.next(), toolName: name, state: "running", argumentDigest: CanonicalSigning.bodyDigest(arguments ?? Data()))
+                let invocation = ToolInvocationSnapshot(invocationID: ids.next(), toolName: name, state: "running", argumentDigest: PortableContentDigest.sha256Hex(arguments ?? Data()))
                 providerToolInvocations[binding.runID, default: [:]][providerToolID] = invocation
                 try await recordSemanticTool(runID: run.runID, activityID: invocation.invocationID, executionID: providerToolID, name: name, status: .running, displayArguments: arguments.map { String(decoding: $0, as: UTF8.self) }, displayResult: nil, argumentDigest: invocation.argumentDigest, resultDigest: nil)
                 let envelope = try await store.persistToolInvocation(invocation, session: snapshot, actor: nil, correlationID: invocation.invocationID, eventType: .toolStarted)
                 await eventHub.publish(envelope)
             case let .toolUpdated(providerToolID, output):
                 guard let invocation = providerToolInvocations[binding.runID]?[providerToolID], let snapshot = try? await sessionSnapshot(sessionID: sessionID) else { return }
-                let update = ToolInvocationSnapshot(invocationID: invocation.invocationID, toolName: invocation.toolName, state: "running", argumentDigest: invocation.argumentDigest, resultDigest: CanonicalSigning.bodyDigest(Data(output.utf8)))
+                let update = ToolInvocationSnapshot(invocationID: invocation.invocationID, toolName: invocation.toolName, state: "running", argumentDigest: invocation.argumentDigest, resultDigest: PortableContentDigest.sha256Hex(Data(output.utf8)))
                 try await recordSemanticTool(runID: run.runID, activityID: invocation.invocationID, executionID: providerToolID, name: invocation.toolName, status: .running, displayArguments: nil, displayResult: output, argumentDigest: invocation.argumentDigest, resultDigest: update.resultDigest)
                 let envelope = try await store.persistToolInvocation(update, session: snapshot, actor: nil, correlationID: invocation.invocationID, eventType: .toolUpdated)
                 await eventHub.publish(envelope)
@@ -4111,7 +4099,7 @@ public actor RepoPromptHeadlessAuthority {
                 guard let snapshot = try? await sessionSnapshot(sessionID: sessionID) else { return }
                 let prior = providerToolInvocations[binding.runID]?[providerToolID]
                 let failed = status == .failed
-                let invocation = ToolInvocationSnapshot(invocationID: prior?.invocationID ?? ids.next(), toolName: prior?.toolName ?? name, state: status.rawValue, argumentDigest: prior?.argumentDigest ?? CanonicalSigning.bodyDigest(Data()), resultDigest: output.map { CanonicalSigning.bodyDigest(Data($0.utf8)) }, errorCode: failed ? .dependencyUnavailable : nil)
+                let invocation = ToolInvocationSnapshot(invocationID: prior?.invocationID ?? ids.next(), toolName: prior?.toolName ?? name, state: status.rawValue, argumentDigest: prior?.argumentDigest ?? PortableContentDigest.sha256Hex(Data()), resultDigest: output.map { PortableContentDigest.sha256Hex(Data($0.utf8)) }, errorCode: failed ? .dependencyUnavailable : nil)
                 providerToolInvocations[binding.runID]?[providerToolID] = nil
                 try await recordSemanticTool(runID: run.runID, activityID: invocation.invocationID, executionID: providerToolID, name: invocation.toolName, status: status, displayArguments: nil, displayResult: output, argumentDigest: invocation.argumentDigest, resultDigest: invocation.resultDigest)
                 let envelope = try await store.persistToolInvocation(invocation, session: snapshot, actor: nil, correlationID: invocation.invocationID, eventType: failed ? .toolFailed : .toolCompleted)
@@ -4265,7 +4253,7 @@ public actor RepoPromptHeadlessAuthority {
     }
 
     private static func stableSemanticUUID(runID: UUID, channel: String) -> UUID {
-        let digest = CanonicalSigning.bodyDigest(Data("\(runID.uuidString.lowercased())\u{0}\(channel)".utf8))
+        let digest = PortableContentDigest.sha256Hex(Data("\(runID.uuidString.lowercased())\u{0}\(channel)".utf8))
         let hex = String(digest.filter(\.isHexDigit).prefix(32))
         guard hex.count == 32 else { return runID }
         let value = "\(hex.prefix(8))-\(hex.dropFirst(8).prefix(4))-\(hex.dropFirst(12).prefix(4))-\(hex.dropFirst(16).prefix(4))-\(hex.dropFirst(20).prefix(12))"

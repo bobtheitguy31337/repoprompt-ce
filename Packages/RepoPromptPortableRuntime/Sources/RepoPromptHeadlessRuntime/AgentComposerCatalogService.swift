@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptAgentRuntimeCore
 import RepoPromptAuthorityAPI
 import RepoPromptRuntimeModel
+import RepoPromptShared
 
 public struct AgentComposerWorkflowDescriptor: Hashable, Sendable {
     public let id: String
@@ -118,7 +119,7 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
         )
         let seed = ComposerCatalogWireSnapshot(revision: "pending", context: contextWire, providerGroups: groups, workflows: workflowWire, selected: selected, locks: locks, capabilities: capabilities, emptyState: empty, mcpControlled: context.mcpControlled)
         let seedData = try JSONEncoder.serviceEncoder.encode(seed)
-        let revision = CanonicalSigning.bodyDigest(seedData + Data(ProviderTurnConfigurationAdapters.interpretationRevision.utf8))
+        let revision = PortableContentDigest.sha256Hex(seedData + Data(ProviderTurnConfigurationAdapters.interpretationRevision.utf8))
         return .init(revision: revision, context: contextWire, providerGroups: groups, workflows: workflowWire, selected: selected, locks: locks, capabilities: capabilities, emptyState: empty, mcpControlled: context.mcpControlled)
     }
 
@@ -163,7 +164,7 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
             toolValues: values,
             workflowID: wire.workflowID
         ))
-        let capabilityDigest = try CanonicalSigning.bodyDigest(JSONEncoder.serviceEncoder.encode(model))
+        let capabilityDigest = try PortableContentDigest.sha256Hex(JSONEncoder.serviceEncoder.encode(model))
         let effective = try EffectiveTurnConfigurationRecord(
             catalogRevision: wire.catalogRevision,
             providerID: wire.providerID,

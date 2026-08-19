@@ -89,7 +89,7 @@ final class RepoPromptPortableFixtureTests: XCTestCase {
         let fixture = try JSONDecoder().decode(ProviderTurnFixture.self, from: fixtureData("provider-turn-semantics"))
         XCTAssertEqual(fixture.interpretationRevision, ProviderTurnConfigurationAdapters.interpretationRevision)
         XCTAssertEqual(fixture.requiredMCPServers, ["repoprompt"])
-        XCTAssertEqual(fixture.providerSettingsIDKey, "provider.settingsId")
+        XCTAssertEqual(fixture.directProviderSettingsIDKey, "provider.settingsID")
         XCTAssertEqual(Set(fixture.families.flatMap(\.providerIds)), Set(ProviderSettingsID.allCases))
 
         let resource = OwnedResourceReference(
@@ -101,15 +101,37 @@ final class RepoPromptPortableFixtureTests: XCTestCase {
                 let adapter = try XCTUnwrap(ProviderTurnConfigurationAdapters.builtIn()[providerID])
                 XCTAssertEqual(Set(family.controls), adapter.supportedControlIDs)
                 XCTAssertEqual(Set(family.permissionModes.keys), adapter.supportedPermissionIDs)
+                let model = ProviderModelDescriptor(
+                    providerID: providerID,
+                    modelID: "fixture-model",
+                    providerRawValue: "fixture-model",
+                    displayName: "Fixture Model"
+                )
+                if providerID.isDirectAPI {
+                    XCTAssertEqual(family.fixedExecutionMode, "workspaceWrite")
+                    XCTAssertNil(ProviderComposerStableControls.permissionDescriptor(
+                        providerID: providerID,
+                        selectedID: nil,
+                        mutable: true,
+                        lockReasonCode: nil
+                    ))
+                    let compiled = try adapter.compile(.init(
+                        providerID: providerID,
+                        model: model,
+                        settings: ProviderTurnConfigurationAdapters.defaultSettings(for: providerID),
+                        scopedResources: [resource]
+                    ))
+                    XCTAssertEqual(compiled.permissions.executionMode.rawValue, family.fixedExecutionMode)
+                    XCTAssertEqual(compiled.permissions.scopedResources, [resource])
+                    XCTAssertEqual(compiled.providerSettings[fixture.directProviderSettingsIDKey], providerID.rawValue)
+                    XCTAssertNil(compiled.providerSettings["provider.permissionId"])
+                    continue
+                }
+                XCTAssertNil(family.fixedExecutionMode)
                 for (permissionID, mode) in family.permissionModes {
                     let compiled = try adapter.compile(.init(
                         providerID: providerID,
-                        model: .init(
-                            providerID: providerID,
-                            modelID: "fixture-model",
-                            providerRawValue: "fixture-model",
-                            displayName: "Fixture Model"
-                        ),
+                        model: model,
                         permissionID: permissionID,
                         settings: ProviderTurnConfigurationAdapters.defaultSettings(for: providerID),
                         scopedResources: [resource]
@@ -161,13 +183,14 @@ private struct TranscriptFixture: Decodable {
 private struct ProviderTurnFixture: Decodable {
     let interpretationRevision: String
     let requiredMCPServers: [String]
-    let providerSettingsIDKey: String
+    let directProviderSettingsIDKey: String
     let families: [ProviderTurnFamily]
 }
 
 private struct ProviderTurnFamily: Decodable {
     let providerIds: [ProviderSettingsID]
     let controls: [String]
+    let fixedExecutionMode: String?
     let permissionModes: [String: String]
 }
 

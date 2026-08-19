@@ -45,7 +45,6 @@ let package = Package(
     targets: [
         .target(
             name: "RepoPromptRuntimeModel",
-            dependencies: [.product(name: "Crypto", package: "swift-crypto")],
             swiftSettings: swift6LanguageMode
         ),
         .target(
@@ -90,6 +89,7 @@ let package = Package(
             dependencies: [
                 "RepoPromptRuntimeModel",
                 "RepoPromptAuthorityAPI",
+                "RepoPromptShared",
                 "RepoPromptAgentRuntimeCore",
                 "RepoPromptWorkspaceRuntimeCore",
                 "RepoPromptDomainRuntime"

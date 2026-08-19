@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAuthorityAPI
 import RepoPromptRuntimeModel
+import RepoPromptShared
 
 public protocol ServerSettingsProviderCatalogProviding: Sendable {
     func serverSettingsProviderCatalog() async throws -> ProviderSettingsCatalogResponse
@@ -847,7 +848,7 @@ private extension ServerSettingsService {
         payload: some Encodable
     ) throws -> ServerSettingsAuditMutation {
         let data = try JSONEncoder.serviceEncoder.encode(payload)
-        return .init(operation: operation, attribution: attribution, payloadDigest: CanonicalSigning.bodyDigest(data))
+        return .init(operation: operation, attribution: attribution, payloadDigest: PortableContentDigest.sha256Hex(data))
     }
 
     func normalizeProjectAgentModels(

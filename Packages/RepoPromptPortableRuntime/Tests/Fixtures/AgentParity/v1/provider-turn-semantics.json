@@ -4,7 +4,7 @@
   "generatedFrom": "Packages/RepoPromptPortableRuntime/Sources/RepoPromptAgentRuntimeCore/ProviderTurnConfigurationAdapters.swift",
   "interpretationRevision": "provider-turn-configuration-v3-desktop-profile",
   "requiredMCPServers": ["repoprompt"],
-  "providerSettingsIDKey": "provider.settingsId",
+  "directProviderSettingsIDKey": "provider.settingsID",
   "families": [
     {
       "providerIds": ["codex"],
@@ -54,11 +54,8 @@
     {
       "providerIds": ["openAIAPI", "anthropicAPI", "openRouter", "customOpenAICompatible", "gemini", "azure", "deepseek", "fireworks", "xAI", "groq", "zAI", "ollama"],
       "controls": [],
-      "permissionModes": {
-        "provider.fullAccess": "fullAccess",
-        "provider.readOnly": "readOnly",
-        "provider.workspaceWrite": "workspaceWrite"
-      }
+      "fixedExecutionMode": "workspaceWrite",
+      "permissionModes": {}
     }
   ]
 }

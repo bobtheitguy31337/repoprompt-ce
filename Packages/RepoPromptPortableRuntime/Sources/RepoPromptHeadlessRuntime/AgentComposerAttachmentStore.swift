@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptAgentRuntimeCore
 import RepoPromptAuthorityAPI
 import RepoPromptRuntimeModel
+import RepoPromptShared
 
 public actor AgentComposerAttachmentStore {
     public struct Configuration: Hashable, Sendable {
@@ -105,7 +106,7 @@ public actor AgentComposerAttachmentStore {
             let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
             try handle.synchronize()
             try handle.close()
-            let wire = ComposerAttachmentWire(attachmentID: attachmentID, displayName: Self.sanitizedName(displayName, mediaType: raster.mediaType), mediaType: raster.mediaType, byteSize: data.count, digest: CanonicalSigning.bodyDigest(data), pixelWidth: raster.width, pixelHeight: raster.height, lifecycle: .staged, expiresAt: now.addingTimeInterval(configuration.unclaimedTTL))
+            let wire = ComposerAttachmentWire(attachmentID: attachmentID, displayName: Self.sanitizedName(displayName, mediaType: raster.mediaType), mediaType: raster.mediaType, byteSize: data.count, digest: PortableContentDigest.sha256Hex(data), pixelWidth: raster.width, pixelHeight: raster.height, lifecycle: .staged, expiresAt: now.addingTimeInterval(configuration.unclaimedTTL))
             try await store.upsertComposerAttachment(.init(wire: wire, actorID: actorID, projectID: projectID, stagedPath: path, createdAt: now, updatedAt: now))
             return wire
         } catch {
@@ -158,7 +159,7 @@ public actor AgentComposerAttachmentStore {
             throw ServiceAPIError(code: .invalidRequest, message: "Attachment preview exceeds its bound")
         }
         let data = try Data(contentsOf: URL(fileURLWithPath: path), options: [.mappedIfSafe])
-        guard data.count == record.wire.byteSize, CanonicalSigning.bodyDigest(data) == record.wire.digest else {
+        guard data.count == record.wire.byteSize, PortableContentDigest.sha256Hex(data) == record.wire.digest else {
             throw ServiceAPIError(code: .persistenceUnavailable, message: "Attachment content integrity failed")
         }
         return (record.wire, data)
@@ -219,14 +220,14 @@ public actor AgentComposerAttachmentStore {
             for record in records {
                 guard let stagedPath = record.stagedPath else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Staged attachment path is unavailable") }
                 let stagedData = try Data(contentsOf: URL(fileURLWithPath: stagedPath), options: [.mappedIfSafe])
-                guard stagedData.count == record.wire.byteSize, CanonicalSigning.bodyDigest(stagedData) == record.wire.digest else {
+                guard stagedData.count == record.wire.byteSize, PortableContentDigest.sha256Hex(stagedData) == record.wire.digest else {
                     throw ServiceAPIError(code: .persistenceUnavailable, message: "Staged attachment content integrity failed")
                 }
                 let extensionName = Self.fileExtension(for: record.wire.mediaType)
                 let destination = URL(fileURLWithPath: turnDirectory).appendingPathComponent("\(record.wire.attachmentID.uuidString.lowercased()).\(extensionName)").path
                 if !files.fileExists(atPath: destination) { try files.copyItem(atPath: stagedPath, toPath: destination) }
                 let persistentData = try Data(contentsOf: URL(fileURLWithPath: destination), options: [.mappedIfSafe])
-                guard persistentData.count == record.wire.byteSize, CanonicalSigning.bodyDigest(persistentData) == record.wire.digest else {
+                guard persistentData.count == record.wire.byteSize, PortableContentDigest.sha256Hex(persistentData) == record.wire.digest else {
                     throw ServiceAPIError(code: .persistenceUnavailable, message: "Persistent attachment copy integrity failed")
                 }
                 try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination)

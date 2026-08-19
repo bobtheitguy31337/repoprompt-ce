@@ -224,8 +224,6 @@ public protocol RepoPromptAuthorityStore:
         actor: ExternalActor,
         correlationID: UUID
     ) async throws -> [EventEnvelope]
-    /// SQLiteServiceStore.swift
-    func authorityStore_portalDesktopSettings() async throws -> PortalDesktopSettingsSnapshot?
     /// AgentSemanticLedgerRepository.swift
     func authorityStore_prepareAgentSubmission(_ record: AgentSubmissionRecord) async throws -> AgentSubmissionRecord
     /// SQLiteServiceStore.swift
@@ -346,11 +344,6 @@ public protocol RepoPromptAuthorityStore:
         expectedRevision: Int64,
         audit: ServerSettingsAuditMutation
     ) async throws -> StoredSettingsDocument<MCPShowModelPresetsSettings>
-    /// SQLiteServiceStore.swift
-    func authorityStore_upsertPortalDesktopSettings(
-        _ snapshot: PortalDesktopSettingsSnapshot,
-        expectedRevision: Int64
-    ) async throws -> PortalDesktopSettingsSnapshot
     /// ServerSettingsRepositories.swift
     func authorityStore_upsertProjectSelectionPresetsDocument(
         _ document: StoredSettingsDocument<[ProjectSelectionPreset]>,
@@ -699,10 +692,6 @@ public extension RepoPromptAuthorityStore {
         try await authorityStore_persistWorktrees(snapshots, actor: actor, correlationID: correlationID)
     }
 
-    func portalDesktopSettings() async throws -> PortalDesktopSettingsSnapshot? {
-        try await authorityStore_portalDesktopSettings()
-    }
-
     func prepareAgentSubmission(_ record: AgentSubmissionRecord) async throws -> AgentSubmissionRecord {
         try await authorityStore_prepareAgentSubmission(record)
     }
@@ -889,13 +878,6 @@ public extension RepoPromptAuthorityStore {
         audit: ServerSettingsAuditMutation
     ) async throws -> StoredSettingsDocument<MCPShowModelPresetsSettings> {
         try await authorityStore_upsertMCPShowModelPresetsDocument(document, expectedRevision: expectedRevision, audit: audit)
-    }
-
-    func upsertPortalDesktopSettings(
-        _ snapshot: PortalDesktopSettingsSnapshot,
-        expectedRevision: Int64
-    ) async throws -> PortalDesktopSettingsSnapshot {
-        try await authorityStore_upsertPortalDesktopSettings(snapshot, expectedRevision: expectedRevision)
     }
 
     func upsertProjectSelectionPresetsDocument(

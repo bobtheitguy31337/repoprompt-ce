@@ -6,12 +6,12 @@ every source in the three extracted owners and the deliberate dependency inversi
 
 ## Dependency rule
 
-`RepoPromptRuntimeModel` owns canonical store-independent values and persisted defaults;
-its sole direct external edge is `Crypto`, used by the established canonical digest implementation.
-`RepoPromptAuthorityAPI` owns the async durable-store seam. Agent depends only on Model;
-Workspace depends on Model + Shared; Headless depends on Model + AuthorityAPI + Agent +
-Workspace + Domain. No portable target imports the prototype protocol, persistence, HTTP,
-TLS, app, AppKit, or SwiftUI modules.
+`RepoPromptRuntimeModel` owns canonical store-independent semantic values and persisted
+defaults and has no external dependency. `RepoPromptAuthorityAPI` owns the async durable-store
+seam. Agent depends only on Model; Workspace depends on Model + Shared; Headless depends on
+Model + AuthorityAPI + Shared + Agent + Workspace + Domain. Portable content-identity hashing
+is owned by Shared; transport signing/authentication is deferred. No portable target imports the
+prototype protocol, persistence, HTTP, TLS, app, AppKit, or SwiftUI modules.
 
 Legacy declarations whose names contain `Wire` are retained only where they are the
 established store-independent Codable snapshot/command value used by the runtime. PR 3
@@ -30,7 +30,7 @@ map those envelopes to these canonical values rather than duplicate their defaul
 | `EffectiveTurnConfiguration.swift` | Moved to `RepoPromptRuntimeModel`, because store records and Headless share the value. |
 | `LifecycleGate.swift` | Ported. |
 | `ProviderContracts.swift` | Ported. |
-| `ProviderTurnConfigurationAdapters.swift` | Ported; Desktop adapters map into it explicitly. |
+| `ProviderTurnConfigurationAdapters.swift` | Ported with frozen semantics, including direct providers accepting no caller permission ID, always resolving `workspaceWrite`, and emitting `provider.settingsID`. Desktop integration is deferred until a real production consumer exists. |
 | `RuntimePorts.swift` | Ported. |
 | `SessionAuthority.swift` | Ported. |
 
@@ -109,23 +109,28 @@ events, and reconciliation values. `AuthorityStoreRecords.swift` contains persis
 records required by the authority port but no SQLite behavior. PR 3 retains and maps actual
 HTTP/authentication envelopes at the Server boundary.
 
-The complete 30-file committed closure is:
+The committed prototype closure contains 30 files. PR 2 retains the 28 genuinely portable
+semantic files:
 
-`AdvancedServerSettingsDTOs.swift`, `AgentModelSettingsDTOs.swift`, `CanonicalSigning.swift`,
-`Commands.swift`, `ComposerWireDTOs.swift`, `ContextBuilderSettingsDTOs.swift`,
+`AdvancedServerSettingsDTOs.swift`, `AgentModelSettingsDTOs.swift`, `Commands.swift`,
+`ComposerWireDTOs.swift`, `ContextBuilderSettingsDTOs.swift`,
 `DirectAgentPermissionSettingsDTOs.swift`, `DirectProviderSettingsDTOs.swift`,
 `DurabilityDTOs.swift`, `Errors.swift`, `Events.swift`, `Identifiers.swift`,
 `MCPClientIdentity.swift`, `MCPDisabledToolsSettingsDTOs.swift`, `MCPModelPresetDTOs.swift`,
-`PortalDesktopSettingsDTOs.swift`, `PortalSessionDTOs.swift`, `ProviderConnectionDTOs.swift`,
-`ProviderSettingsDTOs.swift`, `SavedPromptDTOs.swift`, `SelectionPresetDTOs.swift`,
-`ServerSettingsDTOs.swift`, `Snapshots.swift`, `SubagentPermissionSettingsDTOs.swift`,
+`PortalSessionDTOs.swift`, `ProviderConnectionDTOs.swift`, `ProviderSettingsDTOs.swift`,
+`SavedPromptDTOs.swift`, `SelectionPresetDTOs.swift`, `ServerSettingsDTOs.swift`,
+`Snapshots.swift`, `SubagentPermissionSettingsDTOs.swift`,
 `TranscriptPresentationWireDTOs.swift`, `WireDTOs.swift`, `WorkflowPresetDTOs.swift`,
 `WorkflowSettingsDTOs.swift`, `WorkspaceApprovalSettingsDTOs.swift`, and `WorkspaceDTOs.swift`.
-Each is copied to `RepoPromptRuntimeModel/ServiceModel/<same basename>` with only module-edge
-adaptations. Portable fixture tests cover decoding/default compatibility; RuntimeModel tests
-cover raw-value and provider-setting snapshots; Agent tests cover every provider, permission,
-effort/settings path, resource scope, and malformed-input rejection; the root parity test maps
-Desktop owners against the same portable fixture catalog.
+
+`CanonicalSigning.swift` is excluded because canonical envelope serialization and transport
+authentication belong to future `RepoPromptServiceProtocol`; `PortalDesktopSettingsDTOs.swift`
+is excluded because portal request/projection ownership is also Server protocol scope. Shared
+owns the narrower cross-platform SHA-256 content digest used by portable runtime identities,
+so RuntimeModel has no Crypto edge. Portable fixture and RuntimeModel tests cover decoding,
+default, raw-value, and provider-setting compatibility; exhaustive Agent tests cover every
+provider, permission, effort/settings path, resource scope, and malformed-input rejection.
+No dead Desktop projection API or test-only parity bridge is retained.
 
 ## Explicit exclusions
 

@@ -163,17 +163,7 @@ public enum ProviderComposerStableControls {
             ], mutable: mutable, lockReasonCode: lockReasonCode)
         case .openAIAPI, .anthropicAPI, .openRouter, .customOpenAICompatible,
              .gemini, .azure, .deepseek, .fireworks, .xAI, .groq, .zAI, .ollama:
-            return .init(
-                id: "provider.permission",
-                selectedID: selectedID ?? "provider.workspaceWrite",
-                choices: [
-                    .init(id: "provider.readOnly", displayName: "Read Only"),
-                    .init(id: "provider.workspaceWrite", displayName: "Workspace Write"),
-                    .init(id: "provider.fullAccess", displayName: "Full Access", warning: true)
-                ],
-                mutable: mutable,
-                lockReasonCode: lockReasonCode
-            )
+            return nil
         }
     }
 
@@ -425,7 +415,7 @@ public struct TextOnlyACPTurnConfigurationAdapter: ProviderTurnConfigurationAdap
 public struct DirectAPITurnConfigurationAdapter: ProviderTurnConfigurationAdapter {
     public let providerID: ProviderSettingsID
     public let supportedControlIDs: Set<String> = []
-    public let supportedPermissionIDs: Set<String> = ["provider.readOnly", "provider.workspaceWrite", "provider.fullAccess"]
+    public let supportedPermissionIDs: Set<String> = []
 
     public init(providerID: ProviderSettingsID) {
         precondition(providerID.isDirectAPI)
@@ -439,31 +429,22 @@ public struct DirectAPITurnConfigurationAdapter: ProviderTurnConfigurationAdapte
         guard input.toolValues.isEmpty, case .directAPI = input.settings else {
             throw ServiceAPIError(code: .invalidRequest, message: "Direct API providers do not expose composer tool controls")
         }
-        guard let permission = input.permissionID else {
-            throw ServiceAPIError(code: .invalidRequest, message: "Direct API permission is required")
+        guard input.permissionID == nil else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Direct API permissions are managed by the server")
         }
-        let permissions = try ProviderTurnConfigurationAdapters.permissions(
-            permission,
-            readOnly: ["provider.readOnly"],
-            workspaceWrite: ["provider.workspaceWrite"],
-            fullAccess: ["provider.fullAccess"],
-            scopedResources: input.scopedResources
-        )
         let effort = input.effortID ?? input.model.defaultEffortID
         if let effort, !input.model.supportedEffortIDs.contains(effort) {
             throw ServiceAPIError(code: .invalidRequest, message: "Direct API effort is not supported by the selected model")
         }
-        var settings = [
-            "provider.settingsId": providerID.rawValue,
-            "provider.permissionId": permission
-        ]
+        let permissions = ResolvedProviderPermissions.workspaceWrite(scopedResources: input.scopedResources)
+        var settings = ["provider.settingsID": providerID.rawValue]
         if let effort { settings["provider.reasoningEffort"] = effort }
         return .init(
             runtimeKind: .headlessAdapter,
             providerRawModelValue: input.model.providerRawValue,
             effortID: effort,
             permissions: permissions,
-            executionPolicy: .init(mode: permissions.executionMode, providerSettings: settings),
+            executionPolicy: .init(mode: .workspaceWrite, providerSettings: settings),
             supportsNativeImages: input.model.capabilities.nativeImages,
             normalizedToolValues: [:]
         )

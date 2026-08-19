@@ -163,10 +163,6 @@ public struct EventEnvelope: Codable, Hashable, Sendable {
         self.signature = signature
     }
 
-    public func signingData() throws -> Data {
-        try CanonicalSigning.canonicalJSON(UnsignedEventEnvelope(self))
-    }
-
     public func replacingIntegrity(keyID: String, digest: String, signature: String) -> EventEnvelope {
         EventEnvelope(
             protocolVersion: protocolVersion,
@@ -267,57 +263,6 @@ public struct EventEnvelope: Codable, Hashable, Sendable {
         digest = try values.decode(String.self, forKey: .digest)
         keyID = try values.decode(String.self, forKey: .keyID)
         signature = try values.decode(String.self, forKey: .signature)
-    }
-}
-
-private struct UnsignedEventEnvelope: Encodable {
-    let event: EventEnvelope
-    init(_ event: EventEnvelope) {
-        self.event = event
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case protocolVersion
-        case eventID = "eventId"
-        case storeID = "storeId"
-        case globalSequence, cursor, timestamp
-        case projectID = "projectId"
-        case sessionID = "sessionId"
-        case agentID = "agentId"
-        case parentAgentID = "parentAgentId"
-        case rootSessionID = "rootSessionId"
-        case runID = "runId"
-        case sessionSequence, eventType, payloadVersion, generation, turnEpoch, actor
-        case correlationID = "correlationId"
-        case causationID = "causationId"
-        case payload
-        case keyID = "keyId"
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var values = encoder.container(keyedBy: CodingKeys.self)
-        try values.encode(event.protocolVersion, forKey: .protocolVersion)
-        try values.encode(event.eventID, forKey: .eventID)
-        try values.encode(event.storeID, forKey: .storeID)
-        try values.encode(event.globalSequence, forKey: .globalSequence)
-        try values.encode(event.cursor, forKey: .cursor)
-        try values.encode(event.timestamp, forKey: .timestamp)
-        try values.encode(event.projectID, forKey: .projectID)
-        try values.encodeIfPresent(event.sessionID, forKey: .sessionID)
-        try values.encodeIfPresent(event.agentID, forKey: .agentID)
-        try values.encodeIfPresent(event.parentAgentID, forKey: .parentAgentID)
-        try values.encodeIfPresent(event.rootSessionID, forKey: .rootSessionID)
-        try values.encodeIfPresent(event.runID, forKey: .runID)
-        try values.encodeIfPresent(event.sessionSequence, forKey: .sessionSequence)
-        try values.encode(event.eventType, forKey: .eventType)
-        try values.encode(event.payloadVersion, forKey: .payloadVersion)
-        try values.encodeIfPresent(event.generation, forKey: .generation)
-        try values.encodeIfPresent(event.turnEpoch, forKey: .turnEpoch)
-        try values.encodeIfPresent(event.actor, forKey: .actor)
-        try values.encode(event.correlationID, forKey: .correlationID)
-        try values.encodeIfPresent(event.causationID, forKey: .causationID)
-        try values.encode(event.payload, forKey: .payload)
-        try values.encode(event.keyID, forKey: .keyID)
     }
 }
 

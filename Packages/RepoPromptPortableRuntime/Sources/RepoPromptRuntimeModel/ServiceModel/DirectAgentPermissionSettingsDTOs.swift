@@ -252,36 +252,6 @@ public struct DirectAgentPermissionsSettings: Codable, Hashable, Sendable {
 
     public static let `default` = DirectAgentPermissionsSettings()
 
-    /// Project leftover portal string-bag levels into the typed Desktop shape.
-    public static func projected(fromPortalValues values: [String: String]) -> DirectAgentPermissionsSettings {
-        .init(
-            codex: .from(
-                permissionLevel: values[PortalDesktopSettingKey.codexPermissionLevel.rawValue] ?? "autoReview",
-                bashEnabled: values[PortalDesktopSettingKey.codexBashEnabled.rawValue] != "false"
-            ),
-            claude: .from(
-                permissionLevel: values[PortalDesktopSettingKey.claudePermissionLevel.rawValue] ?? "requireApproval",
-                bashEnabled: values[PortalDesktopSettingKey.claudeBashEnabled.rawValue] != "false",
-                mcpStrictModeEnabled: values[PortalDesktopSettingKey.claudeStrictMCPEnabled.rawValue] != "false"
-            ),
-            openCode: .init(
-                permissionLevel: values[PortalDesktopSettingKey.openCodePermissionLevel.rawValue] == "fullAccess"
-                    ? .fullAccess
-                    : .managedDefault
-            ),
-            cursor: .init(
-                permissionLevel: values[PortalDesktopSettingKey.cursorPermissionLevel.rawValue] == "fullAccess"
-                    ? .fullAccess
-                    : .managedDefault
-            ),
-            grokBuild: .init(
-                permissionLevel: values[PortalDesktopSettingKey.grokBuildPermissionLevel.rawValue] == "fullAccess"
-                    ? .fullAccess
-                    : .managedDefault
-            )
-        )
-    }
-
     public func projection(for providerID: ProviderSettingsID) -> DirectAgentRuntimeProjection {
         switch providerID {
         case .codex:

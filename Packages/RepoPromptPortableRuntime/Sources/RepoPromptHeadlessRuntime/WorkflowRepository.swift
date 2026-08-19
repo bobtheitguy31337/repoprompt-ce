@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAuthorityAPI
 import RepoPromptRuntimeModel
+import RepoPromptShared
 import RepoPromptWorkspaceRuntimeCore
 
 public actor WorkflowRepository {
@@ -252,7 +253,7 @@ public actor WorkflowRepository {
             audit: .init(
                 operation: "updatePreferences",
                 attribution: attribution,
-                payloadDigest: CanonicalSigning.bodyDigest(payload)
+                payloadDigest: PortableContentDigest.sha256Hex(payload)
             )
         )
     }
@@ -425,7 +426,7 @@ private extension WorkflowRepository {
             audit: .init(
                 operation: operation,
                 attribution: attribution,
-                payloadDigest: CanonicalSigning.bodyDigest(payload)
+                payloadDigest: PortableContentDigest.sha256Hex(payload)
             )
         )
     }
@@ -532,7 +533,7 @@ private extension WorkflowRepository {
     }
 
     func digest(_ definition: String) -> String {
-        CanonicalSigning.bodyDigest(Data(definition.utf8))
+        PortableContentDigest.sha256Hex(Data(definition.utf8))
     }
 
     func replacing(_ workflowID: String, with replacement: ServerWorkflowDefinition, in workflows: [ServerWorkflowDefinition]) -> [ServerWorkflowDefinition] {

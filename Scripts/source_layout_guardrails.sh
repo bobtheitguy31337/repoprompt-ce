@@ -33,14 +33,18 @@ portable_import_guard() {
   [[ -f "docs/architecture/portable-runtime-prototype-extraction.md" ]] || \
     fail "portable prototype extraction ledger missing"
 
-  for required_adapter in \
-    Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentModel.swift \
-    Sources/RepoPrompt/Features/AgentMode/Runtime/Providers/AgentRuntimeProviderService.swift \
-    Sources/RepoPrompt/Features/AgentMode/Runtime/ProviderBindings/AgentProviderBindingModels.swift; do
-    if ! grep -q -E '^import RepoPrompt(RuntimeModel|AgentRuntimeCore)$' "$required_adapter"; then
-      fail "semantic-owner adapter does not import its portable owner: $required_adapter"
-    fi
-  done
+  print_matches \
+    "Desktop retains a dead test-only portable provider/model projection" \
+    grep -R -n -E 'portable(TurnSettingsSnapshot|SettingsID|ModelIdentifier|PermissionID)' Sources/RepoPrompt
+
+  [[ ! -e "$portable_sources/RepoPromptRuntimeModel/ServiceModel/CanonicalSigning.swift" ]] || \
+    fail "transport signing/authentication belongs to future RepoPromptServiceProtocol"
+  [[ ! -e "$portable_sources/RepoPromptRuntimeModel/ServiceModel/PortalDesktopSettingsDTOs.swift" ]] || \
+    fail "portal request/projection DTOs belong to future RepoPromptServiceProtocol"
+  print_matches \
+    "RuntimeModel retains a Crypto, transport-auth, or portal DTO dependency" \
+    grep -R -n -E '^import[[:space:]]+(Crypto|CryptoKit)([[:space:]]|$)|CanonicalSigning|PortalDesktop(Settings|Setting)' \
+      "$portable_sources/RepoPromptRuntimeModel"
 
   print_matches \
     "portable source imports a prohibited UI, root, wire, persistence, HTTP, TLS, or Server module" \
@@ -128,13 +132,13 @@ PY
   if [[ ! -f "$portable_workflow" ]] || \
      ! grep -q 'Packages/RepoPromptPortableRuntime/\*\*' "$portable_workflow" || \
      ! grep -q 'AgentWorkflow\.swift' "$portable_workflow" || \
-     ! grep -q 'Runtime/ProviderBindings/\*\*' "$portable_workflow" || \
-     ! grep -q 'Runtime/Providers/\*\*' "$portable_workflow" || \
-     ! grep -q 'Infrastructure/AI/Providers/\*\*' "$portable_workflow" || \
      ! grep -q 'GlobalSettingsDocument\.swift' "$portable_workflow" || \
      ! grep -q 'AgentRunSessionStore\.swift' "$portable_workflow" || \
      ! grep -q 'test_contribution_preflight\.py' "$portable_workflow" || \
-     ! grep -q 'validate_portable_dependency_graph\.py' "$portable_workflow"; then
+     ! grep -q 'validate_portable_dependency_graph\.py' "$portable_workflow" || \
+     ! grep -q '^  root-compatibility:' "$portable_workflow" || \
+     ! grep -q 'swift build --product RepoPrompt --disable-automatic-resolution' "$portable_workflow" || \
+     ! grep -q 'swift build --product repoprompt-mcp --disable-automatic-resolution' "$portable_workflow"; then
     fail "portable CI path ownership must cover Portable and every documented Desktop mapping owner"
   fi
   if grep -q 'Packages/RepoPromptServer/\*\*' "$portable_workflow"; then
@@ -337,13 +341,13 @@ if workspace_tests is None or workspace_tests.get("path") != "Tests/RepoPromptWo
     errors.append("RepoPromptWorkspaceCoreTests root target contract drifted")
 
 allowed_edges = {
-    "RepoPromptRuntimeModel": {"Crypto"},
+    "RepoPromptRuntimeModel": set(),
     "RepoPromptAuthorityAPI": {"RepoPromptRuntimeModel"},
     "RepoPromptShared": {"Crypto"},
     "RepoPromptAgentRuntimeCore": {"RepoPromptRuntimeModel"},
     "RepoPromptWorkspaceRuntimeCore": {"RepoPromptRuntimeModel", "RepoPromptShared"},
     "RepoPromptDomainRuntime": {"RepoPromptShared", "RepoPromptRuntimeModel", "RepoPromptC", "RepoPromptCodeMapCore", "Crypto", "Logging", "MCP"},
-    "RepoPromptHeadlessRuntime": {"RepoPromptRuntimeModel", "RepoPromptAuthorityAPI", "RepoPromptAgentRuntimeCore", "RepoPromptWorkspaceRuntimeCore", "RepoPromptDomainRuntime"},
+    "RepoPromptHeadlessRuntime": {"RepoPromptRuntimeModel", "RepoPromptAuthorityAPI", "RepoPromptShared", "RepoPromptAgentRuntimeCore", "RepoPromptWorkspaceRuntimeCore", "RepoPromptDomainRuntime"},
     "RepoPromptLinuxSupport": set(),
     "RepoPromptRegexCore": {"CSwiftPCRE2"},
     "RepoPromptC": set(),

@@ -1,6 +1,4 @@
 import Foundation
-import RepoPromptAgentRuntimeCore
-import RepoPromptRuntimeModel
 
 extension CodexIntegrationConfiguration.ServerEntry: Equatable {
     static func == (
@@ -101,17 +99,6 @@ enum AgentProviderPermissionLevelID: Hashable {
         case let .grokBuild(level):
             level.rawValue
         }
-    }
-
-    var portablePermissionID: ProviderPermissionID {
-        let prefix = switch self {
-        case .codex: "codex"
-        case .claude: "claude"
-        case .openCode: "opencode"
-        case .cursor: "cursor"
-        case .grokBuild: "grok"
-        }
-        return ProviderPermissionID(rawValue: "\(prefix).\(subagentRawValue)")
     }
 
     var displayName: String {
@@ -286,47 +273,4 @@ struct AgentProviderControlsBinding: Equatable {
     let runtimePermission: AgentProviderRuntimePermissionBinding
     let codexTools: CodexToolSettingsBinding?
     let claudeTools: ClaudeToolSettingsBinding?
-
-    var portableTurnSettingsSnapshot: ProviderTurnSettingsSnapshot? {
-        guard let selectedPermission = permission.options.first(where: \.isSelected)?.id else {
-            return nil
-        }
-        switch providerID {
-        case .codex:
-            guard let codexTools else { return nil }
-            let enabledServers = Set(codexTools.mcpServerStatesByNormalizedName.compactMap { key, enabled in
-                enabled ? key : nil
-            })
-            return ProviderTurnSettingsSnapshot(
-                permissionID: selectedPermission.portablePermissionID,
-                settings: .codex(.init(
-                    bashEnabled: codexTools.bashToolEnabled,
-                    searchEnabled: codexTools.searchToolEnabled,
-                    goalsEnabled: codexTools.goalSupportEnabled,
-                    reasoningSummariesEnabled: codexTools.reasoningSummariesEnabled,
-                    memoriesEnabled: codexTools.memoriesEnabled,
-                    mcpServerIDs: enabledServers
-                ))
-            )
-        case .claude:
-            guard let claudeTools,
-                  let promptDelivery = ClaudePromptDelivery(rawValue: claudeTools.agentModePromptDelivery.rawValue)
-            else { return nil }
-            return ProviderTurnSettingsSnapshot(
-                effortID: claudeTools.effortLevel.rawValue,
-                permissionID: selectedPermission.portablePermissionID,
-                settings: .claudeCompatible(.init(
-                    bashEnabled: claudeTools.bashToolEnabled,
-                    strictMCPEnabled: claudeTools.mcpStrictModeEnabled,
-                    toolSearchEnabled: claudeTools.toolSearchEnabled,
-                    promptDelivery: promptDelivery
-                ))
-            )
-        case .openCode, .cursor, .grokBuild:
-            return ProviderTurnSettingsSnapshot(
-                permissionID: selectedPermission.portablePermissionID,
-                settings: .acp
-            )
-        }
-    }
 }

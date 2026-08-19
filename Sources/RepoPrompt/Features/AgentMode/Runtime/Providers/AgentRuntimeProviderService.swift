@@ -1,6 +1,5 @@
 import Foundation
 import Logging
-import RepoPromptRuntimeModel
 
 enum ClaudeCodeRuntimeVariant: String {
     case standard
@@ -45,19 +44,6 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     case claudeCodeGLM
     case kimiCode
     case customClaudeCompatible
-
-    var portableSettingsID: ProviderSettingsID {
-        switch self {
-        case .claudeCode: .claudeCompatible
-        case .codexExec: .codex
-        case .openCode: .openCodeACP
-        case .cursor: .cursorACP
-        case .grokBuild: .grokBuildACP
-        case .claudeCodeGLM: .claudeGLM
-        case .kimiCode: .claudeKimi
-        case .customClaudeCompatible: .claudeCustom
-        }
-    }
 
     static let claudeMCPClientID = "claude-code"
     static let codexMCPClientID = "codex-mcp-client"
