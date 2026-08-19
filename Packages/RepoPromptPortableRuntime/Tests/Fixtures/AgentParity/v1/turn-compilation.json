@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "sectionOrder": ["continuation-context", "provider-instructions", "workflow-guidance", "goal-guidance", "skill", "native-command", "tagged-file", "user-request"],
+  "nativeImagesSeparate": true,
+  "attachmentOnlyRequiresNativeImageCapability": true
+}

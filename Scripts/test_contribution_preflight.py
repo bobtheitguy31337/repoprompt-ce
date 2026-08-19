@@ -34,6 +34,7 @@ PHASE_IDS = [
     "swift_lint",
     "root_tests",
     "provider_tests",
+    "portable_tests",
     "repoprompt_build",
     "mcp_build",
     "xcode_generator_tests",
@@ -46,6 +47,7 @@ CI_APP_TEST_RUNNER_SELFTEST_TARGET = "ci-app-test-runner-selftest"
 SWIFT_LINT_TARGET = "dev-lint"
 ROOT_TEST_TARGET = "dev-test"
 PROVIDER_TEST_TARGET = "dev-provider-test"
+PORTABLE_TEST_TARGET = "dev-portable-test"
 REPOPROMPT_BUILD_TARGET = "dev-swift-build PRODUCT=RepoPrompt"
 MCP_BUILD_TARGET = "dev-swift-build PRODUCT=repoprompt-mcp"
 XCODE_GENERATOR_TEST_TARGET = "xcode-generator-test"
@@ -624,9 +626,16 @@ class ContributionPreflightTests(unittest.TestCase):
                 [GUARDRAILS_TARGET, SWIFT_LINT_TARGET, MCP_BUILD_TARGET],
             ),
             (
-                "shared Swift path",
-                "Sources/RepoPromptShared/MCP/Example.swift",
-                [GUARDRAILS_TARGET, SWIFT_LINT_TARGET, MCP_BUILD_TARGET],
+                "portable shared Swift path",
+                "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/MCP/Example.swift",
+                [
+                    GUARDRAILS_TARGET,
+                    SWIFT_LINT_TARGET,
+                    ROOT_TEST_TARGET,
+                    PORTABLE_TEST_TARGET,
+                    REPOPROMPT_BUILD_TARGET,
+                    MCP_BUILD_TARGET,
+                ],
             ),
             (
                 "non-selected docs path",

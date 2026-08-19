@@ -1,0 +1,69 @@
+name: Portable Runtime
+
+on:
+  pull_request:
+    paths:
+      - "Packages/RepoPromptPortableRuntime/**"
+      - "Packages/RepoPromptServer/**"
+      - "Package.swift"
+      - "Package.resolved"
+      - "Makefile"
+      - "Scripts/conductor.py"
+      - "Scripts/source_layout_guardrails.sh"
+      - "Scripts/test_conductor_lifecycle.py"
+      - ".github/workflows/portable-runtime.yml"
+      - ".github/workflows/linux-server.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "Packages/RepoPromptPortableRuntime/**"
+      - "Packages/RepoPromptServer/**"
+      - "Package.swift"
+      - "Package.resolved"
+      - "Makefile"
+      - "Scripts/conductor.py"
+      - "Scripts/source_layout_guardrails.sh"
+      - "Scripts/test_conductor_lifecycle.py"
+      - ".github/workflows/portable-runtime.yml"
+      - ".github/workflows/linux-server.yml"
+
+concurrency:
+  group: portable-runtime-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Restore portable SwiftPM cache
+        uses: actions/cache@v6
+        with:
+          path: Packages/RepoPromptPortableRuntime/.build
+          key: ${{ runner.os }}-${{ runner.arch }}-portable-${{ hashFiles('Packages/RepoPromptPortableRuntime/Package.swift', 'Packages/RepoPromptPortableRuntime/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-portable-
+
+      - name: Validate portable imports
+        run: Scripts/source_layout_guardrails.sh portable-imports
+
+      - name: Build portable package
+        working-directory: Packages/RepoPromptPortableRuntime
+        run: swift build --disable-automatic-resolution
+
+      - name: Test portable package
+        working-directory: Packages/RepoPromptPortableRuntime
+        run: swift test --disable-automatic-resolution
