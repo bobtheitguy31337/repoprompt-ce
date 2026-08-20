@@ -65,6 +65,7 @@ var repoPromptAppSwiftSettings: [SwiftSetting] = [
 
 var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptApp",
+    "RepoPromptHeadlessLaunchBridge",
     .product(name: "RepoPromptRuntimeModel", package: "RepoPromptPortableRuntime"),
     .product(name: "RepoPromptAgentRuntimeCore", package: "RepoPromptPortableRuntime"),
     .product(name: "RepoPromptDomainRuntime", package: "RepoPromptPortableRuntime"),
@@ -109,6 +110,10 @@ let package = Package(
             path: "Sources/RepoPromptWorkspaceCore"
         ),
         .target(
+            name: "RepoPromptHeadlessLaunchBridge",
+            path: "Sources/RepoPromptHeadlessLaunchBridge"
+        ),
+        .target(
             name: "RepoPromptApp",
             dependencies: repoPromptAppDependencies,
             path: "Sources/RepoPrompt",
@@ -117,6 +122,7 @@ let package = Package(
         .executableTarget(
             name: "RepoPromptMCP",
             dependencies: [
+                "RepoPromptHeadlessLaunchBridge",
                 .product(name: "RepoPromptShared", package: "RepoPromptPortableRuntime"),
                 .product(name: "RepoPromptDomainRuntime", package: "RepoPromptPortableRuntime"),
                 .product(name: "RepoPromptCodeMapCore", package: "RepoPromptPortableRuntime"),
