@@ -328,12 +328,12 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
             // admission/authentication failure if the provider cannot execute.
             let hasKnownModels = sources.contains { !$0.models.isEmpty }
             let catalogReady = settings.runtimePreflightVerified && settings.preflight.ready
-                || (hasKnownModels && settings.authentication.state != .notConfigured)
+                || (hasKnownModels && settings.configurationPresent)
             states.append(.init(
                 providerID: matrix.providerID,
                 displayName: settings.displayName,
                 enabled: settings.preference.enabled && settings.deploymentAllowed,
-                configured: settings.preflight.ready || settings.authentication.state != .notConfigured,
+                configured: settings.preflight.ready || settings.configurationPresent,
                 preflightReady: catalogReady,
                 adapterAvailable: adapters[matrix.providerID] != nil,
                 discoveryPolicy: matrix.discoveryPolicy,

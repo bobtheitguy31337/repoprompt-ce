@@ -79,15 +79,92 @@ public struct UnavailableProviderCredentialTester: ProviderCredentialTesting {
     ) async {}
 }
 
-public struct ProviderManagedAccountSummary: Sendable, Equatable {
-    public let account: String
-    public let plan: String
-    public let authentication: String
+/// Runtime input for establishing a provider connection. This is deliberately
+/// non-Codable: future Server protocol code owns credential-bearing wire input.
+/// The prototype rejects key-helper and workload-identity connections before
+/// reading their wire-only structured fields, so those fields remain deferred.
+public struct ProviderConnectionInput: Sendable {
+    public let authenticationMethod: ProviderAuthenticationMethod
+    public let credential: Data?
+    public let accountLabel: String?
+    public let expiresAt: Date?
 
-    public init(account: String, plan: String, authentication: String) {
-        self.account = account
-        self.plan = plan
-        self.authentication = authentication
+    public init(
+        authenticationMethod: ProviderAuthenticationMethod,
+        credential: Data? = nil,
+        accountLabel: String? = nil,
+        expiresAt: Date? = nil
+    ) {
+        self.authenticationMethod = authenticationMethod
+        self.credential = credential
+        self.accountLabel = accountLabel
+        self.expiresAt = expiresAt
+    }
+}
+
+public enum ProviderManagedAuthenticationFlowKind: Sendable, Equatable {
+    case browserOAuth
+    case deviceCodeBeta
+    case externalProvisioning
+}
+
+public struct ProviderManagedAuthenticationFlowCapability: Sendable, Equatable {
+    public let kind: ProviderManagedAuthenticationFlowKind
+    public let displayName: String
+    public let startable: Bool
+    public let detail: String
+
+    public init(
+        kind: ProviderManagedAuthenticationFlowKind,
+        displayName: String,
+        startable: Bool,
+        detail: String
+    ) {
+        self.kind = kind
+        self.displayName = displayName
+        self.startable = startable
+        self.detail = detail
+    }
+}
+
+public enum ProviderManagedAuthenticationTransactionState: Sendable, Equatable {
+    case pending
+    case completed
+    case failed
+    case cancelled
+    case expired
+}
+
+/// Runtime adapter result. Future Server protocol code maps this to an
+/// authenticated, browser-safe response rather than exposing it directly.
+public struct ProviderManagedAuthenticationTransaction: Sendable, Equatable {
+    public let flowID: UUID
+    public let providerID: ProviderSettingsID
+    public let kind: ProviderManagedAuthenticationFlowKind
+    public let state: ProviderManagedAuthenticationTransactionState
+    public let userCode: String?
+    public let verificationURL: URL?
+    public let expiresAt: Date
+    public let detail: String?
+
+    public init(
+        flowID: UUID,
+        providerID: ProviderSettingsID,
+        kind: ProviderManagedAuthenticationFlowKind,
+        state: ProviderManagedAuthenticationTransactionState,
+        userCode: String? = nil,
+        verificationURL: URL? = nil,
+        expiresAt: Date,
+        detail: String? = nil
+    ) {
+        self.flowID = flowID
+        self.providerID = providerID
+        self.kind = kind
+        self.state = state
+        self.userCode = userCode
+        self.verificationURL = verificationURL
+        self.expiresAt = expiresAt
+        self.detail = detail
     }
 }
 
@@ -101,13 +178,10 @@ public protocol ProviderManagedAuthenticationDriving: Sendable {
     func authFlowDescriptor(
         providerID: ProviderSettingsID,
         forceRefresh: Bool
-    ) async -> ProviderAuthFlowDescriptor?
+    ) async -> ProviderManagedAuthenticationFlowCapability?
     func authenticationState(
         providerID: ProviderSettingsID
     ) async -> ProviderManagedAuthenticationState
-    func accountSummary(
-        providerID: ProviderSettingsID
-    ) async -> ProviderManagedAccountSummary?
     func discoverModelCatalog(
         providerID: ProviderSettingsID,
         forceRefresh: Bool
@@ -116,12 +190,6 @@ public protocol ProviderManagedAuthenticationDriving: Sendable {
 }
 
 public extension ProviderManagedAuthenticationDriving {
-    func accountSummary(
-        providerID _: ProviderSettingsID
-    ) async -> ProviderManagedAccountSummary? {
-        nil
-    }
-
     func discoverModelCatalog(
         providerID _: ProviderSettingsID,
         forceRefresh _: Bool
@@ -138,7 +206,7 @@ public struct UnavailableProviderManagedAuthenticationDriver:
     public func authFlowDescriptor(
         providerID _: ProviderSettingsID,
         forceRefresh _: Bool
-    ) async -> ProviderAuthFlowDescriptor? {
+    ) async -> ProviderManagedAuthenticationFlowCapability? {
         nil
     }
 

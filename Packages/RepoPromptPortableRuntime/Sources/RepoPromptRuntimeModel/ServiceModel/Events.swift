@@ -1,15 +1,5 @@
 import Foundation
 
-public struct ServiceEventSigningKey: Sendable {
-    public let keyID: String
-    public let secret: Data
-
-    public init(keyID: String, secret: Data) {
-        self.keyID = keyID
-        self.secret = secret
-    }
-}
-
 public enum JSONValue: Codable, Hashable, Sendable {
     case object([String: JSONValue])
     case array([JSONValue])

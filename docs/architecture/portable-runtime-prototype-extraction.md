@@ -109,7 +109,7 @@ events, and reconciliation values. `AuthorityStoreRecords.swift` contains persis
 records required by the authority port but no SQLite behavior. PR 3 retains and maps actual
 HTTP/authentication envelopes at the Server boundary.
 
-The committed prototype closure contains 30 files. PR 2 retains the 28 genuinely portable
+The committed prototype closure contains 30 files. PR 2 retains the 27 genuinely portable
 semantic files:
 
 `AdvancedServerSettingsDTOs.swift`, `AgentModelSettingsDTOs.swift`, `Commands.swift`,
@@ -117,7 +117,7 @@ semantic files:
 `DirectAgentPermissionSettingsDTOs.swift`, `DirectProviderSettingsDTOs.swift`,
 `DurabilityDTOs.swift`, `Errors.swift`, `Events.swift`, `Identifiers.swift`,
 `MCPClientIdentity.swift`, `MCPDisabledToolsSettingsDTOs.swift`, `MCPModelPresetDTOs.swift`,
-`PortalSessionDTOs.swift`, `ProviderConnectionDTOs.swift`, `ProviderSettingsDTOs.swift`,
+`ProviderConnectionDTOs.swift`, `ProviderSettingsDTOs.swift`,
 `SavedPromptDTOs.swift`, `SelectionPresetDTOs.swift`, `ServerSettingsDTOs.swift`,
 `Snapshots.swift`, `SubagentPermissionSettingsDTOs.swift`,
 `TranscriptPresentationWireDTOs.swift`, `WireDTOs.swift`, `WorkflowPresetDTOs.swift`,
@@ -125,9 +125,15 @@ semantic files:
 
 `CanonicalSigning.swift` is excluded because canonical envelope serialization and transport
 authentication belong to future `RepoPromptServiceProtocol`; `PortalDesktopSettingsDTOs.swift`
-is excluded because portal request/projection ownership is also Server protocol scope. Shared
-owns the narrower cross-platform SHA-256 content digest used by portable runtime identities,
-so RuntimeModel has no Crypto edge. Portable fixture and RuntimeModel tests cover decoding,
+and `PortalSessionDTOs.swift` are excluded because portal request/projection ownership is also
+Server protocol scope. `ConnectProviderRequest`, the provider auth-flow/browser projection
+DTOs, and `ServiceEventSigningKey` are likewise deferred. Headless preserves the established
+credential and managed-auth behavior through non-Codable runtime ports, while its catalog
+uses only the semantic `authenticationConfigured` state required by portable admission. The
+prototype's key-helper/workload-identity connect branches reject `capabilityMissing` before
+reading their wire-only structured fields, so PR 2 does not invent portable replacements.
+Shared owns the narrower cross-platform SHA-256 content digest used by portable runtime
+identities, so RuntimeModel has no Crypto edge. Portable fixture and RuntimeModel tests cover decoding,
 default, raw-value, and provider-setting compatibility; exhaustive Agent tests cover every
 provider, permission, effort/settings path, resource scope, and malformed-input rejection.
 No dead Desktop projection API or test-only parity bridge is retained.

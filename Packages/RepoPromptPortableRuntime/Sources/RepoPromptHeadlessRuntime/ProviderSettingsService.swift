@@ -5,19 +5,27 @@ import RepoPromptRuntimeModel
 import RepoPromptWorkspaceRuntimeCore
 
 public protocol ProviderAuthFlowCoordinating: Sendable {
-    func start(providerID: ProviderSettingsID, kind: ProviderAuthFlowKind, ownerID: String) async throws -> ProviderAuthTransactionStatus
-    func poll(flowID: UUID, ownerID: String) async throws -> ProviderAuthTransactionStatus
+    func start(
+        providerID: ProviderSettingsID,
+        kind: ProviderManagedAuthenticationFlowKind,
+        ownerID: String
+    ) async throws -> ProviderManagedAuthenticationTransaction
+    func poll(flowID: UUID, ownerID: String) async throws -> ProviderManagedAuthenticationTransaction
     func cancel(flowID: UUID, ownerID: String) async throws
 }
 
 public struct UnavailableProviderAuthFlowCoordinator: ProviderAuthFlowCoordinating {
     public init() {}
 
-    public func start(providerID _: ProviderSettingsID, kind _: ProviderAuthFlowKind, ownerID _: String) async throws -> ProviderAuthTransactionStatus {
+    public func start(
+        providerID _: ProviderSettingsID,
+        kind _: ProviderManagedAuthenticationFlowKind,
+        ownerID _: String
+    ) async throws -> ProviderManagedAuthenticationTransaction {
         throw ServiceAPIError(code: .capabilityMissing, message: "A server-side provider authentication adapter is not installed")
     }
 
-    public func poll(flowID _: UUID, ownerID _: String) async throws -> ProviderAuthTransactionStatus {
+    public func poll(flowID _: UUID, ownerID _: String) async throws -> ProviderManagedAuthenticationTransaction {
         throw ServiceAPIError(code: .notFound, message: "Provider authentication transaction was not found")
     }
 
@@ -26,9 +34,8 @@ public struct UnavailableProviderAuthFlowCoordinator: ProviderAuthFlowCoordinati
     }
 }
 
-/// Provider/settings authority for the Linux portal. It owns only non-secret
-/// preferences and browser-safe projections; native process/session authority
-/// remains in `ProviderCLIAdapter`.
+/// Portable provider/settings authority. It owns non-secret preferences and
+/// runtime connection behavior; future Server protocol code owns wire projections.
 public actor ProviderSettingsService {
     private struct AuthFlowContext {
         let attribution: ProviderMutationAttribution
@@ -45,8 +52,6 @@ public actor ProviderSettingsService {
 
     private struct SanitizedAuthenticationDocument: Decodable {
         let authenticated: Bool
-        let method: ProviderAuthenticationMethod?
-        let expiresAt: Date?
     }
 
     private struct ExternalAuthenticationValidation {
@@ -74,8 +79,7 @@ public actor ProviderSettingsService {
     private var modelCatalogs: [ProviderSettingsID: [ProviderModelCatalogEntry]] = [:]
     private var directConfigurations: [ProviderSettingsID: DirectProviderConfiguration] = [:]
     private var connections: [ProviderSettingsID: StoredProviderConnection] = [:]
-    private var managedAuthFlowDescriptors: [ProviderSettingsID: [ProviderAuthFlowDescriptor]] = [:]
-    private var managedAccountSummaries: [ProviderSettingsID: ProviderManagedAccountSummary] = [:]
+    private var managedAuthFlowCapabilities: [ProviderSettingsID: [ProviderManagedAuthenticationFlowCapability]] = [:]
     private var authFlowContexts: [UUID: AuthFlowContext] = [:]
     private var statusRefreshTasks: [ProviderSettingsID: Task<Void, Never>] = [:]
     private var statusRefreshedAt: [ProviderSettingsID: Date] = [:]
@@ -357,13 +361,17 @@ public actor ProviderSettingsService {
         )
     }
 
-    public func startAuthFlow(providerID: ProviderSettingsID, request: StartProviderAuthFlowRequest, attribution: ProviderMutationAttribution) async throws -> ProviderAuthTransactionStatus {
+    public func startAuthFlow(
+        providerID: ProviderSettingsID,
+        kind: ProviderManagedAuthenticationFlowKind,
+        attribution: ProviderMutationAttribution
+    ) async throws -> ProviderManagedAuthenticationTransaction {
         await refreshManagedAuthenticationCapabilities(providerID: providerID, forceRefresh: true)
-        let descriptor = managedAuthFlowDescriptors[providerID, default: []].first { $0.kind == request.kind }
-        guard descriptor?.startable == true else {
-            throw ServiceAPIError(code: .capabilityMissing, message: descriptor?.detail ?? "Provider authentication flow is unavailable")
+        let capability = managedAuthFlowCapabilities[providerID, default: []].first { $0.kind == kind }
+        guard capability?.startable == true else {
+            throw ServiceAPIError(code: .capabilityMissing, message: capability?.detail ?? "Provider authentication flow is unavailable")
         }
-        let status = try await authFlows.start(providerID: providerID, kind: request.kind, ownerID: attribution.actorID)
+        let status = try await authFlows.start(providerID: providerID, kind: kind, ownerID: attribution.actorID)
         authFlowContexts[status.flowID] = AuthFlowContext(
             attribution: attribution,
             providerID: providerID,
@@ -380,7 +388,7 @@ public actor ProviderSettingsService {
         return status
     }
 
-    public func pollAuthFlow(flowID: UUID, ownerID: String) async throws -> ProviderAuthTransactionStatus {
+    public func pollAuthFlow(flowID: UUID, ownerID: String) async throws -> ProviderManagedAuthenticationTransaction {
         let status = try await authFlows.poll(flowID: flowID, ownerID: ownerID)
         guard status.state != .pending else { return status }
         guard let context = authFlowContexts.removeValue(forKey: flowID) else { return status }
@@ -393,7 +401,7 @@ public actor ProviderSettingsService {
                 operation: "authFlowFinish",
                 attribution: context.attribution,
                 authenticationMethod: .deviceCodeBeta,
-                result: status.state.rawValue
+                result: auditResult(for: status.state)
             )
         }
         return status
@@ -413,7 +421,8 @@ public actor ProviderSettingsService {
         }
     }
 
-    public func connect(providerID: ProviderSettingsID, request: ConnectProviderRequest, attribution: ProviderMutationAttribution) async throws -> ProviderSettingsSnapshot {
+    public func connect(providerID: ProviderSettingsID, input: ProviderConnectionInput, attribution: ProviderMutationAttribution) async throws -> ProviderSettingsSnapshot {
+        let request = input
         guard supportedAuthenticationMethods[providerID, default: []].contains(request.authenticationMethod) else {
             throw ServiceAPIError(code: .capabilityMissing, message: "Authentication method is not supported by this provider")
         }
@@ -631,9 +640,9 @@ public actor ProviderSettingsService {
 
     private func refreshManagedAuthenticationCapabilities(providerID: ProviderSettingsID, forceRefresh: Bool) async {
         if let descriptor = await managedAuthentication.authFlowDescriptor(providerID: providerID, forceRefresh: forceRefresh) {
-            managedAuthFlowDescriptors[providerID] = [descriptor]
+            managedAuthFlowCapabilities[providerID] = [descriptor]
         } else {
-            managedAuthFlowDescriptors[providerID] = []
+            managedAuthFlowCapabilities[providerID] = []
         }
     }
 
@@ -683,7 +692,6 @@ public actor ProviderSettingsService {
     private func reconcileManagedAuthentication(attribution: ProviderMutationAttribution) async throws {
         let providerID = ProviderSettingsID.codex
         let state = await managedAuthentication.authenticationState(providerID: providerID)
-        managedAccountSummaries[providerID] = await managedAuthentication.accountSummary(providerID: providerID)
         let current = connections[providerID]
         if current == nil, case let .authenticated(accountLabel) = state {
             let now = Date()
@@ -764,11 +772,16 @@ public actor ProviderSettingsService {
         channel: "provider-lifecycle"
     )
 
-    private func credentialMaterial(_ request: ConnectProviderRequest, providerID: ProviderSettingsID) throws -> Data? {
+    private func credentialMaterial(_ request: ProviderConnectionInput, providerID: ProviderSettingsID) throws -> Data? {
         switch request.authenticationMethod {
         case .apiKey, .enterpriseAccessToken, .authToken:
-            guard let value = request.credential?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  value.utf8.count >= 8,
+            guard let credential = request.credential,
+                  let rawValue = String(data: credential, encoding: .utf8)
+            else {
+                throw ServiceAPIError(code: .invalidRequest, message: "A valid write-only credential is required")
+            }
+            let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard value.utf8.count >= 8,
                   value.utf8.count <= 65536,
                   !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
             else {
@@ -1081,48 +1094,31 @@ public actor ProviderSettingsService {
             cli: providerID.isDirectAPI || providerID.runtimeKind == nil
                 ? nil
                 : cliHealth[runtimeSettingsID] ?? ProviderCLIHealth(installed: false, healthy: false, detail: "CLI health has not been checked"),
-            authentication: authenticationStatus(providerID),
+            configurationPresent: configurationPresent(providerID),
             connection: connection,
             preflight: preflight,
-            capabilities: projectedCapabilities(definition.capabilities, providerID: providerID, deploymentAllowed: deploymentAllowed),
+            capabilities: projectedCapabilities(
+                definition.capabilities,
+                providerID: providerID,
+                deploymentAllowed: deploymentAllowed
+            ),
             models: models
         )
     }
 
-    private func authenticationStatus(_ providerID: ProviderSettingsID) -> ProviderAuthenticationStatus {
-        if let connection = connections[providerID]?.record {
-            let expired = connection.expiresAt.map { $0 <= Date() } ?? false
-            return ProviderAuthenticationStatus(
-                state: connection.state == .connected && !expired ? .authenticated : .attention,
-                authenticated: connection.state == .connected && !expired,
-                method: connection.authenticationMethod,
-                accountLabel: managedAccountSummaries[providerID]?.account ?? connection.accountLabel,
-                planLabel: managedAccountSummaries[providerID]?.plan,
-                authenticationLabel: managedAccountSummaries[providerID]?.authentication,
-                expiresAt: connection.expiresAt,
-                detail: expired ? "Provider credential has expired" : connection.detail
-            )
-        }
+    private func configurationPresent(_ providerID: ProviderSettingsID) -> Bool {
+        if connections[providerID] != nil { return true }
         if let path = authenticationStatusFiles[providerID],
            let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-           let document = try? JSONDecoder.serviceDecoder.decode(SanitizedAuthenticationDocument.self, from: data)
+           (try? JSONDecoder.serviceDecoder.decode(SanitizedAuthenticationDocument.self, from: data)) != nil
         {
-            return ProviderAuthenticationStatus(
-                state: document.authenticated ? .authenticated : .attention,
-                authenticated: document.authenticated,
-                method: document.method,
-                expiresAt: document.expiresAt,
-                detail: document.authenticated ? "Authenticated" : "Authentication requires attention"
-            )
+            return true
         }
-        if let kind = providerID.runtimeKind,
-           providerID.ownsRuntimeAdmission,
-           let source = configurations[kind]?.credentialSourceDirectory,
-           FileManager.default.fileExists(atPath: source)
-        {
-            return ProviderAuthenticationStatus(state: .unknown, authenticated: false, detail: "Credential home is mounted; sanitized account status is unavailable")
-        }
-        return ProviderAuthenticationStatus(state: .notConfigured, authenticated: false, detail: "Provision credentials on the server")
+        guard let kind = providerID.runtimeKind,
+              providerID.ownsRuntimeAdmission,
+              let source = configurations[kind]?.credentialSourceDirectory
+        else { return false }
+        return FileManager.default.fileExists(atPath: source)
     }
 
     private func preflightStatus(providerID: ProviderSettingsID, preference: ProviderSettingsPreference, deploymentAllowed: Bool, runtimeVerified: Bool, connection: ProviderConnectionRecord?, cli: ProviderCLIHealth?) -> ProviderPreflightStatus {
@@ -1305,32 +1301,34 @@ public actor ProviderSettingsService {
             && !ProviderSecretRedaction.containsLikelySecret(value)
     }
 
+    private func auditResult(for state: ProviderManagedAuthenticationTransactionState) -> String {
+        switch state {
+        case .pending: "pending"
+        case .completed: "completed"
+        case .failed: "failed"
+        case .cancelled: "cancelled"
+        case .expired: "expired"
+        }
+    }
+
     private func projectedCapabilities(
         _ capabilities: ProviderSettingsCapabilities,
         providerID: ProviderSettingsID,
         deploymentAllowed: Bool
     ) -> ProviderSettingsCapabilities {
         var supported = supportedAuthenticationMethods[providerID, default: []]
-        var flows = managedAuthFlowDescriptors[providerID, default: []]
-        if providerID == .codex,
-           deploymentAllowed,
-           !flows.contains(where: { $0.kind == .deviceCodeBeta })
+        let managedCapabilities = managedAuthFlowCapabilities[providerID, default: []]
+        if managedCapabilities.contains(where: { $0.kind == .deviceCodeBeta })
+            || (providerID == .codex && deploymentAllowed)
         {
-            flows.append(.init(
-                kind: .deviceCodeBeta,
-                displayName: "ChatGPT device authorization",
-                startable: false,
-                detail: "RepoPrompt is checking the Codex runtime. Device authorization settings remain available while this status refreshes."
-            ))
+            supported.insert(.deviceCodeBeta)
         }
-        if flows.contains(where: { $0.kind == .deviceCodeBeta }) { supported.insert(.deviceCodeBeta) }
         return .init(
             supportsModelSelection: capabilities.supportsModelSelection,
             supportsReasoningEffort: capabilities.supportsReasoningEffort,
             supportsSpeedMode: capabilities.supportsSpeedMode,
             supportsServiceTier: capabilities.supportsServiceTier,
-            authenticationMethods: ProviderAuthenticationMethod.allCases.filter(supported.contains),
-            authFlows: flows
+            authenticationMethods: ProviderAuthenticationMethod.allCases.filter(supported.contains)
         )
     }
 
@@ -1344,45 +1342,45 @@ public actor ProviderSettingsService {
     private nonisolated static func definition(_ providerID: ProviderSettingsID) -> Definition {
         switch providerID {
         case .codex:
-            Definition(displayName: "Codex", category: .cliProvider, summary: "OpenAI Codex app-server with isolated CODEX_HOME", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: true, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "Codex", category: .cliProvider, summary: "OpenAI Codex app-server with isolated CODEX_HOME", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: true))
         case .claudeCompatible:
-            Definition(displayName: "Claude Code", category: .cliProvider, summary: "Claude-compatible stream JSON with isolated CLAUDE_CONFIG_DIR", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "Claude Code", category: .cliProvider, summary: "Claude-compatible stream JSON with isolated CLAUDE_CONFIG_DIR", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false))
         case .claudeGLM:
-            Definition(displayName: "CC Zai", category: .cliProvider, summary: "Z.ai coding-plan backend launched through the packaged Claude Code CLI", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "CC Zai", category: .cliProvider, summary: "Z.ai coding-plan backend launched through the packaged Claude Code CLI", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false))
         case .claudeKimi:
-            Definition(displayName: "CC Moonshot", category: .cliProvider, summary: "Kimi coding-plan backend launched through the packaged Claude Code CLI", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "CC Moonshot", category: .cliProvider, summary: "Kimi coding-plan backend launched through the packaged Claude Code CLI", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false))
         case .claudeCustom:
-            Definition(displayName: "CC Custom", category: .cliProvider, summary: "Custom Claude Code-compatible HTTPS backend", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "CC Custom", category: .cliProvider, summary: "Custom Claude Code-compatible HTTPS backend", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false))
         case .openCodeACP:
-            Definition(displayName: "OpenCode", category: .cliProvider, summary: "Provider-specific ACP catalog and authentication", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "OpenCode", category: .cliProvider, summary: "Provider-specific ACP catalog and authentication", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false))
         case .cursorACP:
-            Definition(displayName: "Cursor", category: .cliProvider, summary: "Cursor ACP with externally provisioned authentication", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "Cursor", category: .cliProvider, summary: "Cursor ACP with externally provisioned authentication", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false))
         case .grokBuildACP:
-            Definition(displayName: "Grok Build", category: .cliProvider, summary: "Grok Build ACP (`grok agent stdio`) with grok login home or XAI_API_KEY", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "Grok Build", category: .cliProvider, summary: "Grok Build ACP (`grok agent stdio`) with grok login home or XAI_API_KEY", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false))
         case .openAIAPI:
-            Definition(displayName: "OpenAI API", category: .apiProvider, summary: "Direct fixed-host OpenAI HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: true, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "OpenAI API", category: .apiProvider, summary: "Direct fixed-host OpenAI HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: true))
         case .anthropicAPI:
-            Definition(displayName: "Anthropic API", category: .apiProvider, summary: "Direct fixed-host Anthropic Messages HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "Anthropic API", category: .apiProvider, summary: "Direct fixed-host Anthropic Messages HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false))
         case .openRouter:
-            Definition(displayName: "OpenRouter", category: .apiProvider, summary: "Direct fixed-host OpenRouter HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "OpenRouter", category: .apiProvider, summary: "Direct fixed-host OpenRouter HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false))
         case .customOpenAICompatible:
-            Definition(displayName: "Custom OpenAI-Compatible", category: .apiProvider, summary: "Public HTTPS OpenAI-compatible runtime with pinned-address egress", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "Custom OpenAI-Compatible", category: .apiProvider, summary: "Public HTTPS OpenAI-compatible runtime with pinned-address egress", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false))
         case .gemini:
-            Definition(displayName: "Gemini", category: .apiProvider, summary: "Direct fixed-host Gemini HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "Gemini", category: .apiProvider, summary: "Direct fixed-host Gemini HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false))
         case .azure:
-            Definition(displayName: "Azure", category: .apiProvider, summary: "Direct Azure OpenAI HTTPS runtime with persisted resource URL and API version", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "Azure", category: .apiProvider, summary: "Direct Azure OpenAI HTTPS runtime with persisted resource URL and API version", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false))
         case .deepseek:
-            Definition(displayName: "DeepSeek", category: .apiProvider, summary: "Direct fixed-host DeepSeek HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "DeepSeek", category: .apiProvider, summary: "Direct fixed-host DeepSeek HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false))
         case .fireworks:
-            Definition(displayName: "Fireworks", category: .apiProvider, summary: "Direct fixed-host Fireworks HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "Fireworks", category: .apiProvider, summary: "Direct fixed-host Fireworks HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false))
         case .xAI:
-            Definition(displayName: "xAI", category: .apiProvider, summary: "Direct fixed-host xAI HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "xAI", category: .apiProvider, summary: "Direct fixed-host xAI HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: true, supportsSpeedMode: false, supportsServiceTier: false))
         case .groq:
-            Definition(displayName: "Groq", category: .apiProvider, summary: "Direct fixed-host Groq HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "Groq", category: .apiProvider, summary: "Direct fixed-host Groq HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false))
         case .zAI:
-            Definition(displayName: "Z.AI", category: .apiProvider, summary: "Direct fixed-host Z.AI HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "Z.AI", category: .apiProvider, summary: "Direct fixed-host Z.AI HTTPS runtime", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false))
         case .ollama:
-            Definition(displayName: "Ollama", category: .apiProvider, summary: "Persisted Ollama URL runtime; loopback requires REPOPROMPT_ALLOW_LOCAL_PROVIDER_URLS", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false, authenticationMethods: [], authFlows: []))
+            Definition(displayName: "Ollama", category: .apiProvider, summary: "Persisted Ollama URL runtime; loopback requires REPOPROMPT_ALLOW_LOCAL_PROVIDER_URLS", capabilities: .init(supportsModelSelection: true, supportsReasoningEffort: false, supportsSpeedMode: false, supportsServiceTier: false))
         }
     }
 

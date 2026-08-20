@@ -153,7 +153,7 @@ public struct DirectProviderConfiguration: Codable, Hashable, Sendable {
 }
 
 /// Full replacement avoids omitted-versus-null ambiguity. Credential material
-/// is intentionally absent and is accepted only by `ConnectProviderRequest`.
+/// is intentionally absent and enters only through the Headless runtime port.
 public struct UpdateDirectProviderConfigurationRequest: Codable, Hashable, Sendable {
     public let expectedRevision: Int64
     public let baseURL: String?

@@ -41,9 +41,11 @@ portable_import_guard() {
     fail "transport signing/authentication belongs to future RepoPromptServiceProtocol"
   [[ ! -e "$portable_sources/RepoPromptRuntimeModel/ServiceModel/PortalDesktopSettingsDTOs.swift" ]] || \
     fail "portal request/projection DTOs belong to future RepoPromptServiceProtocol"
+  [[ ! -e "$portable_sources/RepoPromptRuntimeModel/ServiceModel/PortalSessionDTOs.swift" ]] || \
+    fail "portal session request/projection DTOs belong to future RepoPromptServiceProtocol"
   print_matches \
     "RuntimeModel retains a Crypto, transport-auth, or portal DTO dependency" \
-    grep -R -n -E '^import[[:space:]]+(Crypto|CryptoKit)([[:space:]]|$)|CanonicalSigning|PortalDesktop(Settings|Setting)' \
+    grep -R -n -E '^import[[:space:]]+(Crypto|CryptoKit)([[:space:]]|$)|CanonicalSigning|ServiceEventSigningKey|Portal[A-Z]|ConnectProviderRequest|ProviderAuthFlow|ProviderAuthentication(Status|State)|ProviderAuthTransaction' \
       "$portable_sources/RepoPromptRuntimeModel"
 
   print_matches \

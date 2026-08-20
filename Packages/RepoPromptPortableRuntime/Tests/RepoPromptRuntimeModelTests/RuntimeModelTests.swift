@@ -107,13 +107,6 @@ final class RuntimeModelTests: XCTestCase {
             ["connected", "attention", "disconnected"]
         )
         XCTAssertEqual(
-            [
-                ProviderAuthTransactionState.pending, .completed, .failed,
-                .cancelled, .expired
-            ].map(\.rawValue),
-            ["pending", "completed", "failed", "cancelled", "expired"]
-        )
-        XCTAssertEqual(
             RunPresentationPhase.allCases.map(\.rawValue),
             ["preparing", "thinking", "working", "waiting", "cancelling"]
         )
