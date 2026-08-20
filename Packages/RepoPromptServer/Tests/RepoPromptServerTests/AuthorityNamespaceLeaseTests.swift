@@ -173,8 +173,13 @@ final class AuthorityNamespaceLeaseTests: XCTestCase {
         XCTAssertTrue(report.mutationDrainTimedOut)
         XCTAssertTrue(report.budgetExhausted)
         XCTAssertGreaterThanOrEqual(report.elapsed, .milliseconds(5))
+        XCTAssertFalse(report.leaseReleased)
+        XCTAssertNotEqual(report.actions.last, .leaseReleased)
+        XCTAssertThrowsError(try AuthorityNamespaceLease.acquire(fixture.descriptor)) { error in
+            XCTAssertEqual((error as? ServiceAPIError)?.code, .authorityHostConflict)
+        }
         _ = try? await mutation.value
-
+        await host.forceCleanupAfterFailedShutdownForTesting()
         let reacquired = try AuthorityNamespaceLease.acquire(fixture.descriptor).lease
         reacquired.release()
     }

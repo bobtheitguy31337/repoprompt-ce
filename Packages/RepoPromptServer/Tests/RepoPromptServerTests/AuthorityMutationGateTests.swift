@@ -43,11 +43,33 @@ final class AuthorityMutationGateTests: XCTestCase {
 
     func testClosingInvalidatesReadAndMutationGenerations() async {
         let gate = AuthorityMutationGate()
+        let read = await gate.readCapability()
+        let subscription = await gate.readCapability(subscription: true)
         let before = await gate.snapshot()
+        await gate.beginDraining()
+        let drainedRead = try? await read.perform { 42 }
+        XCTAssertEqual(drainedRead, 42)
+        do {
+            _ = try await subscription.perform { 1 }
+            XCTFail("subscription unexpectedly survived drain admission closure")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .serviceDraining)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
         await gate.close()
         let after = await gate.snapshot()
         XCTAssertGreaterThan(after.mutationGeneration, before.mutationGeneration)
         XCTAssertGreaterThan(after.readGeneration, before.readGeneration)
         XCTAssertFalse(after.acceptingSubscriptions)
+        XCTAssertFalse(after.acceptingReads)
+        do {
+            _ = try await read.perform { 7 }
+            XCTFail("read capability unexpectedly survived close")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .staleCapability)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
     }
 }

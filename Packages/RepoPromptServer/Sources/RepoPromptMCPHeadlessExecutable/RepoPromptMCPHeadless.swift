@@ -4,6 +4,7 @@ import Darwin
 import Glibc
 #endif
 import Foundation
+import RepoPromptMCPAdapter
 import RepoPromptServerHost
 
 let HEADLESS_CLI_VERSION = "1.3.0"
@@ -25,10 +26,50 @@ enum RepoPromptMCPHeadlessBootstrap {
             exit(64)
         }
         do {
-            try await RepoPromptDirectHeadlessHostRunner.run()
+            if RepoPromptDirectHeadlessChildBridgeRunner.isRequested() {
+                try await RepoPromptDirectHeadlessChildBridgeRunner.run()
+                return
+            }
+            let host = try await RepoPromptDirectHeadlessComposition.start()
+            try await run(host: host)
         } catch {
             fputs("RepoPrompt private headless runtime: \(error)\n", stderr)
             exit(70)
         }
     }
+
+    static func run(
+        host: any RepoPromptMCPHeadlessHosting,
+        execute: @escaping @Sendable (
+            _ adapter: RepoPromptMCPAdapter,
+            _ binding: RepoPromptMCPBinding,
+            _ isRootSession: Bool
+        ) async throws -> Void = { adapter, binding, isRootSession in
+            try await RepoPromptMCPStdioExecution.run(
+                adapter: adapter,
+                binding: binding,
+                isRootSession: isRootSession,
+                policyProfile: .direct
+            )
+        }
+    ) async throws {
+        let adapter = RepoPromptMCPAdapter(serving: host.serving)
+        do {
+            try await execute(adapter, host.binding, host.isRootSession)
+            await host.shutdown()
+        } catch {
+            await host.shutdown()
+            throw error
+        }
+    }
 }
+
+protocol RepoPromptMCPHeadlessHosting: Sendable {
+    var serving: any RepoPromptMCPServingCapability { get }
+    var binding: RepoPromptMCPBinding { get }
+    var isRootSession: Bool { get }
+
+    func shutdown() async
+}
+
+extension RepoPromptDirectHeadlessComposition: RepoPromptMCPHeadlessHosting {}

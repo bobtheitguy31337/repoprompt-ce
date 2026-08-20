@@ -76,15 +76,27 @@ struct RepoPromptServer {
         }
         let database = value(after: "--database") ?? ProcessInfo.processInfo.environment["REPOPROMPT_STATE_DB"] ?? "/var/lib/repoprompt/state/repoprompt.sqlite"
         let root = value(after: "--project-root").map { URL(fileURLWithPath: $0, isDirectory: true) }
-        try FileManager.default.createDirectory(at: URL(fileURLWithPath: database).deletingLastPathComponent(), withIntermediateDirectories: true)
-        let store = try await SQLiteServiceStore.open(storage: .file(database))
+        let storageRoot = URL(fileURLWithPath: database).deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        let namespace = try AuthorityNamespaceDescriptor(
+            storageRoot: storageRoot.path,
+            databasePath: database,
+            profile: ProcessInfo.processInfo.environment["REPOPROMPT_PROFILE"] ?? "default",
+            servingMode: .server
+        )
+        let maintenance = try await AuthorityMaintenanceSession.open(
+            configuration: .init(namespace: namespace)
+        )
         do {
-            let report = try await LegacySessionJSONImporter.run(source: URL(fileURLWithPath: source), store: store, projectRoot: root)
-            try await store.close(clean: true)
+            let report = try await maintenance.importLegacyJSON(
+                source: URL(fileURLWithPath: source),
+                projectRoot: root
+            )
+            try await maintenance.close(clean: true)
             FileHandle.standardOutput.write(try JSONEncoder.serviceEncoder.encode(report))
             FileHandle.standardOutput.write(Data("\n".utf8))
         } catch {
-            try? await store.close(clean: false)
+            try? await maintenance.close(clean: false)
             throw error
         }
     }

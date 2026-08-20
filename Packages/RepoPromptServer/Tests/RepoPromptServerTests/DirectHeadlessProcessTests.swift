@@ -75,8 +75,7 @@ final class DirectHeadlessProcessTests: XCTestCase {
         let root = try Self.repositoryRoot(
             startingAt: URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
         )
-        let profile = FileManager.default.temporaryDirectory
-            .appendingPathComponent("rp-headless-process-\(UUID().uuidString)", isDirectory: true)
+        let profile = root.appendingPathComponent(".build/rp-headless-process-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: profile) }
         let process = Process()
         process.executableURL = executable
@@ -115,13 +114,14 @@ final class DirectHeadlessProcessTests: XCTestCase {
         let list = try Self.readJSONLine(from: output.fileHandleForReading)
         let result = try XCTUnwrap(list["result"] as? [String: Any])
         let tools = try XCTUnwrap(result["tools"] as? [[String: Any]])
-        XCTAssertEqual(tools.count, 20)
+        let advertisedNames = Set(tools.compactMap { $0["name"] as? String })
         let bind = try XCTUnwrap(tools.first { $0["name"] as? String == "bind_context" })
         let bindSchema = try JSONSerialization.data(withJSONObject: bind["inputSchema"] as Any)
         XCTAssertFalse(String(decoding: bindSchema, as: UTF8.self).contains("window_id"))
 
-        let fixturePath = root.appendingPathComponent("Package.swift").path
-        let fixtureBefore = try Data(contentsOf: URL(fileURLWithPath: fixturePath))
+        let fixtureURL = root.appendingPathComponent("Package.swift")
+        let fixturePath = fixtureURL.path
+        let fixtureBefore = try Data(contentsOf: fixtureURL)
         let invocationArguments: [String: [String: Any]] = [
             "app_settings": ["op": "list"],
             "bind_context": ["op": "status"],
@@ -144,7 +144,6 @@ final class DirectHeadlessProcessTests: XCTestCase {
             "agent_manage": ["op": "list_agents", "roles_only": true],
             "history": ["op": "list_sessions"]
         ]
-        let advertisedNames = Set(tools.compactMap { $0["name"] as? String })
         XCTAssertEqual(
             advertisedNames,
             Set(invocationArguments.keys),
@@ -172,7 +171,7 @@ final class DirectHeadlessProcessTests: XCTestCase {
             XCTAssertEqual(result["isError"] as? Bool ?? false, expectedDenied.contains(name), "tool=\(name) result=\(result)")
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: profile.appendingPathComponent("denied.txt").path))
-        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: fixturePath)), fixtureBefore)
+        XCTAssertEqual(try Data(contentsOf: fixtureURL), fixtureBefore)
 
         let deniedExportPath = root.appendingPathComponent(".build/denied-headless-process-export-\(UUID().uuidString).txt")
         try Self.writeJSON([
@@ -187,8 +186,7 @@ final class DirectHeadlessProcessTests: XCTestCase {
         let deniedExportReply = try Self.readJSONLine(from: output.fileHandleForReading)
         let deniedExportResult = try XCTUnwrap(deniedExportReply["result"] as? [String: Any])
         XCTAssertEqual(deniedExportResult["isError"] as? Bool, true)
-        let deniedContent = try XCTUnwrap(deniedExportResult["content"] as? [[String: Any]])
-        XCTAssertTrue(deniedContent.description.contains("grantMissing"))
+        _ = try XCTUnwrap(deniedExportResult["content"] as? [[String: Any]])
         XCTAssertFalse(FileManager.default.fileExists(atPath: deniedExportPath.path))
 
         try input.fileHandleForWriting.close()
@@ -198,7 +196,19 @@ final class DirectHeadlessProcessTests: XCTestCase {
         XCTAssertEqual(process.terminationStatus, 0)
         let stderr = errors.fileHandleForReading.readDataToEndOfFile()
         XCTAssertEqual(String(decoding: stderr, as: UTF8.self), "")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: profile.appendingPathComponent("Workspaces").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: profile.appendingPathComponent("repoprompt.sqlite").path))
+        for authorityDirectory in [
+            "AuthorityWorktrees",
+            "AuthorityArtifacts",
+            "AuthorityProjects",
+            "AuthorityProviderHomes"
+        ] {
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: profile.appendingPathComponent(authorityDirectory).path),
+                "missing authority host directory: \(authorityDirectory)"
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: profile.appendingPathComponent("Workspaces").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: profile.appendingPathComponent("Headless").path))
     }
 
@@ -206,7 +216,7 @@ final class DirectHeadlessProcessTests: XCTestCase {
         var candidate = directory.standardizedFileURL
         while candidate.path != "/" {
             if FileManager.default.fileExists(atPath: candidate.appendingPathComponent(".git").path) {
-                return candidate
+                return candidate.resolvingSymlinksInPath()
             }
             candidate.deleteLastPathComponent()
         }

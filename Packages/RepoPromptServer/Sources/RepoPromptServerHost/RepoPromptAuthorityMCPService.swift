@@ -33,19 +33,33 @@ private typealias RepoPromptMCPBinding = AuthorityMCPBinding
 /// The adapter deliberately owns no project, selection, conversation, run, interaction, or
 /// worktree state. Every tool invocation resolves through `RepoPromptHeadlessAuthority`; the
 /// canonical domain catalog supplies the exact 27 tool names shared with the macOS product.
+public enum RepoPromptAuthorityMCPToolPolicy: Sendable {
+    case headlessCodex
+    case direct
+}
+
 public actor RepoPromptAuthorityMCPService: RepoPromptMCPServing {
     private let authority: RepoPromptHeadlessAuthority
     private let portalSettings: PortalDesktopSettingsService
     private let mutationCapability: AuthorityMutationCapability
+    private let toolPolicy: RepoPromptAuthorityMCPToolPolicy
+    private let readCapability: AuthorityReadCapability?
+    private let subscriptionCapability: AuthorityReadCapability?
 
     public init(
         authority: RepoPromptHeadlessAuthority,
         portalSettings: PortalDesktopSettingsService,
-        mutationCapability: AuthorityMutationCapability
+        mutationCapability: AuthorityMutationCapability,
+        toolPolicy: RepoPromptAuthorityMCPToolPolicy = .headlessCodex,
+        readCapability: AuthorityReadCapability? = nil,
+        subscriptionCapability: AuthorityReadCapability? = nil
     ) {
         self.authority = authority
         self.portalSettings = portalSettings
         self.mutationCapability = mutationCapability
+        self.toolPolicy = toolPolicy
+        self.readCapability = readCapability
+        self.subscriptionCapability = subscriptionCapability
     }
 
     public nonisolated static var canonicalToolNames: [String] {
@@ -53,19 +67,54 @@ public actor RepoPromptAuthorityMCPService: RepoPromptMCPServing {
     }
 
     public func projectSnapshot(id: UUID) async throws -> ProjectSnapshot {
-        try await authority.projectSnapshot(projectID: id)
+        if let readCapability {
+            return try await readCapability.perform { [authority] in
+                try await authority.projectSnapshot(projectID: id)
+            }
+        }
+        return try await authority.projectSnapshot(projectID: id)
     }
 
     public func sessionSnapshot(id: UUID) async throws -> SessionSnapshot {
-        try await authority.sessionSnapshot(sessionID: id)
+        if let readCapability {
+            return try await readCapability.perform { [authority] in
+                try await authority.sessionSnapshot(sessionID: id)
+            }
+        }
+        return try await authority.sessionSnapshot(sessionID: id)
     }
 
     public func events(after cursor: ServiceCursor?, limit: Int) async throws -> EventPage {
-        try await authority.events(after: cursor, limit: limit)
+        if let subscriptionCapability {
+            return try await subscriptionCapability.perform { [authority] in
+                try await authority.events(after: cursor, limit: limit)
+            }
+        }
+        return try await authority.events(after: cursor, limit: limit)
     }
 
     public func advertisedToolNames(isRootSession: Bool) async -> Set<String> {
-        var names = HeadlessCodexMCPToolPolicy.advertisedToolNames(isRootSession: isRootSession)
+        var names: Set<String>
+        switch toolPolicy {
+        case .headlessCodex:
+            names = HeadlessCodexMCPToolPolicy.advertisedToolNames(isRootSession: isRootSession)
+        case .direct:
+            let classification = MCPClientToolPolicyCatalog.classification(for: .direct)
+            let restricted = MCPDomainToolCatalog.toolNames(for: classification.restrictedCapabilities)
+            let granted = MCPDomainToolCatalog.toolNames(for: classification.grantedCapabilities)
+            names = Set(MCPDomainToolCatalog.orderedToolNames.filter { toolName in
+                !restricted.contains(toolName)
+                    && (
+                        !MCPClientToolPolicyCatalog.policyGatedToolNames.contains(toolName)
+                            || granted.contains(toolName)
+                    )
+                    && MCPClientToolPolicyCatalog.shouldAdvertise(
+                        toolName: toolName,
+                        role: classification.role,
+                        allowsAgentExternalControlTools: classification.allowsAgentExternalControlTools
+                    )
+            })
+        }
         names.subtract(await authority.disabledMCPToolNames())
         return names
     }
@@ -96,6 +145,7 @@ public actor RepoPromptAuthorityMCPService: RepoPromptMCPServing {
             throw ServiceAPIError(code: .invalidRequest, message: "Tool '\(toolName)' is disabled.")
         }
         let arguments = try JSONDecoder().decode([String: Value].self, from: argumentsJSON)
+        try enforceInvocationPolicy(toolName: toolName, arguments: arguments)
         let invocation = try await authority.beginToolInvocation(sessionID: binding.sessionID, toolName: toolName, argumentDigest: CanonicalSigning.bodyDigest(argumentsJSON), actor: binding.actor)
         do {
             let backend = AuthorityToolBackend(
@@ -113,6 +163,22 @@ public actor RepoPromptAuthorityMCPService: RepoPromptMCPServing {
             let code = (error as? ServiceAPIError)?.code ?? .dependencyUnavailable
             try? await authority.finishToolInvocation(sessionID: binding.sessionID, invocation: invocation, resultDigest: nil, errorCode: code, actor: binding.actor)
             throw error
+        }
+    }
+
+    private func enforceInvocationPolicy(
+        toolName: String,
+        arguments: [String: Value]
+    ) throws {
+        guard case .direct = toolPolicy else { return }
+        let denied = toolName == "file_actions"
+            || toolName == "apply_edits"
+            || (toolName == "prompt" && arguments["op"]?.stringValue == "export")
+        guard !denied else {
+            throw ServiceAPIError(
+                code: .capabilityMissing,
+                message: "Direct headless invocation requires an explicit mutation grant"
+            )
         }
     }
 
@@ -1947,18 +2013,31 @@ private actor AuthorityToolBackend {
         })
         var candidates: [BoundPath] = []
         for root in project.roots {
-            let physicalRoot = bindings[root.rootID]
-                ?? URL(fileURLWithPath: root.canonicalPath).standardizedFileURL.resolvingSymlinksInPath()
+            let logicalRoot = URL(fileURLWithPath: root.canonicalPath)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+            let physicalRoot = bindings[root.rootID] ?? logicalRoot
             let candidate: URL
             let logicalPath: String
             if rawPath.hasPrefix("/") {
                 let absolute = URL(fileURLWithPath: rawPath).standardizedFileURL
-                guard absolute.path == physicalRoot.path || absolute.path.hasPrefix(physicalRoot.path + "/") else { continue }
-                candidate = absolute
-                logicalPath = String(absolute.path.dropFirst(physicalRoot.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                let checkedAbsolute = allowMissingLeaf
+                    ? absolute.deletingLastPathComponent().resolvingSymlinksInPath().appendingPathComponent(absolute.lastPathComponent)
+                    : absolute.resolvingSymlinksInPath()
+                if checkedAbsolute.path == logicalRoot.path || checkedAbsolute.path.hasPrefix(logicalRoot.path + "/") {
+                    logicalPath = String(checkedAbsolute.path.dropFirst(logicalRoot.path.count))
+                        .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                    candidate = physicalRoot.appendingPathComponent(logicalPath).standardizedFileURL
+                } else if checkedAbsolute.path == physicalRoot.path || checkedAbsolute.path.hasPrefix(physicalRoot.path + "/") {
+                    logicalPath = String(checkedAbsolute.path.dropFirst(physicalRoot.path.count))
+                        .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                    candidate = checkedAbsolute
+                } else {
+                    continue
+                }
             } else {
-                candidate = physicalRoot.appendingPathComponent(rawPath).standardizedFileURL
                 logicalPath = rawPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                candidate = physicalRoot.appendingPathComponent(logicalPath).standardizedFileURL
             }
             let checked = allowMissingLeaf
                 ? candidate.deletingLastPathComponent().resolvingSymlinksInPath().appendingPathComponent(candidate.lastPathComponent)

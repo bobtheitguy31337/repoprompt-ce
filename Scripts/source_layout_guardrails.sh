@@ -201,9 +201,9 @@ server_import_guard() {
   fi
   local direct_lease_acquisition
   direct_lease_acquisition="$(grep -R -n -E 'AuthorityNamespaceLease\.acquire' "$server_sources" \
-    --include='*.swift' | grep -v '/RepoPromptAuthorityHost.swift:' || true)"
+    --include='*.swift' | grep -v -E '/(RepoPromptAuthorityHost|AuthorityMaintenanceSession)\.swift:' || true)"
   if [[ -n "$direct_lease_acquisition" ]]; then
-    fail "only RepoPromptAuthorityHost may acquire the namespace lease"
+    fail "only RepoPromptAuthorityHost or AuthorityMaintenanceSession may acquire the namespace lease"
     printf '%s\n' "$direct_lease_acquisition" >&2
   fi
 

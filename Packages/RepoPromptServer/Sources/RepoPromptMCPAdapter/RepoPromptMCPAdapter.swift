@@ -4,6 +4,7 @@ import RepoPromptDomainRuntime
 import RepoPromptRuntimeModel
 
 public typealias RepoPromptMCPBinding = AuthorityMCPBinding
+public typealias RepoPromptMCPServingCapability = RepoPromptMCPServing
 
 /// State-free canonical MCP transport adapter. It retains only the host-issued
 /// serving interface and owns no project, selection, run, or persistence state.

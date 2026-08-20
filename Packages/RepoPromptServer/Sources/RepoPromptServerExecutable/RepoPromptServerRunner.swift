@@ -576,7 +576,9 @@ public enum RepoPromptServerRunner {
         let mcpServing = RepoPromptAuthorityMCPService(
             authority: authority,
             portalSettings: portalDesktopSettings,
-            mutationCapability: await mutationGate.capability()
+            mutationCapability: await mutationGate.capability(),
+            readCapability: await mutationGate.readCapability(),
+            subscriptionCapability: await mutationGate.readCapability(subscription: true)
         )
         let mcpAdapter = RepoPromptMCPAdapter(serving: mcpServing)
         let mcpSocketURL = URL(
@@ -593,38 +595,47 @@ public enum RepoPromptServerRunner {
         }
 
         var serviceError: Error?
-        let shutdownBudget = AuthorityHostShutdownBudget(total: .seconds(30))
-        var childDrainTimedOut = false
-        await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask { try await internalApplication.runService() }
-            group.addTask { try await healthApplication.runService() }
-            if let portalPort = configuration.portalPort {
-                let portalApplication = Application(
-                    router: service.internalRouter(),
-                    configuration: .init(
-                        address: .hostname(configuration.portalHost, port: portalPort),
-                        serverName: "RepoPromptServer"
-                    )
+        let transportDrain = ServerTransportDrainCoordinator()
+        var transportTasks: [Task<Void, Never>] = []
+        transportTasks.append(await transportDrain.start {
+            try await internalApplication.runService()
+        })
+        transportTasks.append(await transportDrain.start {
+            try await healthApplication.runService()
+        })
+        if let portalPort = configuration.portalPort {
+            let portalApplication = Application(
+                router: service.internalRouter(),
+                configuration: .init(
+                    address: .hostname(configuration.portalHost, port: portalPort),
+                    serverName: "RepoPromptServer"
                 )
-                group.addTask { try await portalApplication.runService() }
-            }
-            do {
-                _ = try await group.next()
-            } catch {
-                serviceError = error
-            }
-            _ = await host.beginShutdown(using: shutdownBudget)
-            let childShutdown = await mcpSocketServer.stop(
-                clientDrainTimeout: shutdownBudget.allowance(maximum: .seconds(5))
             )
-            childDrainTimedOut = !childShutdown.clean
-            group.cancelAll()
+            transportTasks.append(await transportDrain.start {
+                try await portalApplication.runService()
+            })
         }
+        if case let .failed(message) = await transportDrain.waitForFirstCompletion() {
+            serviceError = ServerTransportFailure(message: message)
+        }
+
+        let budget = AuthorityHostShutdownBudget(total: .seconds(30))
+        transportTasks.forEach { $0.cancel() }
+        _ = await host.beginShutdown(using: budget)
+        let childShutdown = await mcpSocketServer.stop(
+            clientDrainTimeout: budget.allowance(maximum: .seconds(5)),
+            forceCloseReapTimeout: budget.allowance(maximum: .seconds(1))
+        )
+        let transportsSettled = await transportDrain.waitForAll(
+            timeout: budget.allowance(maximum: .seconds(5))
+        )
 
         let shutdown = await host.shutdown(
             reason: serviceError == nil ? "listener-stopped" : "listener-failed",
-            using: shutdownBudget,
-            childDrainTimedOut: childDrainTimedOut
+            using: budget,
+            childDrainTimedOut: !childShutdown.clean,
+            childWorkUnsettled: childShutdown.unreapedClientCount > 0,
+            externalTransportDrainTimedOut: !transportsSettled
         )
         hostWasShutdown = true
         if !shutdown.clean, serviceError == nil {
@@ -637,5 +648,67 @@ public enum RepoPromptServerRunner {
             }
             throw error
         }
+    }
+}
+
+struct ServerTransportFailure: Error, Sendable {
+    let message: String
+}
+
+enum ServerTransportCompletion: Sendable, Equatable {
+    case stopped
+    case failed(String)
+}
+
+/// Tracks unstructured listener tasks so cancellation-ignoring services cannot
+/// hold a structured task scope beyond the authority's one total deadline.
+actor ServerTransportDrainCoordinator {
+    private var activeTaskIDs: Set<UUID> = []
+    private var firstCompletion: ServerTransportCompletion?
+    private var firstCompletionWaiters: [CheckedContinuation<ServerTransportCompletion, Never>] = []
+
+    func start(
+        operation: @escaping @Sendable () async throws -> Void
+    ) -> Task<Void, Never> {
+        let taskID = UUID()
+        activeTaskIDs.insert(taskID)
+        return Task {
+            let completion: ServerTransportCompletion
+            do {
+                try await operation()
+                completion = .stopped
+            } catch {
+                completion = .failed(String(describing: error))
+            }
+            self.finish(taskID: taskID, completion: completion)
+        }
+    }
+
+    func waitForFirstCompletion() async -> ServerTransportCompletion {
+        if let firstCompletion { return firstCompletion }
+        return await withCheckedContinuation { continuation in
+            firstCompletionWaiters.append(continuation)
+        }
+    }
+
+    func waitForAll(timeout: Duration) async -> Bool {
+        if activeTaskIDs.isEmpty { return true }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: max(.zero, timeout))
+        while !activeTaskIDs.isEmpty, clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return activeTaskIDs.isEmpty
+    }
+
+    func activeTaskCount() -> Int { activeTaskIDs.count }
+
+    private func finish(taskID: UUID, completion: ServerTransportCompletion) {
+        activeTaskIDs.remove(taskID)
+        guard firstCompletion == nil else { return }
+        firstCompletion = completion
+        let waiters = firstCompletionWaiters
+        firstCompletionWaiters.removeAll()
+        waiters.forEach { $0.resume(returning: completion) }
     }
 }

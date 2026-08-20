@@ -86,6 +86,21 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         return store
     }
 
+    /// Named offline seam used only after `AuthorityMaintenanceSession` owns the
+    /// namespace lease. PR3 preserves the frozen V1-V6 opening behavior here;
+    /// PR4 owns any new migration command, schema, backup, or verification work.
+    public static func openForMaintenance(
+        storage: Storage,
+        eventSigningKey: PersistenceEventSigningKey? = nil,
+        faultInjector: PersistenceFaultInjector = .none
+    ) async throws -> SQLiteServiceStore {
+        try await open(
+            storage: storage,
+            eventSigningKey: eventSigningKey,
+            faultInjector: faultInjector
+        )
+    }
+
     /// Serving never advances a nonempty store. A brand-new empty database may
     /// be initialized to the frozen current schema; every other pending schema
     /// is refused without DDL or migration-ledger mutation.

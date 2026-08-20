@@ -65,8 +65,9 @@ public actor HeadlessMCPSocketServer {
     public struct ShutdownReport: Sendable, Equatable {
         public let clientCount: Int
         public let forceClosedClientCount: Int
+        public let unreapedClientCount: Int
 
-        public var clean: Bool { forceClosedClientCount == 0 }
+        public var clean: Bool { forceClosedClientCount == 0 && unreapedClientCount == 0 }
     }
 
     private struct ClientTask {
@@ -96,6 +97,7 @@ public actor HeadlessMCPSocketServer {
     public let socketURL: URL
     private let adapter: RepoPromptMCPAdapter
     private let logger: Logger
+    private let clientHandlerOverride: (@Sendable (Int32) async -> Void)?
     private var listenFD: Int32 = -1
     private var listenerGeneration: UInt64 = 0
     private var acceptingClients = false
@@ -106,10 +108,12 @@ public actor HeadlessMCPSocketServer {
     public init(
         socketURL: URL,
         adapter: RepoPromptMCPAdapter,
+        clientHandlerOverride: (@Sendable (Int32) async -> Void)? = nil,
         logger: Logger = Logger(label: "com.repoprompt.ce.mcp.headless-socket")
     ) {
         self.socketURL = socketURL
         self.adapter = adapter
+        self.clientHandlerOverride = clientHandlerOverride
         self.logger = logger
     }
 
@@ -160,7 +164,10 @@ public actor HeadlessMCPSocketServer {
     }
 
     @discardableResult
-    public func stop(clientDrainTimeout: Duration = .seconds(5)) async -> ShutdownReport {
+    public func stop(
+        clientDrainTimeout: Duration = .seconds(5),
+        forceCloseReapTimeout: Duration = .seconds(1)
+    ) async -> ShutdownReport {
         if listenFD < 0, !acceptingClients, acceptTask == nil, let lastShutdownReport {
             return lastShutdownReport
         }
@@ -194,9 +201,16 @@ public actor HeadlessMCPSocketServer {
             client.connection.close()
             client.task.cancel()
         }
+        let requestedReapDeadline = clock.now.advanced(by: max(.zero, forceCloseReapTimeout))
+        let reapDeadline = min(deadline, requestedReapDeadline)
+        while remaining.contains(where: { !$0.connection.isCompleted }), clock.now < reapDeadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        let unreaped = remaining.filter { !$0.connection.isCompleted }
         let report = ShutdownReport(
             clientCount: clients.count,
-            forceClosedClientCount: remaining.count
+            forceClosedClientCount: remaining.count,
+            unreapedClientCount: unreaped.count
         )
         lastShutdownReport = report
         return report
@@ -229,6 +243,7 @@ public actor HeadlessMCPSocketServer {
         }
         let connectionID = UUID()
         let connection = HeadlessMCPClientConnection(descriptor: descriptor)
+        let clientHandlerOverride = clientHandlerOverride
         let task = Task.detached { [weak self] in
             guard let self else {
                 connection.close()
@@ -236,6 +251,14 @@ public actor HeadlessMCPSocketServer {
                 return
             }
             do {
+                if let clientHandlerOverride {
+                    await clientHandlerOverride(descriptor)
+                    await self.completeOverride(
+                        connectionID: connectionID,
+                        connection: connection
+                    )
+                    return
+                }
                 let handshake = try Self.readHandshake(from: descriptor)
                 await self.serve(
                     connectionID: connectionID,
@@ -251,6 +274,15 @@ public actor HeadlessMCPSocketServer {
             }
         }
         clientTasks[connectionID] = ClientTask(connection: connection, task: task)
+    }
+
+    private func completeOverride(
+        connectionID: UUID,
+        connection: HeadlessMCPClientConnection
+    ) {
+        connection.close()
+        connection.markCompleted()
+        clientTasks[connectionID] = nil
     }
 
     private func reject(

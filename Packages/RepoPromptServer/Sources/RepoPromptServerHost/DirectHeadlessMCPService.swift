@@ -7,8 +7,12 @@ import Glibc
 import Foundation
 import Logging
 import MCP
+import RepoPromptAgentRuntimeCore
 import RepoPromptAuthorityAPI
 import RepoPromptDomainRuntime
+import RepoPromptHeadlessRuntime
+import RepoPromptRuntimeModel
+import RepoPromptWorkspaceRuntimeCore
 
 private let directHeadlessCLIVersion = "1.3.0"
 
@@ -63,66 +67,6 @@ actor DirectHeadlessMCPService {
         self.logger = logger
         self.environment = environment
         self.currentDirectory = currentDirectory
-    }
-
-    func run() async throws {
-        let prepared = try await prepareRuntime()
-        let server = Server(
-            name: "RepoPrompt CE",
-            version: directHeadlessCLIVersion,
-            title: "RepoPrompt CE Headless",
-            instructions: "Direct AppKit-free RepoPrompt MCP domain runtime.",
-            capabilities: .init(tools: .init(listChanged: false)),
-            configuration: .init(strict: true, responseSendTimeout: .seconds(5))
-        )
-        await installHandlers(
-            server: server,
-            prepared: prepared,
-            connection: ConnectionContext(
-                connectionID: prepared.connectionID,
-                connectionGeneration: prepared.connectionGeneration,
-                principal: prepared.principal,
-                policyProfile: .direct,
-                restrictedToolNames: [],
-                additionalToolNames: [],
-                ephemeralGrantedOperations: Self.topLevelDefaultMutationOperations
-            )
-        )
-        let transport = MCPStdioServerTransport(
-            writeStallTimeout: .seconds(5),
-            logger: logger
-        )
-
-        do {
-            try await prepared.childEndpoint.start { [weak self] fd, peerPID, handshake in
-                await self?.servePrivateChild(
-                    fd: fd,
-                    peerPID: peerPID,
-                    handshake: handshake,
-                    prepared: prepared
-                )
-            }
-            try await server.start(transport: transport)
-            let terminal = await transport.waitUntilTerminal()
-            logger.debug("Headless stdio terminal", metadata: ["reason": "\(terminal)"])
-            _ = await prepared.runtime.domainHost.drain(
-                timeout: prepared.runtime.configuration.hostDrainTimeout
-            )
-            let deliveryDrained = await transport.waitForDeliveryDrain(
-                timeout: prepared.runtime.configuration.hostDrainTimeout
-            )
-            if !deliveryDrained {
-                logger.warning("Headless stdio delivery drain reached its bound")
-            }
-            await server.stop()
-            await server.waitUntilCompleted()
-            guard terminal == .stdinEOF else { throw terminal }
-            await teardown(prepared)
-        } catch {
-            await server.stop()
-            await teardown(prepared)
-            throw error
-        }
     }
 
     func prepareRuntime() async throws -> PreparedRuntime {
@@ -281,24 +225,11 @@ actor DirectHeadlessMCPService {
         connection: ConnectionContext
     ) async {
         let classification = MCPClientToolPolicyCatalog.classification(for: connection.policyProfile)
-        let restrictedNames = MCPDomainToolCatalog
-            .toolNames(for: classification.restrictedCapabilities)
-            .union(connection.restrictedToolNames)
-        let additionalNames = MCPDomainToolCatalog
-            .toolNames(for: classification.grantedCapabilities)
-            .union(connection.additionalToolNames)
-        let visibleNames = Set(MCPDomainToolCatalog.orderedToolNames.filter { toolName in
-            !restrictedNames.contains(toolName)
-                && (
-                    !MCPClientToolPolicyCatalog.policyGatedToolNames.contains(toolName)
-                        || additionalNames.contains(toolName)
-                )
-                && MCPClientToolPolicyCatalog.shouldAdvertise(
-                    toolName: toolName,
-                    role: classification.role,
-                    allowsAgentExternalControlTools: classification.allowsAgentExternalControlTools
-                )
-        })
+        let visibleNames = Self.visibleToolNames(connection)
+        let serving = DirectHeadlessAdapterServing(
+            prepared: prepared,
+            connection: connection
+        )
         await server.withMethodHandler(ListTools.self) { _ in
             let tools = MCPDomainCanonicalToolDefinitions.definitions.compactMap { definition -> MCP.Tool? in
                 guard visibleNames.contains(definition.name) else { return nil }
@@ -330,32 +261,57 @@ actor DirectHeadlessMCPService {
                     toolName: params.name,
                     arguments: params.arguments ?? [:]
                 )
-                let scope: MCPDomainToolRegistrationScope = MCPGlobalToolName.orderedToolNames.contains(params.name)
-                    ? .application
-                    : .standalone(id: prepared.scopeID)
-                let resolution = try await prepared.runtime.domainHost.resolve(
+                let encoded = try JSONEncoder().encode(arguments)
+                let result = try await serving.invoke(
                     toolName: params.name,
-                    scope: scope
+                    argumentsJSON: encoded,
+                    binding: .init(
+                        sessionID: prepared.scopeID.rawValue,
+                        actor: .init(
+                            userID: connection.principal.stableKey
+                                ?? "headless-\(connection.connectionID.uuidString)",
+                            username: connection.principal.displayName,
+                            displayName: connection.principal.displayName
+                        )
+                    )
                 )
-                let invocationID = UUID()
-                let security = await Self.securityContext(
-                    prepared: prepared,
-                    connection: connection,
-                    invocationID: invocationID
-                )
-                let result = try await prepared.mutationCapability.perform {
-                    try await prepared.runtime.domainHost.invoke(MCPDomainHostInvocation(
-                        invocationID: invocationID,
-                        connectionID: connection.connectionID,
-                        resolution: resolution,
-                        arguments: arguments,
-                        securityContext: security
-                    ))
-                }
-                return Self.successResult(result)
+                return Self.successResult(try JSONDecoder().decode(Value.self, from: result))
             } catch {
                 return Self.errorResult(String(describing: error))
             }
+        }
+    }
+
+    fileprivate static func visibleToolNames(_ connection: ConnectionContext) -> Set<String> {
+        let classification = MCPClientToolPolicyCatalog.classification(for: connection.policyProfile)
+        let restrictedNames = MCPDomainToolCatalog
+            .toolNames(for: classification.restrictedCapabilities)
+            .union(connection.restrictedToolNames)
+        let additionalNames = MCPDomainToolCatalog
+            .toolNames(for: classification.grantedCapabilities)
+            .union(connection.additionalToolNames)
+        return Set(MCPDomainToolCatalog.orderedToolNames.filter { toolName in
+            !restrictedNames.contains(toolName)
+                && (
+                    !MCPClientToolPolicyCatalog.policyGatedToolNames.contains(toolName)
+                        || additionalNames.contains(toolName)
+                )
+                && MCPClientToolPolicyCatalog.shouldAdvertise(
+                    toolName: toolName,
+                    role: classification.role,
+                    allowsAgentExternalControlTools: classification.allowsAgentExternalControlTools
+                )
+        })
+    }
+
+    func startPrivateChildEndpoint(_ prepared: PreparedRuntime) async throws {
+        try await prepared.childEndpoint.start { [weak self] fd, peerPID, handshake in
+            await self?.servePrivateChild(
+                fd: fd,
+                peerPID: peerPID,
+                handshake: handshake,
+                prepared: prepared
+            )
         }
     }
 
@@ -610,12 +566,274 @@ actor DirectHeadlessMCPService {
     }
 }
 
-public enum RepoPromptDirectHeadlessHostRunner {
-    public static func run() async throws {
-        if DirectHeadlessChildBridge.isRequested() {
-            try await DirectHeadlessChildBridge.run()
-        } else {
-            try await DirectHeadlessMCPService().run()
+private actor DirectHeadlessAdapterServing: RepoPromptMCPServing {
+    private let prepared: DirectHeadlessMCPService.PreparedRuntime
+    private let connection: DirectHeadlessMCPService.ConnectionContext
+
+    init(
+        prepared: DirectHeadlessMCPService.PreparedRuntime,
+        connection: DirectHeadlessMCPService.ConnectionContext
+    ) {
+        self.prepared = prepared
+        self.connection = connection
+    }
+
+    func projectSnapshot(id _: UUID) async throws -> ProjectSnapshot {
+        throw ServiceAPIError(code: .capabilityMissing, message: "Direct-headless project snapshots use canonical MCP tools")
+    }
+
+    func sessionSnapshot(id _: UUID) async throws -> SessionSnapshot {
+        throw ServiceAPIError(code: .capabilityMissing, message: "Direct-headless session snapshots use canonical MCP tools")
+    }
+
+    func events(after _: ServiceCursor?, limit _: Int) async throws -> EventPage {
+        throw ServiceAPIError(code: .capabilityMissing, message: "Direct-headless event replay is unavailable")
+    }
+
+    func advertisedToolNames(isRootSession _: Bool) async -> Set<String> {
+        DirectHeadlessMCPService.visibleToolNames(connection)
+    }
+
+    func invoke(
+        toolName: String,
+        argumentsJSON: Data,
+        binding _: AuthorityMCPBinding
+    ) async throws -> Data {
+        guard DirectHeadlessMCPService.visibleToolNames(connection).contains(toolName) else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Tool is unavailable for this client policy")
         }
+        let decoded = try JSONDecoder().decode([String: Value].self, from: argumentsJSON)
+        let arguments = try DirectHeadlessMCPService.validatedCallArguments(
+            toolName: toolName,
+            arguments: decoded
+        )
+        let scope: MCPDomainToolRegistrationScope = MCPGlobalToolName.orderedToolNames.contains(toolName)
+            ? .application
+            : .standalone(id: prepared.scopeID)
+        guard let resolved = await prepared.runtime.toolRegistry.resolve(
+            toolName: toolName,
+            scope: scope
+        ) else {
+            throw MCPDomainHostError.scopeUnavailable(toolName: toolName, scope: scope)
+        }
+        let registration = try await prepared.runtime.routingCoordinator.currentRegistration(
+            connectionID: connection.connectionID
+        )
+        guard registration.runtimeID == prepared.runtime.identity.runtimeID,
+              registration.generation == connection.connectionGeneration,
+              await prepared.runtime.toolRegistry.isActive(resolved.handle)
+        else {
+            throw MCPDomainHostError.connectionRegistrationInvalid
+        }
+        let security = await DirectHeadlessMCPService.securityContext(
+            prepared: prepared,
+            connection: connection,
+            invocationID: UUID()
+        )
+        let value = try await prepared.mutationCapability.perform {
+            try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+                try await resolved.binding(arguments)
+            }
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return try encoder.encode(value)
+    }
+}
+
+/// Host-owned direct-headless lifetime. The private executable combines this
+/// opaque serving capability with `RepoPromptMCPAdapter`; the Host target never
+/// imports or constructs that transport adapter.
+public actor RepoPromptDirectHeadlessComposition {
+    public nonisolated let serving: any RepoPromptMCPServing
+    public nonisolated let binding: AuthorityMCPBinding
+    public nonisolated let isRootSession = true
+
+    private let runtime: AuthorityServerRuntime
+    private var stopped = false
+
+    private init(
+        runtime: AuthorityServerRuntime,
+        serving: any RepoPromptMCPServing,
+        binding: AuthorityMCPBinding
+    ) {
+        self.runtime = runtime
+        self.serving = serving
+        self.binding = binding
+    }
+
+    public static func start(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        currentDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    ) async throws -> RepoPromptDirectHeadlessComposition {
+        let locations = try DirectHeadlessRuntimeLocationResolver.resolve(
+            environment: environment,
+            currentDirectory: currentDirectory
+        )
+        try FileManager.default.createDirectory(
+            at: locations.storageDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let stateRoot = try canonicalExistingDirectory(locations.storageDirectory)
+        let directories = DirectHeadlessAuthorityDirectories(root: stateRoot)
+        for directory in directories.all {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
+        let namespace = try AuthorityNamespaceDescriptor(
+            storageRoot: stateRoot.path,
+            databasePath: stateRoot.appendingPathComponent("repoprompt.sqlite").path,
+            profile: locations.profileIdentifier,
+            servingMode: .directHeadless
+        )
+        let runtime = try await RepoPromptAuthorityHostFactory.startServer(
+            configuration: .init(
+                host: .init(namespace: namespace),
+                worktreeDirectory: directories.worktrees.path,
+                artifactDirectory: directories.artifacts.path,
+                projectDirectory: directories.projects.path,
+                providerHomeDirectory: directories.providerHomes.path,
+                providerExecutables: [:],
+                enabledProviders: [],
+                enabledDirectProviders: [],
+                providerVersions: [:],
+                providerProtocols: [:],
+                providerCredentialSources: [:],
+                providerAuthenticationStatusFiles: [:],
+                providerModelCatalogFiles: [:],
+                providerVaultKey: nil,
+                providerVaultDecryptionKeys: [],
+                providerVaultFilePath: stateRoot.appendingPathComponent("provider-credentials.vault").path,
+                restoreActivationTokenPath: nil,
+                projectSourcePolicy: .disabled,
+                projectSourceGitCredentials: try ProjectSourceGitCredentials()
+            )
+        )
+        do {
+            let actor = ExternalActor(
+                userID: "direct-headless:\(locations.profileIdentifier)",
+                username: "direct-headless",
+                displayName: "RepoPrompt Direct Headless"
+            )
+            let project = try await launchProject(
+                authority: runtime.authority,
+                roots: locations.workingDirectories,
+                actor: actor,
+                namespaceID: namespace.namespaceID
+            )
+            // The private helper reuses one session for the same authority/project
+            // instead of accumulating a new visible private session on every launch.
+            let sessionIdentity = "\(namespace.namespaceID):\(project.projectID.uuidString)"
+            let session = try await runtime.authority.createSession(
+                input: .init(
+                    projectID: project.projectID,
+                    provider: .codex,
+                    visibility: .privateSession
+                ),
+                externalActor: actor,
+                idempotencyKey: "direct-headless-session:\(sessionIdentity)",
+                requestDigest: sessionIdentity
+            )
+            let serving = RepoPromptAuthorityMCPService(
+                authority: runtime.authority,
+                portalSettings: runtime.portalDesktopSettings,
+                mutationCapability: await runtime.host.mutationGate.capability(),
+                toolPolicy: .direct,
+                readCapability: await runtime.host.mutationGate.readCapability(),
+                subscriptionCapability: await runtime.host.mutationGate.readCapability(subscription: true)
+            )
+            return RepoPromptDirectHeadlessComposition(
+                runtime: runtime,
+                serving: serving,
+                binding: .init(sessionID: session.sessionID, actor: actor)
+            )
+        } catch {
+            _ = await runtime.host.shutdown(reason: "direct_headless_composition_failed")
+            throw error
+        }
+    }
+
+    public func shutdown() async {
+        guard !stopped else { return }
+        stopped = true
+        _ = await runtime.host.shutdown(reason: "direct_headless_transport_closed")
+    }
+
+    private static func launchProject(
+        authority: RepoPromptHeadlessAuthority,
+        roots: [URL],
+        actor: ExternalActor,
+        namespaceID: String
+    ) async throws -> ProjectSnapshot {
+        let canonicalRoots = roots.map {
+            $0.standardizedFileURL.resolvingSymlinksInPath()
+        }
+        let desiredPaths = Set(canonicalRoots.map(\.path))
+        if let existing = await authority.projectSnapshots().first(where: { project in
+            project.roots.count == desiredPaths.count
+                && Set(project.roots.map(\.canonicalPath)) == desiredPaths
+        }) {
+            return existing
+        }
+        let input = CreateProjectInput(
+            name: canonicalRoots.first?.lastPathComponent.isEmpty == false
+                ? "Headless \(canonicalRoots[0].lastPathComponent)"
+                : "Direct Headless",
+            roots: canonicalRoots.enumerated().map { index, root in
+                .init(
+                    logicalName: root.lastPathComponent.isEmpty ? "root-\(index + 1)" : root.lastPathComponent,
+                    path: root.path,
+                    writable: true
+                )
+            }
+        )
+        let key = "direct-headless-project:\(namespaceID)"
+        return try await authority.createProject(
+            input: input,
+            externalActor: actor,
+            idempotencyKey: key,
+            requestDigest: desiredPaths.sorted().joined(separator: "\u{0}")
+        )
+    }
+
+    private static func canonicalExistingDirectory(_ directory: URL) throws -> URL {
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        guard realpath(directory.path, &buffer) != nil else {
+            throw ServiceAPIError(
+                code: .rootUnauthorized,
+                message: "Direct-headless authority root could not be canonicalized"
+            )
+        }
+        return URL(fileURLWithPath: String(cString: buffer), isDirectory: true)
+    }
+}
+
+private struct DirectHeadlessAuthorityDirectories {
+    let worktrees: URL
+    let artifacts: URL
+    let projects: URL
+    let providerHomes: URL
+
+    init(root: URL) {
+        worktrees = root.appendingPathComponent("AuthorityWorktrees", isDirectory: true)
+        artifacts = root.appendingPathComponent("AuthorityArtifacts", isDirectory: true)
+        projects = root.appendingPathComponent("AuthorityProjects", isDirectory: true)
+        providerHomes = root.appendingPathComponent("AuthorityProviderHomes", isDirectory: true)
+    }
+
+    var all: [URL] { [worktrees, artifacts, projects, providerHomes] }
+}
+
+public enum RepoPromptDirectHeadlessChildBridgeRunner {
+    public static func isRequested() -> Bool {
+        DirectHeadlessChildBridge.isRequested()
+    }
+
+    public static func run() async throws {
+        try await DirectHeadlessChildBridge.run()
     }
 }
