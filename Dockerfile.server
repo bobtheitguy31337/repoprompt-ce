@@ -14,8 +14,10 @@ RUN set -eux; \
     echo "$age_sha  /tmp/$archive" | sha256sum -c -; \
     tar -xzf "/tmp/$archive" -C /tmp; \
     install -D -m 0755 "/tmp/age/age" /out/usr/local/libexec/repoprompt/age; \
+    install -D -m 0755 "/tmp/age/age-keygen" /out/usr/local/libexec/repoprompt/age-keygen; \
     sha256sum /out/usr/local/libexec/repoprompt/age | cut -d' ' -f1 > /out/usr/local/libexec/repoprompt/age.sha256; \
-    chmod 0444 /out/usr/local/libexec/repoprompt/age.sha256; \
+    sha256sum /out/usr/local/libexec/repoprompt/age-keygen | cut -d' ' -f1 > /out/usr/local/libexec/repoprompt/age-keygen.sha256; \
+    chmod 0444 /out/usr/local/libexec/repoprompt/age.sha256 /out/usr/local/libexec/repoprompt/age-keygen.sha256; \
     rm -rf "/tmp/$archive" /tmp/age
 COPY Packages/RepoPromptPortableRuntime Packages/RepoPromptPortableRuntime
 COPY Packages/RepoPromptServer Packages/RepoPromptServer

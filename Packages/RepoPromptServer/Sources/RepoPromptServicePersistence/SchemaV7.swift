@@ -11,8 +11,33 @@ enum SchemaV7 {
     }
 
     static let version = 7
+    /// Legacy PR4 ledger alias accepted for exact-head compatibility.
     static let digest = "repoprompt-service-schema-v7-compatibility-audit-namespace-identity-v1"
     static let transformationID = "prototype-v6-ledger-normalization-v1"
+    static let legacyCanonicalDigest = "sha256:d0bef377110aa4d336cbe11493a2bb9e3b0b24c64de828bcbf75decc166f9f3a"
+    static let canonicalDigest = "sha256:6d2aaea9c3017685d7e2a7016c59811da7b7920d160d047da6ad0f4b54e726a6"
+    static var definition: MigrationDefinition {
+        let planEvidence = prototypeNormalizationPlans.keys.sorted().compactMap { observed -> String? in
+            guard let plan = prototypeNormalizationPlans[observed] else { return nil }
+            return "prototype-v6:\(observed):\(plan.id):ddl=\(plan.appliesFinalV6DDL):legacy-json=\(plan.rewritesLegacyJSONKeys)"
+        }
+        return MigrationDefinition(
+            version: version,
+            transformationID: transformationID,
+            statements: statements,
+            transformationSteps: planEvidence + [
+                "current-v6-canonical:\(SchemaV6.canonicalDigest):prototype-v6-current-audit-only",
+                "final-v6-shape:\(finalV6ShapeDigest)",
+                "legacy-json:goblinUserId->userId",
+                "legacy-json:goblin-explicit-selection->explicit-selection",
+                "legacy-column:goblin_acknowledgement_json->collaboration_acknowledgement_json:copy-if-target-null:drop-source",
+                "validate-final-v6-shape-before-v7-ddl",
+                "insert-schema-compatibility-audit:source-v6:target-v7:dynamic-observed-digest-normalization-and-time",
+                "insert-authority-namespace-identity:fixed-id-1:dynamic-kind-identity-and-time",
+                "set-service-metadata-schema-version:7",
+            ]
+        )
+    }
 
     static let statements: [String] = [
         "CREATE TABLE schema_compatibility_audit(source_version INTEGER NOT NULL CHECK(source_version = 6),observed_digest TEXT NOT NULL,normalization_id TEXT NOT NULL,target_version INTEGER NOT NULL CHECK(target_version = 7),schema_shape_digest TEXT NOT NULL,applied_at REAL NOT NULL,PRIMARY KEY(source_version,observed_digest,normalization_id))",
@@ -29,7 +54,7 @@ enum SchemaV7 {
         "repoprompt-service-schema-v6-typed-settings-agent-composer-semantic-acceptance",
     ]
 
-    static let normalizationPlans: [String: NormalizationPlan] = [
+    private static let prototypeNormalizationPlans: [String: NormalizationPlan] = [
         "repoprompt-service-schema-v6-typed-mcp-show-model-presets": .init(
             id: "prototype-v6-current-audit-only",
             appliesFinalV6DDL: false,
@@ -66,6 +91,18 @@ enum SchemaV7 {
             rewritesLegacyJSONKeys: true
         ),
     ]
+
+    static var normalizationPlans: [String: NormalizationPlan] {
+        var plans = prototypeNormalizationPlans
+        let currentPlan = NormalizationPlan(
+            id: "prototype-v6-current-audit-only",
+            appliesFinalV6DDL: false,
+            rewritesLegacyJSONKeys: false
+        )
+        plans[SchemaV6.legacyCanonicalDigest] = currentPlan
+        plans[SchemaV6.canonicalDigest] = currentPlan
+        return plans
+    }
 
     static let finalV6ShapeManifest: [String] = [
         "index:events_project_sequence",

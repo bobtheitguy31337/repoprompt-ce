@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptRuntimeModel
 import SQLiteNIO
 import XCTest
 @testable import RepoPromptServicePersistence
@@ -54,6 +55,47 @@ final class SQLiteDatabaseExecutorTests: XCTestCase {
         await database.rollbackTransaction(transactionID)
         try await database.close()
     }
+
+    func testAdmissionWaitersAreBoundedAndCancellationReclaimsEverySlot() async throws {
+        let database = try await SQLiteDatabaseExecutor.open(
+            storage: .memory,
+            capacity: 32,
+            reservedControlCapacity: 16,
+            maximumAdmissionWaiters: 32
+        )
+        let transactionID = UUID()
+        try await database.beginTransaction(transactionID)
+
+        let queued = (0 ..< 16).map { _ in
+            Task { try await database.query("SELECT 1", operationClass: .bulk) }
+        }
+        while await database.metrics().queuedByClass[.bulk] != 16 { await Task.yield() }
+        let waiting = (0 ..< 16).map { _ in
+            Task { try await database.query("SELECT 1", operationClass: .bulk) }
+        }
+        while await database.metrics().waitingByClass[.bulk] != 16 { await Task.yield() }
+
+        do {
+            _ = try await database.query("SELECT 1", operationClass: .bulk)
+            XCTFail("non-control work beyond the bounded waiter reserve must be rejected")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .rateLimited)
+            XCTAssertTrue(error.retryable)
+        }
+
+        for task in queued + waiting { task.cancel() }
+        for task in queued + waiting { _ = try? await task.value }
+        while true {
+            let current = await database.metrics()
+            if current.queuedByClass[.bulk] == 0, current.waitingByClass[.bulk] == 0 { break }
+            await Task.yield()
+        }
+        let metrics = await database.metrics()
+        XCTAssertLessThanOrEqual(metrics.maximumQueuedDepthObserved, metrics.capacity)
+        XCTAssertLessThanOrEqual(metrics.maximumWaitingDepthObserved, metrics.maximumAdmissionWaiters)
+        await database.rollbackTransaction(transactionID)
+        try await database.close()
+    }
 }
 
 final class SQLiteDatabaseExecutorFairnessTests: XCTestCase {
@@ -84,6 +126,82 @@ final class SQLiteDatabaseExecutorFairnessTests: XCTestCase {
         try await database.close()
     }
 
+
+    func testSixteenProviderRunsRemainLosslessBoundedFairAndCommitCancelPromptly() async throws {
+        let recorder = SQLiteCompletionRecorder()
+        let database = try await SQLiteDatabaseExecutor.open(
+            storage: .memory,
+            capacity: 32,
+            reservedControlCapacity: 16,
+            maximumAdmissionWaiters: 32
+        )
+        _ = try await database.query(
+            "CREATE TABLE events(run_id INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL)"
+        )
+        await database.installTestCompletionObserver { recorder.append($0) }
+
+        let blockingTransactionID = UUID()
+        try await database.beginTransaction(blockingTransactionID)
+        let payloadBytes = 32 * 1_024
+        let producers = (0 ..< 16).map { runID in
+            Task {
+                let payload = String(repeating: String(runID % 10), count: payloadBytes)
+                for chunk in 0 ..< 8 {
+                    _ = try await database.query(
+                        "INSERT INTO events(run_id, kind, payload) VALUES(?, 'transcript', ?)",
+                        [.integer(runID), .text(payload)],
+                        operationClass: .bulk
+                    )
+                    _ = try await database.query(
+                        "INSERT INTO events(run_id, kind, payload) VALUES(?, 'tool', ?)",
+                        [.integer(runID), .text("")],
+                        operationClass: .interactive
+                    )
+                    if chunk == 0 {
+                        _ = try await database.query(
+                            "INSERT INTO events(run_id, kind, payload) VALUES(?, 'provider', ?)",
+                            [.integer(runID), .text("")],
+                            operationClass: .control
+                        )
+                    }
+                }
+            }
+        }
+        while await database.metrics().queuedByClass[.bulk] != 16 { await Task.yield() }
+
+        let clock = ContinuousClock()
+        let cancelStarted = clock.now
+        let committedCancellation = Task {
+            try await database.query(
+                "INSERT INTO events(run_id, kind, payload) VALUES(-1, 'cancel', '')",
+                operationClass: .control
+            )
+        }
+        try await database.commitTransaction(blockingTransactionID)
+        _ = try await committedCancellation.value
+        XCTAssertLessThan(cancelStarted.duration(to: clock.now), .seconds(1))
+
+        for producer in producers { try await producer.value }
+        let rows = try await database.query("SELECT COUNT(*) AS count FROM events")
+        XCTAssertEqual(rows.first?.column("count")?.integer, 16 * 17 + 1)
+
+        let metrics = await database.metrics()
+        XCTAssertLessThanOrEqual(metrics.maximumQueuedDepthObserved, metrics.capacity)
+        XCTAssertLessThanOrEqual(metrics.maximumWaitingDepthObserved, metrics.maximumAdmissionWaiters)
+        XCTAssertLessThanOrEqual(16 * payloadBytes, 16 * SQLiteDatabaseExecutor.maximumBulkEncodedBytes)
+        for operationClass in SQLiteOperationClass.allCases {
+            XCTAssertGreaterThan(metrics.completedByClass[operationClass, default: 0], 0)
+        }
+
+        let completions = recorder.values
+        for operationClass in SQLiteOperationClass.allCases {
+            guard let first = completions.firstIndex(of: operationClass) else {
+                return XCTFail("expected progress for \(operationClass)")
+            }
+            XCTAssertLessThanOrEqual(first, 8)
+        }
+        try await database.close()
+    }
 
     func testWeightedCycleAndAgingBoundAreDeterministic() async throws {
         let recorder = SQLiteCompletionRecorder()

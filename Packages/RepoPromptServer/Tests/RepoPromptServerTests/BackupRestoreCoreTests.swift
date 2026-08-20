@@ -9,7 +9,10 @@ final class BackupRestoreCoreTests: XCTestCase {
         let root = try StoreMigrationTestSupport.temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let state = root.appendingPathComponent("state", isDirectory: true)
+        let managedArtifacts = root.appendingPathComponent("artifact-source", isDirectory: true)
         try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: managedArtifacts, withIntermediateDirectories: true)
+        try Data("artifact payload".utf8).write(to: managedArtifacts.appendingPathComponent("payload.bin"))
         let databaseURL = state.appendingPathComponent("repoprompt.sqlite")
         try Data("hidden durable material".utf8).write(
             to: state.appendingPathComponent(".event-signing-material")
@@ -31,7 +34,18 @@ final class BackupRestoreCoreTests: XCTestCase {
             request: .init(
                 outputURL: archive,
                 recipientsFileURL: recipients,
-                roots: [.init(logicalID: "", url: state)],
+                roots: [
+                    .init(logicalID: "", url: state),
+                    .init(logicalID: "artifacts", url: managedArtifacts),
+                ],
+                externalAssets: [
+                    .init(
+                        logicalID: "provider.codex.binary",
+                        disposition: .externalOptional,
+                        expectedVersion: "fixture",
+                        expectedSHA256: String(repeating: "f", count: 64)
+                    ),
+                ],
                 namespaceKind: "server",
                 databaseIdentityDigest: sourceDigest
             ),
@@ -45,11 +59,12 @@ final class BackupRestoreCoreTests: XCTestCase {
         XCTAssertEqual(verified.manifest.source, currentEvidence)
         XCTAssertEqual(
             verified.manifest.assets.filter { $0.disposition == .included }.map(\.archivePath),
-            [".event-signing-material", "repoprompt.sqlite"]
+            [".event-signing-material", "artifacts/payload.bin", "repoprompt.sqlite"]
         )
         XCTAssertNotNil(verified.sidecar.verification)
 
         let target = root.appendingPathComponent("restored", isDirectory: true)
+        let restoredArtifacts = root.appendingPathComponent("artifact-restored", isDirectory: true)
         let targetDigest = String(repeating: "2", count: 64)
         _ = try await service.prepareRestore(
             .init(
@@ -57,13 +72,19 @@ final class BackupRestoreCoreTests: XCTestCase {
                 identityFileURL: identity,
                 targetRootURL: target,
                 targetNamespaceKind: "server",
-                targetDatabaseIdentityDigest: targetDigest
+                targetDatabaseIdentityDigest: targetDigest,
+                includedAssetTargetRoots: ["artifacts": restoredArtifacts]
             )
         )
         XCTAssertEqual(
             try Data(contentsOf: target.appendingPathComponent("repoprompt.sqlite")),
             try Data(contentsOf: databaseURL)
         )
+        XCTAssertEqual(
+            try Data(contentsOf: restoredArtifacts.appendingPathComponent("payload.bin")),
+            Data("artifact payload".utf8)
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.appendingPathComponent("artifacts").path))
         let request = try JSONDecoder().decode(
             RestoreNamespaceRequestV1.self,
             from: Data(contentsOf: target.appendingPathComponent("restore-request.json"))
@@ -71,6 +92,7 @@ final class BackupRestoreCoreTests: XCTestCase {
         XCTAssertEqual(request.sourceDatabaseIdentityDigest, sourceDigest)
         XCTAssertEqual(request.targetDatabaseIdentityDigest, targetDigest)
         XCTAssertEqual(request.sourceNamespaceKind, request.targetNamespaceKind)
+        XCTAssertEqual(request.missingExternalOptionalAssetIDs, ["provider.codex.binary"])
         try await store.close(clean: false)
     }
 
@@ -396,6 +418,129 @@ final class BackupRestoreCoreTests: XCTestCase {
         try await store.close(clean: false)
     }
 
+    func testInterruptedLeaseHeldPublicationRemainsFailClosedWithoutActivationRequest() async throws {
+        let fixture = try await makeBackupFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let target = fixture.root.appendingPathComponent("interrupted-target", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        let namespace = try StoreMigrationTestSupport.namespace(root: target)
+        let restore = try AuthorityMaintenanceSession.acquireForRestore(
+            configuration: .init(namespace: namespace)
+        )
+        let service = BackupRestoreService(
+            envelope: CopyingBackupEnvelope(),
+            toolVersion: "RepoPromptServerTests/1",
+            toolDigest: String(repeating: "a", count: 64),
+            restorePublicationFaultInjector: { point in
+                if point.hasPrefix("after-move:") { throw InjectedRestorePublicationFailure() }
+            }
+        )
+        do {
+            _ = try await restore.prepareRestore(
+                service: service,
+                request: .init(
+                    archiveURL: fixture.archive,
+                    identityFileURL: fixture.identity,
+                    targetRootURL: target,
+                    targetNamespaceKind: "server",
+                    targetDatabaseIdentityDigest: namespace.namespaceID
+                )
+            )
+            XCTFail("expected interrupted publication")
+        } catch is InjectedRestorePublicationFailure {}
+        XCTAssertTrue(FileManager.default.fileExists(atPath: target.appendingPathComponent("restore-incomplete.json").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.appendingPathComponent("restore-request.json").path))
+        try await restore.close(clean: false)
+
+        do {
+            _ = try await SQLiteServiceStore.openForServing(
+                storage: .file(namespace.databasePath),
+                namespaceKind: "server",
+                databaseIdentityDigest: namespace.namespaceID
+            )
+            XCTFail("incomplete publication must fail closed")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .quiescing)
+        }
+        try await fixture.store.close(clean: false)
+    }
+
+    func testIdentityModeMustBeExactly0600EvenWithNonCryptographicTestEnvelope() async throws {
+        let fixture = try await makeBackupFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        for mode: mode_t in [0o400, 0o640, 0o700] {
+            XCTAssertEqual(chmod(fixture.identity.path, mode), 0)
+            do {
+                _ = try await fixture.service.verify(
+                    archiveURL: fixture.archive,
+                    identityFileURL: fixture.identity
+                )
+                XCTFail("identity mode \(String(mode, radix: 8)) must be rejected")
+            } catch let error as ServiceAPIError {
+                XCTAssertEqual(error.code, .invalidRequest)
+                XCTAssertFalse(error.message.contains(fixture.identity.path))
+            }
+        }
+        XCTAssertEqual(chmod(fixture.identity.path, 0o600), 0)
+        _ = try await fixture.service.verify(
+            archiveURL: fixture.archive,
+            identityFileURL: fixture.identity
+        )
+        try await fixture.store.close(clean: false)
+    }
+
+    func testMissingOptionalProviderAssetsDisableAndDegradeOnActivation() async throws {
+        let root = try StoreMigrationTestSupport.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let databaseURL = root.appendingPathComponent("repoprompt.sqlite")
+        let sourceDigest = String(repeating: "1", count: 64)
+        let targetDigest = String(repeating: "2", count: 64)
+        let store = try await SQLiteServiceStore.openForServing(
+            storage: .file(databaseURL.path),
+            namespaceKind: "server",
+            databaseIdentityDigest: sourceDigest
+        )
+        _ = try await store.database.query(
+            "INSERT INTO provider_settings(provider_id,schema_version,enabled,revision,updated_at) VALUES('codex',3,1,7,?)",
+            [.float(Date().timeIntervalSince1970)]
+        )
+        _ = try await store.database.query(
+            "INSERT INTO provider_connections(provider_id,schema_version,connection_id,authentication_method,state,test_state,key_helper_configured,workload_identity_configured,created_at,updated_at,revision) VALUES('codex',4,'connection','deviceAuth','ready','passed',0,0,?,?,3)",
+            [.float(Date().timeIntervalSince1970), .float(Date().timeIntervalSince1970)]
+        )
+        let prior = try await store.metadata().storeID
+        _ = try await store.activateRestoredNamespace(
+            from: prior,
+            backupSequence: 0,
+            manifestDigest: String(repeating: "a", count: 64),
+            sourceNamespaceKind: "server",
+            sourceDatabaseIdentityDigest: sourceDigest,
+            targetNamespaceKind: "server",
+            targetDatabaseIdentityDigest: targetDigest,
+            missingExternalOptionalAssetIDs: [
+                "provider.codex.binary",
+                "provider.codex.credentials",
+                "project-source.git-ssh-key",
+            ],
+            activationToken: Data(repeating: 7, count: 32),
+            instanceID: UUID()
+        )
+        let settings = try await store.database.query(
+            "SELECT enabled,revision FROM provider_settings WHERE provider_id='codex'"
+        ).first
+        let connection = try await store.database.query(
+            "SELECT state,test_state,detail,revision FROM provider_connections WHERE provider_id='codex'"
+        ).first
+        XCTAssertEqual(settings?.column("enabled")?.integer, 0)
+        XCTAssertEqual(settings?.column("revision")?.integer, 8)
+        XCTAssertEqual(connection?.column("state")?.string, "attention")
+        XCTAssertEqual(connection?.column("test_state")?.string, "notTested")
+        XCTAssertTrue(connection?.column("detail")?.string?.contains("explicit fingerprint revalidation") == true)
+        XCTAssertEqual(connection?.column("revision")?.integer, 4)
+        try await store.close(clean: false)
+    }
+
     private func makeBackupFixture() async throws -> (
         root: URL,
         archive: URL,
@@ -428,44 +573,209 @@ final class BackupRestoreCoreTests: XCTestCase {
 }
 
 final class BackupRecipientRotationTests: XCTestCase {
-    func testRotationIsAdditiveAndProducesNewRecipientFingerprintSet() async throws {
+    private func assertServiceError(
+        _ code: ServiceErrorCode,
+        operation: () async throws -> Void
+    ) async {
+        do {
+            try await operation()
+            XCTFail("expected service error \(code)")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, code)
+        } catch {
+            XCTFail("unexpected error: \(type(of: error))")
+        }
+    }
+
+    func testIndependentCustodianRotationRestoreActivationAndRetirementBookkeeping() async throws {
         let root = try StoreMigrationTestSupport.temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let state = root.appendingPathComponent("state", isDirectory: true)
         try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
-        let store = try await SQLiteServiceStore.open(storage: .file(state.appendingPathComponent("repoprompt.sqlite").path))
+        let databaseURL = state.appendingPathComponent("repoprompt.sqlite")
+        let sourceDigest = String(repeating: "1", count: 64)
+        let targetDigest = String(repeating: "2", count: 64)
+        let store = try await SQLiteServiceStore.openForServing(
+            storage: .file(databaseURL.path),
+            namespaceKind: "server",
+            databaseIdentityDigest: sourceDigest
+        )
         let old = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
         let new = "age1pppppppppppppppppppppppppppppppppppppppppppppppppppp"
+        let retired = "age1rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+        let oldIdentity = try StoreMigrationTestSupport.identityFile(in: root, name: "old-identity.txt", recipient: old)
+        let newIdentity = try StoreMigrationTestSupport.identityFile(in: root, name: "new-identity.txt", recipient: new)
+        let unrelatedIdentity = try StoreMigrationTestSupport.identityFile(in: root, name: "unrelated-identity.txt", recipient: retired)
         let firstRecipients = try StoreMigrationTestSupport.recipientsFile(in: root, values: [old], name: "old.txt")
         let rotatedRecipients = try StoreMigrationTestSupport.recipientsFile(in: root, values: [old, new], name: "rotated.txt")
+        let retiredRecipients = try StoreMigrationTestSupport.recipientsFile(in: root, values: [new], name: "retired.txt")
         let service = StoreMigrationTestSupport.backupService()
         let firstArchive = root.appendingPathComponent("first.tar.age")
         let rotatedArchive = root.appendingPathComponent("rotated.tar.age")
-        let first = try await service.create(
-            request: .init(
-                outputURL: firstArchive,
-                recipientsFileURL: firstRecipients,
-                roots: [.init(logicalID: "", url: state)],
-                namespaceKind: "server",
-                databaseIdentityDigest: String(repeating: "1", count: 64)
-            ),
-            store: store
-        )
-        let rotated = try await service.create(
-            request: .init(
-                outputURL: rotatedArchive,
-                recipientsFileURL: rotatedRecipients,
-                roots: [.init(logicalID: "", url: state)],
-                namespaceKind: "server",
-                databaseIdentityDigest: String(repeating: "1", count: 64)
-            ),
-            store: store
-        )
+        let retiredArchive = root.appendingPathComponent("retired.tar.age")
+
+        let create: (URL, URL) async throws -> BackupSidecarV1 = { archive, recipients in
+            try await service.create(
+                request: .init(
+                    outputURL: archive,
+                    recipientsFileURL: recipients,
+                    roots: [.init(logicalID: "", url: state)],
+                    namespaceKind: "server",
+                    databaseIdentityDigest: sourceDigest
+                ),
+                store: store
+            )
+        }
+        let first = try await create(firstArchive, firstRecipients)
+        let rotated = try await create(rotatedArchive, rotatedRecipients)
+        let newOnly = try await create(retiredArchive, retiredRecipients)
         XCTAssertEqual(first.recipientFingerprints.count, 1)
         XCTAssertEqual(rotated.recipientFingerprints.count, 2)
+        XCTAssertEqual(newOnly.recipientFingerprints.count, 1)
         XCTAssertTrue(Set(first.recipientFingerprints).isSubset(of: Set(rotated.recipientFingerprints)))
+
+        let firstOld = try await service.verify(archiveURL: firstArchive, identityFileURL: oldIdentity)
+        XCTAssertEqual(firstOld.sidecar.verification?.verifierFingerprint, first.recipientFingerprints[0])
+        await assertServiceError(.invalidRequest) {
+            _ = try await service.verify(archiveURL: firstArchive, identityFileURL: newIdentity)
+        }
+        _ = try await service.verify(archiveURL: rotatedArchive, identityFileURL: oldIdentity)
+        let rotatedNew = try await service.verify(archiveURL: rotatedArchive, identityFileURL: newIdentity)
+        XCTAssertEqual(Set(rotatedNew.sidecar.verificationHistory?.map(\.verifierFingerprint) ?? []), Set(rotated.recipientFingerprints))
+        await assertServiceError(.invalidRequest) {
+            _ = try await service.verify(archiveURL: rotatedArchive, identityFileURL: unrelatedIdentity)
+        }
+        await assertServiceError(.invalidRequest) {
+            _ = try await service.verify(archiveURL: retiredArchive, identityFileURL: oldIdentity)
+        }
+        _ = try await service.verify(archiveURL: retiredArchive, identityFileURL: newIdentity)
         try await store.close(clean: false)
+
+        let target = root.appendingPathComponent("restored", isDirectory: true)
+        _ = try await service.prepareRestore(.init(
+            archiveURL: retiredArchive,
+            identityFileURL: newIdentity,
+            targetRootURL: target,
+            targetNamespaceKind: "server",
+            targetDatabaseIdentityDigest: targetDigest
+        ))
+        let request = try JSONDecoder().decode(
+            RestoreNamespaceRequestV1.self,
+            from: Data(contentsOf: target.appendingPathComponent("restore-request.json"))
+        )
+        let restored = try await SQLiteServiceStore.openForServing(
+            storage: .file(target.appendingPathComponent("repoprompt.sqlite").path),
+            namespaceKind: "server",
+            databaseIdentityDigest: sourceDigest
+        )
+        let freshStoreID = try await restored.activateRestoredNamespace(
+            from: request.restoredFromStoreID,
+            backupSequence: request.backupSequence,
+            manifestDigest: request.backupManifestSHA256,
+            sourceNamespaceKind: request.sourceNamespaceKind,
+            sourceDatabaseIdentityDigest: request.sourceDatabaseIdentityDigest,
+            targetNamespaceKind: request.targetNamespaceKind,
+            targetDatabaseIdentityDigest: request.targetDatabaseIdentityDigest,
+            missingExternalOptionalAssetIDs: request.missingExternalOptionalAssetIDs,
+            activationToken: Data(repeating: 9, count: 32),
+            instanceID: UUID()
+        )
+        XCTAssertNotEqual(freshStoreID, request.restoredFromStoreID)
+        let rebound = try await restored.database.query(
+            "SELECT namespace_kind,database_identity_digest FROM authority_namespace_identity WHERE fixed_id=1"
+        ).first
+        XCTAssertEqual(rebound?.column("namespace_kind")?.string, "server")
+        XCTAssertEqual(rebound?.column("database_identity_digest")?.string, targetDigest)
+        try await restored.close(clean: false)
+    }
+}
+
+final class RealAgeBackupIntegrationTests: XCTestCase {
+    func testPinnedAgePerformsRealOverlapAndRetirementEncryption() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        let agePath = environment["REPOPROMPT_AGE_EXECUTABLE"] ?? "/usr/local/libexec/repoprompt/age"
+        let keygenPath = environment["REPOPROMPT_AGE_KEYGEN_EXECUTABLE"] ?? "/usr/local/libexec/repoprompt/age-keygen"
+        guard FileManager.default.isExecutableFile(atPath: agePath),
+              FileManager.default.isExecutableFile(atPath: keygenPath)
+        else {
+            throw XCTSkip("pinned real age and age-keygen executables are unavailable")
+        }
+        let configuration: AgeRuntimeConfiguration
+        do {
+            configuration = try .environment(environment)
+        } catch {
+            throw XCTSkip("pinned age checksum configuration is unavailable")
+        }
+        let envelope = try AgeBackupEnvelope(configuration: configuration)
+        let service = StoreMigrationTestSupport.backupService(envelope: envelope)
+        let root = try StoreMigrationTestSupport.temporaryDirectory("real-age")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let state = root.appendingPathComponent("state", isDirectory: true)
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        let store = try await SQLiteServiceStore.open(
+            storage: .file(state.appendingPathComponent("repoprompt.sqlite").path)
+        )
+        let oldIdentity = root.appendingPathComponent("custodian-old.agekey")
+        let newIdentity = root.appendingPathComponent("custodian-new.agekey")
+        _ = try run(keygenPath, ["-o", oldIdentity.path])
+        _ = try run(keygenPath, ["-o", newIdentity.path])
+        XCTAssertEqual(chmod(oldIdentity.path, 0o600), 0)
+        XCTAssertEqual(chmod(newIdentity.path, 0o600), 0)
+        let oldRecipient = try run(keygenPath, ["-y", oldIdentity.path]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let newRecipient = try run(keygenPath, ["-y", newIdentity.path]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let overlapRecipients = try StoreMigrationTestSupport.recipientsFile(
+            in: root,
+            values: [oldRecipient, newRecipient],
+            name: "overlap-recipients.txt"
+        )
+        let retiredRecipients = try StoreMigrationTestSupport.recipientsFile(
+            in: root,
+            values: [newRecipient],
+            name: "retired-recipients.txt"
+        )
+        let overlap = root.appendingPathComponent("overlap.tar.age")
+        let retired = root.appendingPathComponent("retired.tar.age")
+        for (archive, recipients) in [(overlap, overlapRecipients), (retired, retiredRecipients)] {
+            _ = try await service.create(
+                request: .init(
+                    outputURL: archive,
+                    recipientsFileURL: recipients,
+                    roots: [.init(logicalID: "", url: state)],
+                    namespaceKind: "server",
+                    databaseIdentityDigest: String(repeating: "1", count: 64)
+                ),
+                store: store
+            )
+        }
+        _ = try await service.verify(archiveURL: overlap, identityFileURL: oldIdentity)
+        let verifiedByNew = try await service.verify(archiveURL: overlap, identityFileURL: newIdentity)
+        XCTAssertEqual(verifiedByNew.sidecar.verificationHistory?.count, 2)
+        do {
+            _ = try await service.verify(archiveURL: retired, identityFileURL: oldIdentity)
+            XCTFail("retired identity unexpectedly decrypted the new-only archive")
+        } catch {
+            XCTAssertFalse(String(describing: error).contains("AGE-SECRET-KEY"))
+        }
+        _ = try await service.verify(archiveURL: retired, identityFileURL: newIdentity)
+        try await store.close(clean: false)
+    }
+
+    private func run(_ executable: String, _ arguments: [String]) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = Pipe()
+        try process.run()
+        let data = try output.fileHandleForReading.readToEnd() ?? Data()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "pinned age integration command failed")
+        }
+        return String(data: data, encoding: .utf8) ?? ""
     }
 }
 
 private struct InjectedRestoreFailure: Error {}
+private struct InjectedRestorePublicationFailure: Error {}

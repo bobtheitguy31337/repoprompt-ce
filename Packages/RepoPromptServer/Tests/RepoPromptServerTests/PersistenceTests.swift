@@ -461,6 +461,52 @@ final class PersistenceTests: XCTestCase {
         try await store.close()
     }
 
+    func testRejectedSessionCursorDoesNotCommitBulkTranscriptRows() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
+        let projectCursor = try await store.nextCursor()
+        let project = ProjectSnapshot(
+            projectID: UUID(),
+            name: "P",
+            creator: actor,
+            state: .active,
+            roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)],
+            revision: 1,
+            cursor: projectCursor
+        )
+        _ = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: nil)
+        let sessionID = UUID()
+        let rejected = SessionSnapshot(
+            sessionID: sessionID,
+            projectID: project.projectID,
+            parentSessionID: nil,
+            rootSessionID: sessionID,
+            creator: actor,
+            provider: .codex,
+            model: nil,
+            visibility: .privateSession,
+            state: .idle,
+            runGeneration: 0,
+            turnEpoch: 0,
+            revision: 1,
+            transcript: [.init(entryID: UUID(), sessionSequence: 1, kind: .human, content: "must roll back", actor: actor, timestamp: Date())],
+            interactions: [],
+            cursor: .init(storeID: UUID(), globalSequence: 0)
+        )
+        do {
+            _ = try await store.persistSession(rejected, eventType: .sessionCreated, actor: actor, correlationID: UUID(), idempotency: nil)
+            XCTFail("expected cursor rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .staleRevision)
+        }
+        let count = try await store.database.query("SELECT COUNT(*) AS count FROM transcript_entries")
+            .first?.column("count")?.integer
+        XCTAssertEqual(count, 0)
+        let storedSession = try await store.session(id: sessionID)
+        XCTAssertNil(storedSession)
+        try await store.close()
+    }
+
     func testContextUsageSurvivesInteractionRebuildAndSilentUpsert() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")

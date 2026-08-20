@@ -132,53 +132,176 @@ final class SchemaMigrationTests: XCTestCase {
 }
 
 final class SQLiteTransactionFaultInjectionTests: XCTestCase {
-    func testV7StatementAndLedgerFaultsRollBackAndReopenAtV6() async throws {
-        for injectedPoint in [
-            PersistenceFaultPoint.afterMigrationStatement,
-            .beforeMigrationLedgerInsert,
-            .afterMigrationLedgerInsert,
-        ] {
-            let root = try StoreMigrationTestSupport.temporaryDirectory(injectedPoint.rawValue)
-            defer { try? FileManager.default.removeItem(at: root) }
-            let databaseURL = root.appendingPathComponent("repoprompt.sqlite")
-            try await StoreMigrationTestSupport.makeV6Store(at: databaseURL)
-            var store = try await SQLiteServiceStore.openForMaintenance(
-                storage: .file(databaseURL.path),
-                faultInjector: PersistenceFaultInjector { point in
-                    if point == injectedPoint { throw InjectedMigrationFailure() }
-                }
-            )
-            let source = try await store.migrationSourceEvidence()
-            do {
-                _ = try await store.migrateToLatest(
-                    verifiedBackup: VerifiedMigrationBackup(
-                        source: source,
-                        archiveSHA256: String(repeating: "a", count: 64),
-                        manifestSHA256: String(repeating: "b", count: 64),
-                        verifierFingerprint: String(repeating: "c", count: 64)
-                    ),
-                    namespaceKind: "server",
-                    databaseIdentityDigest: String(repeating: "d", count: 64)
-                )
-                XCTFail("Expected injected migration failure at \(injectedPoint.rawValue)")
-            } catch is InjectedMigrationFailure {}
-            let metadata = try await store.metadata()
-            XCTAssertEqual(metadata.schemaVersion, 6)
-            let database = await store.database
-            let v7Ledger = try await database.query("SELECT version FROM schema_migrations WHERE version=7").first
-            XCTAssertNil(v7Ledger)
-            let v7Tables = try await database.query(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('schema_compatibility_audit','authority_namespace_identity')"
-            )
-            XCTAssertTrue(v7Tables.isEmpty)
-            try await store.close(clean: false)
+    func testEveryV7StatementInterruptionAndCancellationBoundaryPreservesBytesAndLedger() async throws {
+        let statementCount = try await countHistoricalV7StatementBoundaries()
+        XCTAssertGreaterThan(statementCount, SchemaV6.statements.count)
+        let boundaries = [(PersistenceFaultPoint.afterTransactionBegin, 1)]
+            + (1 ... statementCount).map { (PersistenceFaultPoint.afterMigrationStatement, $0) }
+            + [
+                (PersistenceFaultPoint.beforeMigrationLedgerInsert, 1),
+                (PersistenceFaultPoint.afterMigrationLedgerInsert, 1),
+                (PersistenceFaultPoint.beforeTransactionCommit, 1),
+            ]
 
-            store = try await SQLiteServiceStore.openForMaintenance(storage: .file(databaseURL.path))
-            let reopenedMetadata = try await store.metadata()
-            XCTAssertEqual(reopenedMetadata.schemaVersion, 6)
-            try await store.close(clean: false)
+        for cancellation in [false, true] {
+            for (point, occurrence) in boundaries {
+                try await assertFailedMigrationPreservesV6(
+                    point: point,
+                    occurrence: occurrence,
+                    cancellation: cancellation
+                )
+            }
+        }
+    }
+
+    private func countHistoricalV7StatementBoundaries() async throws -> Int {
+        let root = try StoreMigrationTestSupport.temporaryDirectory("count-v7-boundaries")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let databaseURL = root.appendingPathComponent("repoprompt.sqlite")
+        try await StoreMigrationTestSupport.makeV6Store(
+            at: databaseURL,
+            digest: StoreMigrationTestSupport.knownV6Digests[4]
+        )
+        let counter = MigrationFaultCounter(target: nil, occurrence: 0, cancellation: false)
+        let store = try await SQLiteServiceStore.openForMaintenance(
+            storage: .file(databaseURL.path),
+            faultInjector: PersistenceFaultInjector { point in try counter.hit(point) }
+        )
+        let source = try await store.migrationSourceEvidence()
+        _ = try await store.migrateToLatest(
+            verifiedBackup: verifiedBackup(source),
+            namespaceKind: "server",
+            databaseIdentityDigest: String(repeating: "d", count: 64)
+        )
+        let count = counter.count(for: .afterMigrationStatement)
+        try await store.close(clean: false)
+        return count
+    }
+
+    private func assertFailedMigrationPreservesV6(
+        point: PersistenceFaultPoint,
+        occurrence: Int,
+        cancellation: Bool
+    ) async throws {
+        let root = try StoreMigrationTestSupport.temporaryDirectory("\(point.rawValue)-\(occurrence)-\(cancellation)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let databaseURL = root.appendingPathComponent("repoprompt.sqlite")
+        try await StoreMigrationTestSupport.makeV6Store(
+            at: databaseURL,
+            digest: StoreMigrationTestSupport.knownV6Digests[4]
+        )
+        let counter = MigrationFaultCounter(target: point, occurrence: occurrence, cancellation: cancellation)
+        var store = try await SQLiteServiceStore.openForMaintenance(
+            storage: .file(databaseURL.path),
+            faultInjector: PersistenceFaultInjector { hit in try counter.hit(hit) }
+        )
+        let source = try await store.migrationSourceEvidence()
+        let database = await store.database
+        let ledgerBefore = try await ledgerEvidence(database)
+        let bytesBefore = try Data(contentsOf: databaseURL)
+
+        do {
+            _ = try await store.migrateToLatest(
+                verifiedBackup: verifiedBackup(source),
+                namespaceKind: "server",
+                databaseIdentityDigest: String(repeating: "d", count: 64)
+            )
+            XCTFail("expected fault at \(point.rawValue)#\(occurrence)")
+        } catch is InjectedMigrationFailure {
+            XCTAssertFalse(cancellation)
+        } catch is CancellationError {
+            XCTAssertTrue(cancellation)
+        }
+
+        let bytesAfter = try Data(contentsOf: databaseURL)
+        let ledgerAfter = try await ledgerEvidence(database)
+        let metadataAfter = try await store.metadata()
+        let v7Ledger = try await database.query("SELECT version FROM schema_migrations WHERE version=7").first
+        let v7Tables = try await database.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('schema_compatibility_audit','authority_namespace_identity')"
+        )
+        XCTAssertEqual(bytesAfter, bytesBefore)
+        XCTAssertEqual(ledgerAfter, ledgerBefore)
+        XCTAssertEqual(metadataAfter.schemaVersion, 6)
+        XCTAssertNil(v7Ledger)
+        XCTAssertTrue(v7Tables.isEmpty)
+        try await store.close(clean: false)
+
+        store = try await SQLiteServiceStore.openForMaintenance(storage: .file(databaseURL.path))
+        let reopenedMetadata = try await store.metadata()
+        let reopenedDatabase = await store.database
+        let reopenedLedger = try await ledgerEvidence(reopenedDatabase)
+        XCTAssertEqual(reopenedMetadata.schemaVersion, 6)
+        XCTAssertEqual(reopenedLedger, ledgerBefore)
+        try await store.close(clean: false)
+    }
+
+    private func ledgerEvidence(_ database: SQLiteDatabaseExecutor) async throws -> [String] {
+        try await database.query("SELECT version,digest FROM schema_migrations ORDER BY version").map {
+            "\($0.column("version")?.integer ?? -1):\($0.column("digest")?.string ?? "")"
+        }
+    }
+
+    private func verifiedBackup(_ source: MigrationSourceEvidence) -> VerifiedMigrationBackup {
+        VerifiedMigrationBackup(
+            source: source,
+            archiveSHA256: String(repeating: "a", count: 64),
+            manifestSHA256: String(repeating: "b", count: 64),
+            verifierFingerprint: String(repeating: "c", count: 64)
+        )
+    }
+
+    func testCanonicalMigrationDigestsMatchCheckedInPrograms() {
+        let migrations: [(version: Int, frozen: String, computed: String)] = [
+            (SchemaV1.version, SchemaV1.canonicalDigest, SchemaV1.definition.computedDigest),
+            (SchemaV2.version, SchemaV2.canonicalDigest, SchemaV2.definition.computedDigest),
+            (SchemaV3.version, SchemaV3.canonicalDigest, SchemaV3.definition.computedDigest),
+            (SchemaV4.version, SchemaV4.canonicalDigest, SchemaV4.definition.computedDigest),
+            (SchemaV5.version, SchemaV5.canonicalDigest, SchemaV5.definition.computedDigest),
+            (SchemaV6.version, SchemaV6.canonicalDigest, SchemaV6.definition.computedDigest),
+            (SchemaV7.version, SchemaV7.canonicalDigest, SchemaV7.definition.computedDigest),
+        ]
+        XCTAssertEqual(migrations.map(\.version), Array(1 ... 7))
+        for migration in migrations {
+            XCTAssertEqual(
+                migration.computed,
+                migration.frozen,
+                "migration V\(migration.version) is immutable; append a new version instead of changing its program"
+            )
         }
     }
 }
 
 private struct InjectedMigrationFailure: Error {}
+
+private final class MigrationFaultCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private let target: PersistenceFaultPoint?
+    private let occurrence: Int
+    private let cancellation: Bool
+    private var counts: [String: Int] = [:]
+
+    init(target: PersistenceFaultPoint?, occurrence: Int, cancellation: Bool) {
+        self.target = target
+        self.occurrence = occurrence
+        self.cancellation = cancellation
+    }
+
+    func hit(_ point: PersistenceFaultPoint) throws {
+        lock.lock()
+        let count = counts[point.rawValue, default: 0] + 1
+        counts[point.rawValue] = count
+        let shouldFail = point == target && count == occurrence
+        lock.unlock()
+        if shouldFail {
+            if cancellation { throw CancellationError() }
+            throw InjectedMigrationFailure()
+        }
+    }
+
+    func count(for point: PersistenceFaultPoint) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return counts[point.rawValue, default: 0]
+    }
+}

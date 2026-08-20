@@ -91,11 +91,13 @@ private struct RestoreActivationRequest: Decodable {
     let sourceDatabaseIdentityDigest: String
     let targetNamespaceKind: String
     let targetDatabaseIdentityDigest: String
+    let missingExternalOptionalAssetIDs: [String]?
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, acknowledged, backupSequence, backupCreatedAt
         case sourceNamespaceKind, sourceDatabaseIdentityDigest
         case targetNamespaceKind, targetDatabaseIdentityDigest
+        case missingExternalOptionalAssetIDs
         case restoredFromStoreID = "restoredFromStoreId"
         case backupManifestSHA256 = "backupManifestSha256"
     }
@@ -164,6 +166,7 @@ public extension RepoPromptAuthorityHostFactory {
                         sourceDatabaseIdentityDigest: request.sourceDatabaseIdentityDigest,
                         targetNamespaceKind: request.targetNamespaceKind,
                         targetDatabaseIdentityDigest: request.targetDatabaseIdentityDigest,
+                        missingExternalOptionalAssetIDs: request.missingExternalOptionalAssetIDs ?? [],
                         activationToken: token,
                         instanceID: instanceID
                     )

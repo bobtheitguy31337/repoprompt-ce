@@ -16,6 +16,17 @@ final class SchemaV7CompatibilityFixtureTests: XCTestCase {
                 "INSERT INTO projects(project_id,schema_version,name,creator_json,lifecycle_state,revision,snapshot_json,created_at,updated_at) VALUES(?,1,'goblinUserId',?,'active',1,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 [.text(projectID.uuidString), .text(legacyJSON), .text(legacyJSON)]
             )
+            let legacySessionID = UUID().uuidString
+            if digest != SchemaV6.digest {
+                _ = try await store.database.query(
+                    "INSERT INTO sessions(session_id,project_id,root_session_id,schema_version,creator_external_id,lifecycle_state,provider_kind,visibility,run_generation,turn_epoch,revision,snapshot_json,created_at,updated_at) VALUES(?,?,?,1,'fixture','active','fake','private',0,0,1,'{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                    [.text(legacySessionID), .text(projectID.uuidString), .text(legacySessionID)]
+                )
+                _ = try await store.database.query(
+                    "INSERT INTO collaboration_metadata(session_id,schema_version,visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision,collaboration_acknowledgement_json,goblin_acknowledgement_json,updated_at) VALUES(?,1,'private',0,'fixture',1,1,1,NULL,'{\"accepted\":true}',CURRENT_TIMESTAMP)",
+                    [.text(legacySessionID)]
+                )
+            }
             let source = try await store.migrationSourceEvidence()
             _ = try await store.migrateToLatest(
                 verifiedBackup: .init(
@@ -53,6 +64,19 @@ final class SchemaV7CompatibilityFixtureTests: XCTestCase {
                     #"{"userId":"u1","selection":"explicit-selection"}"#
                 )
             }
+            if digest != SchemaV6.digest {
+                let collaboration = try await store.database.query(
+                    "SELECT collaboration_acknowledgement_json FROM collaboration_metadata WHERE session_id=?",
+                    [.text(legacySessionID)]
+                ).first
+                XCTAssertEqual(
+                    collaboration?.column("collaboration_acknowledgement_json")?.string,
+                    "{\"accepted\":true}"
+                )
+                let columns = Set(try await store.database.query("PRAGMA table_info(collaboration_metadata)")
+                    .compactMap { $0.column("name")?.string })
+                XCTAssertFalse(columns.contains("goblin_acknowledgement_json"))
+            }
             let metadata = try await store.metadata()
             XCTAssertEqual(metadata.schemaVersion, 7)
             try await store.close(clean: false)
@@ -60,7 +84,11 @@ final class SchemaV7CompatibilityFixtureTests: XCTestCase {
     }
 
     func testV7OwnsOnlyTwoNewTables() {
-        XCTAssertEqual(Set(SchemaV7.normalizationPlans.keys), SchemaV7.knownPrototypeV6Digests)
+        XCTAssertEqual(
+            Set(SchemaV7.normalizationPlans.keys),
+            SchemaV7.knownPrototypeV6Digests.union([SchemaV6.legacyCanonicalDigest, SchemaV6.canonicalDigest])
+        )
+        XCTAssertEqual(SchemaV7.knownPrototypeV6Digests.count, 7)
         XCTAssertEqual(SchemaV7.statements.count, 2)
         XCTAssertTrue(SchemaV7.statements[0].contains("schema_compatibility_audit"))
         XCTAssertTrue(SchemaV7.statements[1].contains("authority_namespace_identity"))

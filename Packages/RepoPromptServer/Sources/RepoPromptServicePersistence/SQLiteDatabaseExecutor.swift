@@ -2,24 +2,29 @@ import Foundation
 import RepoPromptRuntimeModel
 import SQLiteNIO
 
-public enum SQLiteOperationClass: String, CaseIterable, Sendable {
+enum SQLiteOperationClass: String, CaseIterable, Sendable {
     case control
     case interactive
     case bulk
 }
 
-public struct SQLiteDatabaseExecutorMetrics: Sendable, Equatable {
-    public let capacity: Int
-    public let reservedControlCapacity: Int
-    public let queuedByClass: [SQLiteOperationClass: Int]
-    public let saturationCount: Int
-    public let completedByClass: [SQLiteOperationClass: Int]
-    public let totalWaitNanosecondsByClass: [SQLiteOperationClass: UInt64]
-    public let totalExecuteNanosecondsByClass: [SQLiteOperationClass: UInt64]
+struct SQLiteDatabaseExecutorMetrics: Sendable, Equatable {
+    let capacity: Int
+    let reservedControlCapacity: Int
+    let maximumAdmissionWaiters: Int
+    let queuedByClass: [SQLiteOperationClass: Int]
+    let waitingByClass: [SQLiteOperationClass: Int]
+    let maximumQueuedDepthObserved: Int
+    let maximumWaitingDepthObserved: Int
+    let saturationCount: Int
+    let completedByClass: [SQLiteOperationClass: Int]
+    let totalWaitNanosecondsByClass: [SQLiteOperationClass: UInt64]
+    let totalExecuteNanosecondsByClass: [SQLiteOperationClass: UInt64]
 }
 
 enum SQLiteExecutionContext {
     @TaskLocal static var transactionID: UUID?
+    @TaskLocal static var operationClass: SQLiteOperationClass?
 }
 
 /// The sole owner of a SQLite connection.
@@ -28,11 +33,12 @@ enum SQLiteExecutionContext {
 /// worker. Transaction-affine statements are the only work eligible between
 /// BEGIN and COMMIT/ROLLBACK, so actor reentrancy cannot expose a partially
 /// applied transaction to unrelated reads.
-public actor SQLiteDatabaseExecutor {
-    public static let defaultCapacity = 256
-    public static let defaultReservedControlCapacity = 32
-    public static let maximumBulkRows = 256
-    public static let maximumBulkEncodedBytes = 1_048_576
+actor SQLiteDatabaseExecutor {
+    static let defaultCapacity = 256
+    static let defaultReservedControlCapacity = 32
+    static let defaultMaximumAdmissionWaiters = 256
+    static let maximumBulkRows = 256
+    static let maximumBulkEncodedBytes = 1_048_576
 
     private enum Work: Sendable {
         case query(String, [SQLiteData])
@@ -53,23 +59,32 @@ public actor SQLiteDatabaseExecutor {
 
     private struct AdmissionWaiter {
         let id: UUID
+        let sequence: UInt64
+        let operationClass: SQLiteOperationClass
         let continuation: CheckedContinuation<Void, Error>
     }
 
     private let connection: SQLiteConnection
     private let capacity: Int
     private let reservedControlCapacity: Int
+    private let maximumAdmissionWaiters: Int
     private var queues: [SQLiteOperationClass: [Job]] = [
         .control: [],
         .interactive: [],
         .bulk: [],
     ]
-    private var admissionWaiters: [AdmissionWaiter] = []
+    private var admissionWaiters: [SQLiteOperationClass: [AdmissionWaiter]] = [
+        .control: [],
+        .interactive: [],
+        .bulk: [],
+    ]
     private var activeTransactionID: UUID?
     private var nextSequence: UInt64 = 1
     private var workerRunning = false
     private var closed = false
     private var saturationCount = 0
+    private var maximumQueuedDepthObserved = 0
+    private var maximumWaitingDepthObserved = 0
     private var completedByClass: [SQLiteOperationClass: Int] = [
         .control: 0,
         .interactive: 0,
@@ -101,21 +116,25 @@ public actor SQLiteDatabaseExecutor {
     private init(
         connection: SQLiteConnection,
         capacity: Int,
-        reservedControlCapacity: Int
+        reservedControlCapacity: Int,
+        maximumAdmissionWaiters: Int
     ) {
         self.connection = connection
         self.capacity = capacity
         self.reservedControlCapacity = reservedControlCapacity
+        self.maximumAdmissionWaiters = maximumAdmissionWaiters
     }
 
-    public static func open(
+    static func open(
         storage: SQLiteConnection.Storage,
         capacity: Int = defaultCapacity,
-        reservedControlCapacity: Int = defaultReservedControlCapacity
+        reservedControlCapacity: Int = defaultReservedControlCapacity,
+        maximumAdmissionWaiters: Int = defaultMaximumAdmissionWaiters
     ) async throws -> SQLiteDatabaseExecutor {
         guard capacity > 0,
               reservedControlCapacity >= 16,
-              reservedControlCapacity < capacity
+              reservedControlCapacity < capacity,
+              maximumAdmissionWaiters >= reservedControlCapacity
         else {
             throw ServiceAPIError(
                 code: .invalidRequest,
@@ -126,18 +145,22 @@ public actor SQLiteDatabaseExecutor {
         return SQLiteDatabaseExecutor(
             connection: connection,
             capacity: capacity,
-            reservedControlCapacity: reservedControlCapacity
+            reservedControlCapacity: reservedControlCapacity,
+            maximumAdmissionWaiters: maximumAdmissionWaiters
         )
     }
 
-    public func query(
+    /// Package-internal SQL seam. Production callers outside the persistence
+    /// module can submit only typed `SQLiteServiceStore` operations.
+    func query(
         _ sql: String,
         _ bindings: [SQLiteData] = [],
-        operationClass: SQLiteOperationClass = .interactive
+        operationClass: SQLiteOperationClass? = nil
     ) async throws -> [SQLiteRow] {
-        try await submit(
+        let resolvedClass = operationClass ?? SQLiteExecutionContext.operationClass ?? .interactive
+        return try await submit(
             .query(sql, bindings),
-            operationClass: operationClass,
+            operationClass: resolvedClass,
             transactionID: SQLiteExecutionContext.transactionID
         )
     }
@@ -158,13 +181,19 @@ public actor SQLiteDatabaseExecutor {
         )
     }
 
-    public func metrics() -> SQLiteDatabaseExecutorMetrics {
+    func metrics() -> SQLiteDatabaseExecutorMetrics {
         SQLiteDatabaseExecutorMetrics(
             capacity: capacity,
             reservedControlCapacity: reservedControlCapacity,
+            maximumAdmissionWaiters: maximumAdmissionWaiters,
             queuedByClass: Dictionary(uniqueKeysWithValues: SQLiteOperationClass.allCases.map {
                 ($0, queues[$0, default: []].count)
             }),
+            waitingByClass: Dictionary(uniqueKeysWithValues: SQLiteOperationClass.allCases.map {
+                ($0, admissionWaiters[$0, default: []].count)
+            }),
+            maximumQueuedDepthObserved: maximumQueuedDepthObserved,
+            maximumWaitingDepthObserved: maximumWaitingDepthObserved,
             saturationCount: saturationCount,
             completedByClass: completedByClass,
             totalWaitNanosecondsByClass: totalWaitNanosecondsByClass,
@@ -178,9 +207,9 @@ public actor SQLiteDatabaseExecutor {
         testCompletionObserver = observer
     }
 
-    public func close() async throws {
+    func close() async throws {
         guard !closed else { return }
-        guard activeTransactionID == nil, queuedCount == 0 else {
+        guard activeTransactionID == nil, queuedCount == 0, waitingCount == 0 else {
             throw ServiceAPIError(
                 code: .persistenceUnavailable,
                 message: "Cannot close SQLite while work is active",
@@ -199,6 +228,14 @@ public actor SQLiteDatabaseExecutor {
         queues[.interactive, default: []].count + queues[.bulk, default: []].count
     }
 
+    private var waitingCount: Int {
+        admissionWaiters.values.reduce(0) { $0 + $1.count }
+    }
+
+    private var nonControlWaitingCount: Int {
+        admissionWaiters[.interactive, default: []].count + admissionWaiters[.bulk, default: []].count
+    }
+
     private func hasAdmissionCapacity(for operationClass: SQLiteOperationClass) -> Bool {
         guard queuedCount < capacity else { return false }
         if operationClass == .control { return true }
@@ -211,8 +248,26 @@ public actor SQLiteDatabaseExecutor {
     ) async throws {
         while !hasAdmissionCapacity(for: operationClass) {
             saturationCount += 1
+            let canWait = waitingCount < maximumAdmissionWaiters
+                && (operationClass == .control
+                    || nonControlWaitingCount < maximumAdmissionWaiters - reservedControlCapacity)
+            guard canWait else {
+                throw ServiceAPIError(
+                    code: .rateLimited,
+                    message: "SQLite admission is saturated",
+                    retryable: true
+                )
+            }
+            let sequence = nextSequence
+            nextSequence &+= 1
             try await withCheckedThrowingContinuation { continuation in
-                admissionWaiters.append(.init(id: jobID, continuation: continuation))
+                admissionWaiters[operationClass, default: []].append(.init(
+                    id: jobID,
+                    sequence: sequence,
+                    operationClass: operationClass,
+                    continuation: continuation
+                ))
+                maximumWaitingDepthObserved = max(maximumWaitingDepthObserved, waitingCount)
             }
         }
     }
@@ -259,6 +314,10 @@ public actor SQLiteDatabaseExecutor {
             throw ServiceAPIError(code: .persistenceUnavailable, message: "SQLite executor is closed")
         }
         try await waitForAdmission(operationClass, jobID: jobID)
+        // Cancellation can race the waiter continuation being resumed. Recheck
+        // before materializing the job so a canceled producer never consumes a
+        // queue slot after admission.
+        try Task.checkCancellation()
         let sequence = nextSequence
         nextSequence &+= 1
         return try await withCheckedThrowingContinuation { continuation in
@@ -273,15 +332,18 @@ public actor SQLiteDatabaseExecutor {
                     continuation: continuation
                 )
             )
+            maximumQueuedDepthObserved = max(maximumQueuedDepthObserved, queuedCount)
             startWorkerIfNeeded()
         }
     }
 
     private func cancel(jobID: UUID) {
-        if let index = admissionWaiters.firstIndex(where: { $0.id == jobID }) {
-            let waiter = admissionWaiters.remove(at: index)
-            waiter.continuation.resume(throwing: CancellationError())
-            return
+        for operationClass in SQLiteOperationClass.allCases {
+            if let index = admissionWaiters[operationClass, default: []].firstIndex(where: { $0.id == jobID }) {
+                let waiter = admissionWaiters[operationClass, default: []].remove(at: index)
+                waiter.continuation.resume(throwing: CancellationError())
+                return
+            }
         }
         for operationClass in SQLiteOperationClass.allCases {
             if let index = queues[operationClass, default: []].firstIndex(where: { $0.id == jobID }) {
@@ -399,8 +461,17 @@ public actor SQLiteDatabaseExecutor {
     }
 
     private func resumeAdmissionWaiters() {
-        let waiters = admissionWaiters
-        admissionWaiters.removeAll(keepingCapacity: true)
-        for waiter in waiters { waiter.continuation.resume() }
+        // Wake only work that can actually claim the newly available slot. The
+        // oldest eligible waiter wins, preserving FIFO admission without an
+        // unbounded thundering herd of suspended producer tasks.
+        let eligible = SQLiteOperationClass.allCases.compactMap { operationClass -> AdmissionWaiter? in
+            guard hasAdmissionCapacity(for: operationClass) else { return nil }
+            return admissionWaiters[operationClass, default: []].first
+        }
+        guard let selected = eligible.min(by: { $0.sequence < $1.sequence }),
+              let index = admissionWaiters[selected.operationClass, default: []].firstIndex(where: { $0.id == selected.id })
+        else { return }
+        let waiter = admissionWaiters[selected.operationClass, default: []].remove(at: index)
+        waiter.continuation.resume()
     }
 }

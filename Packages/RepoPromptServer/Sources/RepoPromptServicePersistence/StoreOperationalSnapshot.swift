@@ -52,13 +52,10 @@ public extension SQLiteServiceStore {
         })
         let metadata = try await metadata()
         let migrationsValid = metadata.schemaVersion == SchemaV7.version
-            && migrationMap[SchemaV1.version] == SchemaV1.digest
-            && migrationMap[SchemaV2.version] == SchemaV2.digest
-            && migrationMap[SchemaV3.version] == SchemaV3.digest
-            && migrationMap[SchemaV4.version] == SchemaV4.digest
-            && migrationMap[SchemaV5.version] == SchemaV5.digest
-            && migrationMap[SchemaV6.version] == SchemaV6.digest
-            && migrationMap[SchemaV7.version] == SchemaV7.digest
+            && migrationMap.count == SchemaV7.version
+            && (1 ... SchemaV7.version).allSatisfy { version in
+                migrationMap[version].map { MigrationLedgerPolicy.accepts(version: version, digest: $0) } == true
+            }
         let liveEventCount = try await scalarInt("SELECT COUNT(*) AS value FROM events")
         let archiveSegmentCount = try await scalarInt("SELECT COUNT(*) AS value FROM event_archive_blobs")
         let archivedEventCount = try await scalarInt("SELECT COALESCE(SUM(event_count),0) AS value FROM event_archive_blobs")

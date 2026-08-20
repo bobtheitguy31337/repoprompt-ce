@@ -68,6 +68,8 @@ public struct BackupManifestV1: Codable, Equatable, Sendable {
 
 public struct BackupVerificationRecord: Codable, Equatable, Sendable {
     public let verifiedAt: Date
+    /// Fingerprint of the public recipient derived from the verifying identity.
+    /// This is recipient-safe material and never identifies a private path/value.
     public let verifierFingerprint: String
     public let maintenanceToolVersion: String
     public let maintenanceToolDigest: String
@@ -84,6 +86,7 @@ public struct BackupSidecarV1: Codable, Equatable, Sendable {
     public let toolVersion: String
     public let toolDigest: String
     public var verification: BackupVerificationRecord?
+    public var verificationHistory: [BackupVerificationRecord]?
 }
 
 public struct VerifiedBackupArchive: Sendable {
@@ -133,6 +136,9 @@ public struct BackupRestoreRequest: Sendable {
     public let targetNamespaceKind: String
     public let targetDatabaseIdentityDigest: String
     public let observedExternalAssets: [String: String]
+    /// Target-environment destinations for included non-namespace roots. Keys
+    /// are manifest logical root IDs; physical paths never enter the archive.
+    public let includedAssetTargetRoots: [String: URL]
 
     public init(
         archiveURL: URL,
@@ -140,7 +146,8 @@ public struct BackupRestoreRequest: Sendable {
         targetRootURL: URL,
         targetNamespaceKind: String,
         targetDatabaseIdentityDigest: String,
-        observedExternalAssets: [String: String] = [:]
+        observedExternalAssets: [String: String] = [:],
+        includedAssetTargetRoots: [String: URL] = [:]
     ) {
         self.archiveURL = archiveURL
         self.identityFileURL = identityFileURL
@@ -148,21 +155,34 @@ public struct BackupRestoreRequest: Sendable {
         self.targetNamespaceKind = targetNamespaceKind
         self.targetDatabaseIdentityDigest = targetDatabaseIdentityDigest
         self.observedExternalAssets = observedExternalAssets
+        self.includedAssetTargetRoots = includedAssetTargetRoots
     }
 }
 
 public protocol BackupEnvelopeEncrypting: Sendable {
     func encrypt(plaintext: URL, recipientsFile: URL, ciphertext: URL) async throws
     func decrypt(ciphertext: URL, identityFile: URL, plaintext: URL) async throws
+    /// Returns a recipient-safe fingerprint derived from the identity's public
+    /// material. Implementations must never hash or return private bytes.
+    func identityRecipientFingerprint(identityFile: URL) async throws -> String
 }
 
 public struct AgeRuntimeConfiguration: Sendable {
     public let executableURL: URL
     public let expectedExecutableSHA256: String
+    public let keygenExecutableURL: URL
+    public let expectedKeygenExecutableSHA256: String
 
-    public init(executableURL: URL, expectedExecutableSHA256: String) {
+    public init(
+        executableURL: URL,
+        expectedExecutableSHA256: String,
+        keygenExecutableURL: URL,
+        expectedKeygenExecutableSHA256: String
+    ) {
         self.executableURL = executableURL
         self.expectedExecutableSHA256 = expectedExecutableSHA256
+        self.keygenExecutableURL = keygenExecutableURL
+        self.expectedKeygenExecutableSHA256 = expectedKeygenExecutableSHA256
     }
 
     public static func environment(_ environment: [String: String] = ProcessInfo.processInfo.environment) throws -> Self {
@@ -182,7 +202,26 @@ public struct AgeRuntimeConfiguration: Sendable {
             }
             checksum = String(value)
         }
-        return .init(executableURL: URL(fileURLWithPath: executable), expectedExecutableSHA256: checksum)
+        let keygen = environment["REPOPROMPT_AGE_KEYGEN_EXECUTABLE"]
+            ?? URL(fileURLWithPath: executable).deletingLastPathComponent().appendingPathComponent("age-keygen").path
+        let keygenChecksum: String
+        if let configured = environment["REPOPROMPT_AGE_KEYGEN_SHA256"] {
+            keygenChecksum = configured
+        } else {
+            let checksumURL = URL(fileURLWithPath: keygen + ".sha256")
+            guard let value = try? String(contentsOf: checksumURL, encoding: .utf8)
+                .split(whereSeparator: { $0.isWhitespace }).first
+            else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "Pinned age-keygen checksum is not configured")
+            }
+            keygenChecksum = String(value)
+        }
+        return .init(
+            executableURL: URL(fileURLWithPath: executable),
+            expectedExecutableSHA256: checksum,
+            keygenExecutableURL: URL(fileURLWithPath: keygen),
+            expectedKeygenExecutableSHA256: keygenChecksum
+        )
     }
 }
 
@@ -190,16 +229,16 @@ public struct AgeBackupEnvelope: BackupEnvelopeEncrypting {
     public let configuration: AgeRuntimeConfiguration
 
     public init(configuration: AgeRuntimeConfiguration) throws {
-        let data = try Data(contentsOf: configuration.executableURL, options: [.mappedIfSafe])
-        let observed = BackupCryptography.sha256(data)
-        guard observed == configuration.expectedExecutableSHA256.lowercased(),
-              observed.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil
-        else {
-            throw ServiceAPIError(
-                code: .dependencyUnavailable,
-                message: "Pinned age executable checksum mismatch"
-            )
-        }
+        try Self.verifyPinnedExecutable(
+            configuration.executableURL,
+            expectedSHA256: configuration.expectedExecutableSHA256,
+            logicalName: "age"
+        )
+        try Self.verifyPinnedExecutable(
+            configuration.keygenExecutableURL,
+            expectedSHA256: configuration.expectedKeygenExecutableSHA256,
+            logicalName: "age-keygen"
+        )
         self.configuration = configuration
     }
 
@@ -222,6 +261,33 @@ public struct AgeBackupEnvelope: BackupEnvelopeEncrypting {
         ])
     }
 
+    public func identityRecipientFingerprint(identityFile: URL) async throws -> String {
+        try BackupFileSafety.requireIdentityFile(identityFile)
+        let output = try await runForOutput(
+            executableURL: configuration.keygenExecutableURL,
+            arguments: ["-y", identityFile.path]
+        )
+        let recipient = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let fingerprint = BackupRecipientFingerprint.make(recipient) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "age identity did not derive a supported public recipient")
+        }
+        return fingerprint
+    }
+
+    private static func verifyPinnedExecutable(
+        _ url: URL,
+        expectedSHA256: String,
+        logicalName: String
+    ) throws {
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        let observed = BackupCryptography.sha256(data)
+        guard observed == expectedSHA256.lowercased(),
+              observed.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil
+        else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Pinned \(logicalName) executable checksum mismatch")
+        }
+    }
+
     private func run(_ arguments: [String]) async throws {
         let executableURL = configuration.executableURL
         try await Task.detached(priority: .utility) {
@@ -241,6 +307,28 @@ public struct AgeBackupEnvelope: BackupEnvelopeEncrypting {
             }
         }.value
     }
+
+    private func runForOutput(executableURL: URL, arguments: [String]) async throws -> String {
+        try await Task.detached(priority: .utility) {
+            let process = Process()
+            let stdout = Pipe()
+            process.executableURL = executableURL
+            process.arguments = arguments
+            process.standardInput = FileHandle.nullDevice
+            process.standardOutput = stdout
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            let data = try stdout.fileHandleForReading.readToEnd() ?? Data()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "age public-identity derivation failed", retryable: false)
+            }
+            guard let value = String(data: data, encoding: .utf8), value.utf8.count <= 4096 else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "age public-identity derivation returned invalid output")
+            }
+            return value
+        }.value
+    }
 }
 
 public actor BackupRestoreService {
@@ -250,6 +338,7 @@ public actor BackupRestoreService {
     private let envelope: any BackupEnvelopeEncrypting
     private let toolVersion: String
     private let toolDigest: String
+    private let restorePublicationFaultInjector: (@Sendable (String) throws -> Void)?
 
     public init(
         envelope: any BackupEnvelopeEncrypting,
@@ -259,6 +348,19 @@ public actor BackupRestoreService {
         self.envelope = envelope
         self.toolVersion = toolVersion
         self.toolDigest = toolDigest
+        restorePublicationFaultInjector = nil
+    }
+
+    init(
+        envelope: any BackupEnvelopeEncrypting,
+        toolVersion: String,
+        toolDigest: String,
+        restorePublicationFaultInjector: @escaping @Sendable (String) throws -> Void
+    ) {
+        self.envelope = envelope
+        self.toolVersion = toolVersion
+        self.toolDigest = toolDigest
+        self.restorePublicationFaultInjector = restorePublicationFaultInjector
     }
 
     public func create(
@@ -342,7 +444,8 @@ public actor BackupRestoreService {
                 createdAt: manifest.createdAt,
                 toolVersion: toolVersion,
                 toolDigest: toolDigest,
-                verification: nil
+                verification: nil,
+                verificationHistory: nil
             )
             try BackupFileSafety.writeAtomic(
                 Self.encoder.encode(sidecar),
@@ -397,22 +500,31 @@ public actor BackupRestoreService {
             throw ServiceAPIError(code: .persistenceUnavailable, message: "Backup manifest and sidecar disagree")
         }
         try Self.verifyEntries(entries, manifest: manifest, manifestData: manifestData)
-        let verifierFingerprint = BackupCryptography.sha256(Data(
-            "identity-verified-v1\u{0}\(sidecar.archiveSHA256)\u{0}\(sidecar.manifestSHA256)\u{0}\(toolDigest)".utf8
-        ))
-        sidecar.verification = BackupVerificationRecord(
+        let verifierFingerprint = try await envelope.identityRecipientFingerprint(identityFile: identityFileURL)
+        guard manifest.recipientFingerprints.contains(verifierFingerprint) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Verifying identity is not an authorized backup recipient")
+        }
+        let verification = BackupVerificationRecord(
             verifiedAt: Date(),
             verifierFingerprint: verifierFingerprint,
             maintenanceToolVersion: toolVersion,
             maintenanceToolDigest: toolDigest
         )
+        sidecar.verification = verification
+        var history = sidecar.verificationHistory ?? []
+        history.removeAll { $0.verifierFingerprint == verifierFingerprint }
+        history.append(verification)
+        sidecar.verificationHistory = history.sorted { $0.verifierFingerprint < $1.verifierFingerprint }
         if updateSidecar {
             try BackupFileSafety.writeAtomic(try Self.encoder.encode(sidecar), to: sidecarURL, mode: 0o600)
         }
         return VerifiedBackupArchive(manifest: manifest, sidecar: sidecar, plaintextEntries: entries.mapValues(\.data))
     }
 
-    public func prepareRestore(_ request: BackupRestoreRequest) async throws -> BackupManifestV1 {
+    /// Package-internal publication seam. External callers must restore through
+    /// `AuthorityMaintenanceSession`, which acquires the target namespace lease
+    /// before verification, extraction, or publication begins.
+    func prepareRestore(_ request: BackupRestoreRequest) async throws -> BackupManifestV1 {
         let verified = try await verify(
             archiveURL: request.archiveURL,
             identityFileURL: request.identityFileURL
@@ -429,6 +541,7 @@ public actor BackupRestoreService {
                 message: "Restore target reuses the archived source database identity"
             )
         }
+        var missingOptionalAssetIDs: [String] = []
         for asset in verified.manifest.assets where asset.disposition != .included {
             let observed = request.observedExternalAssets[asset.logicalID]
             if asset.disposition == .externalRequired, observed != asset.sha256 {
@@ -443,25 +556,110 @@ public actor BackupRestoreService {
                     message: "External restore dependency checksum mismatch: \(asset.logicalID)"
                 )
             }
+            if asset.disposition == .externalOptional, observed == nil {
+                missingOptionalAssetIDs.append(asset.logicalID)
+            }
         }
 
         let target = request.targetRootURL.standardizedFileURL
-        if FileManager.default.fileExists(atPath: target.path) {
+        let targetAlreadyExists = FileManager.default.fileExists(atPath: target.path)
+        if targetAlreadyExists {
             let children = try FileManager.default.contentsOfDirectory(atPath: target.path)
-            guard children.isEmpty else {
-                throw ServiceAPIError(code: .invalidRequest, message: "Restore target must be empty")
+            let lockSuffix = ".authority.lock"
+            let lockFiles = children.filter { $0.hasSuffix(lockSuffix) }
+            guard lockFiles.count == 1 else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Restore target must contain exactly one active maintenance lease")
             }
+            let databaseName = String(lockFiles[0].dropLast(lockSuffix.count))
+            let maintenanceLeaseFiles = Set([
+                databaseName + ".authority.lock",
+                databaseName + ".authority-owner.json",
+                databaseName + ".authority-purpose.json",
+            ])
+            guard Set(children).isSubset(of: maintenanceLeaseFiles) else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Restore target must be empty except for its active maintenance lease")
+            }
+        } else {
+            try FileManager.default.createDirectory(
+                at: target,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
         }
+
+        struct ExternalPublication {
+            let logicalID: String
+            let target: URL
+            let staging: URL
+        }
+        let includedLogicalIDs = Set(verified.manifest.assets
+            .filter { $0.disposition == .included && !$0.logicalID.isEmpty }
+            .map(\.logicalID))
+        var externalPublications: [String: ExternalPublication] = [:]
+        for logicalID in includedLogicalIDs.sorted() {
+            guard let configuredTarget = request.includedAssetTargetRoots[logicalID] else {
+                throw ServiceAPIError(
+                    code: .dependencyUnavailable,
+                    message: "Included restore root has no target-environment binding: \(logicalID)"
+                )
+            }
+            let externalTarget = configuredTarget.standardizedFileURL
+            guard externalTarget.path != target.path,
+                  !externalTarget.path.hasPrefix(target.path + "/"),
+                  !target.path.hasPrefix(externalTarget.path + "/"),
+                  !FileManager.default.fileExists(atPath: externalTarget.path),
+                  FileManager.default.fileExists(atPath: externalTarget.deletingLastPathComponent().path)
+            else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Included restore target is unsafe or not empty: \(logicalID)")
+            }
+            let staging = externalTarget.deletingLastPathComponent()
+                .appendingPathComponent(".\(externalTarget.lastPathComponent).restore-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: staging,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+            externalPublications[logicalID] = .init(logicalID: logicalID, target: externalTarget, staging: staging)
+        }
+
         let staging = target.deletingLastPathComponent()
             .appendingPathComponent(".\(target.lastPathComponent).restore-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         var published = false
-        defer { if !published { try? FileManager.default.removeItem(at: staging) } }
+        var publishedExternalRoots: [URL] = []
+        defer {
+            if !published {
+                try? FileManager.default.removeItem(at: staging)
+                for publication in externalPublications.values {
+                    try? FileManager.default.removeItem(at: publication.staging)
+                }
+                for url in publishedExternalRoots.reversed() {
+                    try? FileManager.default.removeItem(at: url)
+                    try? BackupFileSafety.syncDirectory(url.deletingLastPathComponent())
+                }
+            }
+        }
         for asset in verified.manifest.assets where asset.disposition == .included {
             guard let data = verified.plaintextEntries[asset.archivePath] else {
                 throw ServiceAPIError(code: .persistenceUnavailable, message: "Backup asset is missing during restore")
             }
-            let destination = try BackupFileSafety.safeDestination(root: staging, relativePath: asset.archivePath)
+            let root: URL
+            let relativePath: String
+            if asset.logicalID.isEmpty {
+                root = staging
+                relativePath = asset.archivePath
+            } else {
+                guard let publication = externalPublications[asset.logicalID] else {
+                    throw ServiceAPIError(code: .dependencyUnavailable, message: "Included restore root binding disappeared")
+                }
+                let prefix = asset.logicalID + "/"
+                guard asset.archivePath.hasPrefix(prefix) else {
+                    throw ServiceAPIError(code: .persistenceUnavailable, message: "Included restore asset root is inconsistent")
+                }
+                root = publication.staging
+                relativePath = String(asset.archivePath.dropFirst(prefix.count))
+            }
+            let destination = try BackupFileSafety.safeDestination(root: root, relativePath: relativePath)
             try FileManager.default.createDirectory(
                 at: destination.deletingLastPathComponent(),
                 withIntermediateDirectories: true,
@@ -471,7 +669,14 @@ public actor BackupRestoreService {
             guard chmod(destination.path, mode_t(asset.mode)) == 0 else {
                 throw ServiceAPIError(code: .persistenceUnavailable, message: "Unable to restore asset permissions")
             }
+            try BackupFileSafety.syncFile(destination)
+            try BackupFileSafety.syncDirectory(destination.deletingLastPathComponent())
         }
+        try BackupFileSafety.syncDirectory(staging)
+        for publication in externalPublications.values {
+            try BackupFileSafety.syncDirectory(publication.staging)
+        }
+
         let restoreRequest = RestoreNamespaceRequestV1(
             schemaVersion: 1,
             acknowledged: true,
@@ -482,17 +687,48 @@ public actor BackupRestoreService {
             restoredFromStoreID: verified.manifest.source.storeID,
             backupSequence: verified.manifest.source.nextGlobalSequence,
             backupCreatedAt: Self.formatDate(verified.manifest.createdAt),
-            backupManifestSHA256: verified.sidecar.manifestSHA256
+            backupManifestSHA256: verified.sidecar.manifestSHA256,
+            missingExternalOptionalAssetIDs: missingOptionalAssetIDs.sorted()
         )
         try BackupFileSafety.writeAtomic(
             try Self.encoder.encode(restoreRequest),
             to: staging.appendingPathComponent("restore-request.json"),
             mode: 0o600
         )
-        if FileManager.default.fileExists(atPath: target.path) {
-            try FileManager.default.removeItem(at: target)
+
+        // Fence serving before publishing either namespace or configured roots.
+        // The activation request moves last and the maintenance lease inode is
+        // never replaced. Newly published external roots roll back on errors.
+        let incomplete = target.appendingPathComponent("restore-incomplete.json")
+        try BackupFileSafety.writeAtomic(
+            Data("{\"schemaVersion\":1,\"state\":\"publishing\"}\n".utf8),
+            to: incomplete,
+            mode: 0o600
+        )
+        try restorePublicationFaultInjector?("after-incomplete-marker")
+        for publication in externalPublications.values.sorted(by: { $0.logicalID < $1.logicalID }) {
+            try FileManager.default.moveItem(at: publication.staging, to: publication.target)
+            publishedExternalRoots.append(publication.target)
+            try BackupFileSafety.syncDirectory(publication.target.deletingLastPathComponent())
+            try restorePublicationFaultInjector?("after-external-move:\(publication.logicalID)")
         }
-        try FileManager.default.moveItem(at: staging, to: target)
+        let names = try FileManager.default.contentsOfDirectory(atPath: staging.path)
+        let orderedNames = names.sorted { left, right in
+            if left == "restore-request.json" { return false }
+            if right == "restore-request.json" { return true }
+            return left < right
+        }
+        for name in orderedNames {
+            try FileManager.default.moveItem(
+                at: staging.appendingPathComponent(name),
+                to: target.appendingPathComponent(name)
+            )
+            try restorePublicationFaultInjector?("after-move:\(name)")
+        }
+        try BackupFileSafety.syncDirectory(target)
+        try FileManager.default.removeItem(at: incomplete)
+        try BackupFileSafety.syncDirectory(target)
+        try FileManager.default.removeItem(at: staging)
         published = true
         try BackupFileSafety.syncDirectory(target.deletingLastPathComponent())
         return verified.manifest
@@ -528,7 +764,7 @@ public actor BackupRestoreService {
             guard !value.isEmpty, !value.hasPrefix("#") else { return nil }
             let type = value.hasPrefix("age1pq1") ? "hybrid" : (value.hasPrefix("age1") ? "x25519" : "unsupported")
             guard type != "unsupported" else { return nil }
-            return "\(type):\(BackupCryptography.sha256(Data(value.utf8)))"
+            return BackupRecipientFingerprint.make(value)
         }
     }
 
@@ -649,6 +885,7 @@ public struct RestoreNamespaceRequestV1: Codable, Equatable, Sendable {
     public let backupSequence: Int64
     public let backupCreatedAt: String
     public let backupManifestSHA256: String
+    public let missingExternalOptionalAssetIDs: [String]
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion
@@ -661,6 +898,18 @@ public struct RestoreNamespaceRequestV1: Codable, Equatable, Sendable {
         case backupSequence
         case backupCreatedAt
         case backupManifestSHA256 = "backupManifestSha256"
+        case missingExternalOptionalAssetIDs
+    }
+}
+
+private enum BackupRecipientFingerprint {
+    static func make(_ recipient: String) -> String? {
+        let normalized = recipient.trimmingCharacters(in: .whitespacesAndNewlines)
+        let type = normalized.hasPrefix("age1pq1")
+            ? "hybrid"
+            : (normalized.hasPrefix("age1") ? "x25519" : nil)
+        guard let type, !normalized.contains(where: \.isWhitespace) else { return nil }
+        return "\(type):\(BackupCryptography.sha256(Data(normalized.utf8)))"
     }
 }
 
@@ -692,7 +941,7 @@ private enum BackupFileSafety {
         guard values.isSymbolicLink != true,
               attributes[.type] as? FileAttributeType == .typeRegular,
               let permissions = attributes[.posixPermissions] as? NSNumber,
-              permissions.intValue & 0o077 == 0
+              permissions.intValue & 0o777 == 0o600
         else {
             throw ServiceAPIError(code: .invalidRequest, message: "age identity file must be a private regular file")
         }
@@ -706,6 +955,10 @@ private enum BackupFileSafety {
 
     static func protectAndSync(_ url: URL) throws {
         try protectFile(url)
+        try syncFile(url)
+    }
+
+    static func syncFile(_ url: URL) throws {
         let fd = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
         guard fd >= 0 else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Unable to open backup output") }
         defer { _ = close(fd) }

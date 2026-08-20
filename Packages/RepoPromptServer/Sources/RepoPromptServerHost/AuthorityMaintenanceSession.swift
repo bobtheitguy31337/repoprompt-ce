@@ -57,6 +57,28 @@ public actor AuthorityMaintenanceSession {
         storeWasOpened = true
     }
 
+    private init(
+        restoreConfiguration configuration: AuthorityMaintenanceConfiguration,
+        lease: AuthorityNamespaceLease
+    ) {
+        self.configuration = configuration
+        self.lease = lease
+        store = nil
+        phaseValue = .ready
+        phases = [.idle, .acquiringLease, .ready]
+        storeWasOpened = false
+    }
+
+    public static func acquireForRestore(
+        configuration: AuthorityMaintenanceConfiguration
+    ) throws -> AuthorityMaintenanceSession {
+        let acquisition = try AuthorityNamespaceLease.acquire(configuration.namespace)
+        return AuthorityMaintenanceSession(
+            restoreConfiguration: configuration,
+            lease: acquisition.lease
+        )
+    }
+
     public static func open(
         configuration: AuthorityMaintenanceConfiguration
     ) async throws -> AuthorityMaintenanceSession {
@@ -183,6 +205,33 @@ public actor AuthorityMaintenanceSession {
             phaseValue = .ready
             phases.append(.ready)
             return evidence
+        } catch {
+            phaseValue = .ready
+            phases.append(.ready)
+            throw error
+        }
+    }
+
+    public func prepareRestore(
+        service: BackupRestoreService,
+        request: BackupRestoreRequest
+    ) async throws -> BackupManifestV1 {
+        guard phaseValue == .ready, store == nil else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Restore maintenance session is not ready")
+        }
+        guard request.targetRootURL.standardizedFileURL.path == configuration.namespace.storageRoot,
+              request.targetNamespaceKind == configuration.namespace.servingMode.rawValue,
+              request.targetDatabaseIdentityDigest == configuration.namespace.namespaceID
+        else {
+            throw ServiceAPIError(code: .namespacePurposeMismatch, message: "Restore request does not match the leased target namespace")
+        }
+        phaseValue = .restoring
+        phases.append(.restoring)
+        do {
+            let manifest = try await service.prepareRestore(request)
+            phaseValue = .ready
+            phases.append(.ready)
+            return manifest
         } catch {
             phaseValue = .ready
             phases.append(.ready)

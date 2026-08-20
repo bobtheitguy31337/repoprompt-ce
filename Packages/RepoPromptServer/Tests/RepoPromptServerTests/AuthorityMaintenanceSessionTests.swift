@@ -71,6 +71,33 @@ final class AuthorityMaintenanceSessionTests: XCTestCase {
         _ = await host.shutdown(reason: "test")
     }
 
+    func testRestoreAcquiresTargetLeaseBeforeAnyStoreOrPublicationWork() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let restore = try AuthorityMaintenanceSession.acquireForRestore(
+            configuration: .init(namespace: fixture.descriptor)
+        )
+        let observation = await restore.observation()
+        XCTAssertEqual(observation.phases, [.idle, .acquiringLease, .ready])
+        XCTAssertFalse(observation.storeWasOpened)
+        XCTAssertFalse(observation.leaseWasReleased)
+
+        do {
+            _ = try AuthorityMaintenanceSession.acquireForRestore(
+                configuration: .init(namespace: fixture.descriptor)
+            )
+            XCTFail("a second restore must fail before decrypt or target publication")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .authorityHostConflict)
+        }
+
+        try await restore.close(clean: false)
+        let reacquired = try AuthorityMaintenanceSession.acquireForRestore(
+            configuration: .init(namespace: fixture.descriptor)
+        )
+        try await reacquired.close(clean: false)
+    }
+
     private struct Fixture {
         let root: URL
         let descriptor: AuthorityNamespaceDescriptor
