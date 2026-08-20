@@ -331,7 +331,7 @@ public actor HeadlessMCPSocketServer {
         )
         let adapter = adapter
         await server.withMethodHandler(ListTools.self) { _ in
-            let visibleNames = await adapter.advertisedToolNames(isRootSession: isRootSession)
+            let visibleNames = try await adapter.advertisedToolNames(isRootSession: isRootSession)
             let tools = MCPDomainCanonicalToolDefinitions.definitions.compactMap { definition -> MCP.Tool? in
                 guard visibleNames.contains(definition.name) else { return nil }
                 let projected = definition.annotations.projected(for: classification.annotationProfile)
@@ -351,11 +351,11 @@ public actor HeadlessMCPSocketServer {
             return ListTools.Result(tools: tools)
         }
         await server.withMethodHandler(CallTool.self) { params in
-            let visibleNames = await adapter.advertisedToolNames(isRootSession: isRootSession)
-            guard visibleNames.contains(params.name) else {
-                return Self.errorResult("Tool is unavailable for this client policy: \(params.name)")
-            }
             do {
+                let visibleNames = try await adapter.advertisedToolNames(isRootSession: isRootSession)
+                guard visibleNames.contains(params.name) else {
+                    return Self.errorResult("Tool is unavailable for this client policy: \(params.name)")
+                }
                 let arguments = params.arguments ?? [:]
                 let data = try await adapter.invoke(
                     toolName: params.name,

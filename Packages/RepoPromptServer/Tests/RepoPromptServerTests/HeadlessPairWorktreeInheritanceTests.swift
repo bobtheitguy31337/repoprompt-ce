@@ -49,7 +49,7 @@ final class HeadlessPairWorktreeInheritanceTests: XCTestCase {
             idempotencyKey: "pair-parent",
             requestDigest: "pair-parent"
         )
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let parentBinding = RepoPromptMCPBinding(sessionID: parent.sessionID, actor: actor)
         let report = "docs/investigations/pair-report.md"
         let seed = "# Investigation\n\n## Investigator Findings\n"

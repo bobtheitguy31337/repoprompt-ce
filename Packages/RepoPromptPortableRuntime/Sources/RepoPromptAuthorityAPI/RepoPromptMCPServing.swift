@@ -20,6 +20,6 @@ public protocol RepoPromptMCPServing: Sendable {
     func projectSnapshot(id: UUID) async throws -> ProjectSnapshot
     func sessionSnapshot(id: UUID) async throws -> SessionSnapshot
     func events(after cursor: ServiceCursor?, limit: Int) async throws -> EventPage
-    func advertisedToolNames(isRootSession: Bool) async -> Set<String>
+    func advertisedToolNames(isRootSession: Bool) async throws -> Set<String>
     func invoke(toolName: String, argumentsJSON: Data, binding: AuthorityMCPBinding) async throws -> Data
 }

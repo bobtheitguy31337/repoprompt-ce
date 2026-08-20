@@ -30,6 +30,7 @@ actor DirectHeadlessMCPService {
         let providerCoordinator: DirectHeadlessProviderCoordinator
         let authorityHost: RepoPromptAuthorityHost
         let mutationCapability: AuthorityMutationCapability
+        let readCapability: AuthorityReadCapability
     }
 
     struct ConnectionContext {
@@ -114,6 +115,7 @@ actor DirectHeadlessMCPService {
             runtime: runtime
         )
         let mutationCapability = await authorityHost.mutationGate.capability()
+        let readCapability = await authorityHost.mutationGate.readCapability()
         do {
             let workingDirectories = locations.workingDirectories
             if locations.mayBootstrapIsolatedWorkspace {
@@ -208,7 +210,8 @@ actor DirectHeadlessMCPService {
                 childLaunchCoordinator: childLaunchCoordinator,
                 providerCoordinator: providerCoordinator,
                 authorityHost: authorityHost,
-                mutationCapability: mutationCapability
+                mutationCapability: mutationCapability,
+                readCapability: readCapability
             )
         } catch {
             _ = await authorityHost.shutdown(
@@ -225,12 +228,12 @@ actor DirectHeadlessMCPService {
         connection: ConnectionContext
     ) async {
         let classification = MCPClientToolPolicyCatalog.classification(for: connection.policyProfile)
-        let visibleNames = Self.visibleToolNames(connection)
         let serving = DirectHeadlessAdapterServing(
             prepared: prepared,
             connection: connection
         )
         await server.withMethodHandler(ListTools.self) { _ in
+            let visibleNames = try await serving.advertisedToolNames(isRootSession: true)
             let tools = MCPDomainCanonicalToolDefinitions.definitions.compactMap { definition -> MCP.Tool? in
                 guard visibleNames.contains(definition.name) else { return nil }
                 let projected = definition.annotations.projected(
@@ -253,10 +256,11 @@ actor DirectHeadlessMCPService {
         }
 
         await server.withMethodHandler(CallTool.self) { params in
-            guard visibleNames.contains(params.name) else {
-                return Self.errorResult("Tool is unavailable for this client policy: \(params.name)")
-            }
             do {
+                let visibleNames = try await serving.advertisedToolNames(isRootSession: true)
+                guard visibleNames.contains(params.name) else {
+                    return Self.errorResult("Tool is unavailable for this client policy: \(params.name)")
+                }
                 let arguments = try Self.validatedCallArguments(
                     toolName: params.name,
                     arguments: params.arguments ?? [:]
@@ -590,8 +594,10 @@ private actor DirectHeadlessAdapterServing: RepoPromptMCPServing {
         throw ServiceAPIError(code: .capabilityMissing, message: "Direct-headless event replay is unavailable")
     }
 
-    func advertisedToolNames(isRootSession _: Bool) async -> Set<String> {
-        DirectHeadlessMCPService.visibleToolNames(connection)
+    func advertisedToolNames(isRootSession _: Bool) async throws -> Set<String> {
+        try await prepared.readCapability.perform { [connection] in
+            DirectHeadlessMCPService.visibleToolNames(connection)
+        }
     }
 
     func invoke(
@@ -738,13 +744,9 @@ public actor RepoPromptDirectHeadlessComposition {
                 idempotencyKey: "direct-headless-session:\(sessionIdentity)",
                 requestDigest: sessionIdentity
             )
-            let serving = RepoPromptAuthorityMCPService(
-                authority: runtime.authority,
+            let serving = try await runtime.host.makeMCPService(
                 portalSettings: runtime.portalDesktopSettings,
-                mutationCapability: await runtime.host.mutationGate.capability(),
-                toolPolicy: .direct,
-                readCapability: await runtime.host.mutationGate.readCapability(),
-                subscriptionCapability: await runtime.host.mutationGate.readCapability(subscription: true)
+                toolPolicy: .direct
             )
             return RepoPromptDirectHeadlessComposition(
                 runtime: runtime,

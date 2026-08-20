@@ -20,7 +20,7 @@ final class HeadlessMCPLauncherIntegrationTests: XCTestCase {
         try await RepoPromptMCPHeadlessBootstrap.run(host: host) { adapter, observedBinding, isRoot in
             XCTAssertEqual(observedBinding.sessionID, binding.sessionID)
             XCTAssertTrue(isRoot)
-            let toolNames = await adapter.advertisedToolNames(isRootSession: true)
+            let toolNames = try await adapter.advertisedToolNames(isRootSession: true)
             XCTAssertEqual(toolNames, ["app_settings"])
             let result = try await adapter.invoke(
                 toolName: "app_settings",
@@ -135,7 +135,7 @@ private actor HeadlessHelperServingProbe: RepoPromptMCPServing {
         throw ServiceAPIError(code: .capabilityMissing, message: "unused")
     }
 
-    func advertisedToolNames(isRootSession _: Bool) async -> Set<String> { ["app_settings"] }
+    func advertisedToolNames(isRootSession _: Bool) async throws -> Set<String> { ["app_settings"] }
 
     func invoke(
         toolName: String,

@@ -41,7 +41,7 @@ final class RepoPromptMCPAdapterTests: XCTestCase {
             idempotencyKey: "adapter-session",
             requestDigest: "adapter-session"
         )
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
 
         XCTAssertEqual(RepoPromptMCPAdapter.canonicalToolNames.count, 27)
@@ -150,7 +150,7 @@ final class RepoPromptMCPAdapterTests: XCTestCase {
             idempotencyKey: "workflow-session",
             requestDigest: "workflow-session"
         )
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
         let data = try await adapter.invoke(
             toolName: "agent_manage",
@@ -271,6 +271,41 @@ final class RepoPromptMCPAdapterTests: XCTestCase {
         let chat = try await authority.oracleChatState(sessionID: session.sessionID, chatID: first.chatID)
         XCTAssertEqual(chat.providerSessionID, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
         try await store.close()
+    }
+
+    func testRetainedProductionAdapterRejectsToolAdvertisementBeforeClosedStoreAccess() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rp-retained-adapter-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let descriptor = try AuthorityNamespaceDescriptor(
+            storageRoot: directory.path,
+            databasePath: directory.appendingPathComponent("state.sqlite").path,
+            profile: "retained-adapter",
+            servingMode: .server
+        )
+        let host = try await RepoPromptAuthorityHostFactory.start(
+            configuration: .init(namespace: descriptor)
+        )
+        let store = try await host.storeForRecovery()
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        try await authority.recover()
+        await host.installRecoveredAuthority(authority)
+        let serving = try await host.makeMCPService(
+            portalSettings: PortalDesktopSettingsService(store: store)
+        )
+        let retainedAdapter = RepoPromptMCPAdapter(serving: serving)
+
+        let report = await host.shutdown(reason: "retained-adapter-test", deadline: .seconds(1))
+        XCTAssertTrue(report.clean)
+        XCTAssertTrue(report.leaseReleased)
+
+        do {
+            _ = try await retainedAdapter.advertisedToolNames(isRootSession: true)
+            XCTFail("retained production adapter reached the closed authority store")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .staleCapability)
+        }
     }
 
     private func json(_ object: Any) throws -> Data {

@@ -76,7 +76,7 @@ final class AppSettingsEngineKeysPersistTests: XCTestCase {
             idempotencyKey: "engine-keys-session",
             requestDigest: "engine-keys-session"
         )
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
         let rootID = try XCTUnwrap(project.roots.first?.rootID)
 

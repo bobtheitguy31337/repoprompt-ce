@@ -207,7 +207,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             XCTAssertEqual(error.message, WorkspaceApprovalOperation.createWorkspace.deniedByUserMessage)
         }
 
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let projectRoot = FileManager.default.temporaryDirectory.appendingPathComponent("ws-approval-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: projectRoot) }
@@ -304,7 +304,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             idempotencyKey: "ws-per-op-session",
             requestDigest: "ws-per-op-session"
         )
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
         _ = try await adapter.invoke(
             toolName: "manage_workspaces",
@@ -407,7 +407,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             idempotencyKey: "ws-trusted-session",
             requestDigest: "ws-trusted-session"
         )
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let familyBinding = RepoPromptMCPBinding(
             sessionID: session.sessionID,
             actor: actor,
@@ -489,7 +489,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             idempotencyKey: "ws-untrusted-session",
             requestDigest: "ws-untrusted-session"
         )
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let baseline = HeadlessCodexMCPToolPolicy.advertisedToolNames(isRootSession: true)
         let victim = try XCTUnwrap(baseline.sorted().first)
         let kept = try XCTUnwrap(baseline.sorted().first { $0 != victim })
@@ -518,7 +518,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             expectedRevision: 0,
             attribution: Self.attribution
         )
-        let advertised = await adapter.advertisedToolNames(isRootSession: true)
+        let advertised = try await adapter.advertisedToolNames(isRootSession: true)
         XCTAssertFalse(advertised.contains(victim))
         XCTAssertTrue(advertised.contains(kept))
         do {
@@ -587,7 +587,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             idempotencyKey: "ws-disabled-session",
             requestDigest: "ws-disabled-session"
         )
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let baseline = HeadlessCodexMCPToolPolicy.advertisedToolNames(isRootSession: true)
         XCTAssertFalse(baseline.isEmpty)
         let victim = try XCTUnwrap(baseline.sorted().first)
@@ -599,7 +599,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             attribution: Self.attribution
         )
         XCTAssertTrue(disabledAdvertised.settings.disabledTools.contains(victim))
-        let advertised = await adapter.advertisedToolNames(isRootSession: true)
+        let advertised = try await adapter.advertisedToolNames(isRootSession: true)
         XCTAssertFalse(advertised.contains(victim))
         XCTAssertTrue(advertised.contains(kept))
 
@@ -636,7 +636,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             attribution: Self.attribution
         )
         XCTAssertFalse(restoredVictim.settings.disabledTools.contains(victim))
-        let restored = await adapter.advertisedToolNames(isRootSession: true)
+        let restored = try await adapter.advertisedToolNames(isRootSession: true)
         XCTAssertTrue(restored.contains(victim))
         XCTAssertEqual(restored, baseline)
     }
@@ -686,7 +686,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         let hiddenDiscovery = try await service.modelDiscovery(projectID: project.projectID)
         XCTAssertTrue(hiddenDiscovery.presets.isEmpty)
 
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
         func invoke(tool: String, _ object: [String: Any]) async throws -> [String: Any] {
             let data = try await adapter.invoke(
@@ -1733,7 +1733,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             idempotencyKey: "settings-session",
             requestDigest: "settings-session"
         )
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
 
         func invoke(_ object: [String: Any]) async throws -> [String: Any] {
@@ -1793,7 +1793,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             idempotencyKey: "packaging-session",
             requestDigest: "packaging-session"
         )
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
 
         func invoke(_ object: [String: Any]) async throws -> [String: Any] {
@@ -1865,7 +1865,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             idempotencyKey: "permissions-session",
             requestDigest: "permissions-session"
         )
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
 
         func invoke(_ object: [String: Any]) async throws -> [String: Any] {
@@ -1940,7 +1940,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             idempotencyKey: "cli-settings-session",
             requestDigest: "cli-settings-session"
         )
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
 
         func invoke(_ object: [String: Any]) async throws -> [String: Any] {
@@ -2030,7 +2030,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
             idempotencyKey: "workspace-settings-session",
             requestDigest: "workspace-settings-session"
         )
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
 
         func invoke(_ object: [String: Any]) async throws -> [String: Any] {

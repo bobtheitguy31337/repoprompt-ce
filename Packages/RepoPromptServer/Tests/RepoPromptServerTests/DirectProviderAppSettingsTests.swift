@@ -43,7 +43,7 @@ final class DirectProviderAppSettingsTests: XCTestCase {
             idempotencyKey: "direct-settings-session",
             requestDigest: "direct-settings-session"
         )
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
 
         func invoke(_ object: [String: Any]) async throws -> [String: Any] {

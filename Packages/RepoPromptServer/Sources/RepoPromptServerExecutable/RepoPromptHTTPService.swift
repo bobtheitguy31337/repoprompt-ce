@@ -73,6 +73,11 @@ public struct RepoPromptHTTPService: Sendable {
         case heartbeat
     }
 
+    private enum HTTPReadAdmission: Equatable {
+        case ordinary
+        case subscription
+    }
+
     private let authority: RepoPromptHeadlessAuthority
     private let store: SQLiteServiceStore
     private let authenticator: InternalRequestAuthenticator
@@ -141,7 +146,17 @@ public struct RepoPromptHTTPService: Sendable {
     public func healthRouter() -> Router<BasicRequestContext> {
         let router = Router<BasicRequestContext>()
         router.get("/health/live") { _, _ in Response(status: .ok) }
-        router.get("/health/ready") { _, _ in await readiness.snapshot().ready ? Response(status: .ok) : Response(status: .serviceUnavailable) }
+        router.get("/health/ready") { _, _ in
+            do {
+                let capability = await mutationGate.readCapability()
+                let ready = try await capability.perform { [readiness] in
+                    await readiness.snapshot().ready
+                }
+                return ready ? Response(status: .ok) : Response(status: .serviceUnavailable)
+            } catch {
+                return Response(status: .serviceUnavailable)
+            }
+        }
         return router
     }
 
@@ -1266,7 +1281,7 @@ public struct RepoPromptHTTPService: Sendable {
             }
             return try await HTTPResponses.json(authority.events(after: cursor, limit: limit))
         } }
-        router.get("/internal/v1/events/stream") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.sync], operation: "eventStream")
+        router.get("/internal/v1/events/stream") { request, context in await respond(request, readAdmission: .subscription) { _ = try await authenticate(request, context: context, body: Data(), roles: [.sync], operation: "eventStream")
             let stream: AsyncThrowingStream<EventEnvelope, Error>
             do {
                 stream = try await authority.subscribe(after: parseCursor(request))
@@ -1311,19 +1326,25 @@ public struct RepoPromptHTTPService: Sendable {
         return router
     }
 
-    private func respond(_ request: Request, _ operation: @escaping @Sendable () async throws -> Response) async -> Response {
+    private func respond(
+        _ request: Request,
+        readAdmission: HTTPReadAdmission = .ordinary,
+        _ operation: @escaping @Sendable () async throws -> Response
+    ) async -> Response {
         let method = String(describing: request.method).uppercased()
         let path = request.uri.string
         let isMutation = method == "POST" || method == "PUT" || method == "PATCH" || method == "DELETE"
-        guard isMutation else {
-            let response: Response
-            do { response = try await operation() } catch { response = HTTPResponses.error(error) }
-            return responseSigner.sign(response, requestPathAndQuery: path)
-        }
         let response: Response
         do {
-            let capability = await mutationGate.capability()
-            response = try await capability.perform(operation)
+            if isMutation {
+                let capability = await mutationGate.capability()
+                response = try await capability.perform(operation)
+            } else {
+                let capability = await mutationGate.readCapability(
+                    subscription: readAdmission == .subscription
+                )
+                response = try await capability.perform(operation)
+            }
         } catch {
             response = HTTPResponses.error(error)
         }
@@ -1339,7 +1360,8 @@ public struct RepoPromptHTTPService: Sendable {
                 let capability = await mutationGate.capability()
                 response = try await capability.perform(operation)
             } else {
-                response = try await operation()
+                let capability = await mutationGate.readCapability()
+                response = try await capability.perform(operation)
             }
         } catch { response = portalError(error) }
         return response
@@ -1579,7 +1601,7 @@ public struct RepoPromptHTTPService: Sendable {
         case .notFound: .notFound
         case .staleRevision, .controllerChanged: .conflict
         case .rateLimited: .tooManyRequests
-        case .dependencyUnavailable, .quiescing, .persistenceUnavailable: .serviceUnavailable
+        case .dependencyUnavailable, .quiescing, .persistenceUnavailable, .serviceDraining, .staleCapability: .serviceUnavailable
         default: .unprocessableContent
         }
         return (try? portalJSON(apiError, status: status)) ?? Response(status: .internalServerError)

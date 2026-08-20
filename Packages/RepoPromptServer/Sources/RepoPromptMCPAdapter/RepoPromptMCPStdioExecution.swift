@@ -29,7 +29,7 @@ public enum RepoPromptMCPStdioExecution {
         )
         let classification = MCPClientToolPolicyCatalog.classification(for: policyProfile)
         await server.withMethodHandler(ListTools.self) { _ in
-            let advertised = await adapter.advertisedToolNames(isRootSession: isRootSession)
+            let advertised = try await adapter.advertisedToolNames(isRootSession: isRootSession)
             let restricted = MCPDomainToolCatalog
                 .toolNames(for: classification.restrictedCapabilities)
             let additionallyGranted = MCPDomainToolCatalog
@@ -66,11 +66,11 @@ public enum RepoPromptMCPStdioExecution {
             })
         }
         await server.withMethodHandler(CallTool.self) { params in
-            let advertised = await adapter.advertisedToolNames(isRootSession: isRootSession)
-            guard advertised.contains(params.name) else {
-                return errorResult("Tool is unavailable for this client policy: \(params.name)")
-            }
             do {
+                let advertised = try await adapter.advertisedToolNames(isRootSession: isRootSession)
+                guard advertised.contains(params.name) else {
+                    return errorResult("Tool is unavailable for this client policy: \(params.name)")
+                }
                 let arguments = params.arguments ?? [:]
                 let data = try JSONEncoder().encode(arguments)
                 let result = try await adapter.invoke(

@@ -31,8 +31,8 @@ public actor RepoPromptMCPAdapter {
         try await serving.events(after: cursor, limit: limit)
     }
 
-    public func advertisedToolNames(isRootSession: Bool) async -> Set<String> {
-        await serving.advertisedToolNames(isRootSession: isRootSession)
+    public func advertisedToolNames(isRootSession: Bool) async throws -> Set<String> {
+        try await serving.advertisedToolNames(isRootSession: isRootSession)
     }
 
     public func invoke(

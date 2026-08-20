@@ -872,7 +872,7 @@ final class AuthorityTests: XCTestCase {
 
         // Direct MCP observes the identical durable session rather than another
         // controller/transcript runtime.
-        let directMCP = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let directMCP = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let historyData = try await directMCP.invoke(
             toolName: "history",
             argumentsJSON: try JSONSerialization.data(withJSONObject: [
@@ -940,7 +940,7 @@ final class AuthorityTests: XCTestCase {
         XCTAssertEqual(failed.activeRun?.state, "failed")
         XCTAssertTrue(failed.session.transcript.contains { $0.content == "partial authority output" })
 
-        let direct = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let direct = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let historyData = try await direct.invoke(
             toolName: "history",
             argumentsJSON: try JSONSerialization.data(withJSONObject: [

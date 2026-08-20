@@ -43,16 +43,16 @@ public actor RepoPromptAuthorityMCPService: RepoPromptMCPServing {
     private let portalSettings: PortalDesktopSettingsService
     private let mutationCapability: AuthorityMutationCapability
     private let toolPolicy: RepoPromptAuthorityMCPToolPolicy
-    private let readCapability: AuthorityReadCapability?
-    private let subscriptionCapability: AuthorityReadCapability?
+    private let readCapability: AuthorityReadCapability
+    private let subscriptionCapability: AuthorityReadCapability
 
-    public init(
+    init(
         authority: RepoPromptHeadlessAuthority,
         portalSettings: PortalDesktopSettingsService,
         mutationCapability: AuthorityMutationCapability,
         toolPolicy: RepoPromptAuthorityMCPToolPolicy = .headlessCodex,
-        readCapability: AuthorityReadCapability? = nil,
-        subscriptionCapability: AuthorityReadCapability? = nil
+        readCapability: AuthorityReadCapability,
+        subscriptionCapability: AuthorityReadCapability
     ) {
         self.authority = authority
         self.portalSettings = portalSettings
@@ -66,34 +66,41 @@ public actor RepoPromptAuthorityMCPService: RepoPromptMCPServing {
         MCPDomainToolCatalog.orderedToolNames
     }
 
+    static func admitted(
+        authority: RepoPromptHeadlessAuthority,
+        portalSettings: PortalDesktopSettingsService,
+        admissionGate: AuthorityMutationGate,
+        toolPolicy: RepoPromptAuthorityMCPToolPolicy = .headlessCodex
+    ) async -> RepoPromptAuthorityMCPService {
+        RepoPromptAuthorityMCPService(
+            authority: authority,
+            portalSettings: portalSettings,
+            mutationCapability: await admissionGate.capability(),
+            toolPolicy: toolPolicy,
+            readCapability: await admissionGate.readCapability(),
+            subscriptionCapability: await admissionGate.readCapability(subscription: true)
+        )
+    }
+
     public func projectSnapshot(id: UUID) async throws -> ProjectSnapshot {
-        if let readCapability {
-            return try await readCapability.perform { [authority] in
-                try await authority.projectSnapshot(projectID: id)
-            }
+        try await readCapability.perform { [authority] in
+            try await authority.projectSnapshot(projectID: id)
         }
-        return try await authority.projectSnapshot(projectID: id)
     }
 
     public func sessionSnapshot(id: UUID) async throws -> SessionSnapshot {
-        if let readCapability {
-            return try await readCapability.perform { [authority] in
-                try await authority.sessionSnapshot(sessionID: id)
-            }
+        try await readCapability.perform { [authority] in
+            try await authority.sessionSnapshot(sessionID: id)
         }
-        return try await authority.sessionSnapshot(sessionID: id)
     }
 
     public func events(after cursor: ServiceCursor?, limit: Int) async throws -> EventPage {
-        if let subscriptionCapability {
-            return try await subscriptionCapability.perform { [authority] in
-                try await authority.events(after: cursor, limit: limit)
-            }
+        try await subscriptionCapability.perform { [authority] in
+            try await authority.events(after: cursor, limit: limit)
         }
-        return try await authority.events(after: cursor, limit: limit)
     }
 
-    public func advertisedToolNames(isRootSession: Bool) async -> Set<String> {
+    public func advertisedToolNames(isRootSession: Bool) async throws -> Set<String> {
         var names: Set<String>
         switch toolPolicy {
         case .headlessCodex:
@@ -115,7 +122,10 @@ public actor RepoPromptAuthorityMCPService: RepoPromptMCPServing {
                     )
             })
         }
-        names.subtract(await authority.disabledMCPToolNames())
+        let disabledNames = try await readCapability.perform { [authority] in
+            await authority.disabledMCPToolNames()
+        }
+        names.subtract(disabledNames)
         return names
     }
 
@@ -200,6 +210,21 @@ public actor RepoPromptAuthorityMCPService: RepoPromptMCPServing {
                 agent: backend,
                 history: backend
             )
+        )
+    }
+}
+
+public extension RepoPromptAuthorityHost {
+    func makeMCPService(
+        portalSettings: PortalDesktopSettingsService,
+        toolPolicy: RepoPromptAuthorityMCPToolPolicy = .headlessCodex
+    ) async throws -> RepoPromptAuthorityMCPService {
+        let capabilities = try capabilities()
+        return await RepoPromptAuthorityMCPService.admitted(
+            authority: capabilities.authority,
+            portalSettings: portalSettings,
+            admissionGate: capabilities.mutationGate,
+            toolPolicy: toolPolicy
         )
     }
 }

@@ -601,6 +601,122 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         try await store.close()
     }
 
+    func testInternalReadAfterAdmissionCloseRejectsBeforeAuthenticationStoreAccess() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let gate = AuthorityMutationGate()
+        let instant = Date(timeIntervalSince1970: 1000)
+        let key = InternalSigningKey(
+            keyID: "app-v1",
+            role: .app,
+            direction: InternalHMACDirection.appToRepoPrompt,
+            secret: Data("secret".utf8)
+        )
+        let path = "/internal/v1/projects"
+        let headers = signedHeaders(
+            method: "GET",
+            path: path,
+            key: key,
+            instant: instant,
+            nonce: "closedreadstore1"
+        )
+        let service = RepoPromptHTTPService(
+            authority: authority,
+            store: store,
+            authenticator: InternalRequestAuthenticator(keys: [key], store: store, now: { instant }),
+            eventSigningKey: responseSigningKey,
+            mutationGate: gate
+        )
+        let app = Application(router: service.internalRouter())
+
+        await gate.close()
+        try await store.close()
+
+        try await app.test(.router) { client in
+            try await client.execute(uri: path, method: .get, headers: headers) { response in
+                XCTAssertEqual(response.status, .unprocessableContent)
+                let error = try JSONDecoder.serviceDecoder.decode(
+                    ServiceAPIError.self,
+                    from: Data(response.body.readableBytesView)
+                )
+                XCTAssertEqual(error.code, .staleCapability)
+                XCTAssertNotNil(response.headers[.init("x-internal-signature")!])
+            }
+        }
+    }
+
+    func testPortalReadAfterAdmissionCloseRejectsBeforeClosedStoreAccess() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let gate = AuthorityMutationGate()
+        let service = RepoPromptHTTPService(
+            authority: authority,
+            store: store,
+            authenticator: InternalRequestAuthenticator(keys: [], store: store),
+            eventSigningKey: responseSigningKey,
+            mutationGate: gate
+        )
+        let app = Application(router: service.internalRouter())
+
+        await gate.close()
+        try await store.close()
+
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/portal/api/v1/auth/status", method: .get) { response in
+                XCTAssertEqual(response.status, .serviceUnavailable)
+                let error = try JSONDecoder.serviceDecoder.decode(
+                    ServiceAPIError.self,
+                    from: Data(response.body.readableBytesView)
+                )
+                XCTAssertEqual(error.code, .staleCapability)
+            }
+        }
+    }
+
+    func testSSEAfterDrainRejectsBeforeAuthenticationOrClosedStoreAccess() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let gate = AuthorityMutationGate()
+        let instant = Date(timeIntervalSince1970: 1000)
+        let key = InternalSigningKey(
+            keyID: "sync-v1",
+            role: .sync,
+            direction: InternalHMACDirection.syncToRepoPrompt,
+            secret: Data("secret".utf8)
+        )
+        let path = "/internal/v1/events/stream"
+        let headers = signedHeaders(
+            method: "GET",
+            path: path,
+            key: key,
+            instant: instant,
+            nonce: "drainedsseaccess"
+        )
+        let service = RepoPromptHTTPService(
+            authority: authority,
+            store: store,
+            authenticator: InternalRequestAuthenticator(keys: [key], store: store, now: { instant }),
+            eventSigningKey: responseSigningKey,
+            mutationGate: gate
+        )
+        let app = Application(router: service.internalRouter())
+
+        await gate.beginDraining()
+        try await store.close()
+
+        try await app.test(.router) { client in
+            try await client.execute(uri: path, method: .get, headers: headers) { response in
+                XCTAssertEqual(response.status, .unprocessableContent)
+                let error = try JSONDecoder.serviceDecoder.decode(
+                    ServiceAPIError.self,
+                    from: Data(response.body.readableBytesView)
+                )
+                XCTAssertEqual(error.code, .serviceDraining)
+                XCTAssertTrue(error.retryable)
+            }
+        }
+    }
+
     func testSSELastEventIDBelowReplayFloorReturnsControlFrame() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let authority = RepoPromptHeadlessAuthority(store: store)

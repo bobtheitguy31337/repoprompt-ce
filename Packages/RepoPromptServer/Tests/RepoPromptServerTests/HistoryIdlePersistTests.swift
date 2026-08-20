@@ -122,7 +122,7 @@ final class HistoryIdlePersistTests: XCTestCase {
             idempotencyKey: "idle-session",
             requestDigest: "idle-session"
         )
-        let adapter = RepoPromptMCPAdapter(serving: RepoPromptAuthorityMCPService(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), mutationCapability: await AuthorityMutationGate().capability()))
+        let adapter = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let binding = RepoPromptMCPBinding(sessionID: session.sessionID, actor: actor)
 
         let omittedData = try await adapter.invoke(

@@ -145,7 +145,7 @@ private struct UnusedMCPServing: RepoPromptMCPServing {
     func projectSnapshot(id _: UUID) async throws -> ProjectSnapshot { throw StubError.unused }
     func sessionSnapshot(id _: UUID) async throws -> SessionSnapshot { throw StubError.unused }
     func events(after _: ServiceCursor?, limit _: Int) async throws -> EventPage { throw StubError.unused }
-    func advertisedToolNames(isRootSession _: Bool) async -> Set<String> { [] }
+    func advertisedToolNames(isRootSession _: Bool) async throws -> Set<String> { [] }
 
     func invoke(
         toolName _: String,

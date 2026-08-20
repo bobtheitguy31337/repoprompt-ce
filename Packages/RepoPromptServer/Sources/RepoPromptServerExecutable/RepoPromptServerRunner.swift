@@ -573,12 +573,8 @@ public enum RepoPromptServerRunner {
             needsSetup: needsSetup,
             setupToken: setupToken
         ).utf8))
-        let mcpServing = RepoPromptAuthorityMCPService(
-            authority: authority,
-            portalSettings: portalDesktopSettings,
-            mutationCapability: await mutationGate.capability(),
-            readCapability: await mutationGate.readCapability(),
-            subscriptionCapability: await mutationGate.readCapability(subscription: true)
+        let mcpServing = try await host.makeMCPService(
+            portalSettings: portalDesktopSettings
         )
         let mcpAdapter = RepoPromptMCPAdapter(serving: mcpServing)
         let mcpSocketURL = URL(
@@ -620,8 +616,10 @@ public enum RepoPromptServerRunner {
         }
 
         let budget = AuthorityHostShutdownBudget(total: .seconds(30))
-        transportTasks.forEach { $0.cancel() }
+        // Close mutation and subscription admission before listener cancellation so
+        // a still-accepting transport cannot establish new authority work in the gap.
         _ = await host.beginShutdown(using: budget)
+        transportTasks.forEach { $0.cancel() }
         let childShutdown = await mcpSocketServer.stop(
             clientDrainTimeout: budget.allowance(maximum: .seconds(5)),
             forceCloseReapTimeout: budget.allowance(maximum: .seconds(1))
