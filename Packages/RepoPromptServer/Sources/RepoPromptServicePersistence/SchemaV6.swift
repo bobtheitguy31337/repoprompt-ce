@@ -1,14 +1,7 @@
 enum SchemaV6 {
     static let version = 6
     static let digest = "repoprompt-service-schema-v6-typed-mcp-show-model-presets"
-    static let compatiblePriorDigests: Set<String> = [
-        "repoprompt-service-schema-v6-typed-mcp-disabled-tools",
-        "repoprompt-service-schema-v6-typed-workspace-approvals",
-        "repoprompt-service-schema-v6-typed-direct-agent-permissions",
-        "repoprompt-service-schema-v6-typed-settings-workflows-direct-providers-cas-audit",
-        "repoprompt-service-schema-v6-agent-composer-semantic-acceptance",
-        "repoprompt-service-schema-v6-typed-settings-agent-composer-semantic-acceptance"
-    ]
+    static let transformationID = "typed-mcp-show-model-presets-v1"
 
     static let statements: [String] = [
         "CREATE TABLE IF NOT EXISTS agent_model_profiles(scope_id TEXT PRIMARY KEY,project_id TEXT,profile_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",

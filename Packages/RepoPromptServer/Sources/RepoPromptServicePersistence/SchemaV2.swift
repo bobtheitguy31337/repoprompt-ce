@@ -1,6 +1,7 @@
 enum SchemaV2 {
     static let version = 2
     static let digest = "repoprompt-service-schema-v2-owned-resources-archives-restore-counters"
+    static let transformationID = "owned-resources-archives-restore-counters-v1"
 
     static let statements: [String] = [
         "CREATE TABLE IF NOT EXISTS session_event_counters(session_id TEXT PRIMARY KEY,event_count INTEGER NOT NULL,last_sequence INTEGER NOT NULL)",

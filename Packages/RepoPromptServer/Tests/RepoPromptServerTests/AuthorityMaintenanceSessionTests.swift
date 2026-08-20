@@ -30,7 +30,7 @@ final class AuthorityMaintenanceSessionTests: XCTestCase {
         let store = try await host.storeForRecovery()
         let schemaVersion = try await store.metadata().schemaVersion
         XCTAssertEqual(storeOpenCount, 0)
-        XCTAssertEqual(schemaVersion, SchemaV6.version)
+        XCTAssertEqual(schemaVersion, SchemaV7.version)
         _ = await host.shutdown(reason: "test")
     }
 

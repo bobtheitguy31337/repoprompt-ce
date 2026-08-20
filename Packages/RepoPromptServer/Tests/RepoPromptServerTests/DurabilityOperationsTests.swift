@@ -59,7 +59,7 @@ final class DurabilityOperationsTests: XCTestCase {
             roots = project.roots
         }
         let old = Date().addingTimeInterval(-31 * 24 * 60 * 60).timeIntervalSince1970
-        _ = try await store.connection.query("UPDATE events SET timestamp=? WHERE global_sequence<=4", [.float(old)])
+        _ = try await store.database.query("UPDATE events SET timestamp=? WHERE global_sequence<=4", [.float(old)])
         let archiveID = try await store.enforceEventRetention(
             policy: .init(minimumLiveEventCount: 3, minimumLiveAge: 30 * 24 * 60 * 60),
             now: Date()
@@ -91,11 +91,11 @@ final class DurabilityOperationsTests: XCTestCase {
         let archived = try await store.archivedEvents(archiveID: archiveID)
         XCTAssertEqual(archived.count, 1)
         do {
-            _ = try await store.connection.query("UPDATE event_archive_blobs SET compression='invalid'")
+            _ = try await store.database.query("UPDATE event_archive_blobs SET compression='invalid'")
             XCTFail("expected immutable archive trigger")
         } catch {}
         do {
-            _ = try await store.connection.query("DELETE FROM snapshot_checkpoints WHERE retention_class='pre_compaction'")
+            _ = try await store.database.query("DELETE FROM snapshot_checkpoints WHERE retention_class='pre_compaction'")
             XCTFail("expected protected checkpoint trigger")
         } catch {}
         let details = try await store.snapshotCheckpointDetails(scope: "events:\(cursor.storeID.uuidString):pre-compaction")
@@ -254,7 +254,7 @@ final class DurabilityOperationsTests: XCTestCase {
             _ = try await store.persistSession(persisted, eventType: .sessionResumed, actor: actor, correlationID: UUID(), idempotency: nil)
         }
         _ = try await store.archiveEvents(through: 3)
-        let counter = try await store.connection.query(
+        let counter = try await store.database.query(
             "SELECT event_count FROM session_event_counters WHERE session_id=?",
             [.text(sessionID.uuidString)]
         ).first?.column("event_count")?.integer

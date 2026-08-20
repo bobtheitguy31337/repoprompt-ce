@@ -1,4 +1,7 @@
 enum SchemaV1 {
+    static let version = 1
+    static let digest = "v1"
+    static let transformationID = "initial-durable-service-schema-v1"
     static let statements: [String] = [
         "CREATE TABLE IF NOT EXISTS service_metadata(fixed_id INTEGER PRIMARY KEY CHECK(fixed_id=1),store_id TEXT NOT NULL,schema_version INTEGER NOT NULL,created_at TEXT NOT NULL,last_clean_shutdown INTEGER NOT NULL,current_boot_epoch INTEGER NOT NULL,next_global_sequence INTEGER NOT NULL,replay_floor INTEGER NOT NULL,restored_from_store_id TEXT,restore_backup_sequence INTEGER,restore_digest TEXT)",
         "CREATE TABLE IF NOT EXISTS projects(project_id TEXT PRIMARY KEY,schema_version INTEGER NOT NULL,name TEXT NOT NULL,creator_json TEXT NOT NULL,lifecycle_state TEXT NOT NULL,revision INTEGER NOT NULL,snapshot_json TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)",

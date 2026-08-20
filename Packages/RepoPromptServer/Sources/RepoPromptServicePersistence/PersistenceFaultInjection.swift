@@ -4,6 +4,9 @@ public enum PersistenceFaultPoint: String, Sendable {
     case afterIdempotencyPreflightMiss
     case afterTransactionBegin
     case afterEventInsertBeforeSequenceAdvance
+    case afterMigrationStatement
+    case beforeMigrationLedgerInsert
+    case afterMigrationLedgerInsert
     case beforeTransactionCommit
 }
 

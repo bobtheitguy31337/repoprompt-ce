@@ -889,8 +889,8 @@ final class SQLiteServiceStoreV6CompatibilityTests: XCTestCase {
     func testMigrationIsAdditiveAndDetectsLegacyLedgerGap() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let metadata = try await store.metadata()
-        XCTAssertEqual(metadata.schemaVersion, 6)
-        let tables = try await store.connection.query("SELECT name FROM sqlite_master WHERE type='table'").compactMap { $0.column("name")?.string }
+        XCTAssertEqual(metadata.schemaVersion, SchemaV7.version)
+        let tables = try await store.database.query("SELECT name FROM sqlite_master WHERE type='table'").compactMap { $0.column("name")?.string }
         XCTAssertTrue(Set(["projects", "sessions", "transcript_entries", "semantic_turns", "semantic_activities", "semantic_tools", "agent_submissions"]).isSubset(of: Set(tables)))
         let sessionID = UUID()
         try await store.advanceSemanticWatermark(sessionID: sessionID, semanticSequence: 2, legacySequence: 5, gapDetected: true, at: Date())
@@ -905,7 +905,11 @@ final class SQLiteServiceStoreV6CompatibilityTests: XCTestCase {
         let path = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-combined-v6-\(UUID().uuidString).sqlite").path
         defer { try? FileManager.default.removeItem(atPath: path) }
 
-        var store: SQLiteServiceStore? = try await SQLiteServiceStore.open(storage: .file(path))
+        try await StoreMigrationTestSupport.makeV6Store(
+            at: URL(fileURLWithPath: path),
+            digest: "repoprompt-service-schema-v6-typed-settings-workflows-direct-providers-cas-audit"
+        )
+        var store: SQLiteServiceStore? = try await SQLiteServiceStore.openForMaintenance(storage: .file(path))
         let composerTables = [
             "composer_provider_catalog_cache", "agent_submissions", "effective_turn_configurations",
             "session_next_turn_defaults", "composer_attachments", "accepted_attachment_manifests",
@@ -913,21 +917,28 @@ final class SQLiteServiceStoreV6CompatibilityTests: XCTestCase {
             "semantic_ingestion_watermarks"
         ]
         for table in composerTables {
-            _ = try await store?.connection.query("DROP TABLE \(table)")
+            _ = try await store?.database.query("DROP TABLE \(table)")
         }
-        _ = try await store?.connection.query(
-            "UPDATE schema_migrations SET description='typed revisioned server settings and digest-only audit',digest=? WHERE version=6",
-            [.text("repoprompt-service-schema-v6-typed-settings-workflows-direct-providers-cas-audit")]
+        let source = try await XCTUnwrap(store).migrationSourceEvidence()
+        _ = try await store?.migrateToLatest(
+            verifiedBackup: .init(
+                source: source,
+                archiveSHA256: String(repeating: "a", count: 64),
+                manifestSHA256: String(repeating: "b", count: 64),
+                verifierFingerprint: String(repeating: "c", count: 64)
+            ),
+            namespaceKind: "server",
+            databaseIdentityDigest: String(repeating: "d", count: 64)
         )
-        try await store?.close()
+        try await store?.close(clean: false)
         store = nil
 
         let upgraded = try await SQLiteServiceStore.open(storage: .file(path))
-        let tables = try await upgraded.connection.query("SELECT name FROM sqlite_master WHERE type='table'").compactMap { $0.column("name")?.string }
+        let tables = try await upgraded.database.query("SELECT name FROM sqlite_master WHERE type='table'").compactMap { $0.column("name")?.string }
         XCTAssertTrue(Set(["advanced_server_settings", "settings_audit", "provider_direct_configurations"]).isSubset(of: Set(tables)))
         XCTAssertTrue(Set(composerTables).isSubset(of: Set(tables)))
-        let digest = try await upgraded.connection.query("SELECT digest FROM schema_migrations WHERE version=6").first?.column("digest")?.string
-        XCTAssertEqual(digest, "repoprompt-service-schema-v6-typed-mcp-show-model-presets")
+        let digest = try await upgraded.database.query("SELECT digest FROM schema_migrations WHERE version=6").first?.column("digest")?.string
+        XCTAssertEqual(digest, "repoprompt-service-schema-v6-typed-settings-workflows-direct-providers-cas-audit")
         try await upgraded.close()
     }
 
@@ -1588,13 +1599,13 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
 
         let publishedSessions = try await fixture.authority.sessionSnapshots()
         XCTAssertTrue(publishedSessions.isEmpty)
-        let rows = try await fixture.store.connection.query("SELECT COUNT(*) AS count FROM sessions")
+        let rows = try await fixture.store.database.query("SELECT COUNT(*) AS count FROM sessions")
         XCTAssertEqual(rows.first?.column("count")?.integer, 0)
-        let eventRows = try await fixture.store.connection.query("SELECT COUNT(*) AS count FROM events WHERE session_id IS NOT NULL")
+        let eventRows = try await fixture.store.database.query("SELECT COUNT(*) AS count FROM events WHERE session_id IS NOT NULL")
         XCTAssertEqual(eventRows.first?.column("count")?.integer, 0)
-        let turnRows = try await fixture.store.connection.query("SELECT COUNT(*) AS count FROM semantic_turns")
+        let turnRows = try await fixture.store.database.query("SELECT COUNT(*) AS count FROM semantic_turns")
         XCTAssertEqual(turnRows.first?.column("count")?.integer, 0)
-        let receiptRows = try await fixture.store.connection.query("SELECT COUNT(*) AS count FROM agent_submissions WHERE state='accepted' OR receipt_json IS NOT NULL")
+        let receiptRows = try await fixture.store.database.query("SELECT COUNT(*) AS count FROM agent_submissions WHERE state='accepted' OR receipt_json IS NOT NULL")
         XCTAssertEqual(receiptRows.first?.column("count")?.integer, 0)
     }
 
@@ -1735,10 +1746,10 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
         XCTAssertEqual(sessions.first?.transcript.map(\.content), ["accepted exactly once"])
         let turns = try await fixture.store.semanticTurns(sessionID: accepted.sessionID)
         XCTAssertEqual(turns.count, 1)
-        let sessionEvents = try await fixture.store.connection.query("SELECT event_type,COUNT(*) AS count FROM events WHERE session_id=? GROUP BY event_type", [.text(accepted.sessionID.uuidString)])
+        let sessionEvents = try await fixture.store.database.query("SELECT event_type,COUNT(*) AS count FROM events WHERE session_id=? GROUP BY event_type", [.text(accepted.sessionID.uuidString)])
         XCTAssertEqual(sessionEvents.first { $0.column("event_type")?.string == EventType.sessionCreated.rawValue }?.column("count")?.integer, 1)
         XCTAssertEqual(sessionEvents.first { $0.column("event_type")?.string == EventType.agentStarted.rawValue }?.column("count")?.integer, 1)
-        let storedReceipts = try await fixture.store.connection.query("SELECT COUNT(*) AS count FROM agent_submissions WHERE state='accepted' AND receipt_json IS NOT NULL")
+        let storedReceipts = try await fixture.store.database.query("SELECT COUNT(*) AS count FROM agent_submissions WHERE state='accepted' AND receipt_json IS NOT NULL")
         XCTAssertEqual(storedReceipts.first?.column("count")?.integer, 1)
     }
 }

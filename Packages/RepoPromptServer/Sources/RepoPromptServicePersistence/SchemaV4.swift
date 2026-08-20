@@ -1,6 +1,7 @@
 enum SchemaV4 {
     static let version = 4
     static let digest = "repoprompt-service-schema-v4-provider-connections-audit"
+    static let transformationID = "provider-connections-audit-v1"
 
     static let statements: [String] = [
         "CREATE TABLE IF NOT EXISTS provider_connections(provider_id TEXT PRIMARY KEY,schema_version INTEGER NOT NULL,connection_id TEXT UNIQUE NOT NULL,authentication_method TEXT NOT NULL,state TEXT NOT NULL,account_label TEXT,expires_at REAL,last_tested_at REAL,test_state TEXT NOT NULL,detail TEXT,key_helper_configured INTEGER NOT NULL,workload_identity_configured INTEGER NOT NULL,credential_reference TEXT,created_at REAL NOT NULL,updated_at REAL NOT NULL,revision INTEGER NOT NULL)",
