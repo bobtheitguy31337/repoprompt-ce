@@ -248,16 +248,17 @@ extension SQLiteServiceStore {
     public func operatorSessionUsername(token: String, now: Date = Date()) async throws -> String? {
         let hash = OperatorPasswordHasher.sha256Hex(Data(token.utf8))
         guard let row = try await database.query(
-            "SELECT session_id,username,expires_at FROM operator_sessions WHERE token_hash=?",
+            "SELECT s.session_id,s.username,s.expires_at,m.revoked_at FROM operator_sessions s JOIN operator_session_metadata m ON m.session_id=s.session_id WHERE s.token_hash=?",
             [.text(hash)]
         ).first,
+              row.column("revoked_at")?.double == nil,
               let username = row.column("username")?.string,
               let expires = row.column("expires_at")?.double
         else { return nil }
         guard expires > now.timeIntervalSince1970 else {
             if let sessionID = row.column("session_id")?.string {
                 _ = try await database.query(
-                    "UPDATE operator_session_metadata SET revoked_at=?,revocation_reason='expired' WHERE session_id=?",
+                    "UPDATE operator_session_metadata SET revoked_at=?,revocation_reason='expired' WHERE session_id=? AND revoked_at IS NULL",
                     [.float(now.timeIntervalSince1970), .text(sessionID)]
                 )
             }
@@ -273,26 +274,101 @@ extension SQLiteServiceStore {
         return username
     }
 
-    public func deleteOperatorSession(token: String, now: Date = Date()) async throws {
-        let hash = OperatorPasswordHasher.sha256Hex(Data(token.utf8))
-        if let sessionID = try await database.query(
-            "SELECT session_id FROM operator_sessions WHERE token_hash=?", [.text(hash)]
-        ).first?.column("session_id")?.string {
-            _ = try await database.query(
-                "UPDATE operator_session_metadata SET revoked_at=?,revocation_reason='logout' WHERE session_id=?",
-                [.float(now.timeIntervalSince1970), .text(sessionID)]
+    @discardableResult
+    public func logoutOperatorSession(
+        token: String?,
+        clientIdentityDigest: String?,
+        correlationID: UUID,
+        now: Date = Date(),
+        faultInjector: (@Sendable (String) throws -> Void)? = nil
+    ) async throws -> Bool {
+        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
+            if let prior = try await database.query(
+                "SELECT detail_code FROM operator_security_audit WHERE operation='logout' AND outcome='success' AND correlation_id=? LIMIT 1",
+                [.text(correlationID.uuidString.lowercased())]
+            ).first {
+                return prior.column("detail_code")?.string == "sessionRevoked"
+            }
+
+            var actor = "operator"
+            var revokedLiveSession = false
+            if let token {
+                let hash = OperatorPasswordHasher.sha256Hex(Data(token.utf8))
+                if let row = try await database.query(
+                    "SELECT s.session_id,s.username,m.revoked_at,m.revocation_reason,m.correlation_id FROM operator_sessions s JOIN operator_session_metadata m ON m.session_id=s.session_id WHERE s.token_hash=?",
+                    [.text(hash)]
+                ).first,
+                    let sessionID = row.column("session_id")?.string
+                {
+                    let username = row.column("username")?.string
+                    if let username {
+                        actor = "operator:\(username)"
+                    }
+                    let rotationCorrelationID = row.column("revocation_reason")?.string == "passwordChanged"
+                        ? row.column("correlation_id")?.string
+                        : nil
+                    if let username, let rotationCorrelationID {
+                        let linked = try await database.query(
+                            "SELECT s.session_id,m.revoked_at FROM operator_sessions s JOIN operator_session_metadata m ON m.session_id=s.session_id WHERE s.username=? AND m.correlation_id=?",
+                            [.text(username), .text(rotationCorrelationID)]
+                        )
+                        revokedLiveSession = linked.contains { $0.column("revoked_at")?.double == nil }
+                        _ = try await database.query(
+                            "UPDATE operator_session_metadata SET revoked_at=?,revocation_reason='logout' WHERE username=? AND correlation_id=?",
+                            [.float(now.timeIntervalSince1970), .text(username), .text(rotationCorrelationID)]
+                        )
+                        try faultInjector?("after-metadata-revocation")
+                        let deleted = try await database.query(
+                            "DELETE FROM operator_sessions WHERE username=? AND session_id IN (SELECT session_id FROM operator_session_metadata WHERE correlation_id=?) RETURNING session_id",
+                            [.text(username), .text(rotationCorrelationID)]
+                        )
+                        guard deleted.count == linked.count, !deleted.isEmpty else {
+                            throw ServiceAPIError(code: .internalFailure, message: "Operator password rotation changed before logout completed")
+                        }
+                    } else {
+                        _ = try await database.query(
+                            "UPDATE operator_session_metadata SET revoked_at=?,revocation_reason='logout' WHERE session_id=?",
+                            [.float(now.timeIntervalSince1970), .text(sessionID)]
+                        )
+                        revokedLiveSession = true
+                        try faultInjector?("after-metadata-revocation")
+                        let deleted = try await database.query(
+                            "DELETE FROM operator_sessions WHERE session_id=? AND token_hash=? RETURNING session_id",
+                            [.text(sessionID), .text(hash)]
+                        )
+                        guard !deleted.isEmpty else {
+                            throw ServiceAPIError(code: .internalFailure, message: "Operator session changed before logout completed")
+                        }
+                    }
+                    try faultInjector?("after-token-deletion")
+                }
+            }
+
+            try await appendOperatorSecurityAudit(
+                operation: "logout",
+                outcome: "success",
+                actor: actor,
+                channel: "portal",
+                clientIdentityDigest: clientIdentityDigest,
+                correlationID: correlationID,
+                detailCode: revokedLiveSession ? "sessionRevoked" : "sessionAlreadyAbsent",
+                now: now
             )
+            try faultInjector?("after-audit-insert")
+            return revokedLiveSession
         }
-        _ = try await database.query("DELETE FROM operator_sessions WHERE token_hash=?", [.text(hash)])
     }
 
     public func changeOperatorPassword(
         username: String = defaultOperatorUsername,
+        authorizingToken: String,
         currentPassword: String,
         newPassword: String,
         clientIdentityDigest: String?,
         correlationID: UUID,
-        now: Date = Date()
+        now: Date = Date(),
+        faultInjector: (@Sendable (String) throws -> Void)? = nil,
+        operationObserver: (@Sendable (String) async -> Void)? = nil
     ) async throws -> String {
         guard let current = try await database.query(
             "SELECT password_salt,password_hash,iterations FROM operator_accounts WHERE username=?",
@@ -329,47 +405,70 @@ extension SQLiteServiceStore {
         }
         let salt = OperatorPasswordHasher.randomSalt()
         let passwordHash = try OperatorPasswordHasher.hash(password: newPassword, salt: salt)
+        let authorizingHash = OperatorPasswordHasher.sha256Hex(Data(authorizingToken.utf8))
         let replacement = OperatorPasswordHasher.randomToken() + OperatorPasswordHasher.randomToken()
         let replacementHash = OperatorPasswordHasher.sha256Hex(Data(replacement.utf8))
         let replacementSessionID = UUID()
         let replacementExpiry = now.addingTimeInterval(Self.operatorSessionDuration)
+        await operationObserver?("before-password-transaction")
         do {
             try await transaction(.interactive(estimatedEncodedBytes: 0)) {
+                guard let authorizingSessionID = try await database.query(
+                    "SELECT s.session_id FROM operator_sessions s JOIN operator_session_metadata m ON m.session_id=s.session_id WHERE s.username=? AND s.token_hash=? AND s.expires_at>? AND m.revoked_at IS NULL",
+                    [.text(username), .text(authorizingHash), .float(now.timeIntervalSince1970)]
+                ).first?.column("session_id")?.string else {
+                    throw ServiceAPIError(code: .internalAuthFailed, message: "Operator session ended before password change completed")
+                }
                 let updated = try await database.query(
                     "UPDATE operator_accounts SET password_salt=?,password_hash=?,iterations=? WHERE username=? AND password_salt=? AND password_hash=? AND iterations=? RETURNING username",
-                [
-                    .text(salt.base64EncodedString()), .text(passwordHash.base64EncodedString()),
-                    .integer(OperatorPasswordHasher.iterations), .text(username), .text(currentSaltText),
-                    .text(currentHashText), .integer(currentIterations),
-                ]
-            )
-            guard !updated.isEmpty else {
-                throw ServiceAPIError(code: .internalAuthFailed, message: "Current password changed before this request completed")
-            }
-            _ = try await database.query(
-                "UPDATE operator_session_metadata SET revoked_at=?,revocation_reason='passwordChanged' WHERE username=? AND revoked_at IS NULL",
-                [.float(now.timeIntervalSince1970), .text(username)]
-            )
-            _ = try await database.query("DELETE FROM operator_sessions WHERE username=?", [.text(username)])
-            _ = try await database.query(
-                "INSERT INTO operator_sessions(session_id,username,token_hash,created_at,expires_at) VALUES(?,?,?,?,?)",
-                [
-                    .text(replacementSessionID.uuidString.lowercased()), .text(username), .text(replacementHash),
-                    .float(now.timeIntervalSince1970), .float(replacementExpiry.timeIntervalSince1970),
-                ]
-            )
-            _ = try await database.query(
-                "INSERT INTO operator_session_metadata(session_id,username,issued_at,last_seen_at,client_identity_digest,correlation_id) VALUES(?,?,?,?,?,?)",
-                [
-                    .text(replacementSessionID.uuidString.lowercased()), .text(username), .float(now.timeIntervalSince1970),
-                    .float(now.timeIntervalSince1970), clientIdentityDigest.map { .text($0) } ?? .null,
-                    .text(correlationID.uuidString.lowercased()),
-                ]
-            )
+                    [
+                        .text(salt.base64EncodedString()), .text(passwordHash.base64EncodedString()),
+                        .integer(OperatorPasswordHasher.iterations), .text(username), .text(currentSaltText),
+                        .text(currentHashText), .integer(currentIterations),
+                    ]
+                )
+                guard !updated.isEmpty else {
+                    throw ServiceAPIError(code: .internalAuthFailed, message: "Current password changed before this request completed")
+                }
+                try faultInjector?("after-account-update")
+                _ = try await database.query(
+                    "UPDATE operator_session_metadata SET revoked_at=?,revocation_reason='passwordChanged' WHERE username=? AND revoked_at IS NULL",
+                    [.float(now.timeIntervalSince1970), .text(username)]
+                )
+                _ = try await database.query(
+                    "UPDATE operator_session_metadata SET correlation_id=? WHERE session_id=?",
+                    [.text(correlationID.uuidString.lowercased()), .text(authorizingSessionID)]
+                )
+                _ = try await database.query(
+                    "DELETE FROM operator_sessions WHERE username=? AND session_id<>?",
+                    [.text(username), .text(authorizingSessionID)]
+                )
+                _ = try await database.query(
+                    "UPDATE operator_sessions SET expires_at=? WHERE session_id=? AND token_hash=?",
+                    [.float(now.timeIntervalSince1970), .text(authorizingSessionID), .text(authorizingHash)]
+                )
+                try faultInjector?("after-prior-session-revocation")
+                _ = try await database.query(
+                    "INSERT INTO operator_sessions(session_id,username,token_hash,created_at,expires_at) VALUES(?,?,?,?,?)",
+                    [
+                        .text(replacementSessionID.uuidString.lowercased()), .text(username), .text(replacementHash),
+                        .float(now.timeIntervalSince1970), .float(replacementExpiry.timeIntervalSince1970),
+                    ]
+                )
+                _ = try await database.query(
+                    "INSERT INTO operator_session_metadata(session_id,username,issued_at,last_seen_at,client_identity_digest,correlation_id) VALUES(?,?,?,?,?,?)",
+                    [
+                        .text(replacementSessionID.uuidString.lowercased()), .text(username), .float(now.timeIntervalSince1970),
+                        .float(now.timeIntervalSince1970), clientIdentityDigest.map { .text($0) } ?? .null,
+                        .text(correlationID.uuidString.lowercased()),
+                    ]
+                )
+                try faultInjector?("after-replacement-session-insert")
                 try await appendOperatorSecurityAudit(
                     operation: "passwordChange", outcome: "success", actor: "operator:\(username)", channel: "portal",
                     clientIdentityDigest: clientIdentityDigest, correlationID: correlationID, now: now
                 )
+                try faultInjector?("after-password-audit-insert")
             }
         } catch {
             try? await appendOperatorSecurityAudit(
@@ -379,6 +478,7 @@ extension SQLiteServiceStore {
             )
             throw error
         }
+        await operationObserver?("after-password-commit")
         return replacement
     }
 

@@ -215,8 +215,12 @@ public struct RepoPromptHTTPService: Sendable {
                 )
                 throw ServiceAPIError(code: .invalidRequest, message: "Password confirmation does not match")
             }
+            guard let authorizingToken = operatorSessionToken(from: request) else {
+                throw ServiceAPIError(code: .internalAuthFailed, message: "Password changes require an operator session")
+            }
             let replacement = try await store.changeOperatorPassword(
                 username: principal.externalActor.username,
+                authorizingToken: authorizingToken,
                 currentPassword: input.currentPassword,
                 newPassword: input.newPassword,
                 clientIdentityDigest: principal.clientIdentityDigest,
@@ -1658,12 +1662,10 @@ public struct RepoPromptHTTPService: Sendable {
     private func completePortalLogout(request: Request, context: RepoPromptRequestContext) async throws -> Response {
         let identity = try portalNetworkIdentity(request: request, context: context)
         let clientDigest = keyedPortalDigest(label: "client", value: identity.clientAddress)
-        if let token = operatorSessionToken(from: request) {
-            try await store.deleteOperatorSession(token: token)
-        }
-        try await store.appendOperatorSecurityAudit(
-            operation: "logout", outcome: "success", actor: "operator", channel: "portal",
-            clientIdentityDigest: clientDigest, correlationID: UUID()
+        try await store.logoutOperatorSession(
+            token: operatorSessionToken(from: request),
+            clientIdentityDigest: clientDigest,
+            correlationID: UUID()
         )
         var response = try portalJSON(["ok": true])
         response.headers[.setCookie] = "rpce_operator_session=; Path=/portal; HttpOnly; SameSite=Strict; Secure; Max-Age=0"

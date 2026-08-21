@@ -122,6 +122,7 @@ final class PortalSecurityTests: XCTestCase {
         let prior1 = try await store.createOperatorSession()
         let prior2 = try await store.createOperatorSession()
         let replacement = try await store.changeOperatorPassword(
+            authorizingToken: prior1,
             currentPassword: "initial-password",
             newPassword: "replacement-password",
             clientIdentityDigest: "client-digest",
@@ -313,6 +314,7 @@ final class PrivatePilotPortalAssetTests: XCTestCase {
             "api/v1/account/password",
             "api/v1/account/sessions",
             "api/v1/account/sessions/revoke-all",
+            "api/v1/logout",
             "api/v1/operations",
         ] {
             XCTAssertTrue(script.contains(path), "missing private-pilot portal path: \(path)")
@@ -321,8 +323,26 @@ final class PrivatePilotPortalAssetTests: XCTestCase {
         XCTAssertTrue(html.contains("id=\"auth-token\" name=\"setupToken\" type=\"password\""))
         XCTAssertGreaterThanOrEqual(html.components(separatedBy: "data-sensitive=\"true\"").count - 1, 3)
         XCTAssertTrue(script.contains("function clearAuthenticationSecrets()"))
-        XCTAssertTrue(script.contains("finally {\n          clearAuthenticationSecrets();"))
+        XCTAssertTrue(script.contains("const logout = element(\"button\", \"danger-button\", \"Logout\")"))
+        XCTAssertTrue(script.contains("logout.addEventListener(\"click\", () => logoutOperator(logout))"))
+        XCTAssertTrue(script.contains("() => api(\"api/v1/logout\", { method: \"POST\" })"))
+        XCTAssertTrue(script.contains("state.logoutPromise = terminatePortalSession("))
+        XCTAssertTrue(script.contains("const authenticationGeneration ="))
+        XCTAssertTrue(script.contains("await fenceAuthenticatedPortalResponse("))
+        XCTAssertTrue(script.contains("function installPortalAuthenticationSubmission("))
+        XCTAssertTrue(script.contains("const mode = state.authenticationMode"))
+        XCTAssertTrue(script.contains("presentPortalAuthenticationMode(state, document, status)"))
+        XCTAssertTrue(script.contains("if (state.authenticationSubmitInstalled) return false;"))
+        XCTAssertTrue(script.contains("function invalidatePortalLoadState(state)"))
+        XCTAssertTrue(script.contains("return runPortalLoad(state, authenticationGeneration, setLoading"))
+        XCTAssertTrue(script.contains("if (state.loadOperation === load)"))
+        XCTAssertTrue(script.contains("resetAuthenticatedPortalState(state, document, location"))
+        XCTAssertTrue(script.contains("state.operatorAuthenticated = false"))
+        XCTAssertTrue(script.contains("app.setAttribute(\"aria-hidden\", \"true\")"))
+        XCTAssertTrue(script.contains("finally {\n        clearSecrets();"))
         XCTAssertTrue(script.contains("if (state.route !== nextRoute) disposeSensitiveInputs();"))
+        XCTAssertTrue(script.contains("window.RepoPromptPortalTest = Object.freeze({"))
+        XCTAssertTrue(script.contains("if (!window.__REPOPROMPT_PORTAL_TEST_HOOK__?.deferStart) start();"))
         XCTAssertTrue(script.contains("owner-only operator-setup-token file"))
         XCTAssertTrue(script.contains("never written to server logs"))
         XCTAssertFalse(script.contains("localStorage"))
