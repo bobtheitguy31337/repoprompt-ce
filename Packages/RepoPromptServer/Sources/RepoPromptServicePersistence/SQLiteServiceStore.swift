@@ -3526,5 +3526,14 @@ extension SQLiteServiceStore {
 
     func saveIdempotency(_ input: IdempotencyInput, status: Int, response: Data) async throws {
         _ = try await database.query("INSERT INTO idempotency_records(actor_id,operation,idempotency_key,request_digest,response_body,status,created_at,expires_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP,datetime('now','+30 days')) ON CONFLICT(actor_id,operation,idempotency_key) DO UPDATE SET response_body=excluded.response_body,status=excluded.status,expires_at=excluded.expires_at WHERE idempotency_records.request_digest=excluded.request_digest", [.text(input.actorID), .text(input.operation), .text(input.key), .text(input.requestDigest), .text(response.base64EncodedString()), .integer(status)])
+        let changed = try await requireRow(database.query("SELECT changes() AS changed"))
+            .column("changed")?.integer
+        guard changed == 1 else {
+            throw ServiceAPIError(
+                code: .idempotencyConflict,
+                message: "Idempotency key was used with a different request",
+                retryable: false
+            )
+        }
     }
 }

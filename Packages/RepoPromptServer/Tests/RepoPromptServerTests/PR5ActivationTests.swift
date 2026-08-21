@@ -6,7 +6,13 @@ import RepoPromptMCPAdapter
 import RepoPromptRuntimeModel
 import RepoPromptServiceProtocol
 import RepoPromptShared
+import RepoPromptWorkspaceRuntimeCore
 import XCTest
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 @_spi(Testing) import RepoPromptHeadlessRuntime
 @testable import RepoPromptServerHost
@@ -571,21 +577,36 @@ final class OrderedEventOutboxTests: XCTestCase {
         XCTAssertEqual(statesAfterCrash.map { $0.column("state")?.string }, ["pending", "pending"])
         XCTAssertEqual(statesAfterCrash.map { $0.column("dispatch_attempt_count")?.integer }, [1, 0])
 
-        try await dispatcher.drainStartupWatermark(first.cursor)
+        var firstIterator = stream.makeAsyncIterator()
+        let deliveredBeforeCrash = try await firstIterator.next()
+        XCTAssertEqual(deliveredBeforeCrash?.globalSequence, first.globalSequence)
+        await hub.finish()
+
+        // Recreate both host-owned components. The client reconnects from its
+        // greatest applied cursor, so redelivered N is suppressed while N+1 is
+        // delivered only after N's marker commits.
+        let restartedHub = ServiceEventHub(subscriberBufferLimit: 8)
+        let restartedStream = await restartedHub.subscribe(
+            consumer: .sse,
+            after: deliveredBeforeCrash?.cursor
+        )
+        let restartedDispatcher = OrderedEventOutboxDispatcher(
+            store: store,
+            hub: restartedHub
+        )
+        try await restartedDispatcher.drainStartupWatermark(first.cursor)
         let statesAfterBoundedDrain = try await store.database.query(
             "SELECT global_sequence,state,dispatch_attempt_count FROM event_outbox ORDER BY global_sequence"
         )
         XCTAssertEqual(statesAfterBoundedDrain.map { $0.column("state")?.string }, ["dispatched", "pending"])
         XCTAssertEqual(statesAfterBoundedDrain.map { $0.column("dispatch_attempt_count")?.integer }, [2, 0])
 
-        try await dispatcher.drainStartupWatermark(second.cursor)
-        await hub.finish()
-        var iterator = stream.makeAsyncIterator()
-        let deliveredFirst = try await iterator.next()
-        let deliveredSecond = try await iterator.next()
-        let exhausted = try await iterator.next()
-        XCTAssertEqual(deliveredFirst?.globalSequence, first.globalSequence)
-        XCTAssertEqual(deliveredSecond?.globalSequence, second.globalSequence)
+        try await restartedDispatcher.drainStartupWatermark(second.cursor)
+        await restartedHub.finish()
+        var restartedIterator = restartedStream.makeAsyncIterator()
+        let deliveredAfterRestart = try await restartedIterator.next()
+        let exhausted = try await restartedIterator.next()
+        XCTAssertEqual(deliveredAfterRestart?.globalSequence, second.globalSequence)
         XCTAssertNil(exhausted)
         let states = try await store.database.query(
             "SELECT state FROM event_outbox ORDER BY global_sequence"
@@ -644,30 +665,49 @@ final class OrderedEventOutboxTests: XCTestCase {
 }
 
 final class EventConsumerDedupeContractTests: XCTestCase {
-    func testNamedRegistryGuardsEverySupportedConsumerAgainstCrashWindowRedelivery() async throws {
+    func testNamedRegistryGuardsActualConsumersAcrossDispatcherAndHubRestart() async throws {
+        let registrations = ServiceEventConsumerRegistry.registrations
+        XCTAssertEqual(Set(registrations.map(\.kind)), Set(ServiceEventConsumerKind.allCases))
+        XCTAssertEqual(registrations.first(where: { $0.kind == .sse })?.deliveryMode, .cursorGatedLive)
+        XCTAssertEqual(registrations.first(where: { $0.kind == .portal })?.deliveryMode, .absent)
+        XCTAssertEqual(registrations.first(where: { $0.kind == .mcpNotification })?.deliveryMode, .absent)
+        XCTAssertEqual(registrations.first(where: { $0.kind == .counter })?.deliveryMode, .durableQuery)
+        XCTAssertEqual(registrations.first(where: { $0.kind == .projection })?.deliveryMode, .durableQuery)
+
+        for kind in ServiceEventConsumerKind.allCases where kind != .sse {
+            let rejected = await ServiceEventHub().subscribe(consumer: kind)
+            var iterator = rejected.makeAsyncIterator()
+            do {
+                _ = try await iterator.next()
+                XCTFail("Expected non-live consumer registration rejection for \(kind.rawValue)")
+            } catch let error as ServiceAPIError {
+                XCTAssertEqual(error.code, .capabilityMissing)
+            }
+        }
+
         let storeID = UUID()
-        let hub = ServiceEventHub(subscriberBufferLimit: 4)
-        var streams: [ServiceEventConsumerKind: AsyncThrowingStream<EventEnvelope, Error>] = [:]
-        for kind in ServiceEventConsumerKind.allCases {
-            streams[kind] = await hub.subscribe(consumer: kind)
-        }
-        let registered = await hub.snapshot()
-        XCTAssertEqual(Set(registered.activeSubscribersByKind.keys), Set(ServiceEventConsumerKind.allCases))
-        XCTAssertTrue(registered.activeSubscribersByKind.values.allSatisfy { $0 == 1 })
+        let duplicate = PR5TestSupport.event(storeID: storeID, sequence: 1)
+        let firstHub = ServiceEventHub(subscriberBufferLimit: 4)
+        let firstStream = await firstHub.subscribe(consumer: .sse)
+        await firstHub.publish(duplicate)
+        var firstIterator = firstStream.makeAsyncIterator()
+        let firstDelivery = try await firstIterator.next()
+        XCTAssertEqual(firstDelivery?.cursor, duplicate.cursor)
+        await firstHub.finish()
 
-        let event = PR5TestSupport.event(storeID: storeID, sequence: 1)
-        await hub.publish(event)
-        // Models dispatcher restart after publish but before the dispatched marker.
-        await hub.publish(event)
-        await hub.finish()
-
-        for kind in ServiceEventConsumerKind.allCases {
-            var iterator = try XCTUnwrap(streams[kind]).makeAsyncIterator()
-            let delivered = try await iterator.next()
-            let duplicate = try await iterator.next()
-            XCTAssertEqual(delivered?.cursor, event.cursor, "missing delivery for \(kind.rawValue)")
-            XCTAssertNil(duplicate, "duplicate delivery for \(kind.rawValue)")
-        }
+        // Crash after publish/before the outbox marker: a new dispatcher and hub
+        // redeliver sequence 1, while the reconnect cursor suppresses it.
+        let restartedHub = ServiceEventHub(subscriberBufferLimit: 4)
+        let restartedStream = await restartedHub.subscribe(consumer: .sse, after: duplicate.cursor)
+        await restartedHub.publish(duplicate)
+        let next = PR5TestSupport.event(storeID: storeID, sequence: 2, projectID: duplicate.projectID)
+        await restartedHub.publish(next)
+        await restartedHub.finish()
+        var restartedIterator = restartedStream.makeAsyncIterator()
+        let restartedDelivery = try await restartedIterator.next()
+        let restartedExhaustion = try await restartedIterator.next()
+        XCTAssertEqual(restartedDelivery?.cursor, next.cursor)
+        XCTAssertNil(restartedExhaustion)
     }
 
     func testGateRejectsDuplicateAndStoreChangeUntilExplicitResnapshot() {
@@ -688,7 +728,7 @@ final class EventReplayLiveRaceTests: XCTestCase {
     func testRegisterFirstLiveGateDropsReplayOverlapAndPreservesNextSequence() async throws {
         let storeID = UUID()
         let hub = ServiceEventHub(subscriberBufferLimit: 8)
-        let stream = await hub.subscribe(consumer: .portal, after: .init(storeID: storeID, globalSequence: 10))
+        let stream = await hub.subscribe(consumer: .sse, after: .init(storeID: storeID, globalSequence: 10))
         let replayOverlap = PR5TestSupport.event(storeID: storeID, sequence: 10)
         let live = PR5TestSupport.event(
             storeID: storeID,
@@ -726,7 +766,7 @@ final class EventReplayLiveRaceTests: XCTestCase {
     func testStoreIdentityChangeTerminatesRegisteredConsumer() async throws {
         let firstStore = UUID()
         let hub = ServiceEventHub(subscriberBufferLimit: 2)
-        let stream = await hub.subscribe(consumer: .projection, after: .init(storeID: firstStore, globalSequence: 4))
+        let stream = await hub.subscribe(consumer: .sse, after: .init(storeID: firstStore, globalSequence: 4))
         await hub.publish(PR5TestSupport.event(storeID: UUID(), sequence: 1))
         var iterator = stream.makeAsyncIterator()
         do {
@@ -816,6 +856,13 @@ final class MCPInvocationIdentityContractTests: XCTestCase {
         XCTAssertEqual(
             RepoPromptMCPStdioExecution.invocationBinding(base, timelineIdentity: fresh).appInvocationID,
             secondAppInvocationID
+        )
+        let staleServingBinding = base.withAppInvocationID(firstAppInvocationID)
+        XCTAssertNil(
+            RepoPromptMCPStdioExecution.invocationBinding(
+                staleServingBinding,
+                timelineIdentity: nil
+            ).appInvocationID
         )
         let direct = try DirectHeadlessMCPService.requestTimelineIdentity(
             metadataAppInvocationID: firstAppInvocationID,
@@ -958,6 +1005,7 @@ private actor PR5ProviderDispatcher: AgentProviderDispatcher {
     }
 
     func hasActiveRun(_ runID: UUID) -> Bool { active.contains(runID) }
+    func activeRunIDs() -> Set<UUID> { active }
     func cancelCallCount() -> Int { cancelRequests }
     func executionCallCount() -> Int { executionRequests }
 
@@ -1011,6 +1059,25 @@ private actor PR5ProviderDispatcher: AgentProviderDispatcher {
 }
 
 final class IdempotencyRetryContractTests: XCTestCase {
+    func testConflictingDigestUpsertFailsInsideTransactionInsteadOfCommittingNoOp() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let first = IdempotencyInput(actorID: "actor", operation: "mutation", key: "shared", requestDigest: "digest-a")
+        try await store.saveIdempotency(first, status: 202, response: Data("first".utf8))
+        do {
+            try await store.saveIdempotency(
+                .init(actorID: "actor", operation: "mutation", key: "shared", requestDigest: "digest-b"),
+                status: 202,
+                response: Data("second".utf8)
+            )
+            XCTFail("Expected conflicting upsert to fail")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .idempotencyConflict)
+        }
+        let replay = try await store.existingIdempotency(first)
+        XCTAssertEqual(replay?.0, Data("first".utf8))
+        try await store.close()
+    }
+
     func testSameLifecycleIdentityReplaysReceiptAndConflictingDigestIsRejected() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let provider = PR5ProviderDispatcher(mode: .immediate)
@@ -1090,6 +1157,47 @@ final class IdempotencyRetryContractTests: XCTestCase {
             XCTAssertEqual(error.code, .operationReconciling)
         }
         try await store.close()
+    }
+}
+
+final class WorkspaceLaunchAcknowledgementTests: XCTestCase {
+    func testFailedAcknowledgementForcesTerminationWhenChildIgnoresSIGTERM() async throws {
+        let root = try StoreMigrationTestSupport.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let pidFile = root.appendingPathComponent("pid")
+        let runner = LocalWorkspaceCommandRunner()
+
+        do {
+            _ = try await runner.run(
+                executable: "/bin/sh",
+                arguments: ["-c", "trap '' TERM; echo $$ > '\(pidFile.path)'; while :; do :; done"],
+                workingDirectory: root.path,
+                maximumBytes: 1024,
+                launchValidation: {},
+                launchAcknowledgement: {
+                    for _ in 0 ..< 100 {
+                        if FileManager.default.fileExists(atPath: pidFile.path) {
+                            throw PR5InjectedFailure()
+                        }
+                        try await Task.sleep(for: .milliseconds(10))
+                    }
+                    throw ServiceAPIError(
+                        code: .dependencyUnavailable,
+                        message: "Child did not reach the launch boundary"
+                    )
+                }
+            )
+            XCTFail("Expected acknowledgement persistence failure")
+        } catch is PR5InjectedFailure {}
+
+        let text = try String(contentsOf: pidFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let pid = try XCTUnwrap(Int32(text))
+        #if canImport(Darwin) || canImport(Glibc)
+            errno = 0
+            XCTAssertEqual(kill(pid, 0), -1)
+            XCTAssertEqual(errno, ESRCH)
+        #endif
     }
 }
 
@@ -1446,14 +1554,26 @@ final class ProviderLifecycleRecoveryTests: XCTestCase {
         XCTAssertEqual(transitions.last?.state, .reconciliationRequired)
         let cancelRequestedRun = try await store.latestRun(sessionID: session.sessionID)
         XCTAssertEqual(cancelRequestedRun?.state, "cancelRequested")
+        let readiness = RepoPromptReadinessService(
+            authority: authority,
+            store: store,
+            minimumFreeBytes: 0,
+            minimumFreeNodes: 0
+        )
+        let blocked = await readiness.snapshot(forceRefresh: true)
+        XCTAssertFalse(blocked.ready)
+        XCTAssertEqual(
+            blocked.checks.first(where: { $0.name == "authority-transitions" })?.ready,
+            false
+        )
+
         await provider.abandon(run.runID)
         await authority.waitForProviderRunsToSettle()
-
-        let recovered = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
-        try await recovered.recover()
-        let recoveredSession = try await recovered.sessionSnapshot(sessionID: session.sessionID)
+        let reconciled = await readiness.snapshot(forceRefresh: true)
+        let recoveredSession = try await authority.sessionSnapshot(sessionID: session.sessionID)
         let recoveredRun = try await store.latestRun(sessionID: session.sessionID)
         let recoveredTransitions = try await store.nonfinalAuthorityTransitions()
+        XCTAssertTrue(reconciled.ready, "\(reconciled.checks)")
         XCTAssertEqual(recoveredSession.state, .canceled)
         XCTAssertEqual(recoveredRun?.state, "canceled")
         XCTAssertTrue(recoveredTransitions.isEmpty)
@@ -1464,7 +1584,7 @@ final class ProviderLifecycleRecoveryTests: XCTestCase {
 final class SustainedProviderConcurrencyTests: XCTestCase {
     func testOneAssembledAuthoritySustainsSixteenCrossProjectRunsWithoutLeakage() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let provider = PR5ProviderDispatcher(mode: .immediate)
+        let provider = PR5ProviderDispatcher(mode: .held)
         let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
         var sessions: [SessionSnapshot] = []
         var roots: [URL] = []
@@ -1502,18 +1622,38 @@ final class SustainedProviderConcurrencyTests: XCTestCase {
             }
             try await group.waitForAll()
         }
-        await authority.waitForProviderRunsToSettle()
+        var runs: [ProviderRunSnapshot] = []
         for session in sessions {
-            let snapshot = try await authority.sessionSnapshot(sessionID: session.sessionID)
-            XCTAssertEqual(snapshot.state, .completed)
             let latestRun = try await store.latestRun(sessionID: session.sessionID)
-        let run = try XCTUnwrap(latestRun)
-            XCTAssertEqual(run.sessionID, session.sessionID)
-            let sessionEvents = try await authority.events(after: nil, limit: 10_000, projectID: session.projectID).events
-            XCTAssertTrue(sessionEvents.allSatisfy { $0.projectID == session.projectID })
+            let run = try XCTUnwrap(latestRun)
+            runs.append(run)
+            await provider.waitUntilStarted(run.runID)
         }
+        let simultaneouslyActive = await provider.activeRunIDs()
+        XCTAssertEqual(simultaneouslyActive, Set(runs.map(\.runID)))
+        XCTAssertEqual(simultaneouslyActive.count, 16)
+        for run in runs { await provider.complete(run.runID) }
+        await authority.waitForProviderRunsToSettle()
+
+        let expectedProjectIDs = Set(sessions.map(\.projectID))
         let events = try await store.events(after: nil, limit: 10_000).events
         XCTAssertEqual(events.map(\.globalSequence), Array(1 ... Int64(events.count)))
+        XCTAssertTrue(events.allSatisfy { expectedProjectIDs.contains($0.projectID) })
+        for (session, run) in zip(sessions, runs) {
+            let snapshot = try await authority.sessionSnapshot(sessionID: session.sessionID)
+            XCTAssertEqual(snapshot.state, .completed)
+            XCTAssertEqual(run.sessionID, session.sessionID)
+            let rawSessionEvents = events.filter { $0.sessionID == session.sessionID }
+            XCTAssertFalse(rawSessionEvents.isEmpty)
+            XCTAssertTrue(rawSessionEvents.allSatisfy { $0.projectID == session.projectID })
+        }
+        let rawRunOwnershipRows = try await store.database.query(
+            "SELECT COUNT(*) AS run_count,COUNT(DISTINCT r.session_id) AS session_count,COUNT(DISTINCT s.project_id) AS project_count FROM runs r JOIN sessions s ON s.session_id=r.session_id WHERE r.generation>=1"
+        )
+        let rawRunOwnership = try XCTUnwrap(rawRunOwnershipRows.first)
+        XCTAssertEqual(rawRunOwnership.column("run_count")?.integer, 16)
+        XCTAssertEqual(rawRunOwnership.column("session_count")?.integer, 16)
+        XCTAssertEqual(rawRunOwnership.column("project_count")?.integer, 16)
         let uncovered = try await store.database.query(
             "SELECT COUNT(*) AS value FROM events e LEFT JOIN event_outbox o ON o.global_sequence=e.global_sequence WHERE o.global_sequence IS NULL"
         ).first?.column("value")?.integer

@@ -557,13 +557,17 @@ public actor DirectAPIProviderRuntime: AgentProviderRuntime {
         )
         let response: ValidatedProviderHTTPResponse
         do {
-            response = try await transport.execute(mapped)
+            response = try await transport.execute(
+                mapped,
+                onRequestSent: { try await request.acknowledgeLaunch() }
+            )
         } catch is CancellationError {
             throw CancellationError()
+        } catch let error as ServiceAPIError {
+            throw error
         } catch {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Direct provider request failed", retryable: true)
         }
-        try await request.acknowledgeLaunch()
         guard (200 ..< 300).contains(response.statusCode) else {
             throw ServiceAPIError(
                 code: response.statusCode == 401 || response.statusCode == 403 ? .providerUnavailable : .dependencyUnavailable,

@@ -192,7 +192,16 @@ public actor RepoPromptHeadlessAuthority {
         try await workflowRepository.recover()
     }
 
-    private func reconcileDurableTransitions(unclean: Bool) async throws {
+    /// Retries only durable nonfinal transitions. Unlike startup recovery, this
+    /// never treats an otherwise healthy active run as interrupted.
+    public func reconcileActionableTransitions() async throws {
+        try await reconcileDurableTransitions(unclean: false, actionableOnly: true)
+    }
+
+    private func reconcileDurableTransitions(
+        unclean: Bool,
+        actionableOnly: Bool = false
+    ) async throws {
         let nonfinal = try await store.nonfinalAuthorityTransitions()
         let transitionByRun = Dictionary(
             grouping: nonfinal,
@@ -219,6 +228,13 @@ public actor RepoPromptHeadlessAuthority {
             await session.applyCommitted(snapshot, binding: binding, terminal: false)
             guard unclean || transitionByRun[run.runID] != nil else { continue }
             let existing = transitionByRun[run.runID]
+            if actionableOnly,
+               existing?.state != .reconciliationRequired,
+               existing?.kind != .cancel,
+               existing?.kind != .interrupt
+            {
+                continue
+            }
             let processWasActive = await providerAdapter?.hasActiveRun(run.runID) == true
 
             if existing?.kind == .cancel || existing?.kind == .interrupt || existing?.state == .reconciliationRequired, processWasActive {

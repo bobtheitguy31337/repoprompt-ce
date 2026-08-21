@@ -261,24 +261,14 @@ public extension AgentProviderDispatcher {
 
     func executeStreaming(
         _ request: ProviderExecutionRequest,
-        onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
+        onEvent _: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
     ) async throws -> ProviderExecutionResult {
         try request.validateLaunch()
-        let result = try await execute(
-            kind: request.kind,
-            model: request.model,
-            prompt: request.prompt,
-            workingDirectory: request.workingDirectory,
-            maximumBytes: request.maximumBytes,
-            runID: request.runID,
-            resumeProviderSessionID: request.resumeProviderSessionID
-        ) { identity in
-            await onEvent(.providerIdentity(identity))
-        }
-        try await request.acknowledgeLaunch()
-        await onEvent(.assistantFinal(result.output))
-        await onEvent(.completed(providerSessionID: result.providerSessionID))
-        return result
+        throw ServiceAPIError(
+            code: .capabilityMissing,
+            message: "Provider dispatcher must implement an observable launch-acknowledgement boundary",
+            retryable: false
+        )
     }
 
     func steer(runID _: UUID, text _: String, targetTurnEpoch _: Int64) async throws {

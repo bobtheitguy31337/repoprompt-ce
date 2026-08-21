@@ -115,6 +115,7 @@ public actor RepoPromptReadinessService {
         var checks = [ReadinessCheck]()
         var operational: StoreOperationalSnapshot?
         do {
+            try await authority.reconcileActionableTransitions()
             let snapshot = try await store.operationalSnapshot()
             operational = snapshot
             checks.append(.init(name: "sqlite-integrity", ready: snapshot.integrityValid, detail: snapshot.integrityValid ? "ok" : "failed"))
@@ -126,15 +127,12 @@ public actor RepoPromptReadinessService {
             checks.append(.init(name: "supervisor-recovery", ready: true, detail: "active-families=\(snapshot.activeProcessFamilyCount)"))
             checks.append(.init(name: "owned-resources", ready: snapshot.ownedResources.ready, detail: snapshot.ownedResources.ready ? "reconciled" : "degraded"))
             let transitions = try await store.nonfinalAuthorityTransitions()
-            let blockingTransitions = transitions.filter { $0.state != .reconciliationRequired }
-            let actionableTransitions = transitions.count - blockingTransitions.count
-            let transitionsReady = blockingTransitions.isEmpty
             checks.append(.init(
                 name: "authority-transitions",
-                ready: transitionsReady,
+                ready: transitions.isEmpty,
                 detail: transitions.isEmpty
                     ? "reconciled"
-                    : "blocking=\(blockingTransitions.count),actionable=\(actionableTransitions)"
+                    : "blocking=\(transitions.count),actionable=\(transitions.count(where: { $0.state == .reconciliationRequired }))"
             ))
         } catch {
             checks.append(.init(name: "sqlite-integrity", ready: false, detail: "unavailable"))

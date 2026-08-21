@@ -13,6 +13,36 @@ public enum ServiceEventConsumerKind: String, CaseIterable, Codable, Sendable {
     case projection
 }
 
+public enum ServiceEventConsumerDeliveryMode: String, Codable, Sendable {
+    case cursorGatedLive
+    case durableQuery
+    case absent
+}
+
+public struct ServiceEventConsumerRegistration: Codable, Sendable, Equatable {
+    public let kind: ServiceEventConsumerKind
+    public let deliveryMode: ServiceEventConsumerDeliveryMode
+    public let detail: String
+}
+
+/// Exhaustive PR5 consumer registry. Portal delivery remains PR6 scope and this
+/// server exposes no MCP notification bridge; counters/projections are derived
+/// from durable queries rather than live delivery.
+public enum ServiceEventConsumerRegistry {
+    public static let registrations: [ServiceEventConsumerRegistration] = [
+        .init(kind: .sse, deliveryMode: .cursorGatedLive, detail: "client-resumable EventDeliveryCursorGate"),
+        .init(kind: .portal, deliveryMode: .absent, detail: "portal event projection is not present before PR6"),
+        .init(kind: .mcpNotification, deliveryMode: .absent, detail: "no MCP event-notification surface is exposed"),
+        .init(kind: .counter, deliveryMode: .durableQuery, detail: "metrics derive from SQLite operational snapshots"),
+        .init(kind: .projection, deliveryMode: .durableQuery, detail: "authority projections derive from committed rows")
+    ]
+
+    public static func registration(for kind: ServiceEventConsumerKind) -> ServiceEventConsumerRegistration {
+        precondition(registrations.count == ServiceEventConsumerKind.allCases.count)
+        return registrations.first(where: { $0.kind == kind })!
+    }
+}
+
 public actor ServiceEventHub {
     private struct Subscriber {
         let kind: ServiceEventConsumerKind
@@ -85,6 +115,16 @@ public actor ServiceEventHub {
         consumer kind: ServiceEventConsumerKind,
         after cursor: ServiceCursor? = nil
     ) -> AsyncThrowingStream<EventEnvelope, Error> {
+        let registration = ServiceEventConsumerRegistry.registration(for: kind)
+        guard registration.deliveryMode == .cursorGatedLive else {
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: ServiceAPIError(
+                    code: .capabilityMissing,
+                    message: "Event consumer \(kind.rawValue) is \(registration.deliveryMode.rawValue): \(registration.detail)",
+                    retryable: false
+                ))
+            }
+        }
         let id = UUID()
         return AsyncThrowingStream(bufferingPolicy: .bufferingOldest(subscriberBufferLimit)) { continuation in
             subscribers[id] = Subscriber(

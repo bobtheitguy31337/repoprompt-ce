@@ -659,23 +659,27 @@ private actor DirectHeadlessAdapterServing: RepoPromptMCPServing {
         let inheritedAppInvocationID = binding.appInvocationID
             ?? MCPRequestTimelineContext.current?.appInvocationID
         let invocationID: UUID
-        if Self.isProviderLifecycleMutation(toolName: toolName, arguments: arguments) {
-            guard let inheritedAppInvocationID,
-                  let durableInvocationID = UUID(uuidString: inheritedAppInvocationID)
-            else {
+        if let inheritedAppInvocationID {
+            guard let durableInvocationID = UUID(uuidString: inheritedAppInvocationID) else {
                 throw ServiceAPIError(
                     code: .idempotencyRequired,
-                    message: "A host-issued application invocation identity is required before direct-headless provider reservation",
+                    message: "The host-issued application invocation identity is invalid",
                     retryable: false
                 )
             }
             invocationID = durableInvocationID
-        } else {
+        } else if resolved.binding.definition.annotations.readOnlyHint == true {
             localInvocationOrdinal &+= 1
             invocationID = Self.localCorrelationID(
                 connectionID: connection.connectionID,
                 generation: connection.connectionGeneration,
                 ordinal: localInvocationOrdinal
+            )
+        } else {
+            throw ServiceAPIError(
+                code: .idempotencyRequired,
+                message: "A host-issued application invocation identity is required before direct-headless mutation reservation",
+                retryable: false
             )
         }
         let security = await DirectHeadlessMCPService.securityContext(
@@ -691,20 +695,6 @@ private actor DirectHeadlessAdapterServing: RepoPromptMCPServing {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         return try encoder.encode(value)
-    }
-
-    private nonisolated static func isProviderLifecycleMutation(
-        toolName: String,
-        arguments: [String: Value]
-    ) -> Bool {
-        let operation = arguments["op"]?.stringValue
-        if toolName == "agent_run" {
-            return operation == "start" || operation == "cancel"
-        }
-        if toolName == "agent_manage" {
-            return operation == "cancel"
-        }
-        return false
     }
 
     private nonisolated static func localCorrelationID(

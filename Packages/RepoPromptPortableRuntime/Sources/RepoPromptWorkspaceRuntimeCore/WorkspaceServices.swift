@@ -1,6 +1,11 @@
 import Foundation
 import RepoPromptRuntimeModel
 import RepoPromptShared
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 public struct WorkspaceCodeMapBuildResult: Hashable, Sendable {
     public let status: String
@@ -45,11 +50,13 @@ public extension WorkspaceCommandRunning {
         return try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes)
     }
 
-    func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, launchValidation: @escaping @Sendable () throws -> Void, launchAcknowledgement: @escaping @Sendable () async throws -> Void) async throws -> String {
+    func run(executable _: String, arguments _: [String], workingDirectory _: String, maximumBytes _: Int, launchValidation: @escaping @Sendable () throws -> Void, launchAcknowledgement _: @escaping @Sendable () async throws -> Void) async throws -> String {
         try launchValidation()
-        let result = try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes)
-        try await launchAcknowledgement()
-        return result
+        throw ServiceAPIError(
+            code: .capabilityMissing,
+            message: "Workspace command runner must implement an observable launch-acknowledgement boundary",
+            retryable: false
+        )
     }
 }
 
@@ -89,7 +96,14 @@ public actor LocalWorkspaceCommandRunner: WorkspaceCommandRunning {
         process.standardError = errors
         try launchValidation()
         try process.run()
-        try await launchAcknowledgement()
+        do {
+            try await launchAcknowledgement()
+        } catch {
+            try? output.fileHandleForReading.close()
+            try? errors.fileHandleForReading.close()
+            await stopAfterFailedLaunchAcknowledgement(process)
+            throw error
+        }
         async let outputData = output.fileHandleForReading.readToEnd()
         async let errorData = errors.fileHandleForReading.readToEnd()
         process.waitUntilExit()
@@ -100,6 +114,22 @@ public actor LocalWorkspaceCommandRunner: WorkspaceCommandRunning {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Workspace command failed: \(message)")
         }
         return String(decoding: stdout.prefix(maximumBytes), as: UTF8.self)
+    }
+
+    private func stopAfterFailedLaunchAcknowledgement(_ process: Process) async {
+        guard process.isRunning else { return }
+        process.terminate()
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .milliseconds(500))
+        while process.isRunning, clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        #if canImport(Darwin) || canImport(Glibc)
+            if process.isRunning {
+                _ = kill(process.processIdentifier, SIGKILL)
+            }
+        #endif
+        process.waitUntilExit()
     }
 }
 

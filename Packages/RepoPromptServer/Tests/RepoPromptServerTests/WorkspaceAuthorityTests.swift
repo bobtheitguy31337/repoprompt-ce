@@ -1069,6 +1069,24 @@ private actor WorkflowWorkspaceRunner: WorkspaceCommandRunning {
         return "provider 1.0"
     }
 
+    func run(
+        executable: String,
+        arguments: [String],
+        workingDirectory: String,
+        maximumBytes: Int,
+        launchValidation: @escaping @Sendable () throws -> Void,
+        launchAcknowledgement: @escaping @Sendable () async throws -> Void
+    ) async throws -> String {
+        try launchValidation()
+        try await launchAcknowledgement()
+        return try await run(
+            executable: executable,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            maximumBytes: maximumBytes
+        )
+    }
+
     func oraclePrompts() -> [String] {
         recordedOraclePrompts
     }
@@ -1087,6 +1105,24 @@ private actor QuestionWorkspaceRunner: WorkspaceCommandRunning {
             return #"{"tool":"finish","args":{}}"#
         }
         throw ServiceAPIError(code: .dependencyUnavailable, message: "unexpected Context Builder prompt")
+    }
+
+    func run(
+        executable: String,
+        arguments: [String],
+        workingDirectory: String,
+        maximumBytes: Int,
+        launchValidation: @escaping @Sendable () throws -> Void,
+        launchAcknowledgement: @escaping @Sendable () async throws -> Void
+    ) async throws -> String {
+        try launchValidation()
+        try await launchAcknowledgement()
+        return try await run(
+            executable: executable,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            maximumBytes: maximumBytes
+        )
     }
 }
 

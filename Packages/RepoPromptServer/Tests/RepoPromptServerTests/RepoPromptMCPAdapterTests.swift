@@ -340,6 +340,24 @@ private actor NativeOracleRunner: WorkspaceCommandRunning {
         """
     }
 
+    func run(
+        executable: String,
+        arguments: [String],
+        workingDirectory: String,
+        maximumBytes: Int,
+        launchValidation: @escaping @Sendable () throws -> Void,
+        launchAcknowledgement: @escaping @Sendable () async throws -> Void
+    ) async throws -> String {
+        try launchValidation()
+        try await launchAcknowledgement()
+        return try await run(
+            executable: executable,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            maximumBytes: maximumBytes
+        )
+    }
+
     func calls() -> [[String]] {
         recorded
     }

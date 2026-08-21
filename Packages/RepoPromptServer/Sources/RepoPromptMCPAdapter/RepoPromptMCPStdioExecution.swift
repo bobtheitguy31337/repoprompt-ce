@@ -124,7 +124,7 @@ public enum RepoPromptMCPStdioExecution {
         _ binding: RepoPromptMCPBinding,
         timelineIdentity: MCPRequestTimelineIdentity?
     ) -> RepoPromptMCPBinding {
-        binding.withAppInvocationID(timelineIdentity?.appInvocationID ?? binding.appInvocationID)
+        binding.withAppInvocationID(timelineIdentity?.appInvocationID)
     }
 
     private static func errorResult(_ message: String) -> CallTool.Result {
