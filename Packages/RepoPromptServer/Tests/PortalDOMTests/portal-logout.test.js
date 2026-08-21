@@ -4,10 +4,25 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const path = require("node:path");
 
-const { resetAuthenticatedPortalState, terminatePortalSession } = require(path.resolve(
+const {
+  authenticatedPortalResponseGeneration,
+  fenceAuthenticatedPortalResponse,
+  resetAuthenticatedPortalState,
+  terminatePortalSession,
+} = require(path.resolve(
   __dirname,
   "../../Sources/RepoPromptServiceHTTP/Resources/Portal/portal.js",
 ));
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
 
 class FakeNode {
   constructor({ value = "", textContent = "", hidden = false } = {}) {
@@ -197,4 +212,72 @@ test("unconfirmed logout fails closed at the authentication gate", async () => {
     nodes.get("auth-error").textContent,
     "Logout could not be confirmed.",
   );
+});
+
+test("late authenticated success and failure responses cannot restore portal state", async () => {
+  const { document, location, nodes, state } = fixture();
+  const providerSuccess = deferred();
+  const providerFailure = deferred();
+  const authFlowSuccess = deferred();
+  const authFlowFailure = deferred();
+  const generation = authenticatedPortalResponseGeneration(state);
+  const resumed = [];
+
+  void fenceAuthenticatedPortalResponse(
+    state,
+    generation,
+    () => providerSuccess.promise,
+  ).then((provider) => {
+    resumed.push("provider-success");
+    state.providers = [provider];
+    state.operatorAuthenticated = true;
+    nodes.get("app").hidden = false;
+  });
+  void fenceAuthenticatedPortalResponse(
+    state,
+    generation,
+    () => providerFailure.promise,
+  ).catch(() => {
+    resumed.push("provider-failure");
+    state.providers = [{ providerID: "restored-by-failure" }];
+    nodes.get("app").hidden = false;
+  });
+  void fenceAuthenticatedPortalResponse(
+    state,
+    generation,
+    () => authFlowSuccess.promise,
+  ).then((flow) => {
+    resumed.push("auth-flow-success");
+    state.activeFlow = flow;
+    state.operatorAuthenticated = true;
+    nodes.get("app").hidden = false;
+  });
+  void fenceAuthenticatedPortalResponse(
+    state,
+    generation,
+    () => authFlowFailure.promise,
+  ).catch(() => {
+    resumed.push("auth-flow-failure");
+    state.activeFlow = { userCode: "restored-by-failure" };
+    nodes.get("app").hidden = false;
+  });
+
+  resetAuthenticatedPortalState(state, document, location, {
+    passwordLoginEnabled: true,
+    title: "Signed out",
+  });
+  providerSuccess.resolve({ providerID: "late-provider" });
+  providerFailure.reject(new Error("late provider failure"));
+  authFlowSuccess.resolve({ userCode: "late-auth-code" });
+  authFlowFailure.reject(new Error("late auth-flow failure"));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(resumed, []);
+  assert.equal(state.operatorAuthenticated, false);
+  assert.deepEqual(state.providers, []);
+  assert.equal(state.activeFlow, null);
+  assert.equal(nodes.get("app").hidden, true);
+  assert.equal(nodes.get("app").inert, true);
+  assert.equal(nodes.get("app").attributes.get("aria-hidden"), "true");
+  assert.equal(nodes.get("auth-gate").hidden, false);
 });

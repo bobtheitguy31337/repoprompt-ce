@@ -215,8 +215,12 @@ public struct RepoPromptHTTPService: Sendable {
                 )
                 throw ServiceAPIError(code: .invalidRequest, message: "Password confirmation does not match")
             }
+            guard let authorizingToken = operatorSessionToken(from: request) else {
+                throw ServiceAPIError(code: .internalAuthFailed, message: "Password changes require an operator session")
+            }
             let replacement = try await store.changeOperatorPassword(
                 username: principal.externalActor.username,
+                authorizingToken: authorizingToken,
                 currentPassword: input.currentPassword,
                 newPassword: input.newPassword,
                 clientIdentityDigest: principal.clientIdentityDigest,

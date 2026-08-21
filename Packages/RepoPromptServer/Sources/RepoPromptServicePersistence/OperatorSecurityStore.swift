@@ -367,8 +367,14 @@ extension SQLiteServiceStore {
         let exceptHash = exceptToken.map { OperatorPasswordHasher.sha256Hex(Data($0.utf8)) }
         do {
             return try await transaction(.interactive(estimatedEncodedBytes: 0)) {
-                let rows = try await database.query("SELECT session_id,token_hash FROM operator_sessions WHERE username=?", [.text(username)])
-                let revoked = rows.filter { exceptHash == nil || $0.column("token_hash")?.string != exceptHash }
+                let rows = try await database.query(
+                    "SELECT s.session_id,s.token_hash,m.revoked_at FROM operator_sessions s JOIN operator_session_metadata m ON m.session_id=s.session_id WHERE s.username=?",
+                    [.text(username)]
+                )
+                let revoked = rows.filter {
+                    $0.column("revoked_at")?.double == nil
+                        && (exceptHash == nil || $0.column("token_hash")?.string != exceptHash)
+                }
                 for row in revoked {
                     guard let sessionID = row.column("session_id")?.string else { continue }
                     _ = try await database.query(

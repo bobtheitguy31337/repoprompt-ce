@@ -153,6 +153,49 @@ final class PortalOperatorOnboardingTests: XCTestCase {
         XCTAssertFalse(String(describing: logoutAudit).contains(token))
     }
 
+    func testLogoutRejectsPasswordReplacementCookieHeldPastCommittedLogout() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let setupToken = try await store.issueOperatorSetupToken()
+        try await store.createOperatorAccount(password: "initial-http-password", setupToken: setupToken)
+        let originalToken = try await store.createOperatorSession()
+        let service = try await Self.service(store: store)
+        let app = Application(router: service.internalRouter())
+
+        try await app.test(.router) { client in
+            var originalHeaders = Self.portalMutationHeaders()
+            originalHeaders[.cookie] = "rpce_operator_session=\(originalToken)"
+            var lateReplacementCookie = ""
+            try await client.execute(
+                uri: "/portal/api/v1/account/password",
+                method: .post,
+                headers: originalHeaders,
+                body: ByteBuffer(string: #"{"currentPassword":"initial-http-password","newPassword":"replacement-http-password","passwordConfirmation":"replacement-http-password"}"#)
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                lateReplacementCookie = try XCTUnwrap(response.headers[.setCookie])
+                XCTAssertFalse(lateReplacementCookie.contains("Max-Age=0"))
+            }
+            try await client.execute(
+                uri: "/portal/api/v1/logout",
+                method: .post,
+                headers: originalHeaders
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertTrue((response.headers[.setCookie] ?? "").contains("Max-Age=0"))
+            }
+            var replacementHeaders = HTTPFields()
+            replacementHeaders[.cookie] = lateReplacementCookie.split(separator: ";").first.map(String.init)
+            try await client.execute(
+                uri: "/portal/api/v1/bootstrap",
+                method: .get,
+                headers: replacementHeaders
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+        }
+    }
+
     func testSetupRejectsMismatchedPasswordAndInvalidToken() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }

@@ -1,5 +1,29 @@
 "use strict";
 
+function authenticatedPortalResponseGeneration(state) {
+  return state.operatorAuthenticated
+    ? Number(state.authenticationGeneration) || 0
+    : null;
+}
+
+function authenticatedPortalResponseIsCurrent(state, generation) {
+  return (
+    generation === null ||
+    (state.operatorAuthenticated &&
+      generation === (Number(state.authenticationGeneration) || 0))
+  );
+}
+
+async function fenceAuthenticatedPortalResponse(state, generation, operation) {
+  try {
+    const result = await operation();
+    if (authenticatedPortalResponseIsCurrent(state, generation)) return result;
+  } catch (error) {
+    if (authenticatedPortalResponseIsCurrent(state, generation)) throw error;
+  }
+  return await new Promise(() => {});
+}
+
 function resetAuthenticatedPortalState(
   state,
   document,
@@ -134,7 +158,12 @@ async function terminatePortalSession(request, reset) {
 }
 
 if (typeof module === "object" && module.exports) {
-  module.exports = { resetAuthenticatedPortalState, terminatePortalSession };
+  module.exports = {
+    authenticatedPortalResponseGeneration,
+    fenceAuthenticatedPortalResponse,
+    resetAuthenticatedPortalState,
+    terminatePortalSession,
+  };
 }
 
 if (typeof window !== "undefined" && typeof document !== "undefined") {
@@ -513,54 +542,63 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     const method = (options.method || "GET").toUpperCase();
     const mutation = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
     const reportsSettingsFeedback = isSettingsMutationPath(path, method);
+    const authenticationGeneration =
+      authenticatedPortalResponseGeneration(state);
     if (reportsSettingsFeedback) beginSettingsMutation();
     try {
-      let response;
-      try {
-        response = await fetch(path, {
-          cache: "no-store",
-          credentials: "same-origin",
-          ...options,
-          method,
-          headers: {
-            Accept: "application/json",
-            ...(options.body ? { "Content-Type": "application/json" } : {}),
-            ...(mutation ? { "X-RepoPrompt-Portal-CSRF": "1" } : {}),
-            ...(options.headers || {}),
-          },
-        });
-      } catch (_error) {
-        throw new PortalError(
-          "Cannot reach the RepoPrompt server. Check the connection and try again.",
-          {
-            network: true,
-            retryable: true,
-          },
-        );
-      }
+      const body = await fenceAuthenticatedPortalResponse(
+        state,
+        authenticationGeneration,
+        async () => {
+          let response;
+          try {
+            response = await fetch(path, {
+              cache: "no-store",
+              credentials: "same-origin",
+              ...options,
+              method,
+              headers: {
+                Accept: "application/json",
+                ...(options.body ? { "Content-Type": "application/json" } : {}),
+                ...(mutation ? { "X-RepoPrompt-Portal-CSRF": "1" } : {}),
+                ...(options.headers || {}),
+              },
+            });
+          } catch (_error) {
+            throw new PortalError(
+              "Cannot reach the RepoPrompt server. Check the connection and try again.",
+              {
+                network: true,
+                retryable: true,
+              },
+            );
+          }
 
-      const contentType = response.headers.get("content-type") || "";
-      const text = response.status === 204 ? "" : await response.text();
-      let body = null;
-      if (text && contentType.includes("application/json")) {
-        try {
-          body = JSON.parse(text);
-        } catch (_error) {
-          throw new PortalError("The server returned an unreadable response.", {
-            status: response.status,
-          });
-        }
-      }
-      if (!response.ok) {
-        throw new PortalError(
-          body?.message || `Request failed (${response.status}).`,
-          {
-            status: response.status,
-            code: body?.code,
-            retryable: body?.retryable,
-          },
-        );
-      }
+          const contentType = response.headers.get("content-type") || "";
+          const text = response.status === 204 ? "" : await response.text();
+          let responseBody = null;
+          if (text && contentType.includes("application/json")) {
+            try {
+              responseBody = JSON.parse(text);
+            } catch (_error) {
+              throw new PortalError("The server returned an unreadable response.", {
+                status: response.status,
+              });
+            }
+          }
+          if (!response.ok) {
+            throw new PortalError(
+              responseBody?.message || `Request failed (${response.status}).`,
+              {
+                status: response.status,
+                code: responseBody?.code,
+                retryable: responseBody?.retryable,
+              },
+            );
+          }
+          return responseBody;
+        },
+      );
       if (reportsSettingsFeedback) finishSettingsMutation();
       return body;
     } catch (error) {

@@ -122,6 +122,7 @@ final class PortalSecurityTests: XCTestCase {
         let prior1 = try await store.createOperatorSession()
         let prior2 = try await store.createOperatorSession()
         let replacement = try await store.changeOperatorPassword(
+            authorizingToken: prior1,
             currentPassword: "initial-password",
             newPassword: "replacement-password",
             clientIdentityDigest: "client-digest",
@@ -326,6 +327,8 @@ final class PrivatePilotPortalAssetTests: XCTestCase {
         XCTAssertTrue(script.contains("logout.addEventListener(\"click\", () => logoutOperator(logout))"))
         XCTAssertTrue(script.contains("() => api(\"api/v1/logout\", { method: \"POST\" })"))
         XCTAssertTrue(script.contains("state.logoutPromise = terminatePortalSession("))
+        XCTAssertTrue(script.contains("const authenticationGeneration ="))
+        XCTAssertTrue(script.contains("await fenceAuthenticatedPortalResponse("))
         XCTAssertTrue(script.contains("resetAuthenticatedPortalState(state, document, location"))
         XCTAssertTrue(script.contains("state.operatorAuthenticated = false"))
         XCTAssertTrue(script.contains("app.setAttribute(\"aria-hidden\", \"true\")"))

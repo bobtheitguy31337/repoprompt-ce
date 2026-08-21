@@ -349,6 +349,7 @@ final class PR6AuditCorrectionTests: XCTestCase {
             XCTFail("expected setup token failure")
         } catch {}
         try await store.createOperatorAccount(password: accountPassword, setupToken: setupToken)
+        let passwordChangeSession = try await store.createOperatorSession()
 
         _ = try await store.reserveOperatorAuthenticationAttempt(
             scope: .login,
@@ -367,6 +368,7 @@ final class PR6AuditCorrectionTests: XCTestCase {
         )
         do {
             _ = try await store.changeOperatorPassword(
+                authorizingToken: passwordChangeSession,
                 currentPassword: "wrong-current-password",
                 newPassword: "unused-new-password",
                 clientIdentityDigest: "audit-client-digest",
