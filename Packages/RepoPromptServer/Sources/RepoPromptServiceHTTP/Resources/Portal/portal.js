@@ -24,6 +24,225 @@ async function fenceAuthenticatedPortalResponse(state, generation, operation) {
   return await new Promise(() => {});
 }
 
+class PortalError extends Error {
+  constructor(message, options = {}) {
+    super(message);
+    this.name = "PortalError";
+    this.status = options.status || 0;
+    this.code = options.code || null;
+    this.retryable = options.retryable === true;
+    this.network = options.network === true;
+  }
+}
+
+function invalidatePortalLoadState(state) {
+  state.loadGeneration = (Number(state.loadGeneration) || 0) + 1;
+  state.loadOperation = null;
+  state.loadPromise = null;
+  state.loading = false;
+}
+
+function runPortalLoad(
+  state,
+  authenticationGeneration,
+  setLoading,
+  operation,
+) {
+  const loadGeneration = Number(state.loadGeneration) || 0;
+  const current = state.loadOperation;
+  if (
+    current &&
+    current.authenticationGeneration === authenticationGeneration &&
+    current.loadGeneration === loadGeneration
+  ) {
+    return current.promise;
+  }
+
+  const load = {
+    authenticationGeneration,
+    loadGeneration,
+    promise: null,
+  };
+  state.loadOperation = load;
+  setLoading(true);
+  load.promise = (async () => {
+    try {
+      return await operation();
+    } finally {
+      if (state.loadOperation === load) {
+        state.loadOperation = null;
+        state.loadPromise = null;
+        setLoading(false);
+      }
+    }
+  })();
+  state.loadPromise = load.promise;
+  return load.promise;
+}
+
+async function executePortalAPIRequest(
+  state,
+  path,
+  options,
+  {
+    fetchImpl,
+    reportsSettingsFeedback = false,
+    beginSettingsMutation = () => {},
+    finishSettingsMutation = () => {},
+  },
+) {
+  const method = (options.method || "GET").toUpperCase();
+  const mutation = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
+  const authenticationGeneration = authenticatedPortalResponseGeneration(state);
+  if (reportsSettingsFeedback) beginSettingsMutation();
+  try {
+    const body = await fenceAuthenticatedPortalResponse(
+      state,
+      authenticationGeneration,
+      async () => {
+        let response;
+        try {
+          response = await fetchImpl(path, {
+            cache: "no-store",
+            credentials: "same-origin",
+            ...options,
+            method,
+            headers: {
+              Accept: "application/json",
+              ...(options.body ? { "Content-Type": "application/json" } : {}),
+              ...(mutation ? { "X-RepoPrompt-Portal-CSRF": "1" } : {}),
+              ...(options.headers || {}),
+            },
+          });
+        } catch (_error) {
+          throw new PortalError(
+            "Cannot reach the RepoPrompt server. Check the connection and try again.",
+            {
+              network: true,
+              retryable: true,
+            },
+          );
+        }
+
+        const contentType = response.headers.get("content-type") || "";
+        const text = response.status === 204 ? "" : await response.text();
+        let responseBody = null;
+        if (text && contentType.includes("application/json")) {
+          try {
+            responseBody = JSON.parse(text);
+          } catch (_error) {
+            throw new PortalError("The server returned an unreadable response.", {
+              status: response.status,
+            });
+          }
+        }
+        if (!response.ok) {
+          throw new PortalError(
+            responseBody?.message || `Request failed (${response.status}).`,
+            {
+              status: response.status,
+              code: responseBody?.code,
+              retryable: responseBody?.retryable,
+            },
+          );
+        }
+        return responseBody;
+      },
+    );
+    if (reportsSettingsFeedback) finishSettingsMutation();
+    return body;
+  } catch (error) {
+    if (reportsSettingsFeedback) finishSettingsMutation(error);
+    throw error;
+  }
+}
+
+function presentPortalAuthenticationMode(state, document, status) {
+  const passwordLoginEnabled = status.passwordLoginEnabled !== false;
+  const mode = !passwordLoginEnabled
+    ? "certificate"
+    : status.needsSetup
+      ? "setup"
+      : "login";
+  state.authenticationMode = mode;
+  state.passwordLoginEnabled = passwordLoginEnabled;
+
+  const form = document.getElementById("auth-form");
+  form.hidden = !passwordLoginEnabled;
+  document.getElementById("auth-title").textContent =
+    mode === "setup"
+      ? "Create the operator password"
+      : mode === "login"
+        ? "Sign in"
+        : "Operator certificate required";
+  document.getElementById("auth-copy").textContent =
+    mode === "setup"
+      ? "This is the first launch. Choose a password for the operator account and paste the setup token from the owner-only operator-setup-token file in the server state directory. The token is never written to server logs."
+      : mode === "login"
+        ? "Enter the operator password to open the portal."
+        : "This server uses mutual TLS. Import the operator client certificate in your browser, then reload.";
+  document.getElementById("auth-token-field").hidden = mode !== "setup";
+  document.getElementById("auth-confirm-field").hidden = mode !== "setup";
+  document.getElementById("auth-password").autocomplete =
+    mode === "setup" ? "new-password" : "current-password";
+  document.getElementById("auth-submit").textContent =
+    mode === "setup" ? "Create password" : "Sign in";
+  return mode;
+}
+
+function installPortalAuthenticationSubmission(
+  state,
+  document,
+  { request, activate, afterAuthenticated, clearSecrets },
+) {
+  if (state.authenticationSubmitInstalled) return false;
+  const form = document.getElementById("auth-form");
+  const error = document.getElementById("auth-error");
+  state.authenticationSubmitInstalled = true;
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (state.authenticationSubmission) return;
+    const mode = state.authenticationMode;
+    if (mode !== "setup" && mode !== "login") return;
+    error.hidden = true;
+    const password = document.getElementById("auth-password").value;
+    const submission = { promise: null };
+    state.authenticationSubmission = submission;
+    submission.promise = (async () => {
+      try {
+        if (mode === "setup") {
+          await request("api/v1/setup", {
+            method: "POST",
+            body: JSON.stringify({
+              password,
+              passwordConfirmation: document.getElementById(
+                "auth-password-confirm",
+              ).value,
+              setupToken: document.getElementById("auth-token").value.trim(),
+            }),
+          });
+        } else {
+          await request("api/v1/login", {
+            method: "POST",
+            body: JSON.stringify({ password }),
+          });
+        }
+        activate({ passwordLoginEnabled: state.passwordLoginEnabled });
+        void afterAuthenticated();
+      } catch (failure) {
+        error.hidden = false;
+        error.textContent = failure.message;
+      } finally {
+        clearSecrets();
+        if (state.authenticationSubmission === submission) {
+          state.authenticationSubmission = null;
+        }
+      }
+    })();
+  });
+  return true;
+}
+
 function resetAuthenticatedPortalState(
   state,
   document,
@@ -42,7 +261,9 @@ function resetAuthenticatedPortalState(
 
   state.authenticationGeneration =
     (Number(state.authenticationGeneration) || 0) + 1;
+  invalidatePortalLoadState(state);
   state.operatorAuthenticated = false;
+  state.authenticationMode = passwordLoginEnabled ? "login" : "unavailable";
   state.passwordLoginEnabled = passwordLoginEnabled;
   state.providers = [];
   state.bootstrap = null;
@@ -159,9 +380,15 @@ async function terminatePortalSession(request, reset) {
 
 if (typeof module === "object" && module.exports) {
   module.exports = {
+    PortalError,
     authenticatedPortalResponseGeneration,
+    executePortalAPIRequest,
     fenceAuthenticatedPortalResponse,
+    installPortalAuthenticationSubmission,
+    invalidatePortalLoadState,
+    presentPortalAuthenticationMode,
     resetAuthenticatedPortalState,
+    runPortalLoad,
     terminatePortalSession,
   };
 }
@@ -264,6 +491,8 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     operations: null,
     route: "home",
     loading: false,
+    loadGeneration: 0,
+    loadOperation: null,
     loadPromise: null,
     online: navigator.onLine !== false,
     activeFlow: null,
@@ -277,6 +506,9 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     operatorAuthenticated: false,
     passwordLoginEnabled: true,
     authenticationGeneration: 0,
+    authenticationMode: "checking",
+    authenticationSubmitInstalled: false,
+    authenticationSubmission: null,
     logoutPromise: null,
     agent: {
       selectedProjectID: null,
@@ -389,17 +621,6 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     link: '<path d="M6.5 9.5 9.5 6.5M5 11H3.5a2.5 2.5 0 0 1 0-5H6M10 5h2.5a2.5 2.5 0 0 1 0 5H10"/>',
     send: '<path d="M1.5 8 14.5 2 10 14l-2-5zM8 9l6.5-7"/>',
   };
-
-  class PortalError extends Error {
-    constructor(message, options = {}) {
-      super(message);
-      this.name = "PortalError";
-      this.status = options.status || 0;
-      this.code = options.code || null;
-      this.retryable = options.retryable === true;
-      this.network = options.network === true;
-    }
-  }
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -540,71 +761,12 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
 
   async function api(path, options = {}) {
     const method = (options.method || "GET").toUpperCase();
-    const mutation = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
-    const reportsSettingsFeedback = isSettingsMutationPath(path, method);
-    const authenticationGeneration =
-      authenticatedPortalResponseGeneration(state);
-    if (reportsSettingsFeedback) beginSettingsMutation();
-    try {
-      const body = await fenceAuthenticatedPortalResponse(
-        state,
-        authenticationGeneration,
-        async () => {
-          let response;
-          try {
-            response = await fetch(path, {
-              cache: "no-store",
-              credentials: "same-origin",
-              ...options,
-              method,
-              headers: {
-                Accept: "application/json",
-                ...(options.body ? { "Content-Type": "application/json" } : {}),
-                ...(mutation ? { "X-RepoPrompt-Portal-CSRF": "1" } : {}),
-                ...(options.headers || {}),
-              },
-            });
-          } catch (_error) {
-            throw new PortalError(
-              "Cannot reach the RepoPrompt server. Check the connection and try again.",
-              {
-                network: true,
-                retryable: true,
-              },
-            );
-          }
-
-          const contentType = response.headers.get("content-type") || "";
-          const text = response.status === 204 ? "" : await response.text();
-          let responseBody = null;
-          if (text && contentType.includes("application/json")) {
-            try {
-              responseBody = JSON.parse(text);
-            } catch (_error) {
-              throw new PortalError("The server returned an unreadable response.", {
-                status: response.status,
-              });
-            }
-          }
-          if (!response.ok) {
-            throw new PortalError(
-              responseBody?.message || `Request failed (${response.status}).`,
-              {
-                status: response.status,
-                code: responseBody?.code,
-                retryable: responseBody?.retryable,
-              },
-            );
-          }
-          return responseBody;
-        },
-      );
-      if (reportsSettingsFeedback) finishSettingsMutation();
-      return body;
-    } catch (error) {
-      if (reportsSettingsFeedback) finishSettingsMutation(error);
-      throw error;
-    }
+    return executePortalAPIRequest(state, path, options, {
+      fetchImpl: fetch,
+      reportsSettingsFeedback: isSettingsMutationPath(path, method),
+      beginSettingsMutation,
+      finishSettingsMutation,
+    });
   }
 
   function orderedProviders() {
@@ -918,10 +1080,8 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
   }
 
   async function loadAll(refresh = false) {
-    if (state.loadPromise) return state.loadPromise;
     const authenticationGeneration = state.authenticationGeneration;
-    setLoading(true);
-    state.loadPromise = (async () => {
+    return runPortalLoad(state, authenticationGeneration, setLoading, async () => {
       try {
         const [
           bootstrap,
@@ -1011,12 +1171,8 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
         }
         toast(error.message, true);
         announce(error.message);
-      } finally {
-        setLoading(false);
-        state.loadPromise = null;
       }
-    })();
-    return state.loadPromise;
+    });
   }
 
   function updateShell() {
@@ -1741,7 +1897,9 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
   function activateAuthenticatedPortal(status) {
     clearAuthenticationSecrets();
     state.authenticationGeneration += 1;
+    invalidatePortalLoadState(state);
     state.operatorAuthenticated = true;
+    state.authenticationMode = "authenticated";
     state.passwordLoginEnabled = status?.passwordLoginEnabled !== false;
     const app = document.getElementById("app");
     app.hidden = false;
@@ -7994,6 +8152,12 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
   function start() {
     if (state.initialized) return;
     state.initialized = true;
+    installPortalAuthenticationSubmission(state, document, {
+      request: api,
+      activate: activateAuthenticatedPortal,
+      afterAuthenticated: () => loadAll(false),
+      clearSecrets: clearAuthenticationSecrets,
+    });
     applyPortalAppearance();
     installIcons();
     renderInitialLoading();
@@ -8095,8 +8259,6 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
   async function ensureOperatorSession() {
     clearAuthenticationSecrets();
     const gate = document.getElementById("auth-gate");
-    const form = document.getElementById("auth-form");
-    const error = document.getElementById("auth-error");
     let status;
     try {
       status = await api("api/v1/auth/status");
@@ -8118,63 +8280,8 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
       passwordLoginEnabled: status.passwordLoginEnabled,
     });
     gate.hidden = false;
-    if (!status.passwordLoginEnabled) {
-      document.getElementById("auth-title").textContent = "Operator certificate required";
-      document.getElementById("auth-copy").textContent =
-        "This server uses mutual TLS. Import the operator client certificate in your browser, then reload.";
-      form.hidden = true;
-      return false;
-    }
-    form.hidden = false;
-    const setup = !!status.needsSetup;
-    document.getElementById("auth-title").textContent = setup
-      ? "Create the operator password"
-      : "Sign in";
-    document.getElementById("auth-copy").textContent = setup
-      ? "This is the first launch. Choose a password for the operator account and paste the setup token from the owner-only operator-setup-token file in the server state directory. The token is never written to server logs."
-      : "Enter the operator password to open the portal.";
-    document.getElementById("auth-token-field").hidden = !setup;
-    document.getElementById("auth-confirm-field").hidden = !setup;
-    document.getElementById("auth-password").autocomplete = setup
-      ? "new-password"
-      : "current-password";
-    document.getElementById("auth-submit").textContent = setup
-      ? "Create password"
-      : "Sign in";
-    return await new Promise((resolve) => {
-      form.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        error.hidden = true;
-        const password = document.getElementById("auth-password").value;
-        try {
-          if (setup) {
-            const confirmation = document.getElementById(
-              "auth-password-confirm",
-            ).value;
-            await api("api/v1/setup", {
-              method: "POST",
-              body: JSON.stringify({
-                password,
-                passwordConfirmation: confirmation,
-                setupToken: document.getElementById("auth-token").value.trim(),
-              }),
-            });
-          } else {
-            await api("api/v1/login", {
-              method: "POST",
-              body: JSON.stringify({ password }),
-            });
-          }
-          activateAuthenticatedPortal(status);
-          resolve(true);
-        } catch (failure) {
-          error.hidden = false;
-          error.textContent = failure.message;
-        } finally {
-          clearAuthenticationSecrets();
-        }
-      });
-    });
+    presentPortalAuthenticationMode(state, document, status);
+    return false;
   }
 
   if (window.__REPOPROMPT_PORTAL_TEST_HOOK__) {
@@ -8193,6 +8300,7 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
       resetAuthenticatedPortalState: (options) =>
         resetAuthenticatedPortalState(state, document, location, options),
       whenIdle: async () => {
+        await state.authenticationSubmission?.promise;
         await state.loadPromise;
         await state.settingsMutation;
         await Promise.all(Object.values(state.domainMutations).filter(Boolean));
