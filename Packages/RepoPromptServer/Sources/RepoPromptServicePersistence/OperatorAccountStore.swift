@@ -273,17 +273,65 @@ extension SQLiteServiceStore {
         return username
     }
 
-    public func deleteOperatorSession(token: String, now: Date = Date()) async throws {
-        let hash = OperatorPasswordHasher.sha256Hex(Data(token.utf8))
-        if let sessionID = try await database.query(
-            "SELECT session_id FROM operator_sessions WHERE token_hash=?", [.text(hash)]
-        ).first?.column("session_id")?.string {
-            _ = try await database.query(
-                "UPDATE operator_session_metadata SET revoked_at=?,revocation_reason='logout' WHERE session_id=?",
-                [.float(now.timeIntervalSince1970), .text(sessionID)]
+    @discardableResult
+    public func logoutOperatorSession(
+        token: String?,
+        clientIdentityDigest: String?,
+        correlationID: UUID,
+        now: Date = Date(),
+        faultInjector: (@Sendable (String) throws -> Void)? = nil
+    ) async throws -> Bool {
+        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
+            if let prior = try await database.query(
+                "SELECT detail_code FROM operator_security_audit WHERE operation='logout' AND outcome='success' AND correlation_id=? LIMIT 1",
+                [.text(correlationID.uuidString.lowercased())]
+            ).first {
+                return prior.column("detail_code")?.string == "sessionRevoked"
+            }
+
+            var actor = "operator"
+            var revokedLiveSession = false
+            if let token {
+                let hash = OperatorPasswordHasher.sha256Hex(Data(token.utf8))
+                if let row = try await database.query(
+                    "SELECT session_id,username FROM operator_sessions WHERE token_hash=?",
+                    [.text(hash)]
+                ).first,
+                    let sessionID = row.column("session_id")?.string
+                {
+                    if let username = row.column("username")?.string {
+                        actor = "operator:\(username)"
+                    }
+                    _ = try await database.query(
+                        "UPDATE operator_session_metadata SET revoked_at=?,revocation_reason='logout' WHERE session_id=?",
+                        [.float(now.timeIntervalSince1970), .text(sessionID)]
+                    )
+                    try faultInjector?("after-metadata-revocation")
+                    let deleted = try await database.query(
+                        "DELETE FROM operator_sessions WHERE session_id=? AND token_hash=? RETURNING session_id",
+                        [.text(sessionID), .text(hash)]
+                    )
+                    guard !deleted.isEmpty else {
+                        throw ServiceAPIError(code: .internalFailure, message: "Operator session changed before logout completed")
+                    }
+                    revokedLiveSession = true
+                    try faultInjector?("after-token-deletion")
+                }
+            }
+
+            try await appendOperatorSecurityAudit(
+                operation: "logout",
+                outcome: "success",
+                actor: actor,
+                channel: "portal",
+                clientIdentityDigest: clientIdentityDigest,
+                correlationID: correlationID,
+                detailCode: revokedLiveSession ? "sessionRevoked" : "sessionAlreadyAbsent",
+                now: now
             )
+            try faultInjector?("after-audit-insert")
+            return revokedLiveSession
         }
-        _ = try await database.query("DELETE FROM operator_sessions WHERE token_hash=?", [.text(hash)])
     }
 
     public func changeOperatorPassword(

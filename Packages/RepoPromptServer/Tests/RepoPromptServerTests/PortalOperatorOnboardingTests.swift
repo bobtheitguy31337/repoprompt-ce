@@ -107,6 +107,52 @@ final class PortalOperatorOnboardingTests: XCTestCase {
         }
     }
 
+    func testPortalLogoutCommitsTokenMetadataAndAuditBeforeClearingCookie() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let setupToken = try await store.issueOperatorSetupToken()
+        try await store.createOperatorAccount(password: "logout-http-password", setupToken: setupToken)
+        let token = try await store.createOperatorSession()
+        let issuedSessions = try await store.operatorSessions(currentToken: token)
+        let target = try XCTUnwrap(issuedSessions.first(where: \.current))
+        let service = try await Self.service(store: store)
+        let app = Application(router: service.internalRouter())
+
+        try await app.test(.router) { client in
+            var headers = Self.portalMutationHeaders()
+            headers[.cookie] = "rpce_operator_session=\(token)"
+            try await client.execute(
+                uri: "/portal/api/v1/logout",
+                method: .post,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertTrue((response.headers[.setCookie] ?? "").contains("Max-Age=0"))
+            }
+            try await client.execute(
+                uri: "/portal/api/v1/bootstrap",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+        }
+
+        let authenticatedAfterLogout = try await store.operatorSessionUsername(token: token)
+        XCTAssertNil(authenticatedAfterLogout)
+        let sessionsAfterLogout = try await store.operatorSessions(currentToken: token)
+        let record = try XCTUnwrap(sessionsAfterLogout.first { $0.sessionID == target.sessionID })
+        XCTAssertNotNil(record.revokedAt)
+        XCTAssertEqual(record.revocationReason, "logout")
+        let securityAudit = try await store.operatorSecurityAudit(limit: 100)
+        let logoutAudit = try XCTUnwrap(securityAudit.first {
+            $0.operation == "logout" && $0.outcome == "success" && $0.detailCode == "sessionRevoked"
+        })
+        XCTAssertEqual(logoutAudit.actor, "operator:\(SQLiteServiceStore.defaultOperatorUsername)")
+        XCTAssertNotNil(logoutAudit.clientIdentityDigest)
+        XCTAssertFalse(String(describing: logoutAudit).contains(token))
+    }
+
     func testSetupRejectsMismatchedPasswordAndInvalidToken() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }

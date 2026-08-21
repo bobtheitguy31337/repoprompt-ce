@@ -56,6 +56,20 @@ The release-blocking corrections were applied additively on top of published PR 
 
 Correction checks also passed `node --check`, `git diff --check`, `make guardrails`, and an explicit changed-path guard proving no `SchemaV7.swift`, `SchemaV8.swift`, or frozen fixture was modified.
 
+## Atomic portal logout correction evidence
+
+The final logout correction was applied additively on top of published PR head `3c78453f66e54bebce51a144b9f7aa8ffb35c28a`. The account store now owns one transaction for bearer-token deletion, session-metadata revocation, and the secret-free V9 logout audit; the HTTP handler has no split persistence or audit path.
+
+| Corrected boundary | Result | Conductor ticket |
+| --- | --- | --- |
+| File-backed logout rollback/reopen at metadata, token-deletion, and audit-insert fault points; same-token retry; correlation-idempotent replay; post-commit authentication rejection | PASS, 8-test correction suite | `26a551a9-47bc-43eb-be6f-4ce43c6b531d` |
+| Portal logout cookie clearing, stale-cookie authentication rejection, revoked metadata, and secret-free audit projection | PASS, 7-test onboarding/HTTP suite | `761fd491-f1e3-4473-acc5-2b29c9fe0224` |
+| Existing password/session and revoke-all-preserves-current semantics | PASS, 3-test portal security suite | `b8d8a786-1eb0-455c-a997-33215ad8f5ed` |
+| SwiftFormat + SwiftLint strict | PASS | `3fb5eb71-1569-4697-aa32-3d9aaab48b8b` |
+| RepoPromptServer product build | PASS | `94e3fdf5-78b6-4da9-b483-99fa1cad9d90` |
+
+No new full-suite result is claimed by this focused correction; the cumulative unrelated limitations below remain applicable. No SchemaV7/SchemaV8 or frozen fixture file is touched.
+
 ## Exact limitations
 
 - Full `make dev-server-test` was attempted twice. Ticket `08af6536-4244-4e55-b6c8-94a1e2cd19c3` was canceled after 21 minutes 28 seconds and ticket `36e3d338-02c7-46bf-95a7-2a31deb36ca0` after 5 minutes 12 seconds. Both made progress with no reported assertion failure, then stopped producing output at the same untouched `DirectHeadlessStdioTransportTests` boundary immediately after `testCleanEOFAndTruncatedEOFHaveDistinctTerminalProvenance`. No PR6 source or test file changes that transport suite. Focused touched-boundary suites above completed.

@@ -7,6 +7,102 @@ import XCTest
 private struct InjectedPR6AuditFailure: Error {}
 
 final class PR6AuditCorrectionTests: XCTestCase {
+    func testLogoutRollbackRetryAndIdempotencyKeepTokenMetadataAndAuditAtomic() async throws {
+        for faultPoint in [
+            "after-metadata-revocation",
+            "after-token-deletion",
+            "after-audit-insert",
+        ] {
+            let root = try StoreMigrationTestSupport.temporaryDirectory("logout-\(faultPoint)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let databaseURL = root.appendingPathComponent("repoprompt.sqlite")
+            var store = try await SQLiteServiceStore.open(storage: .file(databaseURL.path))
+            let setupToken = try await store.issueOperatorSetupToken()
+            try await store.createOperatorAccount(password: "logout-atomic-password", setupToken: setupToken)
+            let token = try await store.createOperatorSession()
+            let issuedSessions = try await store.operatorSessions(currentToken: token)
+            let target = try XCTUnwrap(issuedSessions.first(where: \.current))
+            let correlationID = UUID()
+            let now = Date(timeIntervalSince1970: 50_000)
+
+            do {
+                try await store.logoutOperatorSession(
+                    token: token,
+                    clientIdentityDigest: "logout-client-digest",
+                    correlationID: correlationID,
+                    now: now,
+                    faultInjector: { observed in
+                        if observed == faultPoint { throw InjectedPR6AuditFailure() }
+                    }
+                )
+                XCTFail("expected injected logout failure at \(faultPoint)")
+            } catch is InjectedPR6AuditFailure {}
+            try await store.close(clean: false)
+
+            store = try await SQLiteServiceStore.open(storage: .file(databaseURL.path))
+            let database = await store.database
+            let liveAfterFailure = try await database.query(
+                "SELECT COUNT(*) AS count FROM operator_sessions WHERE session_id=?",
+                [.text(target.sessionID.uuidString.lowercased())]
+            ).first?.column("count")?.integer
+            let metadataAfterFailure = try await database.query(
+                "SELECT revoked_at,revocation_reason FROM operator_session_metadata WHERE session_id=?",
+                [.text(target.sessionID.uuidString.lowercased())]
+            ).first
+            let auditAfterFailure = try await database.query(
+                "SELECT COUNT(*) AS count FROM operator_security_audit WHERE operation='logout' AND correlation_id=?",
+                [.text(correlationID.uuidString.lowercased())]
+            ).first?.column("count")?.integer
+            XCTAssertEqual(liveAfterFailure, 1, faultPoint)
+            XCTAssertNil(metadataAfterFailure?.column("revoked_at")?.double, faultPoint)
+            XCTAssertNil(metadataAfterFailure?.column("revocation_reason")?.string, faultPoint)
+            XCTAssertEqual(auditAfterFailure, 0, faultPoint)
+            let authenticatedAfterFailure = try await store.operatorSessionUsername(token: token)
+            XCTAssertEqual(authenticatedAfterFailure, SQLiteServiceStore.defaultOperatorUsername, faultPoint)
+
+            let revoked = try await store.logoutOperatorSession(
+                token: token,
+                clientIdentityDigest: "logout-client-digest",
+                correlationID: correlationID,
+                now: now
+            )
+            XCTAssertTrue(revoked, faultPoint)
+            let authenticatedAfterCommit = try await store.operatorSessionUsername(token: token)
+            XCTAssertNil(authenticatedAfterCommit, faultPoint)
+            let liveAfterCommit = try await database.query(
+                "SELECT COUNT(*) AS count FROM operator_sessions WHERE session_id=?",
+                [.text(target.sessionID.uuidString.lowercased())]
+            ).first?.column("count")?.integer
+            let metadataAfterCommit = try await database.query(
+                "SELECT revoked_at,revocation_reason FROM operator_session_metadata WHERE session_id=?",
+                [.text(target.sessionID.uuidString.lowercased())]
+            ).first
+            let auditAfterCommit = try await database.query(
+                "SELECT COUNT(*) AS count FROM operator_security_audit WHERE operation='logout' AND outcome='success' AND correlation_id=? AND detail_code='sessionRevoked'",
+                [.text(correlationID.uuidString.lowercased())]
+            ).first?.column("count")?.integer
+            XCTAssertEqual(liveAfterCommit, 0, faultPoint)
+            let revokedAt = try XCTUnwrap(metadataAfterCommit?.column("revoked_at")?.double)
+            XCTAssertEqual(revokedAt, now.timeIntervalSince1970, accuracy: 0.001, faultPoint)
+            XCTAssertEqual(metadataAfterCommit?.column("revocation_reason")?.string, "logout", faultPoint)
+            XCTAssertEqual(auditAfterCommit, 1, faultPoint)
+
+            let idempotentRetry = try await store.logoutOperatorSession(
+                token: token,
+                clientIdentityDigest: "logout-client-digest",
+                correlationID: correlationID,
+                now: now.addingTimeInterval(1)
+            )
+            XCTAssertTrue(idempotentRetry, faultPoint)
+            let auditAfterRetry = try await database.query(
+                "SELECT COUNT(*) AS count FROM operator_security_audit WHERE operation='logout' AND correlation_id=?",
+                [.text(correlationID.uuidString.lowercased())]
+            ).first?.column("count")?.integer
+            XCTAssertEqual(auditAfterRetry, 1, faultPoint)
+            try await store.close(clean: false)
+        }
+    }
+
     func testBackupFailureWritesSecretFreeV9SecurityAudit() async throws {
         let root = try StoreMigrationTestSupport.temporaryDirectory("backup-failure-audit")
         defer { try? FileManager.default.removeItem(at: root) }
