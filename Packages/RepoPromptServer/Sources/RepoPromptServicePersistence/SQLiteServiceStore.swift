@@ -2208,15 +2208,20 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         let restoredCursor = ServiceCursor(storeID: fresh, globalSequence: restoredFloor)
         let projects = try await allProjects().map { replacingCursor($0, cursor: restoredCursor) }
         let sessions = try await allSessions().map { replacingCursor($0, cursor: restoredCursor) }
+        let sessionBytes = try retainedEncodedBytes(sessions)
+        let externalAssetBytes = missingExternalOptionalAssetIDs.reduce(activationToken.count) { $0 + $1.utf8.count }
+        let additionalRetainedBytes = try checkedRetainedByteSum(
+            sessionBytes,
+            externalAssetBytes,
+            manifestDigest.utf8.count,
+            sourceNamespaceKind.utf8.count,
+            sourceDatabaseIdentityDigest.utf8.count,
+            targetNamespaceKind.utf8.count,
+            targetDatabaseIdentityDigest.utf8.count
+        )
         let retainedBytes = try retainedInputBytes(
             projects,
-            additional: encoder.encode(sessions).count
-                + missingExternalOptionalAssetIDs.reduce(activationToken.count) { $0 + $1.utf8.count }
-                + manifestDigest.utf8.count
-                + sourceNamespaceKind.utf8.count
-                + sourceDatabaseIdentityDigest.utf8.count
-                + targetNamespaceKind.utf8.count
-                + targetDatabaseIdentityDigest.utf8.count
+            additional: additionalRetainedBytes
         )
         do {
             return try await transaction(.bulk(estimatedEncodedBytes: retainedBytes)) {
