@@ -3455,7 +3455,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     /// mandatory at every call site, and neither this closure nor raw SQL is
     /// exposed outside this module. Only reviewed store implementation code can
     /// suspend inside an open transaction; package clients submit typed commands.
-    func transaction<T>(
+    func transaction<T: Sendable>(
         _ workload: StoreTransactionWorkload,
         _ body: () async throws -> T
     ) async throws -> T {
@@ -3467,8 +3467,8 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             estimatedEncodedBytes: workload.estimatedEncodedBytes
         )
         do {
-            return try await SQLiteExecutionContext.$transactionID.withValue(transactionID) {
-                try await SQLiteExecutionContext.$operationClass.withValue(workload.operationClass) {
+            return try await withTransactionID(transactionID) {
+                try await withOperationClass(workload.operationClass) {
                     try await hitFault(.afterTransactionBegin)
                     let result = try await body()
                     try await hitFault(.beforeTransactionCommit)
@@ -3506,6 +3506,34 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             }
             throw error
         }
+    }
+
+    private nonisolated(nonsending) func withTransactionID<T: Sendable>(
+        _ transactionID: UUID,
+        @_inheritActorContext operation: sending @isolated(any) () async throws -> T
+    ) async rethrows -> T {
+        let isolation = operation.isolation
+        return try await SQLiteExecutionContext.$transactionID.withValue(
+            transactionID,
+            operation: {
+                try await operation()
+            },
+            isolation: isolation
+        )
+    }
+
+    private nonisolated(nonsending) func withOperationClass<T: Sendable>(
+        _ operationClass: SQLiteOperationClass,
+        @_inheritActorContext operation: sending @isolated(any) () async throws -> T
+    ) async rethrows -> T {
+        let isolation = operation.isolation
+        return try await SQLiteExecutionContext.$operationClass.withValue(
+            operationClass,
+            operation: {
+                try await operation()
+            },
+            isolation: isolation
+        )
     }
 
     private struct EncodedTranscriptEntry: Sendable {
