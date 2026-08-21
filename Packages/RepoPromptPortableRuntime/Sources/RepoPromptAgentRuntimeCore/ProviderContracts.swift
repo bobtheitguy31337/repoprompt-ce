@@ -157,8 +157,9 @@ public struct ProviderExecutionRequest: Sendable {
     public let resumeFallbackPrompt: String?
     public let policy: ProviderExecutionPolicy
     private let launchValidation: @Sendable () throws -> Void
+    private let launchAcknowledgement: @Sendable () async throws -> Void
 
-    public init(kind: ProviderKind, model: String?, prompt: String, structuredInput: CompiledProviderTurnInput? = nil, workingDirectory: String, maximumBytes: Int = 8_388_608, runID: UUID, resumeProviderSessionID: String? = nil, resumeFallbackPrompt: String? = nil, policy: ProviderExecutionPolicy = .init(), launchValidation: @escaping @Sendable () throws -> Void = {}) {
+    public init(kind: ProviderKind, model: String?, prompt: String, structuredInput: CompiledProviderTurnInput? = nil, workingDirectory: String, maximumBytes: Int = 8_388_608, runID: UUID, resumeProviderSessionID: String? = nil, resumeFallbackPrompt: String? = nil, policy: ProviderExecutionPolicy = .init(), launchValidation: @escaping @Sendable () throws -> Void = {}, launchAcknowledgement: @escaping @Sendable () async throws -> Void = {}) {
         self.kind = kind
         self.model = model
         self.prompt = structuredInput?.prompt ?? prompt
@@ -170,10 +171,17 @@ public struct ProviderExecutionRequest: Sendable {
         self.resumeFallbackPrompt = resumeFallbackPrompt
         self.policy = policy
         self.launchValidation = launchValidation
+        self.launchAcknowledgement = launchAcknowledgement
     }
 
     public func validateLaunch() throws {
         try launchValidation()
+    }
+
+    /// Called by a provider runtime only after its process/session family is
+    /// reserved and observable, but before it can emit provider frames.
+    public func acknowledgeLaunch() async throws {
+        try await launchAcknowledgement()
     }
 
     public func applying(defaults: ProviderRuntimeDefaults) -> ProviderExecutionRequest {
@@ -193,7 +201,8 @@ public struct ProviderExecutionRequest: Sendable {
             resumeProviderSessionID: resumeProviderSessionID,
             resumeFallbackPrompt: resumeFallbackPrompt,
             policy: ProviderExecutionPolicy(mode: policy.mode, writableRoots: policy.writableRoots, providerSettings: settings),
-            launchValidation: launchValidation
+            launchValidation: launchValidation,
+            launchAcknowledgement: launchAcknowledgement
         )
     }
 }
@@ -255,6 +264,7 @@ public extension AgentProviderDispatcher {
         onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
     ) async throws -> ProviderExecutionResult {
         try request.validateLaunch()
+        try await request.acknowledgeLaunch()
         let result = try await execute(
             kind: request.kind,
             model: request.model,

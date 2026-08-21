@@ -38,6 +38,33 @@ public struct MCPRequestTimelineIdentity: Equatable, Sendable {
     }
 }
 
+/// Internal MCP transport metadata used to carry host-owned request identity without
+/// extending any canonical tool argument schema. The host must mint this UUID before
+/// dispatch and preserve it when replaying a request after an ambiguous response.
+public enum MCPRequestTimelineTransportMetadata {
+    public static let appInvocationIDKey = "com.repoprompt/appInvocationID"
+
+    public static func normalizedAppInvocationID(_ rawValue: String?) -> String? {
+        guard let rawValue,
+              let value = UUID(uuidString: rawValue)
+        else { return nil }
+        return value.uuidString.lowercased()
+    }
+
+    public static func identity(
+        appInvocationID: String,
+        inheriting inherited: MCPRequestTimelineIdentity?
+    ) -> MCPRequestTimelineIdentity {
+        MCPRequestTimelineIdentity(
+            jsonRPCRequestID: inherited?.jsonRPCRequestID,
+            connectionID: inherited?.connectionID,
+            connectionGeneration: inherited?.connectionGeneration,
+            appInvocationID: appInvocationID,
+            requestOrdinal: inherited?.requestOrdinal
+        )
+    }
+}
+
 public enum MCPRequestTimelineContext {
     @TaskLocal public static var current: MCPRequestTimelineIdentity?
 }

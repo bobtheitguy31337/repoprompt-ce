@@ -2,14 +2,27 @@ import Foundation
 import RepoPromptAuthorityAPI
 import RepoPromptRuntimeModel
 
+/// Every host-owned live event consumer must register one of these roles. The
+/// hub is the guard: there is no subscription API that can bypass its durable
+/// `(storeID, globalSequence)` cursor gate.
+public enum ServiceEventConsumerKind: String, CaseIterable, Codable, Sendable {
+    case sse
+    case portal
+    case mcpNotification
+    case counter
+    case projection
+}
+
 public actor ServiceEventHub {
     private struct Subscriber {
+        let kind: ServiceEventConsumerKind
         let continuation: AsyncThrowingStream<EventEnvelope, Error>.Continuation
         var gate: EventDeliveryCursorGate
     }
 
     public struct Snapshot: Sendable, Equatable {
         public let activeSubscribers: Int
+        public let activeSubscribersByKind: [ServiceEventConsumerKind: Int]
         public let slowSubscriberTerminations: Int64
         public let lastPublishedCursor: ServiceCursor?
     }
@@ -68,10 +81,14 @@ public actor ServiceEventHub {
         }
     }
 
-    public func subscribe(after cursor: ServiceCursor? = nil) -> AsyncThrowingStream<EventEnvelope, Error> {
+    public func subscribe(
+        consumer kind: ServiceEventConsumerKind,
+        after cursor: ServiceCursor? = nil
+    ) -> AsyncThrowingStream<EventEnvelope, Error> {
         let id = UUID()
         return AsyncThrowingStream(bufferingPolicy: .bufferingOldest(subscriberBufferLimit)) { continuation in
             subscribers[id] = Subscriber(
+                kind: kind,
                 continuation: continuation,
                 gate: EventDeliveryCursorGate(greatestDelivered: cursor)
             )
@@ -82,6 +99,10 @@ public actor ServiceEventHub {
     public func snapshot() -> Snapshot {
         Snapshot(
             activeSubscribers: subscribers.count,
+            activeSubscribersByKind: Dictionary(
+                grouping: subscribers.values,
+                by: \.kind
+            ).mapValues(\.count),
             slowSubscriberTerminations: slowSubscriberTerminations,
             lastPublishedCursor: lastPublishedCursor
         )

@@ -1289,7 +1289,7 @@ public struct RepoPromptHTTPService: Sendable {
         router.get("/internal/v1/events/stream") { request, context in await respond(request, readAdmission: .subscription) { _ = try await authenticate(request, context: context, body: Data(), roles: [.sync], operation: "eventStream")
             let stream: AsyncThrowingStream<EventEnvelope, Error>
             do {
-                stream = try await authority.subscribe(after: parseCursor(request))
+                stream = try await authority.subscribe(consumer: .sse, after: parseCursor(request))
             } catch let error as ServiceAPIError where error.code == .cursorExpired {
                 return try cursorExpiredStream(error)
             }

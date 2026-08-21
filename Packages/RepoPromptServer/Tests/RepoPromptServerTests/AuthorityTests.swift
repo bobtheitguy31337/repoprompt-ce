@@ -700,7 +700,7 @@ final class AuthorityTests: XCTestCase {
         let authority = RepoPromptHeadlessAuthority(store: store, eventHub: eventHub)
         let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "project-key", requestDigest: "project-digest")
-        let stream = try await authority.subscribe(after: nil)
+        let stream = try await authority.subscribe(consumer: .sse, after: nil)
         _ = try await authority.createSession(input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession), externalActor: actor, idempotencyKey: "session-key", requestDigest: "session-digest")
 
         var iterator = stream.makeAsyncIterator()

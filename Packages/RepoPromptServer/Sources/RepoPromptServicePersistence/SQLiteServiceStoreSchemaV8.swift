@@ -52,6 +52,49 @@ extension SQLiteServiceStore {
                     retryable: false
                 )
             }
+            if transition.state == .finalized,
+               [.complete, .fail].contains(transition.kind),
+               let fence = try await database.query(
+                   "SELECT transition_id FROM authority_transitions WHERE run_id=? AND kind IN ('cancel','interrupt') AND state IN ('prepared','effectAcknowledged','reconciliationRequired') LIMIT 1",
+                   [.text(transition.runID.uuidString)]
+               ).first?.column("transition_id")?.string
+            {
+                throw ServiceAPIError(
+                    code: .staleRevision,
+                    message: "A committed cancellation fence owns terminal precedence: \(fence)",
+                    retryable: false
+                )
+            }
+            if !(transition.kind == .start && transition.state == .prepared) {
+                guard let currentRun = try await database.query(
+                    "SELECT state,generation,turn_epoch FROM runs WHERE run_id=?",
+                    [.text(transition.runID.uuidString)]
+                ).first,
+                    Int64(currentRun.column("generation")?.integer ?? -1) == transition.expectedGeneration,
+                    Int64(currentRun.column("turn_epoch")?.integer ?? -1) == transition.expectedTurnEpoch
+                else {
+                    throw ServiceAPIError(code: .staleRevision, message: "Transition run identity is stale")
+                }
+                let currentRunState = currentRun.column("state")?.string ?? ""
+                if transition.kind == .start,
+                   transition.state == .finalized,
+                   !["launchReserved", "reconciliationRequired"].contains(currentRunState)
+                {
+                    throw ServiceAPIError(code: .staleRevision, message: "Provider launch reservation is no longer current")
+                }
+                if transition.kind == .cancel,
+                   transition.state == .finalized,
+                   currentRunState != "cancelRequested"
+                {
+                    throw ServiceAPIError(code: .staleRevision, message: "Cancellation request no longer owns the run")
+                }
+                if transition.kind == .interrupt,
+                   transition.state == .finalized,
+                   !["launchReserved", "running", "waiting", "reconciliationRequired", "cancelRequested"].contains(currentRunState)
+                {
+                    throw ServiceAPIError(code: .staleRevision, message: "Recovery interruption no longer owns the run")
+                }
+            }
 
             guard let currentRevision = try await database.query(
                 "SELECT revision FROM sessions WHERE session_id=?",

@@ -2,12 +2,13 @@ import Foundation
 import RepoPromptAgentRuntimeCore
 import RepoPromptAuthorityAPI
 import RepoPromptDomainRuntime
-import RepoPromptHeadlessRuntime
+import RepoPromptMCPAdapter
 import RepoPromptRuntimeModel
 import RepoPromptServiceProtocol
 import RepoPromptShared
 import XCTest
 
+@_spi(Testing) import RepoPromptHeadlessRuntime
 @testable import RepoPromptServerHost
 @testable import RepoPromptServicePersistence
 
@@ -22,6 +23,53 @@ private actor PR5ArmedPersistenceFault {
         guard observed == point else { return }
         point = nil
         throw PR5InjectedFailure()
+    }
+}
+
+private actor PR5NthPersistenceFault {
+    private var point: PersistenceFaultPoint?
+    private var targetOccurrence = 0
+    private var observedOccurrences = 0
+    private var prerequisite: PersistenceFaultPoint?
+    private var prerequisiteObserved = false
+
+    func arm(
+        _ point: PersistenceFaultPoint,
+        occurrence: Int = 1,
+        after prerequisite: PersistenceFaultPoint? = nil
+    ) {
+        self.point = point
+        targetOccurrence = occurrence
+        observedOccurrences = 0
+        self.prerequisite = prerequisite
+        prerequisiteObserved = prerequisite == nil
+    }
+
+    func hit(_ observed: PersistenceFaultPoint) throws {
+        if observed == prerequisite { prerequisiteObserved = true }
+        guard prerequisiteObserved, observed == point else { return }
+        observedOccurrences += 1
+        guard observedOccurrences == targetOccurrence else { return }
+        point = nil
+        throw PR5InjectedFailure()
+    }
+}
+
+private actor PR5PostCommitGate {
+    private var paused = false
+    private var released = false
+
+    func pause() async {
+        paused = true
+        while !released { await Task.yield() }
+    }
+
+    func waitUntilPaused() async {
+        while !paused { await Task.yield() }
+    }
+
+    func release() {
+        released = true
     }
 }
 
@@ -79,13 +127,14 @@ private enum PR5TestSupport {
 
     static func makeAuthority(
         store: SQLiteServiceStore,
-        dispatcher: any AgentProviderDispatcher
+        dispatcher: any AgentProviderDispatcher,
+        hooks: RepoPromptHeadlessAuthorityHooks = .none
     ) async throws -> (RepoPromptHeadlessAuthority, SessionSnapshot, URL) {
         let root = FileManager.default.temporaryDirectory
             .resolvingSymlinksInPath()
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: dispatcher)
+        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: dispatcher, hooks: hooks)
         let project = try await authority.createProject(
             input: .init(name: "PR5", roots: [.init(logicalName: "source", path: root.path, writable: true)]),
             externalActor: actor,
@@ -126,6 +175,57 @@ final class SchemaV8MigrationTests: XCTestCase {
 }
 
 final class AuthorityTransitionFaultInjectionTests: XCTestCase {
+    func testStartReservationRollsBackEverySharedLifecycleTransactionBoundaryBeforeProviderLaunch() async throws {
+        let points: [PersistenceFaultPoint] = [
+            .afterAuthorityStateCAS,
+            .afterAuthorityRunWrite,
+            .afterAuthorityTransitionWrite,
+            .afterAuthorityPresentationWrite,
+            .afterAuthoritySessionWrite,
+            .afterAuthorityAgentWrite,
+            .afterEventInsertBeforeOutboxInsert,
+            .afterOutboxInsertBeforeSequenceAdvance,
+            .beforeTransactionCommit,
+        ]
+        for point in points {
+            let armed = PR5ArmedPersistenceFault()
+            let store = try await SQLiteServiceStore.open(storage: .memory, faultInjector: .init { observed in
+                try await armed.hit(observed)
+            })
+            let provider = PR5ProviderDispatcher(mode: .held)
+            let (authority, session, root) = try await PR5TestSupport.makeAuthority(store: store, dispatcher: provider)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let eventCount = try await store.database.query("SELECT COUNT(*) AS value FROM events").first?.column("value")?.integer
+            let outboxCount = try await store.database.query("SELECT COUNT(*) AS value FROM event_outbox").first?.column("value")?.integer
+            await armed.arm(point)
+
+            do {
+                _ = try await authority.execute(
+                    command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh),
+                    sessionID: session.sessionID,
+                    externalActor: PR5TestSupport.actor,
+                    idempotencyKey: "start-boundary-\(point.rawValue)",
+                    requestDigest: "start-boundary"
+                )
+                XCTFail("Expected injected failure at \(point.rawValue)")
+            } catch is PR5InjectedFailure {}
+
+            let persistedRun = try await store.latestRun(sessionID: session.sessionID)
+            let persistedSession = try await store.session(id: session.sessionID)
+            let transitions = try await store.nonfinalAuthorityTransitions()
+            let executionCalls = await provider.executionCallCount()
+            let persistedEventCount = try await store.database.query("SELECT COUNT(*) AS value FROM events").first?.column("value")?.integer
+            let persistedOutboxCount = try await store.database.query("SELECT COUNT(*) AS value FROM event_outbox").first?.column("value")?.integer
+            XCTAssertNil(persistedRun)
+            XCTAssertEqual(persistedSession?.state, session.state)
+            XCTAssertTrue(transitions.isEmpty)
+            XCTAssertEqual(executionCalls, 0)
+            XCTAssertEqual(persistedEventCount, eventCount)
+            XCTAssertEqual(persistedOutboxCount, outboxCount)
+            try await store.close()
+        }
+    }
+
     func testCancelTransitionRollsBackEverySharedLifecycleTransactionBoundary() async throws {
         let points: [PersistenceFaultPoint] = [
             .afterAuthorityStateCAS,
@@ -186,6 +286,108 @@ final class AuthorityTransitionFaultInjectionTests: XCTestCase {
             XCTAssertEqual(cancelCallCount, 0, "Provider side effect ran despite rollback at \(point.rawValue)")
             await provider.abandon(run.runID)
             await authority.waitForProviderRunsToSettle()
+            try await store.close()
+        }
+    }
+
+    func testCompleteFinalizationFaultsBecomeDurablyReconcilingAcrossEverySharedBoundary() async throws {
+        let points: [PersistenceFaultPoint] = [
+            .afterAuthorityStateCAS,
+            .afterAuthorityRunWrite,
+            .afterAuthorityTransitionWrite,
+            .afterAuthorityPresentationWrite,
+            .afterAuthoritySessionWrite,
+            .afterAuthorityAgentWrite,
+            .afterEventInsertBeforeOutboxInsert,
+            .afterOutboxInsertBeforeSequenceAdvance,
+            .beforeTransactionCommit,
+        ]
+        for point in points {
+            let fault = PR5NthPersistenceFault()
+            let store = try await SQLiteServiceStore.open(storage: .memory, faultInjector: .init { observed in
+                try await fault.hit(observed)
+            })
+            let provider = PR5ProviderDispatcher(mode: .terminalHeld)
+            let (authority, session, root) = try await PR5TestSupport.makeAuthority(store: store, dispatcher: provider)
+            defer { try? FileManager.default.removeItem(at: root) }
+            _ = try await authority.execute(
+                command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh),
+                sessionID: session.sessionID,
+                externalActor: PR5TestSupport.actor,
+                idempotencyKey: "complete-start-\(point.rawValue)",
+                requestDigest: "complete-start"
+            )
+            let latestRun = try await store.latestRun(sessionID: session.sessionID)
+            let run = try XCTUnwrap(latestRun)
+            await provider.waitUntilStarted(run.runID)
+            await fault.arm(point)
+            await provider.complete(run.runID)
+            await authority.waitForProviderRunsToSettle()
+
+            let persistedRun = try await store.latestRun(sessionID: session.sessionID)
+            let transitions = try await store.nonfinalAuthorityTransitions()
+            let finalizedComplete = try await store.database.query(
+                "SELECT COUNT(*) AS value FROM authority_transitions WHERE run_id=? AND kind='complete' AND state='finalized'",
+                [.text(run.runID.uuidString)]
+            ).first?.column("value")?.integer
+            XCTAssertEqual(persistedRun?.state, "reconciliationRequired", "boundary \(point.rawValue)")
+            XCTAssertEqual(transitions.last?.state, .reconciliationRequired, "boundary \(point.rawValue)")
+            XCTAssertEqual(finalizedComplete, 0, "boundary \(point.rawValue)")
+            try await store.close()
+        }
+    }
+
+    func testFailFinalizationFaultsBecomeDurablyReconcilingAcrossEverySharedBoundary() async throws {
+        let points: [PersistenceFaultPoint] = [
+            .afterAuthorityStateCAS,
+            .afterAuthorityRunWrite,
+            .afterAuthorityTransitionWrite,
+            .afterAuthorityPresentationWrite,
+            .afterAuthoritySessionWrite,
+            .afterAuthorityAgentWrite,
+            .afterEventInsertBeforeOutboxInsert,
+            .afterOutboxInsertBeforeSequenceAdvance,
+            .beforeTransactionCommit,
+        ]
+        for point in points {
+            let fault = PR5NthPersistenceFault()
+            let store = try await SQLiteServiceStore.open(storage: .memory, faultInjector: .init { observed in
+                try await fault.hit(observed)
+            })
+            let provider = PR5ProviderDispatcher(mode: .failureHeld)
+            let (authority, session, root) = try await PR5TestSupport.makeAuthority(store: store, dispatcher: provider)
+            defer { try? FileManager.default.removeItem(at: root) }
+            _ = try await authority.execute(
+                command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh),
+                sessionID: session.sessionID,
+                externalActor: PR5TestSupport.actor,
+                idempotencyKey: "fail-start-\(point.rawValue)",
+                requestDigest: "fail-start"
+            )
+            let latestRun = try await store.latestRun(sessionID: session.sessionID)
+            let run = try XCTUnwrap(latestRun)
+            await provider.waitUntilStarted(run.runID)
+            switch point {
+            case .afterEventInsertBeforeOutboxInsert,
+                 .afterOutboxInsertBeforeSequenceAdvance:
+                await fault.arm(point, occurrence: 2)
+            case .beforeTransactionCommit:
+                await fault.arm(point, after: .afterAuthorityAgentWrite)
+            default:
+                await fault.arm(point)
+            }
+            await provider.fail(run.runID)
+            await authority.waitForProviderRunsToSettle()
+
+            let persistedRun = try await store.latestRun(sessionID: session.sessionID)
+            let transitions = try await store.nonfinalAuthorityTransitions()
+            let finalizedFail = try await store.database.query(
+                "SELECT COUNT(*) AS value FROM authority_transitions WHERE run_id=? AND kind='fail' AND state='finalized'",
+                [.text(run.runID.uuidString)]
+            ).first?.column("value")?.integer
+            XCTAssertEqual(persistedRun?.state, "reconciliationRequired", "boundary \(point.rawValue)")
+            XCTAssertEqual(transitions.last?.state, .reconciliationRequired, "boundary \(point.rawValue)")
+            XCTAssertEqual(finalizedFail, 0, "boundary \(point.rawValue)")
             try await store.close()
         }
     }
@@ -349,7 +551,7 @@ final class OrderedEventOutboxTests: XCTestCase {
         let first = try await PR5TestSupport.persistProject(in: store, name: "N")
         let second = try await PR5TestSupport.persistProject(in: store, name: "N+1")
         let hub = ServiceEventHub(subscriberBufferLimit: 8)
-        let stream = await hub.subscribe()
+        let stream = await hub.subscribe(consumer: .sse)
         let failOnce = PR5FailOnceHook()
         let dispatcher = OrderedEventOutboxDispatcher(
             store: store,
@@ -442,6 +644,32 @@ final class OrderedEventOutboxTests: XCTestCase {
 }
 
 final class EventConsumerDedupeContractTests: XCTestCase {
+    func testNamedRegistryGuardsEverySupportedConsumerAgainstCrashWindowRedelivery() async throws {
+        let storeID = UUID()
+        let hub = ServiceEventHub(subscriberBufferLimit: 4)
+        var streams: [ServiceEventConsumerKind: AsyncThrowingStream<EventEnvelope, Error>] = [:]
+        for kind in ServiceEventConsumerKind.allCases {
+            streams[kind] = await hub.subscribe(consumer: kind)
+        }
+        let registered = await hub.snapshot()
+        XCTAssertEqual(Set(registered.activeSubscribersByKind.keys), Set(ServiceEventConsumerKind.allCases))
+        XCTAssertTrue(registered.activeSubscribersByKind.values.allSatisfy { $0 == 1 })
+
+        let event = PR5TestSupport.event(storeID: storeID, sequence: 1)
+        await hub.publish(event)
+        // Models dispatcher restart after publish but before the dispatched marker.
+        await hub.publish(event)
+        await hub.finish()
+
+        for kind in ServiceEventConsumerKind.allCases {
+            var iterator = try XCTUnwrap(streams[kind]).makeAsyncIterator()
+            let delivered = try await iterator.next()
+            let duplicate = try await iterator.next()
+            XCTAssertEqual(delivered?.cursor, event.cursor, "missing delivery for \(kind.rawValue)")
+            XCTAssertNil(duplicate, "duplicate delivery for \(kind.rawValue)")
+        }
+    }
+
     func testGateRejectsDuplicateAndStoreChangeUntilExplicitResnapshot() {
         let firstStore = UUID()
         let secondStore = UUID()
@@ -460,7 +688,7 @@ final class EventReplayLiveRaceTests: XCTestCase {
     func testRegisterFirstLiveGateDropsReplayOverlapAndPreservesNextSequence() async throws {
         let storeID = UUID()
         let hub = ServiceEventHub(subscriberBufferLimit: 8)
-        let stream = await hub.subscribe(after: .init(storeID: storeID, globalSequence: 10))
+        let stream = await hub.subscribe(consumer: .portal, after: .init(storeID: storeID, globalSequence: 10))
         let replayOverlap = PR5TestSupport.event(storeID: storeID, sequence: 10)
         let live = PR5TestSupport.event(
             storeID: storeID,
@@ -480,7 +708,7 @@ final class EventReplayLiveRaceTests: XCTestCase {
     func testSlowSubscriberTerminatesWithLastSafeCursor() async throws {
         let storeID = UUID()
         let hub = ServiceEventHub(subscriberBufferLimit: 1)
-        let stream = await hub.subscribe()
+        let stream = await hub.subscribe(consumer: .sse)
         await hub.publish(PR5TestSupport.event(storeID: storeID, sequence: 1))
         await hub.publish(PR5TestSupport.event(storeID: storeID, sequence: 2))
         var iterator = stream.makeAsyncIterator()
@@ -498,7 +726,7 @@ final class EventReplayLiveRaceTests: XCTestCase {
     func testStoreIdentityChangeTerminatesRegisteredConsumer() async throws {
         let firstStore = UUID()
         let hub = ServiceEventHub(subscriberBufferLimit: 2)
-        let stream = await hub.subscribe(after: .init(storeID: firstStore, globalSequence: 4))
+        let stream = await hub.subscribe(consumer: .projection, after: .init(storeID: firstStore, globalSequence: 4))
         await hub.publish(PR5TestSupport.event(storeID: UUID(), sequence: 1))
         var iterator = stream.makeAsyncIterator()
         do {
@@ -537,18 +765,125 @@ final class MCPInvocationIdentityContractTests: XCTestCase {
         )
         XCTAssertEqual(binding.appInvocationID, appInvocationID)
     }
+
+    func testTransportMetadataPreservesHostIdentityAcrossReconnectAndIsolatesReusedJSONRPCID() throws {
+        let sessionID = UUID()
+        let base = AuthorityMCPBinding(sessionID: sessionID, actor: PR5TestSupport.actor)
+        let firstAppInvocationID = UUID().uuidString.lowercased()
+        let secondAppInvocationID = UUID().uuidString.lowercased()
+        let sharedJSONRPCID = JSONRPCBridgeID.number(7)
+        let firstConnection = MCPRequestTimelineIdentity(
+            jsonRPCRequestID: sharedJSONRPCID,
+            connectionID: "connection-a",
+            connectionGeneration: 1,
+            requestOrdinal: 8
+        )
+        let reconnected = MCPRequestTimelineIdentity(
+            jsonRPCRequestID: sharedJSONRPCID,
+            connectionID: "connection-b",
+            connectionGeneration: 2,
+            requestOrdinal: 1
+        )
+        let reusedJSONRPCID = MCPRequestTimelineIdentity(
+            jsonRPCRequestID: sharedJSONRPCID,
+            connectionID: "connection-b",
+            connectionGeneration: 2,
+            requestOrdinal: 2
+        )
+        let first = try RepoPromptMCPStdioExecution.requestTimelineIdentity(
+            metadataAppInvocationID: firstAppInvocationID.uppercased(),
+            inherited: firstConnection
+        )
+        let replay = try RepoPromptMCPStdioExecution.requestTimelineIdentity(
+            metadataAppInvocationID: firstAppInvocationID,
+            inherited: reconnected
+        )
+        let fresh = try RepoPromptMCPStdioExecution.requestTimelineIdentity(
+            metadataAppInvocationID: secondAppInvocationID,
+            inherited: reusedJSONRPCID
+        )
+
+        XCTAssertEqual(first?.connectionID, "connection-a")
+        XCTAssertEqual(replay?.connectionID, "connection-b")
+        XCTAssertEqual(
+            RepoPromptMCPStdioExecution.invocationBinding(base, timelineIdentity: first).appInvocationID,
+            firstAppInvocationID
+        )
+        XCTAssertEqual(
+            RepoPromptMCPStdioExecution.invocationBinding(base, timelineIdentity: replay).appInvocationID,
+            firstAppInvocationID
+        )
+        XCTAssertEqual(
+            RepoPromptMCPStdioExecution.invocationBinding(base, timelineIdentity: fresh).appInvocationID,
+            secondAppInvocationID
+        )
+        let direct = try DirectHeadlessMCPService.requestTimelineIdentity(
+            metadataAppInvocationID: firstAppInvocationID,
+            inherited: reconnected
+        )
+        XCTAssertEqual(direct, replay)
+        XCTAssertNil(try RepoPromptMCPStdioExecution.requestTimelineIdentity(
+            metadataAppInvocationID: nil,
+            inherited: nil
+        ))
+        XCTAssertThrowsError(try RepoPromptMCPStdioExecution.requestTimelineIdentity(
+            metadataAppInvocationID: "not-a-uuid",
+            inherited: firstConnection
+        ))
+    }
+
+    func testMissingHostIdentityRejectsLifecycleBeforeToolReservation() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let provider = PR5ProviderDispatcher(mode: .immediate)
+        let (authority, session, root) = try await PR5TestSupport.makeAuthority(store: store, dispatcher: provider)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let service = await RepoPromptAuthorityMCPService.admitted(
+            authority: authority,
+            portalSettings: PortalDesktopSettingsService(store: store),
+            admissionGate: AuthorityMutationGate()
+        )
+        let arguments = try JSONSerialization.data(
+            withJSONObject: ["op": "start", "message": "must not reserve"],
+            options: [.sortedKeys]
+        )
+        do {
+            _ = try await service.invoke(
+                toolName: "agent_run",
+                argumentsJSON: arguments,
+                binding: .init(sessionID: session.sessionID, actor: PR5TestSupport.actor)
+            )
+            XCTFail("Expected missing durable invocation identity rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .idempotencyRequired)
+        }
+        let toolStarts = try await authority.events(after: nil, limit: 100).events
+            .count(where: { $0.eventType == .toolStarted })
+        XCTAssertEqual(toolStarts, 0)
+        let transitions = try await store.nonfinalAuthorityTransitions()
+        let executionCalls = await provider.executionCallCount()
+        XCTAssertTrue(transitions.isEmpty)
+        XCTAssertEqual(executionCalls, 0)
+        try await store.close()
+    }
 }
 
 private actor PR5ProviderDispatcher: AgentProviderDispatcher {
     enum Mode {
         case immediate
         case held
+        case launchHeld
+        case terminalHeld
+        case failureHeld
         case cancelAmbiguous
+        case cancelRacingCompletion
     }
 
     private let mode: Mode
     private var active: Set<UUID> = []
     private var cancelRequests: Int = 0
+    private var executionRequests: Int = 0
+    private var launchContinuations: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var launchReservationWaiters: [CheckedContinuation<UUID, Never>] = []
     private var executionContinuations: [UUID: CheckedContinuation<ProviderExecutionResult, Error>] = [:]
     private var startWaiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
 
@@ -583,12 +918,27 @@ private actor PR5ProviderDispatcher: AgentProviderDispatcher {
         onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
     ) async throws -> ProviderExecutionResult {
         active.insert(request.runID)
-        await onEvent(.providerIdentity("native-\(request.runID.uuidString)"))
+        defer { active.remove(request.runID) }
+        executionRequests += 1
+        if mode == .launchHeld {
+            await withCheckedContinuation {
+                launchContinuations[request.runID] = $0
+                let waiters = launchReservationWaiters
+                launchReservationWaiters.removeAll()
+                for waiter in waiters { waiter.resume(returning: request.runID) }
+            }
+        }
+        try await request.acknowledgeLaunch()
+        if mode != .failureHeld {
+            await onEvent(.providerIdentity("native-\(request.runID.uuidString)"))
+        }
         let result = try await executeBody(runID: request.runID, output: "provider:\(request.prompt)")
-        await onEvent(.framed(providerEventID: "assistant-final", providerSequence: 2, event: .assistantFinal(result.output)))
-        // Exact redelivery must be discarded by the durable provider receipt.
-        await onEvent(.framed(providerEventID: "assistant-final", providerSequence: 2, event: .assistantFinal(result.output)))
-        await onEvent(.completed(providerSessionID: result.providerSessionID))
+        if mode != .terminalHeld {
+            await onEvent(.framed(providerEventID: "assistant-final", providerSequence: 2, event: .assistantFinal(result.output)))
+            // Exact redelivery must be discarded by the durable provider receipt.
+            await onEvent(.framed(providerEventID: "assistant-final", providerSequence: 2, event: .assistantFinal(result.output)))
+            await onEvent(.completed(providerSessionID: result.providerSessionID))
+        }
         active.remove(request.runID)
         return result
     }
@@ -597,17 +947,47 @@ private actor PR5ProviderDispatcher: AgentProviderDispatcher {
         cancelRequests += 1
         if mode == .cancelAmbiguous { throw PR5InjectedFailure() }
         active.remove(runID)
-        executionContinuations.removeValue(forKey: runID)?.resume(throwing: CancellationError())
+        if mode == .cancelRacingCompletion {
+            executionContinuations.removeValue(forKey: runID)?.resume(returning: .init(
+                output: "racing completion",
+                providerSessionID: "native-\(runID.uuidString)"
+            ))
+        } else {
+            executionContinuations.removeValue(forKey: runID)?.resume(throwing: CancellationError())
+        }
     }
 
     func hasActiveRun(_ runID: UUID) -> Bool { active.contains(runID) }
     func cancelCallCount() -> Int { cancelRequests }
+    func executionCallCount() -> Int { executionRequests }
+
+    func waitForLaunchReservation() async -> UUID {
+        if let runID = launchContinuations.keys.first { return runID }
+        return await withCheckedContinuation { launchReservationWaiters.append($0) }
+    }
+
+    func acknowledgeLaunch(_ runID: UUID) {
+        launchContinuations.removeValue(forKey: runID)?.resume()
+    }
 
     func waitUntilStarted(_ runID: UUID) async {
         if executionContinuations[runID] != nil { return }
         await withCheckedContinuation { continuation in
             startWaiters[runID, default: []].append(continuation)
         }
+    }
+
+    func complete(_ runID: UUID) {
+        active.remove(runID)
+        executionContinuations.removeValue(forKey: runID)?.resume(returning: .init(
+            output: "",
+            providerSessionID: "native-\(runID.uuidString)"
+        ))
+    }
+
+    func fail(_ runID: UUID) {
+        active.remove(runID)
+        executionContinuations.removeValue(forKey: runID)?.resume(throwing: PR5InjectedFailure())
     }
 
     func abandon(_ runID: UUID) {
@@ -621,7 +1001,7 @@ private actor PR5ProviderDispatcher: AgentProviderDispatcher {
             for waiter in startWaiters.removeValue(forKey: runID) ?? [] { waiter.resume() }
             active.remove(runID)
             return .init(output: output, providerSessionID: "native-\(runID.uuidString)")
-        case .held, .cancelAmbiguous:
+        case .held, .launchHeld, .terminalHeld, .failureHeld, .cancelAmbiguous, .cancelRacingCompletion:
             return try await withCheckedThrowingContinuation { continuation in
                 executionContinuations[runID] = continuation
                 for waiter in startWaiters.removeValue(forKey: runID) ?? [] { waiter.resume() }
@@ -665,7 +1045,19 @@ final class IdempotencyRetryContractTests: XCTestCase {
             XCTAssertEqual(error.code, .idempotencyConflict)
         }
         await authority.waitForProviderRunsToSettle()
-        let completed = try await authority.sessionSnapshot(sessionID: session.sessionID)
+        let reconnectedAuthority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
+        try await reconnectedAuthority.recover()
+        let droppedResponseReplay = try await reconnectedAuthority.execute(
+            command: command,
+            sessionID: session.sessionID,
+            externalActor: PR5TestSupport.actor,
+            idempotencyKey: "app-invocation-1",
+            requestDigest: "digest-a"
+        )
+        XCTAssertEqual(droppedResponseReplay.commandID, first.commandID)
+        let executionCalls = await provider.executionCallCount()
+        XCTAssertEqual(executionCalls, 1)
+        let completed = try await reconnectedAuthority.sessionSnapshot(sessionID: session.sessionID)
         XCTAssertEqual(completed.transcript.filter { $0.kind == .assistant }.count, 1)
         let transitionCount = try await store.database.query(
             "SELECT COUNT(*) AS value FROM authority_transitions WHERE kind='start'"
@@ -697,6 +1089,297 @@ final class IdempotencyRetryContractTests: XCTestCase {
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .operationReconciling)
         }
+        try await store.close()
+    }
+}
+
+final class ProviderLaunchAcknowledgementTests: XCTestCase {
+    func testStartRemainsLaunchReservedUntilProviderAcknowledgesAndThenFinalizesRunning() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let provider = PR5ProviderDispatcher(mode: .launchHeld)
+        let (authority, session, root) = try await PR5TestSupport.makeAuthority(store: store, dispatcher: provider)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let start = Task {
+            try await authority.execute(
+                command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh),
+                sessionID: session.sessionID,
+                externalActor: PR5TestSupport.actor,
+                idempotencyKey: "launch-held",
+                requestDigest: "launch-held"
+            )
+        }
+        let reservedRunID = await provider.waitForLaunchReservation()
+        let reserved = try await store.latestRun(sessionID: session.sessionID)
+        let run = try XCTUnwrap(reserved)
+        XCTAssertEqual(run.runID, reservedRunID)
+        let reservedSession = try await store.session(id: session.sessionID)
+        let reservedRun = try await store.latestRun(sessionID: session.sessionID)
+        let reservedTransitions = try await store.nonfinalAuthorityTransitions()
+        XCTAssertEqual(reservedSession?.state, .preparing)
+        XCTAssertEqual(reservedRun?.state, "launchReserved")
+        XCTAssertEqual(reservedTransitions.first?.state, .prepared)
+
+        await provider.acknowledgeLaunch(run.runID)
+        let receipt = try await start.value
+        XCTAssertEqual(receipt.status, "accepted")
+        let runningSession = try await store.session(id: session.sessionID)
+        let runningRun = try await store.latestRun(sessionID: session.sessionID)
+        let runningTransitions = try await store.nonfinalAuthorityTransitions()
+        XCTAssertEqual(runningSession?.state, .running)
+        XCTAssertEqual(runningRun?.state, "running")
+        XCTAssertTrue(runningTransitions.isEmpty)
+
+        await provider.waitUntilStarted(run.runID)
+        await provider.abandon(run.runID)
+        await authority.waitForProviderRunsToSettle()
+        try await store.close()
+    }
+
+    func testPostLaunchPreAcknowledgementFaultBecomesDurablyReconcilingAndRetryDoesNotRelaunch() async throws {
+        let armed = PR5ArmedPersistenceFault()
+        let store = try await SQLiteServiceStore.open(storage: .memory, faultInjector: .init { point in
+            try await armed.hit(point)
+        })
+        let provider = PR5ProviderDispatcher(mode: .launchHeld)
+        let (authority, session, root) = try await PR5TestSupport.makeAuthority(store: store, dispatcher: provider)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let start = Task {
+            try await authority.execute(
+                command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh),
+                sessionID: session.sessionID,
+                externalActor: PR5TestSupport.actor,
+                idempotencyKey: "launch-ambiguous",
+                requestDigest: "launch-ambiguous"
+            )
+        }
+        let reservedRunID = await provider.waitForLaunchReservation()
+        let reserved = try await store.latestRun(sessionID: session.sessionID)
+        let run = try XCTUnwrap(reserved)
+        XCTAssertEqual(run.runID, reservedRunID)
+        await armed.arm(.afterAuthorityStateCAS)
+        await provider.acknowledgeLaunch(run.runID)
+        do {
+            _ = try await start.value
+            XCTFail("Expected ambiguous launch acknowledgement")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .operationReconciling)
+        }
+        let reconcilingRun = try await store.latestRun(sessionID: session.sessionID)
+        let reconcilingTransitions = try await store.nonfinalAuthorityTransitions()
+        XCTAssertEqual(reconcilingRun?.state, "reconciliationRequired")
+        XCTAssertEqual(reconcilingTransitions.first?.state, .reconciliationRequired)
+        let replay = try await authority.execute(
+            command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh),
+            sessionID: session.sessionID,
+            externalActor: PR5TestSupport.actor,
+            idempotencyKey: "launch-ambiguous",
+            requestDigest: "launch-ambiguous"
+        )
+        XCTAssertEqual(replay.status, "pending")
+        let executionCalls = await provider.executionCallCount()
+        XCTAssertEqual(executionCalls, 1)
+        await authority.waitForProviderRunsToSettle()
+
+        let recovered = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
+        try await recovered.recover()
+        let recoveredSession = try await recovered.sessionSnapshot(sessionID: session.sessionID)
+        let recoveredRun = try await store.latestRun(sessionID: session.sessionID)
+        let recoveredTransitions = try await store.nonfinalAuthorityTransitions()
+        XCTAssertEqual(recoveredSession.state, .interrupted)
+        XCTAssertEqual(recoveredRun?.state, "interrupted")
+        XCTAssertTrue(recoveredTransitions.isEmpty)
+        let readiness = await RepoPromptReadinessService(authority: recovered, store: store).snapshot(forceRefresh: true)
+        XCTAssertTrue(readiness.ready)
+        try await store.close()
+    }
+}
+
+final class CancellationPrecedenceTests: XCTestCase {
+    func testCommittedCancelRequestedFencesRacingProviderCompletion() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let provider = PR5ProviderDispatcher(mode: .cancelRacingCompletion)
+        let (authority, session, root) = try await PR5TestSupport.makeAuthority(store: store, dispatcher: provider)
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try await authority.execute(
+            command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh),
+            sessionID: session.sessionID,
+            externalActor: PR5TestSupport.actor,
+            idempotencyKey: "cancel-race-start",
+            requestDigest: "cancel-race-start"
+        )
+        let latestRun = try await store.latestRun(sessionID: session.sessionID)
+        let run = try XCTUnwrap(latestRun)
+        await provider.waitUntilStarted(run.runID)
+        _ = try await authority.execute(
+            command: .cancelSession(expectedRunID: run.runID, expectedGeneration: run.generation),
+            sessionID: session.sessionID,
+            externalActor: PR5TestSupport.actor,
+            idempotencyKey: "cancel-race",
+            requestDigest: "cancel-race"
+        )
+        let canceledSession = try await store.session(id: session.sessionID)
+        let canceledRun = try await store.latestRun(sessionID: session.sessionID)
+        XCTAssertEqual(canceledSession?.state, .canceled)
+        XCTAssertEqual(canceledRun?.state, "canceled")
+        let winners = try await store.database.query(
+            "SELECT kind FROM authority_transitions WHERE run_id=? AND state='finalized' AND kind IN ('cancel','complete','fail','interrupt')",
+            [.text(run.runID.uuidString)]
+        ).compactMap { $0.column("kind")?.string }
+        XCTAssertEqual(winners, ["cancel"])
+        try await store.close()
+    }
+}
+
+final class ArchiveProposalCommitTests: XCTestCase {
+    func testArchiveCommitFailureDoesNotMutateSessionAuthorityMemory() async throws {
+        let armed = PR5ArmedPersistenceFault()
+        let store = try await SQLiteServiceStore.open(storage: .memory, faultInjector: .init { point in
+            try await armed.hit(point)
+        })
+        let provider = PR5ProviderDispatcher(mode: .immediate)
+        let (authority, session, root) = try await PR5TestSupport.makeAuthority(store: store, dispatcher: provider)
+        defer { try? FileManager.default.removeItem(at: root) }
+        await armed.arm(.beforeTransactionCommit)
+        do {
+            _ = try await authority.execute(
+                command: .archiveSession(expectedRevision: session.revision),
+                sessionID: session.sessionID,
+                externalActor: PR5TestSupport.actor,
+                idempotencyKey: "archive-fault",
+                requestDigest: "archive-fault"
+            )
+            XCTFail("Expected archive transaction failure")
+        } catch is PR5InjectedFailure {}
+        let memory = try await authority.sessionSnapshot(sessionID: session.sessionID)
+        let durable = try await store.session(id: session.sessionID)
+        XCTAssertEqual(memory.state, session.state)
+        XCTAssertEqual(memory.revision, session.revision)
+        XCTAssertEqual(durable?.state, session.state)
+        XCTAssertEqual(durable?.revision, session.revision)
+        try await store.close()
+    }
+}
+
+final class PostCommitMemoryApplyTests: XCTestCase {
+    func testEveryRunLifecycleCommitPrecedesInMemoryApply() async throws {
+        let cases: [(mode: PR5ProviderDispatcher.Mode, kind: AuthorityTransitionKind, durable: SessionLifecycleState, memory: SessionLifecycleState)] = [
+            (.launchHeld, .start, .running, .preparing),
+            (.held, .cancel, .canceled, .running),
+            (.terminalHeld, .complete, .completed, .running),
+            (.failureHeld, .fail, .failed, .running),
+        ]
+        for testCase in cases {
+            let gate = PR5PostCommitGate()
+            let hooks = RepoPromptHeadlessAuthorityHooks(
+                afterRunTransitionCommitBeforeMemoryApply: { transition in
+                    if transition.kind == testCase.kind, transition.state == .finalized {
+                        await gate.pause()
+                    }
+                }
+            )
+            let store = try await SQLiteServiceStore.open(storage: .memory)
+            let provider = PR5ProviderDispatcher(mode: testCase.mode)
+            let (authority, session, root) = try await PR5TestSupport.makeAuthority(
+                store: store,
+                dispatcher: provider,
+                hooks: hooks
+            )
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            if testCase.kind == .start {
+                let start = Task {
+                    try await authority.execute(
+                        command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh),
+                        sessionID: session.sessionID,
+                        externalActor: PR5TestSupport.actor,
+                        idempotencyKey: "post-commit-start",
+                        requestDigest: "post-commit-start"
+                    )
+                }
+                let runID = await provider.waitForLaunchReservation()
+                await provider.acknowledgeLaunch(runID)
+                await gate.waitUntilPaused()
+                let durable = try await store.session(id: session.sessionID)
+                let memory = try await authority.inMemorySessionSnapshot(sessionID: session.sessionID)
+                XCTAssertEqual(durable?.state, testCase.durable)
+                XCTAssertEqual(memory.state, testCase.memory)
+                await gate.release()
+                _ = try await start.value
+                await provider.waitUntilStarted(runID)
+                await provider.abandon(runID)
+            } else {
+                _ = try await authority.execute(
+                    command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh),
+                    sessionID: session.sessionID,
+                    externalActor: PR5TestSupport.actor,
+                    idempotencyKey: "post-commit-start-\(testCase.kind.rawValue)",
+                    requestDigest: "post-commit-start"
+                )
+                let latestRun = try await store.latestRun(sessionID: session.sessionID)
+                let run = try XCTUnwrap(latestRun)
+                await provider.waitUntilStarted(run.runID)
+                let commandTask: Task<CommandReceipt, Error>?
+                switch testCase.kind {
+                case .cancel:
+                    commandTask = Task {
+                        try await authority.execute(
+                            command: .cancelSession(expectedRunID: run.runID, expectedGeneration: run.generation),
+                            sessionID: session.sessionID,
+                            externalActor: PR5TestSupport.actor,
+                            idempotencyKey: "post-commit-cancel",
+                            requestDigest: "post-commit-cancel"
+                        )
+                    }
+                case .complete:
+                    commandTask = nil
+                    await provider.complete(run.runID)
+                case .fail:
+                    commandTask = nil
+                    await provider.fail(run.runID)
+                case .start, .interrupt:
+                    XCTFail("Unexpected lifecycle case")
+                    commandTask = nil
+                }
+                await gate.waitUntilPaused()
+                let durable = try await store.session(id: session.sessionID)
+                let memory = try await authority.inMemorySessionSnapshot(sessionID: session.sessionID)
+                XCTAssertEqual(durable?.state, testCase.durable, "kind \(testCase.kind.rawValue)")
+                XCTAssertEqual(memory.state, testCase.memory, "kind \(testCase.kind.rawValue)")
+                await gate.release()
+                if let commandTask { _ = try await commandTask.value }
+            }
+            await authority.waitForProviderRunsToSettle()
+            try await store.close()
+        }
+    }
+
+    func testArchiveCommitPrecedesInMemoryApply() async throws {
+        let gate = PR5PostCommitGate()
+        let hooks = RepoPromptHeadlessAuthorityHooks(
+            afterSessionCommitBeforeMemoryApply: { operation, _ in
+                if operation == "archiveSession" { await gate.pause() }
+            }
+        )
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let provider = PR5ProviderDispatcher(mode: .immediate)
+        let (authority, session, root) = try await PR5TestSupport.makeAuthority(store: store, dispatcher: provider, hooks: hooks)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let archive = Task {
+            try await authority.execute(
+                command: .archiveSession(expectedRevision: session.revision),
+                sessionID: session.sessionID,
+                externalActor: PR5TestSupport.actor,
+                idempotencyKey: "archive-post-commit",
+                requestDigest: "archive-post-commit"
+            )
+        }
+        await gate.waitUntilPaused()
+        let durable = try await store.session(id: session.sessionID)
+        let memory = try await authority.inMemorySessionSnapshot(sessionID: session.sessionID)
+        XCTAssertEqual(durable?.state, .archived)
+        XCTAssertEqual(memory.state, session.state)
+        await gate.release()
+        _ = try await archive.value
         try await store.close()
     }
 }
@@ -765,37 +1448,69 @@ final class ProviderLifecycleRecoveryTests: XCTestCase {
         XCTAssertEqual(cancelRequestedRun?.state, "cancelRequested")
         await provider.abandon(run.runID)
         await authority.waitForProviderRunsToSettle()
+
+        let recovered = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
+        try await recovered.recover()
+        let recoveredSession = try await recovered.sessionSnapshot(sessionID: session.sessionID)
+        let recoveredRun = try await store.latestRun(sessionID: session.sessionID)
+        let recoveredTransitions = try await store.nonfinalAuthorityTransitions()
+        XCTAssertEqual(recoveredSession.state, .canceled)
+        XCTAssertEqual(recoveredRun?.state, "canceled")
+        XCTAssertTrue(recoveredTransitions.isEmpty)
         try await store.close()
     }
 }
 
 final class SustainedProviderConcurrencyTests: XCTestCase {
-    func testConcurrentProjectsKeepGlobalEventsContiguousAndRunsIsolated() async throws {
+    func testOneAssembledAuthoritySustainsSixteenCrossProjectRunsWithoutLeakage() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let provider = PR5ProviderDispatcher(mode: .immediate)
-        var authorities: [(RepoPromptHeadlessAuthority, SessionSnapshot, URL)] = []
-        for _ in 0 ..< 16 {
-            authorities.append(try await PR5TestSupport.makeAuthority(store: store, dispatcher: provider))
+        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
+        var sessions: [SessionSnapshot] = []
+        var roots: [URL] = []
+        for index in 0 ..< 16 {
+            let root = FileManager.default.temporaryDirectory
+                .resolvingSymlinksInPath()
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            roots.append(root)
+            let project = try await authority.createProject(
+                input: .init(name: "PR5-\(index)", roots: [.init(logicalName: "source", path: root.path, writable: true)]),
+                externalActor: PR5TestSupport.actor,
+                idempotencyKey: "concurrent-project-\(index)",
+                requestDigest: "concurrent-project-\(index)"
+            )
+            sessions.append(try await authority.createSession(
+                input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+                externalActor: PR5TestSupport.actor,
+                idempotencyKey: "concurrent-session-\(index)",
+                requestDigest: "concurrent-session-\(index)"
+            ))
         }
-        defer { for item in authorities { try? FileManager.default.removeItem(at: item.2) } }
+        defer { for root in roots { try? FileManager.default.removeItem(at: root) } }
         try await withThrowingTaskGroup(of: Void.self) { group in
-            for (index, item) in authorities.enumerated() {
+            for (index, session) in sessions.enumerated() {
                 group.addTask {
-                    _ = try await item.0.execute(
+                    _ = try await authority.execute(
                         command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh),
-                        sessionID: item.1.sessionID,
+                        sessionID: session.sessionID,
                         externalActor: PR5TestSupport.actor,
-                        idempotencyKey: "concurrent-\(index)",
-                        requestDigest: "concurrent-\(index)"
+                        idempotencyKey: "concurrent-run-\(index)",
+                        requestDigest: "concurrent-run-\(index)"
                     )
-                    await item.0.waitForProviderRunsToSettle()
                 }
             }
             try await group.waitForAll()
         }
-        for item in authorities {
-            let snapshot = try await item.0.sessionSnapshot(sessionID: item.1.sessionID)
+        await authority.waitForProviderRunsToSettle()
+        for session in sessions {
+            let snapshot = try await authority.sessionSnapshot(sessionID: session.sessionID)
             XCTAssertEqual(snapshot.state, .completed)
+            let latestRun = try await store.latestRun(sessionID: session.sessionID)
+        let run = try XCTUnwrap(latestRun)
+            XCTAssertEqual(run.sessionID, session.sessionID)
+            let sessionEvents = try await authority.events(after: nil, limit: 10_000, projectID: session.projectID).events
+            XCTAssertTrue(sessionEvents.allSatisfy { $0.projectID == session.projectID })
         }
         let events = try await store.events(after: nil, limit: 10_000).events
         XCTAssertEqual(events.map(\.globalSequence), Array(1 ... Int64(events.count)))

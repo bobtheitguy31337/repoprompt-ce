@@ -125,11 +125,16 @@ public actor RepoPromptReadinessService {
             // unreconciled startup condition, and remain visible in metrics.
             checks.append(.init(name: "supervisor-recovery", ready: true, detail: "active-families=\(snapshot.activeProcessFamilyCount)"))
             checks.append(.init(name: "owned-resources", ready: snapshot.ownedResources.ready, detail: snapshot.ownedResources.ready ? "reconciled" : "degraded"))
-            let transitionsReady = snapshot.nonfinalAuthorityTransitionCount == 0
+            let transitions = try await store.nonfinalAuthorityTransitions()
+            let blockingTransitions = transitions.filter { $0.state != .reconciliationRequired }
+            let actionableTransitions = transitions.count - blockingTransitions.count
+            let transitionsReady = blockingTransitions.isEmpty
             checks.append(.init(
                 name: "authority-transitions",
                 ready: transitionsReady,
-                detail: transitionsReady ? "reconciled" : "nonfinal=\(snapshot.nonfinalAuthorityTransitionCount)"
+                detail: transitions.isEmpty
+                    ? "reconciled"
+                    : "blocking=\(blockingTransitions.count),actionable=\(actionableTransitions)"
             ))
         } catch {
             checks.append(.init(name: "sqlite-integrity", ready: false, detail: "unavailable"))

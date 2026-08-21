@@ -259,13 +259,10 @@ private struct AuthorityDomainBackend: DomainGlobalControlBackend, DomainWorkspa
     let binding: AuthorityMCPBinding
 
     private func call(_ toolName: String, _ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
-        let invocationBinding = binding.withAppInvocationID(
-            request.securityContext?.invocationID.uuidString.lowercased()
-        )
         return try await DomainPhysicalToolResult(json: adapter.invoke(
             toolName: toolName,
             argumentsJSON: request.argumentsJSON,
-            binding: invocationBinding
+            binding: binding
         ))
     }
 

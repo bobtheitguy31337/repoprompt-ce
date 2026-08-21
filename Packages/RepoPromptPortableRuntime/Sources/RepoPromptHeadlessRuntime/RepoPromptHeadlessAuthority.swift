@@ -5,6 +5,60 @@ import RepoPromptRuntimeModel
 import RepoPromptShared
 import RepoPromptWorkspaceRuntimeCore
 
+public struct RepoPromptHeadlessAuthorityHooks: Sendable {
+    public let afterRunTransitionCommitBeforeMemoryApply: @Sendable (AuthorityTransitionSnapshot) async -> Void
+    public let afterSessionCommitBeforeMemoryApply: @Sendable (String, UUID) async -> Void
+
+    public init(
+        afterRunTransitionCommitBeforeMemoryApply: @escaping @Sendable (AuthorityTransitionSnapshot) async -> Void = { _ in },
+        afterSessionCommitBeforeMemoryApply: @escaping @Sendable (String, UUID) async -> Void = { _, _ in }
+    ) {
+        self.afterRunTransitionCommitBeforeMemoryApply = afterRunTransitionCommitBeforeMemoryApply
+        self.afterSessionCommitBeforeMemoryApply = afterSessionCommitBeforeMemoryApply
+    }
+
+    public static let none = RepoPromptHeadlessAuthorityHooks()
+}
+
+private actor ProviderLaunchReceiptLatch {
+    private var outcome: Result<CommandReceipt, ServiceAPIError>?
+    private var waiters: [CheckedContinuation<CommandReceipt, Error>] = []
+    private(set) var sideEffectObserved = false
+    private(set) var acknowledged = false
+
+    func observeSideEffect() {
+        sideEffectObserved = true
+    }
+
+    func succeed(_ receipt: CommandReceipt) {
+        guard outcome == nil else { return }
+        acknowledged = true
+        outcome = .success(receipt)
+        let current = waiters
+        waiters.removeAll()
+        for waiter in current {
+            waiter.resume(returning: receipt)
+        }
+    }
+
+    func fail(_ error: ServiceAPIError) {
+        guard outcome == nil else { return }
+        outcome = .failure(error)
+        let current = waiters
+        waiters.removeAll()
+        for waiter in current {
+            waiter.resume(throwing: error)
+        }
+    }
+
+    func wait() async throws -> CommandReceipt {
+        if let outcome { return try outcome.get() }
+        return try await withCheckedThrowingContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+}
+
 public actor RepoPromptHeadlessAuthority {
     private struct InFlightProjectSourceOperation {
         let requestDigest: String
@@ -44,6 +98,7 @@ public actor RepoPromptHeadlessAuthority {
     private let workflowRepository: WorkflowRepository
     private let projects = ProjectRuntimeSupervisor()
     private let eventHub: ServiceEventHub
+    private let hooks: RepoPromptHeadlessAuthorityHooks
     private var sessions: [UUID: SessionAuthority] = [:]
     private var agents: [UUID: AgentSnapshot] = [:]
     private var tools: [UUID: ProjectToolAuthority] = [:]
@@ -74,7 +129,8 @@ public actor RepoPromptHeadlessAuthority {
         providerSettings: ProviderSettingsService? = nil,
         directProviderRegistry: (any DirectProviderSettingsProviding)? = nil,
         directProviderDefaults: (any DirectProviderRuntimeDefaultsProviding)? = nil,
-        eventHub: ServiceEventHub = ServiceEventHub()
+        eventHub: ServiceEventHub = ServiceEventHub(),
+        hooks: RepoPromptHeadlessAuthorityHooks = .none
     ) {
         self.store = store
         self.clock = clock
@@ -94,6 +150,7 @@ public actor RepoPromptHeadlessAuthority {
         self.directProviderRegistry = directProviderRegistry
         self.directProviderDefaults = directProviderDefaults
         self.eventHub = eventHub
+        self.hooks = hooks
         workflowRepository = WorkflowRepository(store: store)
         subagentPermissions = SubagentPermissionResolver(
             settings: serverSettings,
@@ -138,10 +195,17 @@ public actor RepoPromptHeadlessAuthority {
     private func reconcileDurableTransitions(unclean: Bool) async throws {
         let nonfinal = try await store.nonfinalAuthorityTransitions()
         let transitionByRun = Dictionary(
-            nonfinal.map { ($0.runID, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        for snapshot in try await sessionSnapshots() where [.preparing, .running, .waiting].contains(snapshot.state) {
+            grouping: nonfinal,
+            by: \.runID
+        ).mapValues { transitions in
+            transitions.max { lhs, rhs in
+                let lhsPriority = [AuthorityTransitionKind.start: 0, .complete: 1, .fail: 2, .cancel: 3, .interrupt: 4][lhs.kind] ?? 0
+                let rhsPriority = [AuthorityTransitionKind.start: 0, .complete: 1, .fail: 2, .cancel: 3, .interrupt: 4][rhs.kind] ?? 0
+                if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+                return lhs.updatedAt < rhs.updatedAt
+            }!
+        }
+        for snapshot in try await sessionSnapshots() where [.preparing, .running, .waiting, .interrupted].contains(snapshot.state) {
             guard let session = sessions[snapshot.sessionID],
                   let run = try await store.latestRun(sessionID: snapshot.sessionID),
                   let agent = agents[snapshot.sessionID]
@@ -157,10 +221,20 @@ public actor RepoPromptHeadlessAuthority {
             let existing = transitionByRun[run.runID]
             let processWasActive = await providerAdapter?.hasActiveRun(run.runID) == true
 
-            if existing?.kind == .cancel, processWasActive {
+            if existing?.kind == .cancel || existing?.kind == .interrupt || existing?.state == .reconciliationRequired, processWasActive {
                 try? await providerAdapter?.cancel(runID: run.runID)
             }
             let processRemainsActive = await providerAdapter?.hasActiveRun(run.runID) == true
+            if existing?.state == .reconciliationRequired,
+               processRemainsActive,
+               existing?.kind != .cancel,
+               existing?.kind != .interrupt
+            {
+                // The exact provider family is still live but its outcome is
+                // ambiguous. Keep the durable transition actionable instead of
+                // manufacturing success or holding readiness permanently false.
+                continue
+            }
             if existing?.kind == .cancel, processRemainsActive {
                 let cursor = try await store.nextCursor()
                 let nextSession = try await replacingCursor(
@@ -217,6 +291,7 @@ public actor RepoPromptHeadlessAuthority {
                     sessionCorrelationID: ids.next(),
                     agentCorrelationID: ids.next()
                 ))
+                await hooks.afterRunTransitionCommitBeforeMemoryApply(committed.transition)
                 await session.applyCommitted(committed.session, binding: binding, terminal: false)
                 agents[snapshot.sessionID] = committed.agent
                 continue
@@ -351,6 +426,7 @@ public actor RepoPromptHeadlessAuthority {
             agentCorrelationID: ids.next(),
             semanticTerminalState: terminalCode
         ))
+        await hooks.afterRunTransitionCommitBeforeMemoryApply(committed.transition)
         await session.applyCommitted(committed.session, binding: terminalCode == nil ? binding : nil, terminal: terminalCode != nil)
         agents[snapshot.sessionID] = committed.agent
     }
@@ -1578,8 +1654,27 @@ public actor RepoPromptHeadlessAuthority {
         case let .steerSession(text, targetTurnEpoch):
             return try await steerProviderRun(command: command, sessionID: sessionID, session: session, text: text, targetTurnEpoch: targetTurnEpoch, actor: externalActor, idempotency: idempotency)
         case let .archiveSession(expectedRevision):
-            try await session.archive(expectedRevision: expectedRevision)
-            eventType = .sessionArchived
+            let proposed = try await session.proposeArchive(expectedRevision: expectedRevision)
+            let cursor = try await store.nextCursor()
+            let persisted = replacingCursor(proposed, cursor: cursor)
+            let receipt = CommandReceipt(
+                commandID: ids.next(),
+                sessionID: sessionID,
+                operation: command.operation,
+                acceptedCursor: cursor,
+                status: "accepted"
+            )
+            _ = try await store.persistSession(
+                persisted,
+                eventType: .sessionArchived,
+                actor: externalActor,
+                correlationID: ids.next(),
+                idempotency: idempotency,
+                idempotencyResponse: JSONEncoder.serviceEncoder.encode(receipt)
+            )
+            await hooks.afterSessionCommitBeforeMemoryApply(command.operation, sessionID)
+            await session.applyCommitted(persisted, binding: nil, terminal: true)
+            return receipt
         case let .answerInteraction(interactionID, expectedRevision, payload):
             _ = try await answerInteraction(sessionID: sessionID, interactionID: interactionID, expectedRevision: expectedRevision, payload: payload, actor: externalActor, idempotencyKey: idempotencyKey, requestDigest: requestDigest)
             return try await commandReceipt(command: command, sessionID: sessionID)
@@ -3237,6 +3332,13 @@ public actor RepoPromptHeadlessAuthority {
         return state
     }
 
+    @_spi(Testing) public func inMemorySessionSnapshot(sessionID: UUID) async throws -> SessionSnapshot {
+        guard let session = sessions[sessionID] else {
+            throw ServiceAPIError(code: .notFound, message: "Session not found")
+        }
+        return await session.snapshot()
+    }
+
     public func sessionSnapshot(sessionID: UUID) async throws -> SessionSnapshot {
         guard sessions[sessionID] != nil,
               let persisted = try await store.sessionWithInteractions(id: sessionID)
@@ -3280,10 +3382,13 @@ public actor RepoPromptHeadlessAuthority {
         return EventPage(storeID: page.storeID, events: filtered, nextCursor: page.nextCursor, replayFloor: page.replayFloor)
     }
 
-    public func subscribe(after cursor: ServiceCursor?) async throws -> AsyncThrowingStream<EventEnvelope, Error> {
+    public func subscribe(
+        consumer: ServiceEventConsumerKind,
+        after cursor: ServiceCursor?
+    ) async throws -> AsyncThrowingStream<EventEnvelope, Error> {
         // Register first so publications racing the durable replay are buffered, then
         // deduplicate anything present in both the transaction log and live stream.
-        let live = await eventHub.subscribe(after: cursor)
+        let live = await eventHub.subscribe(consumer: consumer, after: cursor)
         let firstReplayPage = try await store.events(after: cursor, limit: 1000)
         let replayCeiling = try await store.nextCursor().globalSequence - 1
         return AsyncThrowingStream(bufferingPolicy: .bufferingOldest(1024)) { continuation in
@@ -3816,7 +3921,7 @@ public actor RepoPromptHeadlessAuthority {
             sessionID: sessionID,
             operation: command.operation,
             acceptedCursor: acceptedCursor,
-            status: "accepted"
+            status: "pending"
         )
         let transitionNow = clock.now()
         let transition = AuthorityTransitionSnapshot(
@@ -3901,69 +4006,32 @@ public actor RepoPromptHeadlessAuthority {
                 status: receipt.status
             )
         }
+        await hooks.afterRunTransitionCommitBeforeMemoryApply(preparedCommit.transition)
         await session.applyCommitted(preparedCommit.session, binding: binding, terminal: false)
         agents[sessionID] = preparedCommit.agent
         await providerAdapter.prepareRun(kind: executionProvider, runID: binding.runID)
-        let runningCursor = try await store.nextCursor()
-        let runningSession = replacingCursor(proposal.runningSnapshot, cursor: runningCursor)
-        let runningAgent = AgentSnapshot(
-            agentID: preparedAgent.agentID,
-            sessionID: preparedAgent.sessionID,
-            rootSessionID: preparedAgent.rootSessionID,
-            parentAgentID: preparedAgent.parentAgentID,
-            providerNativeIdentity: preparedAgent.providerNativeIdentity,
-            role: preparedAgent.role,
-            label: preparedAgent.label,
-            state: .running,
-            revision: preparedAgent.revision + 1
-        )
-        let run = ProviderRunSnapshot(
-            runID: reservedRun.runID,
-            sessionID: reservedRun.sessionID,
-            provider: reservedRun.provider,
-            providerSessionID: reservedRun.providerSessionID,
-            state: "running",
-            generation: reservedRun.generation,
-            turnEpoch: reservedRun.turnEpoch,
-            startReason: reservedRun.startReason,
-            startedAt: reservedRun.startedAt
-        )
-        let finalizedStart = transition.replacing(
-            state: .finalized,
-            sideEffectEvidenceJSON: try? JSONEncoder.serviceEncoder.encode(["providerReserved": true]),
-            updatedAt: clock.now(),
-            finalizedAt: clock.now()
-        )
-        let finalizedCommit = try await store.commitRunTransition(.init(
-            transition: finalizedStart,
-            session: runningSession,
-            agent: runningAgent,
-            run: run,
-            presentation: presentation,
-            sessionEventType: .sessionUpdated,
-            agentEventType: .agentUpdated,
-            actor: actor,
-            sessionCorrelationID: ids.next(),
-            agentCorrelationID: ids.next()
-        ))
-        await session.applyCommitted(finalizedCommit.session, binding: binding, terminal: false)
-        agents[sessionID] = finalizedCommit.agent
         let prompt = acceptedSubmission?.providerInput.prompt
             ?? providerPrompt
             ?? snapshot.transcript.last(where: { $0.kind == .human })?.content
             ?? "Continue the repository task."
+        let launchLatch = ProviderLaunchReceiptLatch()
         providerTasks[binding.runID] = Task {
             await self.performProviderRun(
                 sessionID: sessionID,
                 binding: binding,
-                run: finalizedCommit.run,
+                run: preparedCommit.run,
                 prompt: prompt,
                 executionLocation: executionLocation,
                 permissions: permissions,
-                acceptedSubmission: acceptedSubmission
+                acceptedSubmission: acceptedSubmission,
+                launchTransition: transition,
+                launchReceipt: receipt,
+                launchActor: actor,
+                launchIdempotency: idempotency,
+                launchLatch: launchLatch
             )
         }
-        return receipt
+        return try await launchLatch.wait()
     }
 
     private enum CollaborationOperationClass {
@@ -4209,6 +4277,7 @@ public actor RepoPromptHeadlessAuthority {
                 status: receipt.status
             )
         }
+        await hooks.afterRunTransitionCommitBeforeMemoryApply(preparedCommit.transition)
         await session.applyCommitted(preparedCommit.session, binding: binding, terminal: false)
         agents[sessionID] = preparedCommit.agent
 
@@ -4267,6 +4336,7 @@ public actor RepoPromptHeadlessAuthority {
                 sessionCorrelationID: ids.next(),
                 agentCorrelationID: ids.next()
             ))
+            await hooks.afterRunTransitionCommitBeforeMemoryApply(reconcilingCommit.transition)
             await session.applyCommitted(reconcilingCommit.session, binding: binding, terminal: false)
             agents[sessionID] = reconcilingCommit.agent
             throw ServiceAPIError(
@@ -4324,6 +4394,7 @@ public actor RepoPromptHeadlessAuthority {
             agentCorrelationID: ids.next(),
             semanticTerminalState: terminalLifecycle.rawValue
         ))
+        await hooks.afterRunTransitionCommitBeforeMemoryApply(finalizedCommit.transition)
         await session.applyCommitted(finalizedCommit.session, binding: nil, terminal: true)
         agents[sessionID] = finalizedCommit.agent
         return receipt
@@ -4401,8 +4472,116 @@ public actor RepoPromptHeadlessAuthority {
         }
     }
 
-    private func performProviderRun(sessionID: UUID, binding: RunBindingIdentity, run: ProviderRunSnapshot, prompt: String, executionLocation: ProviderExecutionLocation, permissions: ExecutionPermissionSnapshot, acceptedSubmission: AcceptedAgentSubmission? = nil) async {
-        guard let providerAdapter, let session = sessions[sessionID] else { return }
+    private func acknowledgeProviderLaunch(
+        sessionID: UUID,
+        session: SessionAuthority,
+        binding: RunBindingIdentity,
+        reservedRun: ProviderRunSnapshot,
+        transition: AuthorityTransitionSnapshot,
+        presentation: RunPresentationSnapshot,
+        actor: ExternalActor,
+        idempotency: IdempotencyInput,
+        pendingReceipt: CommandReceipt
+    ) async throws -> CommandReceipt {
+        let current = await session.snapshot()
+        let runningCursor = try await store.nextCursor()
+        let runningSession = replacingCursor(
+            current.replacing(state: .running, revision: current.revision + 1),
+            cursor: runningCursor
+        )
+        let preparedAgent = agents[sessionID] ?? AgentSnapshot(
+            agentID: sessionID,
+            sessionID: sessionID,
+            rootSessionID: current.rootSessionID,
+            parentAgentID: current.parentSessionID,
+            role: current.parentSessionID == nil ? "root" : "child",
+            state: .preparing,
+            revision: 0
+        )
+        let runningAgent = AgentSnapshot(
+            agentID: preparedAgent.agentID,
+            sessionID: preparedAgent.sessionID,
+            rootSessionID: preparedAgent.rootSessionID,
+            parentAgentID: preparedAgent.parentAgentID,
+            providerNativeIdentity: preparedAgent.providerNativeIdentity,
+            role: preparedAgent.role,
+            label: preparedAgent.label,
+            state: .running,
+            revision: preparedAgent.revision + 1
+        )
+        let runningRun = ProviderRunSnapshot(
+            runID: reservedRun.runID,
+            sessionID: reservedRun.sessionID,
+            provider: reservedRun.provider,
+            providerSessionID: reservedRun.providerSessionID,
+            state: "running",
+            generation: reservedRun.generation,
+            turnEpoch: reservedRun.turnEpoch,
+            startReason: reservedRun.startReason,
+            startedAt: reservedRun.startedAt
+        )
+        let acceptedReceipt = CommandReceipt(
+            commandID: pendingReceipt.commandID,
+            sessionID: pendingReceipt.sessionID,
+            operation: pendingReceipt.operation,
+            acceptedCursor: runningCursor,
+            status: "accepted"
+        )
+        let now = clock.now()
+        let finalizedStart = transition.replacing(
+            state: .finalized,
+            sideEffectEvidenceJSON: try? JSONEncoder.serviceEncoder.encode([
+                "providerLaunchAcknowledged": "true",
+                "runID": binding.runID.uuidString.lowercased()
+            ]),
+            updatedAt: now,
+            finalizedAt: now
+        )
+        let finalizedCommit = try await store.commitRunTransition(.init(
+            transition: finalizedStart,
+            session: runningSession,
+            agent: runningAgent,
+            run: runningRun,
+            presentation: presentation,
+            sessionEventType: .sessionUpdated,
+            agentEventType: .agentUpdated,
+            actor: actor,
+            sessionCorrelationID: ids.next(),
+            agentCorrelationID: ids.next(),
+            idempotency: idempotency,
+            idempotencyResponse: JSONEncoder.serviceEncoder.encode(acceptedReceipt)
+        ))
+        let committedReceipt = CommandReceipt(
+            commandID: acceptedReceipt.commandID,
+            sessionID: acceptedReceipt.sessionID,
+            operation: acceptedReceipt.operation,
+            acceptedCursor: finalizedCommit.events.first?.cursor ?? acceptedReceipt.acceptedCursor,
+            status: acceptedReceipt.status
+        )
+        await hooks.afterRunTransitionCommitBeforeMemoryApply(finalizedCommit.transition)
+        await session.applyCommitted(finalizedCommit.session, binding: binding, terminal: false)
+        agents[sessionID] = finalizedCommit.agent
+        return committedReceipt
+    }
+
+    private func performProviderRun(
+        sessionID: UUID,
+        binding: RunBindingIdentity,
+        run: ProviderRunSnapshot,
+        prompt: String,
+        executionLocation: ProviderExecutionLocation,
+        permissions: ExecutionPermissionSnapshot,
+        acceptedSubmission: AcceptedAgentSubmission? = nil,
+        launchTransition: AuthorityTransitionSnapshot,
+        launchReceipt: CommandReceipt,
+        launchActor: ExternalActor,
+        launchIdempotency: IdempotencyInput,
+        launchLatch: ProviderLaunchReceiptLatch
+    ) async {
+        guard let providerAdapter, let session = sessions[sessionID] else {
+            await launchLatch.fail(ServiceAPIError(code: .dependencyUnavailable, message: "Provider runtime is not configured"))
+            return
+        }
         defer {
             providerTasks[binding.runID] = nil
             providerToolInvocations[binding.runID] = nil
@@ -4455,7 +4634,32 @@ public actor RepoPromptHeadlessAuthority {
                     resumeProviderSessionID: run.providerSessionID,
                     resumeFallbackPrompt: resumeFallbackPrompt,
                     policy: .init(mode: executionMode, writableRoots: executionMode == .workspaceWrite ? executionLocation.writableRoots : [], providerSettings: providerSettings),
-                    launchValidation: { try executionLocation.validateLaunch() }
+                    launchValidation: { try executionLocation.validateLaunch() },
+                    launchAcknowledgement: {
+                        await launchLatch.observeSideEffect()
+                        do {
+                            guard let launchPresentation = try await self.store.runPresentation(sessionID: sessionID) else {
+                                throw ServiceAPIError(code: .persistenceUnavailable, message: "Reserved provider run presentation is missing")
+                            }
+                            let receipt = try await self.acknowledgeProviderLaunch(
+                                sessionID: sessionID,
+                                session: session,
+                                binding: binding,
+                                reservedRun: run,
+                                transition: launchTransition,
+                                presentation: launchPresentation,
+                                actor: launchActor,
+                                idempotency: launchIdempotency,
+                                pendingReceipt: launchReceipt
+                            )
+                            await launchLatch.succeed(receipt)
+                        } catch {
+                            // The provider side effect is already observable. Let
+                            // the outer lifecycle handler persist reconciliation
+                            // before releasing the start caller.
+                            throw error
+                        }
+                    }
                 )
             ) { event in
                 let normalizedEvent = Self.unframedProviderEvent(event)
@@ -4526,7 +4730,9 @@ public actor RepoPromptHeadlessAuthority {
                 terminalCode: "completed"
             )
         } catch {
-            if error is CancellationError { return }
+            let launchAcknowledged = await launchLatch.acknowledged
+            let launchSideEffectObserved = await launchLatch.sideEffectObserved
+            if error is CancellationError, launchAcknowledged { return }
             let currentContext = try? await providerFrameContext(
                 sessionID: sessionID,
                 expectedBinding: binding
@@ -4535,24 +4741,65 @@ public actor RepoPromptHeadlessAuthority {
             let recoveryRun = currentContext?.1 ?? run
             let observedProviderFrame = await eventState.hasObservedFrame()
             let providerStillActive = await providerAdapter.hasActiveRun(binding.runID)
+            if !launchAcknowledged {
+                if launchSideEffectObserved || observedProviderFrame || providerStillActive {
+                    try? await markProviderRunReconciliationRequired(
+                        sessionID: sessionID,
+                        binding: recoveryBinding,
+                        run: recoveryRun,
+                        diagnosticCode: "provider_launch_ack_ambiguous",
+                        existingTransition: launchTransition
+                    )
+                    await launchLatch.fail(ServiceAPIError(
+                        code: .operationReconciling,
+                        message: "Provider launch outcome requires durable reconciliation",
+                        retryable: false
+                    ))
+                } else {
+                    try? await finalizeProviderLaunchFailure(
+                        sessionID: sessionID,
+                        binding: recoveryBinding,
+                        run: recoveryRun,
+                        transition: launchTransition,
+                        actor: launchActor,
+                        idempotency: launchIdempotency,
+                        pendingReceipt: launchReceipt
+                    )
+                    await launchLatch.fail(ServiceAPIError(
+                        code: .providerUnavailable,
+                        message: "Provider failed before launch acknowledgement",
+                        retryable: false
+                    ))
+                }
+                return
+            }
             if observedProviderFrame || providerStillActive {
                 try? await markProviderRunReconciliationRequired(sessionID: sessionID, binding: recoveryBinding, run: recoveryRun, diagnosticCode: "provider_outcome_ambiguous")
                 return
             }
             try? await recordSemanticActivity(runID: recoveryRun.runID, channel: "conclusion", kind: .error, content: "The provider run failed to launch or complete.", status: "provider_error", replace: true)
-            try? await finalizeProviderRun(
-                sessionID: sessionID,
-                binding: recoveryBinding,
-                run: recoveryRun,
-                providerSessionID: recoveryRun.providerSessionID,
-                lifecycle: .failed,
-                transitionKind: .fail,
-                runState: "failed",
-                endReason: "provider-error",
-                eventType: .sessionFailed,
-                agentEventType: .agentFailed,
-                terminalCode: "provider_error"
-            )
+            do {
+                try await finalizeProviderRun(
+                    sessionID: sessionID,
+                    binding: recoveryBinding,
+                    run: recoveryRun,
+                    providerSessionID: recoveryRun.providerSessionID,
+                    lifecycle: .failed,
+                    transitionKind: .fail,
+                    runState: "failed",
+                    endReason: "provider-error",
+                    eventType: .sessionFailed,
+                    agentEventType: .agentFailed,
+                    terminalCode: "provider_error"
+                )
+            } catch {
+                try? await markProviderRunReconciliationRequired(
+                    sessionID: sessionID,
+                    binding: recoveryBinding,
+                    run: recoveryRun,
+                    diagnosticCode: "provider_failure_finalization_ambiguous"
+                )
+            }
         }
     }
 
@@ -4575,17 +4822,159 @@ public actor RepoPromptHeadlessAuthority {
         return (binding, run)
     }
 
-    private func markProviderRunReconciliationRequired(sessionID: UUID, binding: RunBindingIdentity, run: ProviderRunSnapshot, diagnosticCode: String) async throws {
-        guard let session = sessions[sessionID], let currentAgent = agents[sessionID], let presentation = try await store.runPresentation(sessionID: sessionID) else { return }
+    private func markProviderRunReconciliationRequired(
+        sessionID: UUID,
+        binding: RunBindingIdentity,
+        run: ProviderRunSnapshot,
+        diagnosticCode: String,
+        existingTransition: AuthorityTransitionSnapshot? = nil
+    ) async throws {
+        guard let session = sessions[sessionID],
+              let currentAgent = agents[sessionID],
+              let presentation = try await store.runPresentation(sessionID: sessionID)
+        else { return }
         let currentSession = await session.snapshot()
         let cursor = try await store.nextCursor()
-        let reconcilingSession = try await replacingCursor(session.proposeLifecycle(binding: binding, state: .interrupted), cursor: cursor)
-        let reconcilingAgent = AgentSnapshot(agentID: currentAgent.agentID, sessionID: currentAgent.sessionID, rootSessionID: currentAgent.rootSessionID, parentAgentID: currentAgent.parentAgentID, providerNativeIdentity: currentAgent.providerNativeIdentity, role: currentAgent.role, label: currentAgent.label, state: .interrupted, revision: currentAgent.revision + 1)
-        let reconcilingRun = ProviderRunSnapshot(runID: run.runID, sessionID: run.sessionID, provider: run.provider, providerSessionID: run.providerSessionID, state: "reconciliationRequired", generation: run.generation, turnEpoch: binding.turnEpoch, startReason: run.startReason, endReason: diagnosticCode, startedAt: run.startedAt)
+        let reconcilingSession = try await replacingCursor(
+            session.proposeLifecycle(binding: binding, state: .interrupted),
+            cursor: cursor
+        )
+        let reconcilingAgent = AgentSnapshot(
+            agentID: currentAgent.agentID,
+            sessionID: currentAgent.sessionID,
+            rootSessionID: currentAgent.rootSessionID,
+            parentAgentID: currentAgent.parentAgentID,
+            providerNativeIdentity: currentAgent.providerNativeIdentity,
+            role: currentAgent.role,
+            label: currentAgent.label,
+            state: .interrupted,
+            revision: currentAgent.revision + 1
+        )
+        let reconcilingRun = ProviderRunSnapshot(
+            runID: run.runID,
+            sessionID: run.sessionID,
+            provider: run.provider,
+            providerSessionID: run.providerSessionID,
+            state: "reconciliationRequired",
+            generation: run.generation,
+            turnEpoch: binding.turnEpoch,
+            startReason: run.startReason,
+            endReason: diagnosticCode,
+            startedAt: run.startedAt
+        )
         let now = clock.now()
-        let transition = AuthorityTransitionSnapshot(transitionID: ids.next(), actorID: "provider:\(run.runID.uuidString.lowercased())", operation: "providerReconcile", idempotencyKey: "\(run.runID.uuidString.lowercased()):\(binding.generation):\(binding.turnEpoch):reconcile", requestDigest: PortableContentDigest.sha256Hex(Data("\(run.runID.uuidString):\(diagnosticCode)".utf8)), kind: .fail, sessionID: sessionID, runID: run.runID, expectedSessionRevision: currentSession.revision, expectedGeneration: binding.generation, expectedTurnEpoch: binding.turnEpoch, state: .reconciliationRequired, diagnosticCode: diagnosticCode, createdAt: now, updatedAt: now)
-        let committed = try await store.commitRunTransition(.init(transition: transition, session: reconcilingSession, agent: reconcilingAgent, run: reconcilingRun, presentation: presentation, sessionEventType: .sessionUpdated, agentEventType: .agentUpdated, actor: nil, sessionCorrelationID: ids.next(), agentCorrelationID: ids.next()))
+        let transition = existingTransition?.replacing(
+            state: .reconciliationRequired,
+            diagnosticCode: diagnosticCode,
+            updatedAt: now
+        ) ?? AuthorityTransitionSnapshot(
+            transitionID: ids.next(),
+            actorID: "provider:\(run.runID.uuidString.lowercased())",
+            operation: "providerReconcile",
+            idempotencyKey: "\(run.runID.uuidString.lowercased()):\(binding.generation):\(binding.turnEpoch):reconcile",
+            requestDigest: PortableContentDigest.sha256Hex(Data("\(run.runID.uuidString):\(diagnosticCode)".utf8)),
+            kind: .fail,
+            sessionID: sessionID,
+            runID: run.runID,
+            expectedSessionRevision: currentSession.revision,
+            expectedGeneration: binding.generation,
+            expectedTurnEpoch: binding.turnEpoch,
+            state: .reconciliationRequired,
+            diagnosticCode: diagnosticCode,
+            createdAt: now,
+            updatedAt: now
+        )
+        let committed = try await store.commitRunTransition(.init(
+            transition: transition,
+            session: reconcilingSession,
+            agent: reconcilingAgent,
+            run: reconcilingRun,
+            presentation: presentation,
+            sessionEventType: .sessionUpdated,
+            agentEventType: .agentUpdated,
+            actor: nil,
+            sessionCorrelationID: ids.next(),
+            agentCorrelationID: ids.next()
+        ))
+        await hooks.afterRunTransitionCommitBeforeMemoryApply(committed.transition)
         await session.applyCommitted(committed.session, binding: binding, terminal: false)
+        agents[sessionID] = committed.agent
+    }
+
+    private func finalizeProviderLaunchFailure(
+        sessionID: UUID,
+        binding: RunBindingIdentity,
+        run: ProviderRunSnapshot,
+        transition: AuthorityTransitionSnapshot,
+        actor: ExternalActor,
+        idempotency: IdempotencyInput,
+        pendingReceipt: CommandReceipt
+    ) async throws {
+        guard let session = sessions[sessionID],
+              let currentAgent = agents[sessionID],
+              let presentation = try await store.runPresentation(sessionID: sessionID)
+        else { return }
+        let cursor = try await store.nextCursor()
+        let failedSession = try await replacingCursor(
+            session.proposeLifecycle(binding: binding, state: .failed),
+            cursor: cursor
+        )
+        let failedAgent = AgentSnapshot(
+            agentID: currentAgent.agentID,
+            sessionID: currentAgent.sessionID,
+            rootSessionID: currentAgent.rootSessionID,
+            parentAgentID: currentAgent.parentAgentID,
+            providerNativeIdentity: currentAgent.providerNativeIdentity,
+            role: currentAgent.role,
+            label: currentAgent.label,
+            state: .failed,
+            revision: currentAgent.revision + 1
+        )
+        let failedRun = ProviderRunSnapshot(
+            runID: run.runID,
+            sessionID: run.sessionID,
+            provider: run.provider,
+            providerSessionID: run.providerSessionID,
+            state: "failed",
+            generation: run.generation,
+            turnEpoch: run.turnEpoch,
+            startReason: run.startReason,
+            endReason: "launch-not-acknowledged",
+            startedAt: run.startedAt,
+            endedAt: clock.now()
+        )
+        let failedReceipt = CommandReceipt(
+            commandID: pendingReceipt.commandID,
+            sessionID: pendingReceipt.sessionID,
+            operation: pendingReceipt.operation,
+            acceptedCursor: cursor,
+            status: "failed"
+        )
+        let now = clock.now()
+        let finalized = transition.replacing(
+            state: .finalized,
+            sideEffectEvidenceJSON: try? JSONEncoder.serviceEncoder.encode(["providerLaunchAcknowledged": false]),
+            diagnosticCode: "provider_launch_failed_before_ack",
+            updatedAt: now,
+            finalizedAt: now
+        )
+        let committed = try await store.commitRunTransition(.init(
+            transition: finalized,
+            session: failedSession,
+            agent: failedAgent,
+            run: failedRun,
+            presentation: presentation.settling(code: "provider_launch_failed", at: now),
+            sessionEventType: .sessionFailed,
+            agentEventType: .agentFailed,
+            actor: actor,
+            sessionCorrelationID: ids.next(),
+            agentCorrelationID: ids.next(),
+            idempotency: idempotency,
+            idempotencyResponse: JSONEncoder.serviceEncoder.encode(failedReceipt),
+            semanticTerminalState: "failed"
+        ))
+        await hooks.afterRunTransitionCommitBeforeMemoryApply(committed.transition)
+        await session.applyCommitted(committed.session, binding: nil, terminal: true)
         agents[sessionID] = committed.agent
     }
 
@@ -4683,6 +5072,7 @@ public actor RepoPromptHeadlessAuthority {
             // durable result. Provider completion evidence cannot overturn it.
             return
         }
+        await hooks.afterRunTransitionCommitBeforeMemoryApply(committed.transition)
         await session.applyCommitted(committed.session, binding: nil, terminal: true)
         agents[sessionID] = committed.agent
     }

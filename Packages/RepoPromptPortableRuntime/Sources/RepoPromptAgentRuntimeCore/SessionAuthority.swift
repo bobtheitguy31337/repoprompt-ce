@@ -297,10 +297,10 @@ public actor SessionAuthority {
         return state.gate?.binding
     }
 
-    public func archive(expectedRevision: Int64) throws {
+    public func proposeArchive(expectedRevision: Int64) throws -> SessionSnapshot {
         guard state.activeRunID == nil else { throw ServiceAPIError(code: .runAlreadyActive, message: "An active session cannot be archived") }
         guard expectedRevision == state.snapshot.revision else { throw ServiceAPIError(code: .staleRevision, message: "Session revision is stale", currentRevision: state.snapshot.revision) }
-        replaceSnapshot(state: .archived)
+        return state.snapshot.replacing(state: .archived, revision: state.snapshot.revision + 1)
     }
 
     public func proposeInactiveLifecycle(_ lifecycle: SessionLifecycleState) throws -> SessionSnapshot {
