@@ -34,6 +34,19 @@ public struct PersistedProcessFamily: Codable, Hashable, Sendable {
     public let state: String
 }
 
+struct EventRetentionObservation: Sendable, Equatable {
+    var candidateQueryCount = 0
+    var archiveMutationCount = 0
+    var maximumScannedRows = 0
+    var totalScannedRows = 0
+    var maximumScannedEnvelopeBytes = 0
+    var totalScannedEnvelopeBytes = 0
+    var maximumMaterializedRows = 0
+    var totalMaterializedRows = 0
+    var maximumMaterializedEnvelopeBytes = 0
+    var totalMaterializedEnvelopeBytes = 0
+}
+
 public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     public typealias Metadata = AuthorityStoreMetadata
 
@@ -47,6 +60,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     let storagePath: String?
     private var closed = false
     private var faultInjectionEnabled = false
+    private var eventRetentionObservation = EventRetentionObservation()
 
     /// Closed admission vocabulary for every store-owned transaction. The
     /// transaction body remains a private implementation detail of this actor;
@@ -1498,43 +1512,315 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         _ = try await database.query("PRAGMA wal_checkpoint(TRUNCATE)", operationClass: .control)
     }
 
-    public func enforceEventRetention(policy: EventRetentionPolicy = .init(), now: Date = Date()) async throws -> UUID? {
-        let meta = try await metadata()
-        let latest = meta.nextGlobalSequence - 1
-        let ageBoundary = now.addingTimeInterval(-policy.minimumLiveAge).timeIntervalSince1970
-        let rows = try await database.query(
-            "SELECT global_sequence,timestamp FROM events WHERE global_sequence>? ORDER BY global_sequence",
-            [.integer(Int(meta.replayFloor))]
-        )
-        var ageEligibleThrough = meta.replayFloor
-        for row in rows {
-            guard (row.column("timestamp")?.double ?? .greatestFiniteMagnitude) < ageBoundary else { break }
-            ageEligibleThrough = Int64(row.column("global_sequence")?.integer ?? Int(ageEligibleThrough))
-        }
-        guard let through = policy.eligibleThrough(latestSequence: latest, ageEligibleThrough: ageEligibleThrough, replayFloor: meta.replayFloor) else { return nil }
-        return try await archiveEvents(through: through)
+    private struct EventArchiveCandidate: Sendable {
+        let globalSequence: Int64
+        let timestampBitPattern: UInt64
+        let envelopeBytes: Int
     }
 
-    func archiveEvents(through sequence: Int64) async throws -> UUID? {
-        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
-            let meta = try await metadata()
-            let bounded = min(sequence, meta.nextGlobalSequence - 1)
-            guard bounded > meta.replayFloor else { return nil }
-            let rows = try await database.query(
-                "SELECT envelope_json FROM events WHERE global_sequence>? AND global_sequence<=? ORDER BY global_sequence",
-                [.integer(Int(meta.replayFloor)), .integer(Int(bounded))]
-            )
-            let events = try rows.compactMap { row -> EventEnvelope? in
-                guard let text = row.column("envelope_json")?.string else { return nil }
-                return try decoder.decode(EventEnvelope.self, from: Data(text.utf8))
+    private struct EventArchiveBatchPlan: Sendable {
+        let storeID: UUID
+        let replayFloor: Int64
+        let nextGlobalSequence: Int64
+        let candidates: [EventArchiveCandidate]
+        let rawEnvelopeBytes: Int
+
+        var throughSequence: Int64 { candidates.last?.globalSequence ?? replayFloor }
+    }
+
+    private enum EventArchivePlanError: Error {
+        case stale
+    }
+
+    public func enforceEventRetention(policy: EventRetentionPolicy = .init(), now: Date = Date()) async throws -> UUID? {
+        let ageBoundary = now.addingTimeInterval(-policy.minimumLiveAge).timeIntervalSince1970
+        while true {
+            try Task.checkCancellation()
+            let meta = try await eventArchiveMetadata()
+            let latest = meta.nextGlobalSequence - 1
+            let (countEligibleThrough, underflow) = latest.subtractingReportingOverflow(policy.minimumLiveEventCount)
+            guard !underflow, countEligibleThrough > meta.replayFloor else { return nil }
+            guard let plan = try await eventArchivePlan(
+                metadata: meta,
+                through: countEligibleThrough,
+                ageBoundary: ageBoundary,
+                maximumBatch: policy.maximumArchiveBatch
+            ) else { return nil }
+            do {
+                return try await archiveEvents(plan: plan)
+            } catch EventArchivePlanError.stale {
+                continue
             }
-            guard let first = events.first, let last = events.last,
-                  first.globalSequence == meta.replayFloor + 1,
-                  last.globalSequence == bounded,
-                  events.enumerated().allSatisfy({ $0.element.globalSequence == first.globalSequence + Int64($0.offset) })
-            else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Event archive prefix is not contiguous") }
+        }
+    }
+
+    func archiveEvents(
+        through sequence: Int64,
+        maximumBatch: Int = SQLiteDatabaseExecutor.maximumBulkRows
+    ) async throws -> UUID? {
+        while true {
+            try Task.checkCancellation()
+            let meta = try await eventArchiveMetadata()
+            guard let plan = try await eventArchivePlan(
+                metadata: meta,
+                through: sequence,
+                ageBoundary: nil,
+                maximumBatch: maximumBatch
+            ) else { return nil }
+            do {
+                return try await archiveEvents(plan: plan)
+            } catch EventArchivePlanError.stale {
+                continue
+            }
+        }
+    }
+
+    func eventRetentionObservationForTesting() -> EventRetentionObservation {
+        eventRetentionObservation
+    }
+
+    private func eventArchiveMetadata() async throws -> (storeID: UUID, nextGlobalSequence: Int64, replayFloor: Int64) {
+        let row = try await requireRow(database.query(
+            "SELECT store_id,next_global_sequence,replay_floor FROM service_metadata WHERE fixed_id=1",
+            operationClass: .bulk,
+            estimatedEncodedBytes: 3 * MemoryLayout<UInt64>.size
+        ))
+        return (
+            try requireUUID(row.column("store_id")?.string),
+            Int64(row.column("next_global_sequence")?.integer ?? 1),
+            Int64(row.column("replay_floor")?.integer ?? 0)
+        )
+    }
+
+    private func eventArchivePlan(
+        metadata: (storeID: UUID, nextGlobalSequence: Int64, replayFloor: Int64),
+        through requestedSequence: Int64,
+        ageBoundary: Double?,
+        maximumBatch: Int
+    ) async throws -> EventArchiveBatchPlan? {
+        let latest = metadata.nextGlobalSequence - 1
+        let bounded = min(requestedSequence, latest)
+        guard bounded > metadata.replayFloor else { return nil }
+        guard maximumBatch > 0 else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "Event archive batch limit must be positive",
+                retryable: false
+            )
+        }
+        let rowLimit = min(maximumBatch, SQLiteDatabaseExecutor.maximumBulkRows)
+        let rows = try await database.query(
+            "SELECT global_sequence,timestamp,LENGTH(CAST(envelope_json AS BLOB)) AS envelope_bytes FROM events WHERE global_sequence>? AND global_sequence<=? ORDER BY global_sequence LIMIT ?",
+            [.integer(Int(metadata.replayFloor)), .integer(Int(bounded)), .integer(rowLimit)],
+            operationClass: .bulk,
+            estimatedEncodedBytes: rowLimit * 3 * MemoryLayout<UInt64>.size
+        )
+        let scannedEnvelopeBytes = rows.reduce(into: 0) { total, row in
+            let bytes = max(0, row.column("envelope_bytes")?.integer ?? 0)
+            total = saturatingSum(total, bytes)
+        }
+        eventRetentionObservation.candidateQueryCount = saturatingSum(
+            eventRetentionObservation.candidateQueryCount,
+            1
+        )
+        eventRetentionObservation.maximumScannedRows = max(
+            eventRetentionObservation.maximumScannedRows,
+            rows.count
+        )
+        eventRetentionObservation.totalScannedRows = saturatingSum(
+            eventRetentionObservation.totalScannedRows,
+            rows.count
+        )
+        eventRetentionObservation.maximumScannedEnvelopeBytes = max(
+            eventRetentionObservation.maximumScannedEnvelopeBytes,
+            scannedEnvelopeBytes
+        )
+        eventRetentionObservation.totalScannedEnvelopeBytes = saturatingSum(
+            eventRetentionObservation.totalScannedEnvelopeBytes,
+            scannedEnvelopeBytes
+        )
+        let confirmedMetadata = try await eventArchiveMetadata()
+        guard confirmedMetadata.storeID == metadata.storeID,
+              confirmedMetadata.replayFloor == metadata.replayFloor
+        else { throw EventArchivePlanError.stale }
+
+        var candidates: [EventArchiveCandidate] = []
+        candidates.reserveCapacity(rowLimit)
+        var rawEnvelopeBytes = 0
+        var expectedSequence = metadata.replayFloor + 1
+        for row in rows {
+            try Task.checkCancellation()
+            guard let sequenceValue = row.column("global_sequence")?.integer,
+                  let timestamp = row.column("timestamp")?.double,
+                  timestamp.isFinite,
+                  let envelopeByteCount = row.column("envelope_bytes")?.integer,
+                  envelopeByteCount > 0
+            else {
+                throw ServiceAPIError(
+                    code: .persistenceUnavailable,
+                    message: "Event archive eligibility metadata is invalid",
+                    retryable: false
+                )
+            }
+            let sequence = Int64(sequenceValue)
+            guard sequence == expectedSequence else {
+                throw ServiceAPIError(
+                    code: .persistenceUnavailable,
+                    message: "Event archive prefix is not contiguous",
+                    retryable: false
+                )
+            }
+            guard ageBoundary.map({ timestamp < $0 }) != false else { break }
+            let (nextRawBytes, rawOverflow) = rawEnvelopeBytes.addingReportingOverflow(envelopeByteCount)
+            let (canonicalEstimate, canonicalOverflow) = nextRawBytes.addingReportingOverflow(candidates.count + 2)
+            if rawOverflow || canonicalOverflow
+                || nextRawBytes > SQLiteDatabaseExecutor.maximumBulkEncodedBytes
+                || canonicalEstimate > SQLiteDatabaseExecutor.maximumBulkEncodedBytes
+            {
+                guard !candidates.isEmpty else {
+                    throw ServiceAPIError(
+                        code: .persistenceUnavailable,
+                        message: "Event at sequence \(sequence) exceeds the durable archive batch limit",
+                        retryable: false
+                    )
+                }
+                break
+            }
+            candidates.append(.init(
+                globalSequence: sequence,
+                timestampBitPattern: timestamp.bitPattern,
+                envelopeBytes: envelopeByteCount
+            ))
+            rawEnvelopeBytes = nextRawBytes
+            expectedSequence += 1
+        }
+        guard !candidates.isEmpty else { return nil }
+        return EventArchiveBatchPlan(
+            storeID: metadata.storeID,
+            replayFloor: metadata.replayFloor,
+            nextGlobalSequence: metadata.nextGlobalSequence,
+            candidates: candidates,
+            rawEnvelopeBytes: rawEnvelopeBytes
+        )
+    }
+
+    private func archiveEvents(plan: EventArchiveBatchPlan) async throws -> UUID {
+        let reservation = try eventArchiveReservation(plan: plan)
+        eventRetentionObservation.archiveMutationCount = saturatingSum(
+            eventRetentionObservation.archiveMutationCount,
+            1
+        )
+        return try await transaction(.bulk(estimatedEncodedBytes: reservation)) {
+            let meta = try await eventArchiveMetadata()
+            guard meta.storeID == plan.storeID,
+                  meta.replayFloor == plan.replayFloor,
+                  meta.nextGlobalSequence >= plan.nextGlobalSequence
+            else { throw EventArchivePlanError.stale }
+            let rows = try await database.query(
+                "SELECT global_sequence,timestamp,envelope_json FROM events WHERE global_sequence>? AND global_sequence<=? ORDER BY global_sequence LIMIT ?",
+                [.integer(Int(plan.replayFloor)), .integer(Int(plan.throughSequence)), .integer(plan.candidates.count)],
+                operationClass: .bulk,
+                estimatedEncodedBytes: plan.rawEnvelopeBytes
+                    + plan.candidates.count * 2 * MemoryLayout<UInt64>.size
+            )
+            let materializedBytes = rows.reduce(into: 0) { total, row in
+                total = saturatingSum(total, row.column("envelope_json")?.string?.utf8.count ?? 0)
+            }
+            eventRetentionObservation.maximumMaterializedRows = max(
+                eventRetentionObservation.maximumMaterializedRows,
+                rows.count
+            )
+            eventRetentionObservation.totalMaterializedRows = saturatingSum(
+                eventRetentionObservation.totalMaterializedRows,
+                rows.count
+            )
+            eventRetentionObservation.maximumMaterializedEnvelopeBytes = max(
+                eventRetentionObservation.maximumMaterializedEnvelopeBytes,
+                materializedBytes
+            )
+            eventRetentionObservation.totalMaterializedEnvelopeBytes = saturatingSum(
+                eventRetentionObservation.totalMaterializedEnvelopeBytes,
+                materializedBytes
+            )
+            guard rows.count == plan.candidates.count,
+                  materializedBytes == plan.rawEnvelopeBytes
+            else {
+                throw ServiceAPIError(
+                    code: .persistenceUnavailable,
+                    message: "Event archive batch changed after eligibility planning",
+                    retryable: false
+                )
+            }
+
+            var events: [EventEnvelope] = []
+            events.reserveCapacity(rows.count)
+            for (row, candidate) in zip(rows, plan.candidates) {
+                try Task.checkCancellation()
+                guard Int64(row.column("global_sequence")?.integer ?? -1) == candidate.globalSequence,
+                      row.column("timestamp")?.double?.bitPattern == candidate.timestampBitPattern,
+                      let text = row.column("envelope_json")?.string,
+                      text.utf8.count == candidate.envelopeBytes
+                else {
+                    throw ServiceAPIError(
+                        code: .persistenceUnavailable,
+                        message: "Event archive batch identity changed after eligibility planning",
+                        retryable: false
+                    )
+                }
+                let event = try decoder.decode(EventEnvelope.self, from: Data(text.utf8))
+                guard event.globalSequence == candidate.globalSequence else {
+                    throw ServiceAPIError(
+                        code: .persistenceUnavailable,
+                        message: "Event archive envelope sequence is invalid",
+                        retryable: false
+                    )
+                }
+                events.append(event)
+            }
+
+            var canonicalEntryBytes = 0
+            var archiveCount = 0
+            for event in events {
+                try Task.checkCancellation()
+                let entryBytes = try encoder.encode(event).count
+                let (nextEntryBytes, entryOverflow) = canonicalEntryBytes.addingReportingOverflow(entryBytes)
+                let (arrayBytes, arrayOverflow) = nextEntryBytes.addingReportingOverflow(archiveCount + 2)
+                if entryOverflow || arrayOverflow || arrayBytes > SQLiteDatabaseExecutor.maximumBulkEncodedBytes {
+                    guard archiveCount > 0 else {
+                        throw ServiceAPIError(
+                            code: .persistenceUnavailable,
+                            message: "Event at sequence \(event.globalSequence) exceeds the canonical archive batch limit",
+                            retryable: false
+                        )
+                    }
+                    break
+                }
+                canonicalEntryBytes = nextEntryBytes
+                archiveCount += 1
+            }
+            let archivedEvents = Array(events.prefix(archiveCount))
+            guard let first = archivedEvents.first, let last = archivedEvents.last,
+                  first.globalSequence == plan.replayFloor + 1,
+                  archivedEvents.enumerated().allSatisfy({
+                      $0.element.globalSequence == first.globalSequence + Int64($0.offset)
+                  })
+            else {
+                throw ServiceAPIError(
+                    code: .persistenceUnavailable,
+                    message: "Event archive prefix is not contiguous",
+                    retryable: false
+                )
+            }
+            let bytes = try encoder.encode(archivedEvents)
+            guard bytes.count <= SQLiteDatabaseExecutor.maximumBulkEncodedBytes else {
+                throw ServiceAPIError(
+                    code: .persistenceUnavailable,
+                    message: "Canonical event archive exceeds the durable batch limit",
+                    retryable: false
+                )
+            }
+            try Task.checkCancellation()
             let archiveID = UUID()
-            let bytes = try encoder.encode(events)
             let compressed = EventArchiveCompression.compress(bytes)
             let digest = PersistenceCryptography.bodyDigest(bytes)
             let compressedDigest = PersistenceCryptography.bodyDigest(compressed)
@@ -1549,7 +1835,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 "INSERT INTO event_archive_blobs(archive_id,store_id,first_sequence,last_sequence,event_count,compression,compressed_events_base64,uncompressed_digest,compressed_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 [
                     .text(archiveID.uuidString), .text(meta.storeID.uuidString), .integer(Int(first.globalSequence)),
-                    .integer(Int(last.globalSequence)), .integer(events.count), .text(EventArchiveCompression.algorithm),
+                    .integer(Int(last.globalSequence)), .integer(archivedEvents.count), .text(EventArchiveCompression.algorithm),
                     .text(compressed.base64EncodedString()), .text(digest), .text(compressedDigest),
                     .float(Date().timeIntervalSince1970)
                 ]
@@ -1558,9 +1844,38 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 "DELETE FROM events WHERE global_sequence>=? AND global_sequence<=?",
                 [.integer(Int(first.globalSequence)), .integer(Int(last.globalSequence))]
             )
-            _ = try await database.query("UPDATE service_metadata SET replay_floor=? WHERE fixed_id=1", [.integer(Int(last.globalSequence))])
+            _ = try await database.query(
+                "UPDATE service_metadata SET replay_floor=? WHERE fixed_id=1 AND store_id=? AND replay_floor=?",
+                [.integer(Int(last.globalSequence)), .text(plan.storeID.uuidString), .integer(Int(plan.replayFloor))]
+            )
+            let changed = try await requireRow(database.query("SELECT changes() AS changed"))
+                .column("changed")?.integer
+            guard changed == 1 else { throw EventArchivePlanError.stale }
             return archiveID
         }
+    }
+
+    private func eventArchiveReservation(plan: EventArchiveBatchPlan) throws -> Int {
+        let compressedBound = EventArchiveCompression.maximumCompressedBytes(
+            forInputBytes: SQLiteDatabaseExecutor.maximumBulkEncodedBytes
+        )
+        let checkpointBase64Bound = ((SQLiteDatabaseExecutor.maximumBulkEncodedBytes + 2) / 3) * 4
+        let archiveBase64Bound = ((compressedBound + 2) / 3) * 4
+        return try checkedRetainedByteSum(
+            plan.rawEnvelopeBytes,
+            plan.rawEnvelopeBytes,
+            SQLiteDatabaseExecutor.maximumBulkEncodedBytes,
+            compressedBound,
+            checkpointBase64Bound,
+            archiveBase64Bound,
+            plan.candidates.count * 3 * MemoryLayout<UInt64>.size,
+            4_096
+        )
+    }
+
+    private func saturatingSum(_ lhs: Int, _ rhs: Int) -> Int {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? .max : sum
     }
 
     public func archivedEvents(archiveID: UUID) async throws -> [EventEnvelope] {
