@@ -32,6 +32,7 @@ public protocol WorkspaceCommandRunning: Sendable {
     func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int) async throws -> String
     func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, environment: [String: String]) async throws -> String
     func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, launchValidation: @escaping @Sendable () throws -> Void) async throws -> String
+    func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, launchValidation: @escaping @Sendable () throws -> Void, launchAcknowledgement: @escaping @Sendable () async throws -> Void) async throws -> String
 }
 
 public extension WorkspaceCommandRunning {
@@ -43,24 +44,35 @@ public extension WorkspaceCommandRunning {
         try launchValidation()
         return try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes)
     }
+
+    func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, launchValidation: @escaping @Sendable () throws -> Void, launchAcknowledgement: @escaping @Sendable () async throws -> Void) async throws -> String {
+        try launchValidation()
+        let result = try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes)
+        try await launchAcknowledgement()
+        return result
+    }
 }
 
 public actor LocalWorkspaceCommandRunner: WorkspaceCommandRunning {
     public init() {}
 
     public func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int) async throws -> String {
-        try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes, environment: [:], launchValidation: {})
+        try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes, environment: [:], launchValidation: {}, launchAcknowledgement: {})
     }
 
     public func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, environment: [String: String]) async throws -> String {
-        try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes, environment: environment, launchValidation: {})
+        try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes, environment: environment, launchValidation: {}, launchAcknowledgement: {})
     }
 
     public func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, launchValidation: @escaping @Sendable () throws -> Void) async throws -> String {
-        try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes, environment: [:], launchValidation: launchValidation)
+        try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes, environment: [:], launchValidation: launchValidation, launchAcknowledgement: {})
     }
 
-    private func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, environment: [String: String], launchValidation: @escaping @Sendable () throws -> Void) async throws -> String {
+    public func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, launchValidation: @escaping @Sendable () throws -> Void, launchAcknowledgement: @escaping @Sendable () async throws -> Void) async throws -> String {
+        try await run(executable: executable, arguments: arguments, workingDirectory: workingDirectory, maximumBytes: maximumBytes, environment: [:], launchValidation: launchValidation, launchAcknowledgement: launchAcknowledgement)
+    }
+
+    private func run(executable: String, arguments: [String], workingDirectory: String, maximumBytes: Int, environment: [String: String], launchValidation: @escaping @Sendable () throws -> Void, launchAcknowledgement: @escaping @Sendable () async throws -> Void) async throws -> String {
         guard FileManager.default.isExecutableFile(atPath: executable) else {
             throw ServiceAPIError(code: .capabilityMissing, message: "Required workspace executable is unavailable")
         }
@@ -77,6 +89,7 @@ public actor LocalWorkspaceCommandRunner: WorkspaceCommandRunning {
         process.standardError = errors
         try launchValidation()
         try process.run()
+        try await launchAcknowledgement()
         async let outputData = output.fileHandleForReading.readToEnd()
         async let errorData = errors.fileHandleForReading.readToEnd()
         process.waitUntilExit()

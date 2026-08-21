@@ -432,7 +432,8 @@ private actor CommandCompatibilityProviderRuntime: AgentProviderRuntime {
             arguments: arguments,
             workingDirectory: request.workingDirectory,
             maximumBytes: request.maximumBytes,
-            launchValidation: { try request.validateLaunch() }
+            launchValidation: { try request.validateLaunch() },
+            launchAcknowledgement: { try await request.acknowledgeLaunch() }
         )
         let parsed = Self.parse(raw, kind: kind)
         if let identity = parsed.providerSessionID { await onEvent(.providerIdentity(identity)) }

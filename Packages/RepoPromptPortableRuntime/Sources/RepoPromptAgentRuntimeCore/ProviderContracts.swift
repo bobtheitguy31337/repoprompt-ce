@@ -264,7 +264,6 @@ public extension AgentProviderDispatcher {
         onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
     ) async throws -> ProviderExecutionResult {
         try request.validateLaunch()
-        try await request.acknowledgeLaunch()
         let result = try await execute(
             kind: request.kind,
             model: request.model,
@@ -276,6 +275,7 @@ public extension AgentProviderDispatcher {
         ) { identity in
             await onEvent(.providerIdentity(identity))
         }
+        try await request.acknowledgeLaunch()
         await onEvent(.assistantFinal(result.output))
         await onEvent(.completed(providerSessionID: result.providerSessionID))
         return result

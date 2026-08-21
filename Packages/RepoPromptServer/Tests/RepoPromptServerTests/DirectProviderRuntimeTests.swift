@@ -387,6 +387,7 @@ final class DirectProviderRuntimeTests: XCTestCase {
             credentials: StaticDirectCredentialAccessor(),
             transport: transport
         )
+        let launchAcknowledgement = ProviderLaunchAcknowledgementRecorder()
         let result = try await runtime.execute(.init(
             kind: .headlessAdapter,
             model: nil,
@@ -395,9 +396,12 @@ final class DirectProviderRuntimeTests: XCTestCase {
             runID: UUID(),
             policy: .init(providerSettings: [
                 "provider.settingsID": ProviderSettingsID.customOpenAICompatible.rawValue
-            ])
+            ]),
+            launchAcknowledgement: { await launchAcknowledgement.record() }
         )) { _ in }
         XCTAssertEqual(result.output, "direct response")
+        let launchAcknowledgementCount = await launchAcknowledgement.count()
+        XCTAssertEqual(launchAcknowledgementCount, 1)
         let recordedBody = await transport.lastPostedBody()
         let postedBody = try XCTUnwrap(recordedBody)
         let payload = try XCTUnwrap(try JSONSerialization.jsonObject(with: postedBody) as? [String: Any])
@@ -711,6 +715,13 @@ final class DirectProviderRuntimeTests: XCTestCase {
             customHeaders: headers
         )
     }
+}
+
+private actor ProviderLaunchAcknowledgementRecorder {
+    private var acknowledgements = 0
+
+    func record() { acknowledgements += 1 }
+    func count() -> Int { acknowledgements }
 }
 
 private actor ProviderRuntimeEventRecorder {

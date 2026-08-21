@@ -975,9 +975,22 @@ final class AuthorityTests: XCTestCase {
         let restoredAuthority = RepoPromptHeadlessAuthority(store: reopenedStore)
         try await restoredAuthority.recover()
         let restored = try await restoredAuthority.authoritySessionSnapshot(sessionID: sessionID)
-        XCTAssertEqual(restored.session, reconciling.session)
-        XCTAssertEqual(restored.activeRun, reconciling.activeRun)
+        XCTAssertEqual(restored.session.state, .interrupted)
+        XCTAssertEqual(restored.session.transcript, reconciling.session.transcript)
+        XCTAssertEqual(restored.activeRun?.runID, runID)
+        XCTAssertEqual(restored.activeRun?.state, "interrupted")
+        XCTAssertEqual(restored.activeRun?.endReason, "restart-interrupted")
+        XCTAssertNotNil(restored.activeRun?.endedAt)
         XCTAssertNil(restored.activeBinding)
+        let remainingTransitions = try await reopenedStore.nonfinalAuthorityTransitions()
+        XCTAssertTrue(remainingTransitions.isEmpty)
+        let readiness = await RepoPromptReadinessService(
+            authority: restoredAuthority,
+            store: reopenedStore,
+            minimumFreeBytes: 0,
+            minimumFreeNodes: 0
+        ).snapshot(forceRefresh: true)
+        XCTAssertTrue(readiness.ready, "\(readiness.checks)")
         try await restoredAuthority.quiesce()
         try await reopenedStore.close(clean: true)
     }
@@ -996,6 +1009,7 @@ private actor TerminalFencingProviderRuntime: AgentProviderRuntime {
         _ request: ProviderExecutionRequest,
         onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
     ) async throws -> ProviderExecutionResult {
+        try await request.acknowledgeLaunch()
         await onEvent(.providerIdentity("authority-thread"))
         await onEvent(.assistantFinal("authoritative answer"))
         Task {
@@ -1021,6 +1035,7 @@ private actor FailingProviderRuntime: AgentProviderRuntime {
         _ request: ProviderExecutionRequest,
         onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
     ) async throws -> ProviderExecutionResult {
+        try await request.acknowledgeLaunch()
         await onEvent(.providerIdentity("failure-thread"))
         await onEvent(.assistantDelta("partial authority output"))
         throw ServiceAPIError(code: .dependencyUnavailable, message: "provider failed after partial output")
@@ -1044,6 +1059,24 @@ private actor DelayedProviderRunner: WorkspaceCommandRunning {
     func run(executable _: String, arguments: [String], workingDirectory _: String, maximumBytes _: Int) async throws -> String {
         try await Task.sleep(for: delay)
         return "provider:\(arguments.last ?? "")"
+    }
+
+    func run(
+        executable: String,
+        arguments: [String],
+        workingDirectory: String,
+        maximumBytes: Int,
+        launchValidation: @escaping @Sendable () throws -> Void,
+        launchAcknowledgement: @escaping @Sendable () async throws -> Void
+    ) async throws -> String {
+        try launchValidation()
+        try await launchAcknowledgement()
+        return try await run(
+            executable: executable,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            maximumBytes: maximumBytes
+        )
     }
 }
 
@@ -1071,6 +1104,7 @@ private actor SteeringProviderRuntime: AgentProviderRuntime {
 
     func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
         active.insert(request.runID)
+        try await request.acknowledgeLaunch()
         defer { active.remove(request.runID)
             steeredText[request.runID] = nil
         }
@@ -1130,6 +1164,7 @@ private actor InteractiveEventProviderRuntime: AgentProviderRuntime {
 
     func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
         activeRunID = request.runID
+        try await request.acknowledgeLaunch()
         defer { activeRunID = nil }
         await onEvent(.providerIdentity("event-thread"))
         await onEvent(.reasoning("thinking"))
@@ -1175,6 +1210,7 @@ private actor PolicyRecordingProviderRuntime: AgentProviderRuntime {
 
     func execute(_ request: ProviderExecutionRequest, onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void) async throws -> ProviderExecutionResult {
         policy = request.policy
+        try await request.acknowledgeLaunch()
         await onEvent(.providerIdentity("policy-thread"))
         await onEvent(.assistantFinal("done"))
         await onEvent(.completed(providerSessionID: "policy-thread"))
@@ -1203,6 +1239,7 @@ private actor ResumeRecordingProviderRuntime: AgentProviderRuntime {
         _ request: ProviderExecutionRequest,
         onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
     ) async throws -> ProviderExecutionResult {
+        try await request.acknowledgeLaunch()
         recordedResumeIdentities.append(request.resumeProviderSessionID)
         recordedFallbackPrompts.append(request.resumeFallbackPrompt)
         await onEvent(.providerIdentity("durable-thread"))

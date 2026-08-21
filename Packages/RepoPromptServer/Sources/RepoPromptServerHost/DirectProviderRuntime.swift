@@ -563,6 +563,7 @@ public actor DirectAPIProviderRuntime: AgentProviderRuntime {
         } catch {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Direct provider request failed", retryable: true)
         }
+        try await request.acknowledgeLaunch()
         guard (200 ..< 300).contains(response.statusCode) else {
             throw ServiceAPIError(
                 code: response.statusCode == 401 || response.statusCode == 403 ? .providerUnavailable : .dependencyUnavailable,
