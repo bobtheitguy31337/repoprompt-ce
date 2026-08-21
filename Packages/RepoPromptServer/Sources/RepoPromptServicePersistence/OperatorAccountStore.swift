@@ -17,45 +17,137 @@ extension SQLiteServiceStore {
     ) async throws -> String {
         let token = OperatorPasswordHasher.randomToken()
         let hash = OperatorPasswordHasher.sha256Hex(Data(token.utf8))
-        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
-            _ = try await database.query("DELETE FROM operator_setup_tokens")
-            _ = try await database.query(
-                "INSERT INTO operator_setup_tokens(token_hash,created_at) VALUES(?,CURRENT_TIMESTAMP)",
-                [.text(hash)]
+        do {
+            try await transaction(.interactive(estimatedEncodedBytes: 0)) {
+                _ = try await database.query("DELETE FROM operator_setup_tokens")
+                _ = try await database.query(
+                    "INSERT INTO operator_setup_tokens(token_hash,created_at) VALUES(?,CURRENT_TIMESTAMP)",
+                    [.text(hash)]
+                )
+                try await appendOperatorSecurityAudit(
+                    operation: "setupTokenIssue", outcome: "success", actor: "operator-recovery",
+                    channel: channel, clientIdentityDigest: nil, correlationID: correlationID,
+                    detailCode: "tokenIssued"
+                )
+            }
+            return token
+        } catch {
+            try? await appendOperatorSecurityAudit(
+                operation: "setupTokenIssue", outcome: "failure", actor: "operator-recovery",
+                channel: channel, clientIdentityDigest: nil, correlationID: correlationID,
+                detailCode: "tokenIssueFailed"
             )
-            try await appendOperatorSecurityAudit(
-                operation: "setupTokenIssue", outcome: "success", actor: "operator-recovery",
-                channel: channel, clientIdentityDigest: nil, correlationID: correlationID
-            )
+            throw error
         }
-        return token
     }
 
     public func createOperatorAccount(
         username: String = defaultOperatorUsername,
         password: String,
-        setupToken: String?,
-        allowMissingSetupToken: Bool = false,
+        setupToken: String,
         clientIdentityDigest: String? = nil,
         correlationID: UUID = UUID(),
         channel: String = "portal"
     ) async throws {
-        guard try await hasOperatorAccount() == false else {
-            throw ServiceAPIError(code: .invalidRequest, message: "Operator account already exists")
-        }
-        try OperatorPasswordHasher.validate(password)
-        let salt = OperatorPasswordHasher.randomSalt()
-        let hash = try OperatorPasswordHasher.hash(password: password, salt: salt)
-        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
-            try await consumeSetupToken(setupToken, allowMissing: allowMissingSetupToken)
-            _ = try await database.query(
-                "INSERT INTO operator_accounts(username,password_salt,password_hash,iterations,created_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP)",
-                [.text(username), .text(salt.base64EncodedString()), .text(hash.base64EncodedString()), .integer(OperatorPasswordHasher.iterations)]
+        _ = try await createOperatorAccountAndSession(
+            username: username,
+            password: password,
+            setupToken: setupToken,
+            clientIdentityDigest: clientIdentityDigest,
+            usernameDigest: nil,
+            correlationID: correlationID,
+            channel: channel
+        )
+    }
+
+    public func createOperatorAccountAndSession(
+        username: String = defaultOperatorUsername,
+        password: String,
+        setupToken: String,
+        clientIdentityDigest: String?,
+        usernameDigest: String?,
+        correlationID: UUID,
+        channel: String = "portal",
+        now: Date = Date(),
+        faultInjector: (@Sendable (String) throws -> Void)? = nil
+    ) async throws -> String {
+        do {
+            try OperatorPasswordHasher.validate(password)
+            let salt = OperatorPasswordHasher.randomSalt()
+            let passwordHash = try OperatorPasswordHasher.hash(password: password, salt: salt)
+            let sessionToken = OperatorPasswordHasher.randomToken() + OperatorPasswordHasher.randomToken()
+            let sessionHash = OperatorPasswordHasher.sha256Hex(Data(sessionToken.utf8))
+            let sessionID = UUID()
+            let expiresAt = now.addingTimeInterval(Self.operatorSessionDuration)
+            return try await transaction(.interactive(estimatedEncodedBytes: 0)) {
+                guard try await database.query(
+                    "SELECT 1 FROM operator_accounts LIMIT 1"
+                ).isEmpty else {
+                    throw ServiceAPIError(code: .invalidRequest, message: "Operator account already exists")
+                }
+                try await consumeSetupToken(
+                    setupToken,
+                    clientIdentityDigest: clientIdentityDigest,
+                    correlationID: correlationID,
+                    channel: channel,
+                    now: now
+                )
+                _ = try await database.query(
+                    "INSERT INTO operator_accounts(username,password_salt,password_hash,iterations,created_at) VALUES(?,?,?,?,?)",
+                    [
+                        .text(username), .text(salt.base64EncodedString()),
+                        .text(passwordHash.base64EncodedString()),
+                        .integer(OperatorPasswordHasher.iterations), .float(now.timeIntervalSince1970),
+                    ]
+                )
+                try faultInjector?("after-account-insert")
+                _ = try await database.query(
+                    "INSERT INTO operator_sessions(session_id,username,token_hash,created_at,expires_at) VALUES(?,?,?,?,?)",
+                    [
+                        .text(sessionID.uuidString.lowercased()), .text(username), .text(sessionHash),
+                        .float(now.timeIntervalSince1970), .float(expiresAt.timeIntervalSince1970),
+                    ]
+                )
+                _ = try await database.query(
+                    "INSERT INTO operator_session_metadata(session_id,username,issued_at,last_seen_at,client_identity_digest,correlation_id) VALUES(?,?,?,?,?,?)",
+                    [
+                        .text(sessionID.uuidString.lowercased()), .text(username), .float(now.timeIntervalSince1970),
+                        .float(now.timeIntervalSince1970), clientIdentityDigest.map { .text($0) } ?? .null,
+                        .text(correlationID.uuidString.lowercased()),
+                    ]
+                )
+                try faultInjector?("after-session-insert")
+                if let clientIdentityDigest, let usernameDigest {
+                    try await clearOperatorAuthenticationThrottle(
+                        scope: .setup,
+                        clientIdentityDigest: clientIdentityDigest,
+                        usernameDigest: usernameDigest
+                    )
+                }
+                try await appendOperatorSecurityAudit(
+                    operation: "accountCreate", outcome: "success", actor: "operator:\(username)",
+                    channel: channel, clientIdentityDigest: clientIdentityDigest,
+                    correlationID: correlationID, now: now
+                )
+                try await appendOperatorSecurityAudit(
+                    operation: "setup", outcome: "success", actor: "operator:\(username)",
+                    channel: channel, clientIdentityDigest: clientIdentityDigest,
+                    correlationID: correlationID, now: now
+                )
+                return sessionToken
+            }
+        } catch {
+            try? await appendOperatorSecurityAudit(
+                operation: "accountCreate", outcome: "failure", actor: "anonymous",
+                channel: channel, clientIdentityDigest: clientIdentityDigest,
+                correlationID: correlationID, detailCode: "setupTransactionRejected", now: now
             )
-            try await appendOperatorSecurityAudit(
-                operation: "accountCreate", outcome: "success", actor: "operator:\(username)", channel: channel,
-                clientIdentityDigest: clientIdentityDigest, correlationID: correlationID
+            try? await appendOperatorSecurityAudit(
+                operation: "setupTokenConsume", outcome: "failure", actor: "anonymous",
+                channel: channel, clientIdentityDigest: clientIdentityDigest,
+                correlationID: correlationID, detailCode: "setupTokenRejected", now: now
             )
+            throw error
         }
     }
 
@@ -218,18 +310,33 @@ extension SQLiteServiceStore {
                   iterations: currentIterations
               )
         else {
+            try? await appendOperatorSecurityAudit(
+                operation: "passwordChange", outcome: "failure", actor: "operator:\(username)",
+                channel: "portal", clientIdentityDigest: clientIdentityDigest,
+                correlationID: correlationID, detailCode: "currentPasswordRejected", now: now
+            )
             throw ServiceAPIError(code: .internalAuthFailed, message: "Current password is incorrect")
         }
-        try OperatorPasswordHasher.validate(newPassword)
+        do {
+            try OperatorPasswordHasher.validate(newPassword)
+        } catch {
+            try? await appendOperatorSecurityAudit(
+                operation: "passwordChange", outcome: "failure", actor: "operator:\(username)",
+                channel: "portal", clientIdentityDigest: clientIdentityDigest,
+                correlationID: correlationID, detailCode: "newPasswordRejected", now: now
+            )
+            throw error
+        }
         let salt = OperatorPasswordHasher.randomSalt()
         let passwordHash = try OperatorPasswordHasher.hash(password: newPassword, salt: salt)
         let replacement = OperatorPasswordHasher.randomToken() + OperatorPasswordHasher.randomToken()
         let replacementHash = OperatorPasswordHasher.sha256Hex(Data(replacement.utf8))
         let replacementSessionID = UUID()
         let replacementExpiry = now.addingTimeInterval(Self.operatorSessionDuration)
-        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
-            let updated = try await database.query(
-                "UPDATE operator_accounts SET password_salt=?,password_hash=?,iterations=? WHERE username=? AND password_salt=? AND password_hash=? AND iterations=? RETURNING username",
+        do {
+            try await transaction(.interactive(estimatedEncodedBytes: 0)) {
+                let updated = try await database.query(
+                    "UPDATE operator_accounts SET password_salt=?,password_hash=?,iterations=? WHERE username=? AND password_salt=? AND password_hash=? AND iterations=? RETURNING username",
                 [
                     .text(salt.base64EncodedString()), .text(passwordHash.base64EncodedString()),
                     .integer(OperatorPasswordHasher.iterations), .text(username), .text(currentSaltText),
@@ -259,10 +366,18 @@ extension SQLiteServiceStore {
                     .text(correlationID.uuidString.lowercased()),
                 ]
             )
-            try await appendOperatorSecurityAudit(
-                operation: "passwordChange", outcome: "success", actor: "operator:\(username)", channel: "portal",
-                clientIdentityDigest: clientIdentityDigest, correlationID: correlationID, now: now
+                try await appendOperatorSecurityAudit(
+                    operation: "passwordChange", outcome: "success", actor: "operator:\(username)", channel: "portal",
+                    clientIdentityDigest: clientIdentityDigest, correlationID: correlationID, now: now
+                )
+            }
+        } catch {
+            try? await appendOperatorSecurityAudit(
+                operation: "passwordChange", outcome: "failure", actor: "operator:\(username)",
+                channel: "portal", clientIdentityDigest: clientIdentityDigest,
+                correlationID: correlationID, detailCode: "passwordChangeTransactionFailed", now: now
             )
+            throw error
         }
         return replacement
     }
@@ -273,44 +388,107 @@ extension SQLiteServiceStore {
         correlationID: UUID = UUID(),
         now: Date = Date()
     ) async throws {
-        try OperatorPasswordHasher.validate(newPassword)
-        let salt = OperatorPasswordHasher.randomSalt()
-        let passwordHash = try OperatorPasswordHasher.hash(password: newPassword, salt: salt)
-        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
-            let updated = try await database.query(
-                "UPDATE operator_accounts SET password_salt=?,password_hash=?,iterations=? WHERE username=? RETURNING username",
-                [.text(salt.base64EncodedString()), .text(passwordHash.base64EncodedString()), .integer(OperatorPasswordHasher.iterations), .text(username)]
+        let clientIdentityDigest = OperatorPasswordHasher.sha256Hex(Data("offline-maintenance".utf8))
+        let usernameDigest = OperatorPasswordHasher.sha256Hex(Data(username.lowercased().utf8))
+        let reservation = try await reserveOperatorAuthenticationAttempt(
+            scope: .offlineReset,
+            clientIdentityDigest: clientIdentityDigest,
+            usernameDigest: usernameDigest,
+            now: now
+        )
+        guard reservation.allowed else {
+            try? await appendOperatorSecurityAudit(
+                operation: "passwordReset", outcome: "rateLimited", actor: "operator-recovery",
+                channel: "offline", clientIdentityDigest: clientIdentityDigest,
+                correlationID: correlationID, detailCode: "durableThrottle", now: now
             )
-            guard !updated.isEmpty else {
-                throw ServiceAPIError(code: .notFound, message: "Operator account does not exist")
+            throw ServiceAPIError(
+                code: .rateLimited,
+                message: "Offline password reset is temporarily throttled",
+                retryable: true
+            )
+        }
+        do {
+            try OperatorPasswordHasher.validate(newPassword)
+            let salt = OperatorPasswordHasher.randomSalt()
+            let passwordHash = try OperatorPasswordHasher.hash(password: newPassword, salt: salt)
+            try await transaction(.interactive(estimatedEncodedBytes: 0)) {
+                let updated = try await database.query(
+                    "UPDATE operator_accounts SET password_salt=?,password_hash=?,iterations=? WHERE username=? RETURNING username",
+                    [
+                        .text(salt.base64EncodedString()), .text(passwordHash.base64EncodedString()),
+                        .integer(OperatorPasswordHasher.iterations), .text(username),
+                    ]
+                )
+                guard !updated.isEmpty else {
+                    throw ServiceAPIError(code: .notFound, message: "Operator account does not exist")
+                }
+                _ = try await database.query(
+                    "UPDATE operator_session_metadata SET revoked_at=?,revocation_reason='offlinePasswordReset' WHERE username=? AND revoked_at IS NULL",
+                    [.float(now.timeIntervalSince1970), .text(username)]
+                )
+                _ = try await database.query("DELETE FROM operator_sessions WHERE username=?", [.text(username)])
+                try await completeReservedOperatorAuthenticationSuccess(
+                    scope: .offlineReset,
+                    clientIdentityDigest: clientIdentityDigest,
+                    usernameDigest: usernameDigest,
+                    now: now
+                )
+                try await appendOperatorSecurityAudit(
+                    operation: "passwordReset", outcome: "success", actor: "operator-recovery", channel: "offline",
+                    clientIdentityDigest: clientIdentityDigest, correlationID: correlationID,
+                    detailCode: "sessionsRevoked", now: now
+                )
             }
-            _ = try await database.query(
-                "UPDATE operator_session_metadata SET revoked_at=?,revocation_reason='offlinePasswordReset' WHERE username=? AND revoked_at IS NULL",
-                [.float(now.timeIntervalSince1970), .text(username)]
+        } catch {
+            let failure = try? await recordReservedOperatorAuthenticationFailure(
+                scope: .offlineReset,
+                clientIdentityDigest: clientIdentityDigest,
+                usernameDigest: usernameDigest,
+                auditOperation: "passwordReset",
+                auditActor: "operator-recovery",
+                auditChannel: "offline",
+                correlationID: correlationID,
+                detailCode: "offlineResetRejected",
+                now: now
             )
-            _ = try await database.query("DELETE FROM operator_sessions WHERE username=?", [.text(username)])
-            try await appendOperatorSecurityAudit(
-                operation: "passwordReset", outcome: "success", actor: "operator-recovery", channel: "offline",
-                clientIdentityDigest: nil, correlationID: correlationID, now: now
-            )
+            if failure?.allowed == false {
+                throw ServiceAPIError(
+                    code: .rateLimited,
+                    message: "Offline password reset is temporarily throttled",
+                    retryable: true
+                )
+            }
+            throw error
         }
     }
 
-    private func consumeSetupToken(_ token: String?, allowMissing: Bool) async throws {
-        guard let pending = try await database.query("SELECT token_hash FROM operator_setup_tokens WHERE consumed_at IS NULL").first,
-              let expectedHash = pending.column("token_hash")?.string
+    private func consumeSetupToken(
+        _ token: String,
+        clientIdentityDigest: String?,
+        correlationID: UUID,
+        channel: String,
+        now: Date
+    ) async throws {
+        guard let pending = try await database.query(
+            "SELECT token_hash FROM operator_setup_tokens WHERE consumed_at IS NULL"
+        ).first,
+            let expectedHash = pending.column("token_hash")?.string
         else {
-            if allowMissing { return }
             throw ServiceAPIError(code: .invalidRequest, message: "First-run setup is not available")
         }
-        if allowMissing {
-            _ = try await database.query("UPDATE operator_setup_tokens SET consumed_at=CURRENT_TIMESTAMP WHERE token_hash=?", [.text(expectedHash)])
-            return
-        }
-        let provided = OperatorPasswordHasher.sha256Hex(Data((token ?? "").utf8))
+        let provided = OperatorPasswordHasher.sha256Hex(Data(token.utf8))
         guard OperatorPasswordHasher.constantTimeEquals(Data(provided.utf8), Data(expectedHash.utf8)) else {
             throw ServiceAPIError(code: .internalAuthFailed, message: "First-run setup token is invalid")
         }
-        _ = try await database.query("UPDATE operator_setup_tokens SET consumed_at=CURRENT_TIMESTAMP WHERE token_hash=?", [.text(expectedHash)])
+        _ = try await database.query(
+            "UPDATE operator_setup_tokens SET consumed_at=? WHERE token_hash=? AND consumed_at IS NULL",
+            [.float(now.timeIntervalSince1970), .text(expectedHash)]
+        )
+        try await appendOperatorSecurityAudit(
+            operation: "setupTokenConsume", outcome: "success", actor: "operator:onboarding",
+            channel: channel, clientIdentityDigest: clientIdentityDigest,
+            correlationID: correlationID, detailCode: "tokenConsumed", now: now
+        )
     }
 }

@@ -244,6 +244,17 @@ public actor RepoPromptAuthorityHost {
                 databaseIdentityDigest: configuration.namespace.namespaceID,
                 allowPendingRestoreRebind: configuration.allowsPendingRestoreRebind
             )
+            if acquisition.recoveredStaleOwner, let storeValue {
+                try await storeValue.appendOperatorSecurityAudit(
+                    operation: "staleOwnerRecovery",
+                    outcome: "success",
+                    actor: "authority-host",
+                    channel: "startup",
+                    clientIdentityDigest: nil,
+                    correlationID: UUID(),
+                    detailCode: "leaseOwnerRecovered"
+                )
+            }
             stateValue = .recoveringResources
         } catch let error as ServiceAPIError {
             stateValue = .failed(phase: "startup", diagnosticCode: error.code.rawValue)

@@ -1516,9 +1516,17 @@
     });
   }
 
+  function clearAuthenticationSecrets() {
+    const form = document.getElementById("auth-form");
+    if (form) disposeSensitiveInputs(form);
+  }
+
   function renderRoute() {
     const route = normalizedRoute();
-    state.route = route.surface === "home" ? "home" : `settings/${route.page}`;
+    const nextRoute =
+      route.surface === "home" ? "home" : `settings/${route.page}`;
+    if (state.route !== nextRoute) disposeSensitiveInputs();
+    state.route = nextRoute;
     const home = document.getElementById("home-shell");
     const settings = document.getElementById("settings-shell");
     home.hidden = route.surface !== "home";
@@ -4229,10 +4237,12 @@
     save.addEventListener("click", async () => {
       if (!currentPassword.value || !newPassword.value) {
         toast("Enter the current and new passwords.", true);
+        disposeSensitiveInputs(passwordCard);
         return;
       }
       if (newPassword.value !== confirmation.value) {
         toast("Password confirmation does not match.", true);
+        disposeSensitiveInputs(passwordCard);
         return;
       }
       setDisabledReason(save, true, "Password change is in progress.");
@@ -4245,14 +4255,12 @@
             passwordConfirmation: confirmation.value,
           }),
         });
-        currentPassword.value = "";
-        newPassword.value = "";
-        confirmation.value = "";
         await refreshPrivatePilotState();
         toast("Operator password changed and prior sessions revoked.");
       } catch (error) {
         toast(error.message, true);
       } finally {
+        disposeSensitiveInputs(passwordCard);
         setDisabledReason(save, false);
       }
     });
@@ -7812,6 +7820,7 @@
   }
 
   async function ensureOperatorSession() {
+    clearAuthenticationSecrets();
     const gate = document.getElementById("auth-gate");
     const form = document.getElementById("auth-form");
     const error = document.getElementById("auth-error");
@@ -7819,10 +7828,12 @@
     try {
       status = await api("api/v1/auth/status");
     } catch (failure) {
+      clearAuthenticationSecrets();
       gate.hidden = true;
       return true;
     }
     if (status.authenticated) {
+      clearAuthenticationSecrets();
       gate.hidden = true;
       return true;
     }
@@ -7840,7 +7851,7 @@
       ? "Create the operator password"
       : "Sign in";
     document.getElementById("auth-copy").textContent = setup
-      ? "This is the first launch. Choose a password for the operator account. If you are not on this machine, paste the setup token printed in the server log."
+      ? "This is the first launch. Choose a password for the operator account and paste the setup token from the owner-only operator-setup-token file in the server state directory. The token is never written to server logs."
       : "Enter the operator password to open the portal.";
     document.getElementById("auth-token-field").hidden = !setup;
     document.getElementById("auth-confirm-field").hidden = !setup;
@@ -7879,6 +7890,8 @@
         } catch (failure) {
           error.hidden = false;
           error.textContent = failure.message;
+        } finally {
+          clearAuthenticationSecrets();
         }
       });
     });

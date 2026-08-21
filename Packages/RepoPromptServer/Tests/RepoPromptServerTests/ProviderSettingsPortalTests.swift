@@ -320,21 +320,21 @@ final class ProviderSettingsPortalTests: XCTestCase {
     func testPortalMutationProtectionRequiresSameOriginJSONAndCustomHeader() throws {
         XCTAssertNoThrow(try RepoPromptPortalRequestProtection.validateMutation(
             origin: "https://server.example:9443",
-            host: "server.example:9443",
+            expectedOrigin: "https://server.example:9443",
             fetchSite: "same-origin",
             contentType: "application/json; charset=utf-8",
             csrfHeader: "1"
         ))
         XCTAssertThrowsError(try RepoPromptPortalRequestProtection.validateMutation(
             origin: "https://attacker.example",
-            host: "server.example:9443",
+            expectedOrigin: "https://server.example:9443",
             fetchSite: "cross-site",
             contentType: "application/json",
             csrfHeader: "1"
         ))
         XCTAssertThrowsError(try RepoPromptPortalRequestProtection.validateMutation(
             origin: "https://server.example:9443",
-            host: "server.example:9443",
+            expectedOrigin: "https://server.example:9443",
             fetchSite: nil,
             contentType: "application/x-www-form-urlencoded",
             csrfHeader: nil

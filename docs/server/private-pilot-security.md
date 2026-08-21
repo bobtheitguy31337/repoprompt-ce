@@ -11,9 +11,7 @@ The internal API remains TLS. A browser portal cannot share a client-certificate
 
 ## First-run setup
 
-On an empty V9 store the server issues a single-use setup token to the owner-only `operator-setup-token` file in the configured state directory with mode `0600`. Neither the token nor its path is emitted in structured logs. The file is removed on a later start after the operator account exists.
-
-The portal requires the token by default, including loopback and trusted-proxy requests. `REPOPROMPT_ALLOW_LOOPBACK_SETUP_WITHOUT_TOKEN=1` is a development-only exception and applies only to a resolved loopback client.
+On an empty V9 store the server issues a single-use setup token to the owner-only `operator-setup-token` file in the configured state directory with mode `0600`. Neither the token nor its path is emitted in structured logs. The portal requires that token for every first-run setup, including loopback and trusted-proxy requests; there is no tokenless pilot exception. Account creation, token consumption, initial-session creation, throttle clearing, and their success audit records commit in one database transaction. The owner-only token file is deleted before the successful onboarding response is returned.
 
 ## Passwords and sessions
 
@@ -36,6 +34,6 @@ Do not place passwords in shell history or environment variables. Prefer a secre
 
 ## Throttling and audit
 
-Setup and login failures are bucketed by keyed client and username digests. Five failures in a 60-second window block the bucket through the end of that window; ten consecutive failures impose a 15-minute block. Buckets survive restart and successful authentication clears the matching bucket.
+Setup, login, and offline-reset attempts are reserved atomically in durable buckets keyed by client and username digests before secret verification. Five attempts in a 60-second window block the bucket through the end of that window; ten consecutive failures impose a 15-minute block. Buckets survive restart. Successful setup/login clears the matching bucket; successful offline reset preserves its attempt window so repeated maintenance resets cannot bypass the limit.
 
 The V9 security audit contains operation, outcome, actor label, channel, keyed client digest, correlation ID, bounded detail code, and timestamp. It must never contain passwords, tokens, credential paths, forwarded raw addresses, or provider credentials.

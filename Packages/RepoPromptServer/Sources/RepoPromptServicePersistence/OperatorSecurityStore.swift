@@ -25,6 +25,37 @@ public struct OperatorSessionRecord: Codable, Sendable {
     public let current: Bool
 }
 
+public struct MaintenanceReceiptEvidence: Sendable, Equatable {
+    public let archiveSHA256: String
+    public let manifestSHA256: String
+    public let source: MigrationSourceEvidence
+    public let verifierFingerprint: String?
+    public let recipientFingerprints: [String]
+    public let sidecarSHA256: String
+    public let toolVersion: String
+    public let toolDigest: String
+
+    public init(
+        archiveSHA256: String,
+        manifestSHA256: String,
+        source: MigrationSourceEvidence,
+        verifierFingerprint: String?,
+        recipientFingerprints: [String],
+        sidecarSHA256: String,
+        toolVersion: String,
+        toolDigest: String
+    ) {
+        self.archiveSHA256 = archiveSHA256
+        self.manifestSHA256 = manifestSHA256
+        self.source = source
+        self.verifierFingerprint = verifierFingerprint
+        self.recipientFingerprints = recipientFingerprints
+        self.sidecarSHA256 = sidecarSHA256
+        self.toolVersion = toolVersion
+        self.toolDigest = toolDigest
+    }
+}
+
 public struct MaintenanceReceiptRecord: Codable, Sendable {
     public let receiptID: UUID
     public let operation: String
@@ -78,6 +109,141 @@ extension SQLiteServiceStore {
         return .init(allowed: true, retryAfterSeconds: nil)
     }
 
+    public func reserveOperatorAuthenticationAttempt(
+        scope: OperatorAuthenticationScope,
+        clientIdentityDigest: String,
+        usernameDigest: String,
+        now: Date = Date()
+    ) async throws -> OperatorAuthenticationAdmission {
+        let key = operatorThrottleKey(
+            scope: scope,
+            clientIdentityDigest: clientIdentityDigest,
+            usernameDigest: usernameDigest
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: 0)) {
+            let timestamp = now.timeIntervalSince1970
+            let row = try await database.query(
+                "SELECT window_started_at,attempt_count,consecutive_failures,blocked_until FROM operator_auth_throttle_buckets WHERE bucket_key=?",
+                [.text(key)]
+            ).first
+            let priorWindow = row?.column("window_started_at")?.double ?? timestamp
+            let withinWindow = timestamp - priorWindow < 60
+            let windowStarted = withinWindow ? priorWindow : timestamp
+            let attempts = withinWindow ? (row?.column("attempt_count")?.integer ?? 0) : 0
+            let failures = row?.column("consecutive_failures")?.integer ?? 0
+            let priorBlock = row?.column("blocked_until")?.double
+            if let priorBlock, priorBlock > timestamp {
+                return .init(
+                    allowed: false,
+                    retryAfterSeconds: max(1, Int(ceil(priorBlock - timestamp)))
+                )
+            }
+            if attempts >= 5 {
+                let blockedUntil = max(priorBlock ?? 0, windowStarted + 60)
+                _ = try await database.query(
+                    "UPDATE operator_auth_throttle_buckets SET blocked_until=?,updated_at=? WHERE bucket_key=?",
+                    [.float(blockedUntil), .float(timestamp), .text(key)]
+                )
+                return .init(
+                    allowed: false,
+                    retryAfterSeconds: max(1, Int(ceil(blockedUntil - timestamp)))
+                )
+            }
+            _ = try await database.query(
+                "INSERT INTO operator_auth_throttle_buckets(bucket_key,scope,client_identity_digest,username_digest,window_started_at,attempt_count,consecutive_failures,blocked_until,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(bucket_key) DO UPDATE SET window_started_at=excluded.window_started_at,attempt_count=excluded.attempt_count,consecutive_failures=excluded.consecutive_failures,blocked_until=excluded.blocked_until,updated_at=excluded.updated_at",
+                [
+                    .text(key), .text(scope.rawValue), .text(clientIdentityDigest), .text(usernameDigest),
+                    .float(windowStarted), .integer(attempts + 1), .integer(failures), .null,
+                    .float(timestamp),
+                ]
+            )
+            return .init(allowed: true, retryAfterSeconds: nil)
+        }
+    }
+
+    public func recordReservedOperatorAuthenticationFailure(
+        scope: OperatorAuthenticationScope,
+        clientIdentityDigest: String,
+        usernameDigest: String,
+        auditOperation: String,
+        auditActor: String,
+        auditChannel: String,
+        correlationID: UUID,
+        detailCode: String,
+        now: Date = Date()
+    ) async throws -> OperatorAuthenticationAdmission {
+        let key = operatorThrottleKey(
+            scope: scope,
+            clientIdentityDigest: clientIdentityDigest,
+            usernameDigest: usernameDigest
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: 0)) {
+            let timestamp = now.timeIntervalSince1970
+            let row = try await database.query(
+                "SELECT window_started_at,attempt_count,consecutive_failures,blocked_until FROM operator_auth_throttle_buckets WHERE bucket_key=?",
+                [.text(key)]
+            ).first
+            let windowStarted = row?.column("window_started_at")?.double ?? timestamp
+            let attempts = max(1, row?.column("attempt_count")?.integer ?? 0)
+            let failures = (row?.column("consecutive_failures")?.integer ?? 0) + 1
+            let priorBlock = row?.column("blocked_until")?.double
+            let blockedUntil: Double? = if failures >= 10 {
+                max(priorBlock ?? 0, timestamp + 15 * 60)
+            } else if attempts >= 5 {
+                max(priorBlock ?? 0, windowStarted + 60)
+            } else {
+                priorBlock.flatMap { $0 > timestamp ? $0 : nil }
+            }
+            _ = try await database.query(
+                "INSERT INTO operator_auth_throttle_buckets(bucket_key,scope,client_identity_digest,username_digest,window_started_at,attempt_count,consecutive_failures,blocked_until,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(bucket_key) DO UPDATE SET attempt_count=excluded.attempt_count,consecutive_failures=excluded.consecutive_failures,blocked_until=excluded.blocked_until,updated_at=excluded.updated_at",
+                [
+                    .text(key), .text(scope.rawValue), .text(clientIdentityDigest), .text(usernameDigest),
+                    .float(windowStarted), .integer(attempts), .integer(failures),
+                    blockedUntil.map { .float($0) } ?? .null, .float(timestamp),
+                ]
+            )
+            try await appendOperatorSecurityAudit(
+                operation: auditOperation,
+                outcome: blockedUntil.map { $0 > timestamp } == true ? "rateLimited" : "failure",
+                actor: auditActor,
+                channel: auditChannel,
+                clientIdentityDigest: clientIdentityDigest,
+                correlationID: correlationID,
+                detailCode: detailCode,
+                now: now
+            )
+            return .init(
+                allowed: blockedUntil.map { $0 <= timestamp } ?? true,
+                retryAfterSeconds: blockedUntil.map { max(1, Int(ceil($0 - timestamp))) }
+            )
+        }
+    }
+
+    func completeReservedOperatorAuthenticationSuccess(
+        scope: OperatorAuthenticationScope,
+        clientIdentityDigest: String,
+        usernameDigest: String,
+        now: Date
+    ) async throws {
+        if scope == .offlineReset {
+            let key = operatorThrottleKey(
+                scope: scope,
+                clientIdentityDigest: clientIdentityDigest,
+                usernameDigest: usernameDigest
+            )
+            _ = try await database.query(
+                "UPDATE operator_auth_throttle_buckets SET consecutive_failures=0,blocked_until=NULL,updated_at=? WHERE bucket_key=?",
+                [.float(now.timeIntervalSince1970), .text(key)]
+            )
+        } else {
+            try await clearOperatorAuthenticationThrottle(
+                scope: scope,
+                clientIdentityDigest: clientIdentityDigest,
+                usernameDigest: usernameDigest
+            )
+        }
+    }
+
     public func clearOperatorAuthenticationThrottle(
         scope: OperatorAuthenticationScope,
         clientIdentityDigest: String,
@@ -101,46 +267,33 @@ extension SQLiteServiceStore {
         succeeded: Bool,
         now: Date = Date()
     ) async throws -> OperatorAuthenticationAdmission {
-        let key = operatorThrottleKey(scope: scope, clientIdentityDigest: clientIdentityDigest, usernameDigest: usernameDigest)
         if succeeded {
-            try await clearOperatorAuthenticationThrottle(
+            try await completeReservedOperatorAuthenticationSuccess(
                 scope: scope,
                 clientIdentityDigest: clientIdentityDigest,
-                usernameDigest: usernameDigest
+                usernameDigest: usernameDigest,
+                now: now
             )
             return .init(allowed: true, retryAfterSeconds: nil)
         }
-        return try await transaction(.interactive(estimatedEncodedBytes: 0)) {
-            let timestamp = now.timeIntervalSince1970
-            let row = try await database.query(
-                "SELECT window_started_at,attempt_count,consecutive_failures,blocked_until FROM operator_auth_throttle_buckets WHERE bucket_key=?",
-                [.text(key)]
-            ).first
-            let priorWindow = row?.column("window_started_at")?.double ?? timestamp
-            let withinWindow = timestamp - priorWindow < 60
-            let attempts = withinWindow ? (row?.column("attempt_count")?.integer ?? 0) + 1 : 1
-            let failures = (row?.column("consecutive_failures")?.integer ?? 0) + 1
-            let priorBlock = row?.column("blocked_until")?.double
-            let blockedUntil: Double? = if failures >= 10 {
-                max(priorBlock ?? 0, timestamp + 15 * 60)
-            } else if attempts >= 5 {
-                max(priorBlock ?? 0, (withinWindow ? priorWindow : timestamp) + 60)
-            } else {
-                priorBlock.flatMap { $0 > timestamp ? $0 : nil }
-            }
-            _ = try await database.query(
-                "INSERT INTO operator_auth_throttle_buckets(bucket_key,scope,client_identity_digest,username_digest,window_started_at,attempt_count,consecutive_failures,blocked_until,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(bucket_key) DO UPDATE SET window_started_at=excluded.window_started_at,attempt_count=excluded.attempt_count,consecutive_failures=excluded.consecutive_failures,blocked_until=excluded.blocked_until,updated_at=excluded.updated_at",
-                [
-                    .text(key), .text(scope.rawValue), .text(clientIdentityDigest), .text(usernameDigest),
-                    .float(withinWindow ? priorWindow : timestamp), .integer(attempts), .integer(failures),
-                    blockedUntil.map { .float($0) } ?? .null, .float(timestamp),
-                ]
-            )
-            return .init(
-                allowed: blockedUntil.map { $0 <= timestamp } ?? true,
-                retryAfterSeconds: blockedUntil.map { max(1, Int(ceil($0 - timestamp))) }
-            )
-        }
+        let reservation = try await reserveOperatorAuthenticationAttempt(
+            scope: scope,
+            clientIdentityDigest: clientIdentityDigest,
+            usernameDigest: usernameDigest,
+            now: now
+        )
+        guard reservation.allowed else { return reservation }
+        return try await recordReservedOperatorAuthenticationFailure(
+            scope: scope,
+            clientIdentityDigest: clientIdentityDigest,
+            usernameDigest: usernameDigest,
+            auditOperation: scope.rawValue,
+            auditActor: "anonymous",
+            auditChannel: scope == .offlineReset ? "offline" : "portal",
+            correlationID: UUID(),
+            detailCode: "authenticationRejected",
+            now: now
+        )
     }
 
     public func appendOperatorSecurityAudit(
@@ -212,25 +365,36 @@ extension SQLiteServiceStore {
         now: Date = Date()
     ) async throws -> Int {
         let exceptHash = exceptToken.map { OperatorPasswordHasher.sha256Hex(Data($0.utf8)) }
-        return try await transaction(.interactive(estimatedEncodedBytes: 0)) {
-            let rows = try await database.query("SELECT session_id,token_hash FROM operator_sessions WHERE username=?", [.text(username)])
-            let revoked = rows.filter { exceptHash == nil || $0.column("token_hash")?.string != exceptHash }
-            for row in revoked {
-                guard let sessionID = row.column("session_id")?.string else { continue }
-                _ = try await database.query(
-                    "UPDATE operator_session_metadata SET revoked_at=?,revocation_reason=? WHERE session_id=?",
-                    [.float(now.timeIntervalSince1970), .text(reason), .text(sessionID)]
-                )
-                _ = try await database.query("DELETE FROM operator_sessions WHERE session_id=?", [.text(sessionID)])
+        do {
+            return try await transaction(.interactive(estimatedEncodedBytes: 0)) {
+                let rows = try await database.query("SELECT session_id,token_hash FROM operator_sessions WHERE username=?", [.text(username)])
+                let revoked = rows.filter { exceptHash == nil || $0.column("token_hash")?.string != exceptHash }
+                for row in revoked {
+                    guard let sessionID = row.column("session_id")?.string else { continue }
+                    _ = try await database.query(
+                        "UPDATE operator_session_metadata SET revoked_at=?,revocation_reason=? WHERE session_id=?",
+                        [.float(now.timeIntervalSince1970), .text(reason), .text(sessionID)]
+                    )
+                    _ = try await database.query("DELETE FROM operator_sessions WHERE session_id=?", [.text(sessionID)])
+                }
+                if let auditActor, let auditChannel, let correlationID {
+                    try await appendOperatorSecurityAudit(
+                        operation: "sessionRevokeAll", outcome: "success", actor: auditActor,
+                        channel: auditChannel, clientIdentityDigest: clientIdentityDigest,
+                        correlationID: correlationID, detailCode: "revoked=\(revoked.count)", now: now
+                    )
+                }
+                return revoked.count
             }
+        } catch {
             if let auditActor, let auditChannel, let correlationID {
-                try await appendOperatorSecurityAudit(
-                    operation: "sessionRevokeAll", outcome: "success", actor: auditActor,
+                try? await appendOperatorSecurityAudit(
+                    operation: "sessionRevokeAll", outcome: "failure", actor: auditActor,
                     channel: auditChannel, clientIdentityDigest: clientIdentityDigest,
-                    correlationID: correlationID, detailCode: "revoked=\(revoked.count)", now: now
+                    correlationID: correlationID, detailCode: "sessionRevokeRejected", now: now
                 )
             }
-            return revoked.count
+            throw error
         }
     }
 
@@ -272,28 +436,58 @@ extension SQLiteServiceStore {
         correlationID: UUID = UUID(),
         now: Date = Date()
     ) async throws {
-        let fingerprints = try encodeText(recipientFingerprints.sorted())
-        try await transaction(.interactive(estimatedEncodedBytes: fingerprints.utf8.count)) {
-            _ = try await database.query(
-                "INSERT INTO maintenance_receipts(receipt_id,operation,outcome,archive_sha256,manifest_sha256,source_store_id,source_schema_version,source_global_sequence,verifier_fingerprint,recipient_fingerprints_json,sidecar_sha256,tool_version,tool_digest,correlation_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                [
-                    .text(UUID().uuidString.lowercased()), .text(operation), .text(outcome),
-                    .text(archiveSHA256), .text(manifestSHA256), .text(source.storeID.uuidString.lowercased()),
-                    .integer(source.schemaVersion), .integer(Int(source.nextGlobalSequence)),
-                    verifierFingerprint.map { .text($0) } ?? .null, .text(fingerprints), .text(sidecarSHA256),
-                    .text(toolVersion), .text(toolDigest), .text(correlationID.uuidString.lowercased()),
-                    .float(now.timeIntervalSince1970),
-                ]
-            )
-            _ = try await database.query(
-                "INSERT INTO operator_security_audit(audit_id,operation,outcome,actor,channel,correlation_id,detail_code,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                [
-                    .text(UUID().uuidString.lowercased()), .text(operation), .text(outcome),
-                    .text("operator-maintenance"), .text("offline"), .text(correlationID.uuidString.lowercased()),
-                    .text("maintenance-receipt"), .float(now.timeIntervalSince1970),
-                ]
+        let evidence = MaintenanceReceiptEvidence(
+            archiveSHA256: archiveSHA256,
+            manifestSHA256: manifestSHA256,
+            source: source,
+            verifierFingerprint: verifierFingerprint,
+            recipientFingerprints: recipientFingerprints,
+            sidecarSHA256: sidecarSHA256,
+            toolVersion: toolVersion,
+            toolDigest: toolDigest
+        )
+        let retainedBytes = try encodeText(recipientFingerprints.sorted()).utf8.count
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            try await insertMaintenanceReceipt(
+                operation: operation,
+                outcome: outcome,
+                evidence: evidence,
+                correlationID: correlationID,
+                now: now
             )
         }
+    }
+
+    func insertMaintenanceReceipt(
+        operation: String,
+        outcome: String,
+        evidence: MaintenanceReceiptEvidence,
+        correlationID: UUID,
+        now: Date
+    ) async throws {
+        let fingerprints = try encodeText(evidence.recipientFingerprints.sorted())
+        _ = try await database.query(
+            "INSERT INTO maintenance_receipts(receipt_id,operation,outcome,archive_sha256,manifest_sha256,source_store_id,source_schema_version,source_global_sequence,verifier_fingerprint,recipient_fingerprints_json,sidecar_sha256,tool_version,tool_digest,correlation_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                .text(UUID().uuidString.lowercased()), .text(operation), .text(outcome),
+                .text(evidence.archiveSHA256), .text(evidence.manifestSHA256),
+                .text(evidence.source.storeID.uuidString.lowercased()),
+                .integer(evidence.source.schemaVersion), .integer(Int(evidence.source.nextGlobalSequence)),
+                evidence.verifierFingerprint.map { .text($0) } ?? .null, .text(fingerprints),
+                .text(evidence.sidecarSHA256), .text(evidence.toolVersion), .text(evidence.toolDigest),
+                .text(correlationID.uuidString.lowercased()), .float(now.timeIntervalSince1970),
+            ]
+        )
+        try await appendOperatorSecurityAudit(
+            operation: operation,
+            outcome: outcome,
+            actor: "operator-maintenance",
+            channel: "offline",
+            clientIdentityDigest: nil,
+            correlationID: correlationID,
+            detailCode: "maintenanceReceipt",
+            now: now
+        )
     }
 
     func operatorThrottleKey(scope: OperatorAuthenticationScope, clientIdentityDigest: String, usernameDigest: String) -> String {

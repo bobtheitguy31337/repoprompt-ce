@@ -93,14 +93,14 @@ final class BackupRestoreCoreTests: XCTestCase {
         XCTAssertEqual(request.targetDatabaseIdentityDigest, targetDigest)
         XCTAssertEqual(request.sourceNamespaceKind, request.targetNamespaceKind)
         XCTAssertEqual(request.missingExternalOptionalAssetIDs, ["provider.codex.binary"])
-        XCTAssertEqual(request.maintenanceReceipt?.source, currentEvidence)
-        XCTAssertEqual(request.maintenanceReceipt?.archiveSHA256, verified.sidecar.archiveSHA256)
-        XCTAssertEqual(request.maintenanceReceipt?.manifestSHA256, verified.sidecar.manifestSHA256)
+        XCTAssertEqual(request.maintenanceReceipt.source, currentEvidence)
+        XCTAssertEqual(request.maintenanceReceipt.archiveSHA256, verified.sidecar.archiveSHA256)
+        XCTAssertEqual(request.maintenanceReceipt.manifestSHA256, verified.sidecar.manifestSHA256)
         XCTAssertEqual(
-            request.maintenanceReceipt?.sidecarSHA256,
+            request.maintenanceReceipt.sidecarSHA256,
             BackupCryptography.sha256(try Data(contentsOf: BackupRestoreService.sidecarURL(for: archive)))
         )
-        XCTAssertFalse(request.maintenanceReceipt?.verifierFingerprint?.isEmpty ?? true)
+        XCTAssertFalse(request.maintenanceReceipt.verifierFingerprint?.isEmpty ?? true)
         try await store.close(clean: false)
     }
 
@@ -382,7 +382,12 @@ final class BackupRestoreCoreTests: XCTestCase {
                 targetNamespaceKind: "server",
                 targetDatabaseIdentityDigest: targetDigest,
                 activationToken: Data(repeating: 7, count: 32),
-                instanceID: UUID()
+                instanceID: UUID(),
+                maintenanceReceipt: makeTestMaintenanceReceipt(
+                    storeID: prior,
+                    backupSequence: 0,
+                    manifestSHA256: String(repeating: "a", count: 64)
+                )
             )
             XCTFail("Expected interruption before restore commit")
         } catch is InjectedRestoreFailure {}
@@ -408,7 +413,12 @@ final class BackupRestoreCoreTests: XCTestCase {
             targetNamespaceKind: "server",
             targetDatabaseIdentityDigest: targetDigest,
             activationToken: Data(repeating: 7, count: 32),
-            instanceID: UUID()
+            instanceID: UUID(),
+            maintenanceReceipt: makeTestMaintenanceReceipt(
+                storeID: prior,
+                backupSequence: 0,
+                manifestSHA256: String(repeating: "a", count: 64)
+            )
         )
         let replayed = try await store.activateRestoredNamespace(
             from: prior,
@@ -419,7 +429,12 @@ final class BackupRestoreCoreTests: XCTestCase {
             targetNamespaceKind: "server",
             targetDatabaseIdentityDigest: targetDigest,
             activationToken: Data(repeating: 7, count: 32),
-            instanceID: UUID()
+            instanceID: UUID(),
+            maintenanceReceipt: makeTestMaintenanceReceipt(
+                storeID: prior,
+                backupSequence: 0,
+                manifestSHA256: String(repeating: "a", count: 64)
+            )
         )
         XCTAssertNotEqual(fresh, prior)
         XCTAssertEqual(replayed, fresh)
@@ -590,7 +605,12 @@ final class BackupRestoreCoreTests: XCTestCase {
                 "project-source.git-ssh-key",
             ],
             activationToken: Data(repeating: 7, count: 32),
-            instanceID: UUID()
+            instanceID: UUID(),
+            maintenanceReceipt: makeTestMaintenanceReceipt(
+                storeID: prior,
+                backupSequence: 0,
+                manifestSHA256: String(repeating: "a", count: 64)
+            )
         )
         let settings = try await store.database.query(
             "SELECT enabled,revision FROM provider_settings WHERE provider_id='codex'"
@@ -744,7 +764,8 @@ final class BackupRecipientRotationTests: XCTestCase {
             targetDatabaseIdentityDigest: request.targetDatabaseIdentityDigest,
             missingExternalOptionalAssetIDs: request.missingExternalOptionalAssetIDs,
             activationToken: Data(repeating: 9, count: 32),
-            instanceID: UUID()
+            instanceID: UUID(),
+            maintenanceReceipt: makeTestMaintenanceReceipt(request.maintenanceReceipt)
         )
         XCTAssertNotEqual(freshStoreID, request.restoredFromStoreID)
         let rebound = try await restored.database.query(

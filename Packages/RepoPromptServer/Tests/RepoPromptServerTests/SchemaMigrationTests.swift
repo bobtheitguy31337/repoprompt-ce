@@ -232,6 +232,56 @@ final class SchemaMigrationTests: XCTestCase {
 }
 
 final class SQLiteTransactionFaultInjectionTests: XCTestCase {
+    func testV9RetryImportsPriorAtomicMigrationFailureIntoSecurityAudit() async throws {
+        let root = try StoreMigrationTestSupport.temporaryDirectory("v9-failure-audit")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let databaseURL = root.appendingPathComponent("repoprompt.sqlite")
+        try await StoreMigrationTestSupport.makeV6Store(
+            at: databaseURL,
+            digest: StoreMigrationTestSupport.knownV6Digests[4]
+        )
+        let counter = MigrationFaultCounter(
+            target: .beforeTransactionCommit,
+            occurrence: 3,
+            cancellation: false
+        )
+        var store = try await SQLiteServiceStore.openForMaintenance(
+            storage: .file(databaseURL.path),
+            faultInjector: PersistenceFaultInjector { point in try counter.hit(point) }
+        )
+        let source = try await store.migrationSourceEvidence()
+        do {
+            _ = try await store.migrateToLatest(
+                verifiedBackup: verifiedBackup(source),
+                namespaceKind: "server",
+                databaseIdentityDigest: String(repeating: "d", count: 64)
+            )
+            XCTFail("expected V9 transaction fault")
+        } catch is InjectedMigrationFailure {}
+        let metadataAfterFailure = try await store.metadata()
+        XCTAssertEqual(metadataAfterFailure.schemaVersion, 8)
+        let marker = try await store.database.query(
+            "SELECT payload_json FROM audit_events WHERE event_type='security.schema_v9_failed'"
+        ).first?.column("payload_json")?.string
+        XCTAssertEqual(marker, #"{"detailCode":"migrationTransactionRolledBack"}"#)
+        try await store.close(clean: false)
+
+        store = try await SQLiteServiceStore.openForMaintenance(storage: .file(databaseURL.path))
+        let retrySource = try await store.migrationSourceEvidence()
+        _ = try await store.migrateToLatest(
+            verifiedBackup: verifiedBackup(retrySource),
+            namespaceKind: "server",
+            databaseIdentityDigest: String(repeating: "d", count: 64)
+        )
+        let audit = try await store.operatorSecurityAudit(limit: 100)
+        XCTAssertTrue(audit.contains {
+            $0.operation == "schemaMigrationV9"
+                && $0.outcome == "failure"
+                && $0.detailCode == "priorMigrationTransactionRolledBack"
+        })
+        try await store.close(clean: false)
+    }
+
     func testEveryV7ThroughV9StatementInterruptionBoundaryPreservesLastCommittedVersion() async throws {
         let statementCount = try await countHistoricalV7StatementBoundaries()
         let v8StatementCount = SchemaV8.statements.count + 2

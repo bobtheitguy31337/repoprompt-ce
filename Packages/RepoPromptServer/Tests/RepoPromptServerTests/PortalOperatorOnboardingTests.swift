@@ -13,6 +13,47 @@ import XCTest
 @testable import RepoPromptServerExecutable
 @testable import RepoPromptHeadlessRuntime
 final class PortalOperatorOnboardingTests: XCTestCase {
+    func testSetupRequiresTokenAndDeletesOwnerOnlyTokenFileBeforeSuccess() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tokenURL = root.appendingPathComponent("operator-setup-token")
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let token = try await store.issueOperatorSetupToken()
+        try Data("\(token)\n".utf8).write(to: tokenURL)
+        let service = try await Self.service(store: store, setupTokenURL: tokenURL)
+        let app = Application(router: service.internalRouter())
+
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/portal/api/v1/setup",
+                method: .post,
+                headers: Self.portalMutationHeaders(),
+                body: ByteBuffer(string: #"{"password":"operator-password","passwordConfirmation":"operator-password"}"#)
+            ) { response in
+                XCTAssertEqual(response.status, .badRequest)
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: tokenURL.path))
+            let accountExists = try await store.hasOperatorAccount()
+            XCTAssertFalse(accountExists)
+
+            try await client.execute(
+                uri: "/portal/api/v1/setup",
+                method: .post,
+                headers: Self.portalMutationHeaders(),
+                body: ByteBuffer(data: try JSONEncoder.serviceEncoder.encode(SetupBody(
+                    password: "operator-password",
+                    passwordConfirmation: "operator-password",
+                    setupToken: token
+                )))
+            ) { response in
+                XCTAssertEqual(response.status, .created)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: tokenURL.path))
+            }
+        }
+    }
+
     func testFirstRunSetupThenLoginIssuesSessionCookie() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
@@ -177,14 +218,18 @@ final class PortalOperatorOnboardingTests: XCTestCase {
         }
     }
 
-    private static func service(store: SQLiteServiceStore) async throws -> RepoPromptHTTPService {
+    private static func service(
+        store: SQLiteServiceStore,
+        setupTokenURL: URL? = nil
+    ) async throws -> RepoPromptHTTPService {
         let authority = RepoPromptHeadlessAuthority(store: store)
         return RepoPromptHTTPService(
             authority: authority,
             store: store,
             authenticator: InternalRequestAuthenticator(keys: [], store: store),
             eventSigningKey: InternalSigningKey(keyID: "response", role: .sync, direction: InternalHMACDirection.repoPromptToClient, secret: Data("response-secret-32-bytes-long!!".utf8)),
-            portalPasswordLoginEnabled: true
+            portalPasswordLoginEnabled: true,
+            operatorSetupTokenURL: setupTokenURL
         , mutationGate: AuthorityMutationGate()
         )
     }

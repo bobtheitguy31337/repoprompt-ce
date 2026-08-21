@@ -183,6 +183,36 @@ final class PortalSecurityTests: XCTestCase {
 }
 
 final class TrustedProxyIntegrationTests: XCTestCase {
+    func testCSRFUsesValidatedTrustedProxyPublicOriginNotBackendAuthority() throws {
+        let policy = try PortalNetworkPolicy(.trustedProxy(
+            publicOrigin: "https://pilot.example.test:9443",
+            trustedProxyCIDRs: ["127.0.0.0/8"]
+        ))
+        let identity = try policy.resolve(
+            immediatePeer: "127.0.0.1",
+            forwarded: nil,
+            forwardedFor: "203.0.113.8",
+            forwardedProto: "https",
+            forwardedHost: "pilot.example.test:9443",
+            realIP: nil
+        )
+        let publicOrigin = try XCTUnwrap(identity.publicOrigin)
+        XCTAssertNoThrow(try RepoPromptPortalRequestProtection.validateMutation(
+            origin: publicOrigin,
+            expectedOrigin: publicOrigin,
+            fetchSite: "same-origin",
+            contentType: "application/json",
+            csrfHeader: "1"
+        ))
+        XCTAssertThrowsError(try RepoPromptPortalRequestProtection.validateMutation(
+            origin: "http://127.0.0.1:9081",
+            expectedOrigin: publicOrigin,
+            fetchSite: "same-origin",
+            contentType: "application/json",
+            csrfHeader: "1"
+        ))
+    }
+
     func testDirectTLSRejectsAllForwardedIdentityHeaders() throws {
         let policy = try PortalNetworkPolicy(.directTLS)
         XCTAssertThrowsError(try policy.resolve(
@@ -267,7 +297,7 @@ final class BackupKeyCustodyRotationTests: XCTestCase {
         XCTAssertEqual(receipts.first?.recipientFingerprints, ["age:x25519:custodian-a", "age:x25519:custodian-b"])
         let operational = try await store.operationalSnapshot(now: Date(timeIntervalSince1970: 20_001))
         XCTAssertEqual(operational.maintenanceReceiptCount, 1)
-        XCTAssertEqual(operational.securityAuditCount, 1)
+        XCTAssertEqual(operational.securityAuditCount, 3)
         XCTAssertEqual(operational.lastSuccessfulBackupAt, Date(timeIntervalSince1970: 20_000))
     }
 }
@@ -288,6 +318,13 @@ final class PrivatePilotPortalAssetTests: XCTestCase {
             XCTAssertTrue(script.contains(path), "missing private-pilot portal path: \(path)")
         }
         XCTAssertTrue(script.contains("dataset.sensitive"))
+        XCTAssertTrue(html.contains("id=\"auth-token\" name=\"setupToken\" type=\"password\""))
+        XCTAssertGreaterThanOrEqual(html.components(separatedBy: "data-sensitive=\"true\"").count - 1, 3)
+        XCTAssertTrue(script.contains("function clearAuthenticationSecrets()"))
+        XCTAssertTrue(script.contains("finally {\n          clearAuthenticationSecrets();"))
+        XCTAssertTrue(script.contains("if (state.route !== nextRoute) disposeSensitiveInputs();"))
+        XCTAssertTrue(script.contains("owner-only operator-setup-token file"))
+        XCTAssertTrue(script.contains("never written to server logs"))
         XCTAssertFalse(script.contains("localStorage"))
         XCTAssertFalse(script.contains("sessionStorage"))
     }

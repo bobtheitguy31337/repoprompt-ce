@@ -26,7 +26,6 @@ public struct RepoPromptServerConfiguration: Sendable {
     public let portalHost: String
     public let portalPort: Int?
     public let portalTopology: PortalNetworkTopology
-    public let allowLoopbackSetupWithoutToken: Bool
     public let certificatePath: String
     public let privateKeyPath: String
     public let clientCAPath: String?
@@ -314,7 +313,6 @@ public struct RepoPromptServerConfiguration: Sendable {
             portalTopology = .directTLS
         }
         _ = try PortalNetworkPolicy(portalTopology)
-        let allowLoopbackSetupWithoutToken = environment["REPOPROMPT_ALLOW_LOOPBACK_SETUP_WITHOUT_TOKEN"] == "1"
         return Self(
             profileIdentifier: environment["REPOPROMPT_PROFILE"] ?? "default",
             stateDatabasePath: stateDatabase,
@@ -328,7 +326,6 @@ public struct RepoPromptServerConfiguration: Sendable {
             portalHost: portalHost,
             portalPort: portalPort,
             portalTopology: portalTopology,
-            allowLoopbackSetupWithoutToken: allowLoopbackSetupWithoutToken,
             certificatePath: tlsCert ?? trustDirectory.appendingPathComponent("server.crt").path,
             privateKeyPath: tlsKey ?? trustDirectory.appendingPathComponent("server.key").path,
             clientCAPath: clientCAPath,
@@ -562,6 +559,8 @@ public enum RepoPromptServerRunner {
             providerSettings: providerSettings,
             eventOutboxDispatcher: runtime.eventOutboxDispatcher
         )
+        let setupTokenURL = URL(fileURLWithPath: stateDirectory, isDirectory: true)
+            .appendingPathComponent("operator-setup-token", isDirectory: false)
         let service = RepoPromptHTTPService(
             authority: authority,
             store: store,
@@ -579,7 +578,7 @@ public enum RepoPromptServerRunner {
             portalDesktopSettings: portalDesktopSettings,
             portalPasswordLoginEnabled: true,
             portalNetworkPolicy: try PortalNetworkPolicy(configuration.portalTopology),
-            allowLoopbackSetupWithoutToken: configuration.allowLoopbackSetupWithoutToken,
+            operatorSetupTokenURL: setupTokenURL,
             mutationGate: mutationGate
         )
         let internalApplication = try Application(
@@ -598,8 +597,6 @@ public enum RepoPromptServerRunner {
             )
         )
         let needsSetup = try await store.hasOperatorAccount() == false
-        let setupTokenURL = URL(fileURLWithPath: stateDirectory, isDirectory: true)
-            .appendingPathComponent("operator-setup-token", isDirectory: false)
         if needsSetup {
             let token = try await store.issueOperatorSetupToken(channel: "startup")
             try writeOwnerOnlySecret(Data((token + "\n").utf8), to: setupTokenURL)

@@ -22,7 +22,7 @@
         <form id="auth-form" hidden>
           <label id="auth-token-field" hidden>
             Setup token
-            <input id="auth-token" name="setupToken" autocomplete="off" spellcheck="false" />
+            <input id="auth-token" name="setupToken" type="password" autocomplete="off" spellcheck="false" data-sensitive="true" />
           </label>
           <label>
             Password
@@ -31,6 +31,7 @@
               type="password"
               name="password"
               autocomplete="current-password"
+              data-sensitive="true"
               required
             />
           </label>
@@ -41,6 +42,7 @@
               type="password"
               name="passwordConfirmation"
               autocomplete="new-password"
+              data-sensitive="true"
             />
           </label>
           <p id="auth-error" class="auth-error" role="alert" hidden></p>

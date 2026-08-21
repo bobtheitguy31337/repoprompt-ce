@@ -155,9 +155,16 @@ public actor AuthorityMaintenanceSession {
         guard phaseValue == .ready, let store else {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Authority maintenance session is not open")
         }
+        let correlationID = UUID()
         guard request.namespaceKind == configuration.namespace.servingMode.rawValue,
               request.databaseIdentityDigest == configuration.namespace.namespaceID
         else {
+            try? await store.appendOperatorSecurityAudit(
+                operation: "backupCreate", outcome: "failure",
+                actor: "operator-maintenance", channel: "offline",
+                clientIdentityDigest: nil, correlationID: correlationID,
+                detailCode: "namespaceMismatch"
+            )
             throw ServiceAPIError(code: .namespacePurposeMismatch, message: "Backup request does not match the leased namespace")
         }
         phaseValue = .backingUp
@@ -175,13 +182,20 @@ public actor AuthorityMaintenanceSession {
                     recipientFingerprints: sidecar.recipientFingerprints,
                     sidecarSHA256: BackupRestoreService.sidecarDigest(sidecar),
                     toolVersion: sidecar.toolVersion,
-                    toolDigest: sidecar.toolDigest
+                    toolDigest: sidecar.toolDigest,
+                    correlationID: correlationID
                 )
             }
             phaseValue = .ready
             phases.append(.ready)
             return sidecar
         } catch {
+            try? await store.appendOperatorSecurityAudit(
+                operation: "backupCreate", outcome: "failure",
+                actor: "operator-maintenance", channel: "offline",
+                clientIdentityDigest: nil, correlationID: correlationID,
+                detailCode: "backupCreateRejected"
+            )
             phaseValue = .ready
             phases.append(.ready)
             throw error
@@ -198,6 +212,7 @@ public actor AuthorityMaintenanceSession {
         }
         phaseValue = .backingUp
         phases.append(.backingUp)
+        let correlationID = UUID()
         do {
             let verified = try await service.verify(
                 archiveURL: archiveURL,
@@ -226,13 +241,20 @@ public actor AuthorityMaintenanceSession {
                     recipientFingerprints: sidecar.recipientFingerprints,
                     sidecarSHA256: BackupRestoreService.sidecarDigest(sidecar),
                     toolVersion: sidecar.verification?.maintenanceToolVersion ?? sidecar.toolVersion,
-                    toolDigest: sidecar.verification?.maintenanceToolDigest ?? sidecar.toolDigest
+                    toolDigest: sidecar.verification?.maintenanceToolDigest ?? sidecar.toolDigest,
+                    correlationID: correlationID
                 )
             }
             phaseValue = .ready
             phases.append(.ready)
             return verified
         } catch {
+            try? await store.appendOperatorSecurityAudit(
+                operation: "backupVerify", outcome: "failure",
+                actor: "operator-maintenance", channel: "offline",
+                clientIdentityDigest: nil, correlationID: correlationID,
+                detailCode: "backupVerificationRejected"
+            )
             phaseValue = .ready
             phases.append(.ready)
             throw error
@@ -275,6 +297,7 @@ public actor AuthorityMaintenanceSession {
         }
         phaseValue = .migrating
         phases.append(.migrating)
+        let correlationID = UUID()
         do {
             // Verification deliberately runs while the source lease remains
             // held and immediately precedes the first migration transaction.
@@ -293,10 +316,22 @@ public actor AuthorityMaintenanceSession {
                 namespaceKind: configuration.namespace.servingMode.rawValue,
                 databaseIdentityDigest: configuration.namespace.namespaceID
             )
+            try await store.appendOperatorSecurityAudit(
+                operation: "schemaMigration", outcome: "success",
+                actor: "operator-maintenance", channel: "offline",
+                clientIdentityDigest: nil, correlationID: correlationID,
+                detailCode: "verifiedBackupApplied"
+            )
             phaseValue = .ready
             phases.append(.ready)
             return evidence
         } catch {
+            try? await store.appendOperatorSecurityAudit(
+                operation: "schemaMigration", outcome: "failure",
+                actor: "operator-maintenance", channel: "offline",
+                clientIdentityDigest: nil, correlationID: correlationID,
+                detailCode: "migrationRejected"
+            )
             phaseValue = .ready
             phases.append(.ready)
             throw error

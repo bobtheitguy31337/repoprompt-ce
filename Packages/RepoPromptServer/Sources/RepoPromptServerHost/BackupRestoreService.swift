@@ -932,7 +932,7 @@ public struct RestoreNamespaceRequestV1: Codable, Equatable, Sendable {
     public let backupCreatedAt: String
     public let backupManifestSHA256: String
     public let missingExternalOptionalAssetIDs: [String]
-    public let maintenanceReceipt: RestoreMaintenanceReceiptV1?
+    public let maintenanceReceipt: RestoreMaintenanceReceiptV1
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion
