@@ -340,7 +340,7 @@ final class AuthorityTests: XCTestCase {
             try? await store.close()
             return
         }
-        try await Task.sleep(for: .milliseconds(150))
+        await authority.waitForProviderRunsToSettle()
         let completed = try await authority.sessionSnapshot(sessionID: session.sessionID)
         XCTAssertEqual(completed.state, .completed)
         XCTAssertEqual(completed.transcript.suffix(2).map(\.content), ["second", "provider:second"])
@@ -543,7 +543,10 @@ final class AuthorityTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let authority = RepoPromptHeadlessAuthority(store: store)
+        let eventHub = ServiceEventHub()
+        let dispatcher = OrderedEventOutboxDispatcher(store: store, hub: eventHub)
+        await dispatcher.start()
+        let authority = RepoPromptHeadlessAuthority(store: store, eventHub: eventHub)
         let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let projectInput = CreateProjectInput(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)])
         let project = try await authority.createProject(input: projectInput, externalActor: actor, idempotencyKey: "project-key", requestDigest: "project-digest")
@@ -562,10 +565,12 @@ final class AuthorityTests: XCTestCase {
 
         let events = try await authority.events(after: nil, limit: 10)
         XCTAssertEqual(events.events.map(\.eventType), [.projectCreated, .sessionCreated, .agentStarted, .transcriptMessage])
+        await dispatcher.stop()
+        await eventHub.finish()
         try await store.close()
     }
 
-    func testRootCancellationDoesNotCancelDescendantsOrFenceNewChildren() async throws {
+    func testRootCancellationCancelsDescendantsAndFencesNewChildren() async throws {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .resolvingSymlinksInPath()
             .appendingPathComponent(".test-root-cancel-\(UUID().uuidString)", isDirectory: true)
@@ -589,16 +594,19 @@ final class AuthorityTests: XCTestCase {
 
         _ = try await authority.execute(command: .resumeSession(expectedRunID: nil, providerResumeMode: .fresh), sessionID: rootSession.sessionID, externalActor: actor, idempotencyKey: "resume-tree", requestDigest: "resume-tree")
         _ = try await authority.execute(command: .cancelSession(expectedRunID: nil, expectedGeneration: 1), sessionID: rootSession.sessionID, externalActor: actor, idempotencyKey: "cancel-tree", requestDigest: "cancel-tree")
-        let survivingChild = try await authority.sessionSnapshot(sessionID: child.sessionID)
+        let canceledChild = try await authority.sessionSnapshot(sessionID: child.sessionID)
         let canceledRoot = try await authority.sessionSnapshot(sessionID: rootSession.sessionID)
         let agents = try await authority.agentSnapshots(rootSessionID: rootSession.sessionID)
         XCTAssertEqual(canceledRoot.state, .canceled)
-        XCTAssertEqual(survivingChild.state, .idle)
-        XCTAssertEqual(agents.first(where: { $0.sessionID == child.sessionID })?.state, .idle)
+        XCTAssertEqual(canceledChild.state, .canceled)
+        XCTAssertEqual(agents.first(where: { $0.sessionID == child.sessionID })?.state, .canceled)
 
-        let late = try await authority.spawnChildSession(parentSessionID: rootSession.sessionID, initialPrompt: "late")
-        XCTAssertEqual(late.parentSessionID, rootSession.sessionID)
-        XCTAssertEqual(late.state, .idle)
+        do {
+            _ = try await authority.spawnChildSession(parentSessionID: rootSession.sessionID, initialPrompt: "late")
+            XCTFail("Expected root cancellation to fence new descendants")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .quiescing)
+        }
         try await authority.quiesce()
         try await store.close()
     }
@@ -686,7 +694,10 @@ final class AuthorityTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let store = try await SQLiteServiceStore.open(storage: .memory)
-        let authority = RepoPromptHeadlessAuthority(store: store)
+        let eventHub = ServiceEventHub()
+        let dispatcher = OrderedEventOutboxDispatcher(store: store, hub: eventHub)
+        await dispatcher.start()
+        let authority = RepoPromptHeadlessAuthority(store: store, eventHub: eventHub)
         let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
         let project = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "project-key", requestDigest: "project-digest")
         let stream = try await authority.subscribe(after: nil)
@@ -698,6 +709,8 @@ final class AuthorityTests: XCTestCase {
         XCTAssertEqual(replayed?.eventType, .projectCreated)
         XCTAssertEqual(live?.eventType, .sessionCreated)
         XCTAssertEqual(live?.globalSequence, replayed.map { $0.globalSequence + 1 })
+        await dispatcher.stop()
+        await eventHub.finish()
         try await store.close()
     }
 
@@ -900,7 +913,7 @@ final class AuthorityTests: XCTestCase {
         try await reopenedStore.close(clean: true)
     }
 
-    func testEmbeddedProviderFailureCannotDivergeFromDirectMCPOrRestart() async throws {
+    func testAmbiguousEmbeddedProviderFailureRemainsReconcilingAcrossDirectMCPAndRestart() async throws {
         let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -933,12 +946,14 @@ final class AuthorityTests: XCTestCase {
         )
         let runID = try XCTUnwrap(running.activeBinding?.runID)
         await authority.waitForProviderRunsToSettle()
-        let failed = try await authority.authoritySessionSnapshot(sessionID: sessionID)
-        XCTAssertEqual(failed.session.state, .failed)
-        XCTAssertNil(failed.activeBinding)
-        XCTAssertEqual(failed.activeRun?.runID, runID)
-        XCTAssertEqual(failed.activeRun?.state, "failed")
-        XCTAssertTrue(failed.session.transcript.contains { $0.content == "partial authority output" })
+        let reconciling = try await authority.authoritySessionSnapshot(sessionID: sessionID)
+        XCTAssertEqual(reconciling.session.state, .interrupted)
+        XCTAssertEqual(reconciling.activeBinding?.runID, runID)
+        XCTAssertEqual(reconciling.activeRun?.runID, runID)
+        XCTAssertEqual(reconciling.activeRun?.state, "reconciliationRequired")
+        XCTAssertTrue(reconciling.session.transcript.contains { $0.content == "partial authority output" })
+        let nonfinalTransitions = try await store.nonfinalAuthorityTransitions()
+        XCTAssertEqual(nonfinalTransitions.last?.state, .reconciliationRequired)
 
         let direct = RepoPromptMCPAdapter(serving: await RepoPromptAuthorityMCPService.admitted(authority: authority, portalSettings: PortalDesktopSettingsService(store: store), admissionGate: AuthorityMutationGate()))
         let historyData = try await direct.invoke(
@@ -951,7 +966,7 @@ final class AuthorityTests: XCTestCase {
         )
         XCTAssertEqual(
             try JSONDecoder.serviceDecoder.decode(SessionSnapshot.self, from: historyData),
-            failed.session
+            reconciling.session
         )
 
         try await authority.quiesce()
@@ -960,8 +975,8 @@ final class AuthorityTests: XCTestCase {
         let restoredAuthority = RepoPromptHeadlessAuthority(store: reopenedStore)
         try await restoredAuthority.recover()
         let restored = try await restoredAuthority.authoritySessionSnapshot(sessionID: sessionID)
-        XCTAssertEqual(restored.session, failed.session)
-        XCTAssertEqual(restored.activeRun, failed.activeRun)
+        XCTAssertEqual(restored.session, reconciling.session)
+        XCTAssertEqual(restored.activeRun, reconciling.activeRun)
         XCTAssertNil(restored.activeBinding)
         try await restoredAuthority.quiesce()
         try await reopenedStore.close(clean: true)

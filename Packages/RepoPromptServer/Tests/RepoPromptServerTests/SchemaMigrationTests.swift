@@ -16,7 +16,9 @@ final class SchemaMigrationTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let databaseURL = root.appendingPathComponent("repoprompt.sqlite")
         let store = try await SQLiteServiceStore.open(storage: .file(databaseURL.path))
-        _ = try await store.database.query("UPDATE service_metadata SET schema_version=8 WHERE fixed_id=1")
+        _ = try await store.database.query(
+            "UPDATE service_metadata SET schema_version=\(SchemaV8.version + 1) WHERE fixed_id=1"
+        )
         try await store.close(clean: false)
         let before = try Data(contentsOf: databaseURL)
         do {
@@ -179,6 +181,27 @@ final class SchemaMigrationTests: XCTestCase {
             allowPendingRestoreRebind: true
         )
         try await activationOpen.close(clean: false)
+    }
+
+    func testCanonicalMigrationDigestsMatchCheckedInPrograms() {
+        let migrations: [(version: Int, frozen: String, computed: String)] = [
+            (SchemaV1.version, SchemaV1.canonicalDigest, SchemaV1.definition.computedDigest),
+            (SchemaV2.version, SchemaV2.canonicalDigest, SchemaV2.definition.computedDigest),
+            (SchemaV3.version, SchemaV3.canonicalDigest, SchemaV3.definition.computedDigest),
+            (SchemaV4.version, SchemaV4.canonicalDigest, SchemaV4.definition.computedDigest),
+            (SchemaV5.version, SchemaV5.canonicalDigest, SchemaV5.definition.computedDigest),
+            (SchemaV6.version, SchemaV6.canonicalDigest, SchemaV6.definition.computedDigest),
+            (SchemaV7.version, SchemaV7.canonicalDigest, SchemaV7.definition.computedDigest),
+            (SchemaV8.version, SchemaV8.canonicalDigest, SchemaV8.definition.computedDigest),
+        ]
+        XCTAssertEqual(migrations.map(\.version), Array(1 ... 8))
+        for migration in migrations {
+            XCTAssertEqual(
+                migration.computed,
+                migration.frozen,
+                "migration V\(migration.version) is immutable; append a new version instead of changing its program"
+            )
+        }
     }
 
     private func ledgerEvidence(_ database: SQLiteDatabaseExecutor) async throws -> [String] {
@@ -392,25 +415,6 @@ final class SQLiteTransactionFaultInjectionTests: XCTestCase {
         )
     }
 
-    func testCanonicalMigrationDigestsMatchCheckedInPrograms() {
-        let migrations: [(version: Int, frozen: String, computed: String)] = [
-            (SchemaV1.version, SchemaV1.canonicalDigest, SchemaV1.definition.computedDigest),
-            (SchemaV2.version, SchemaV2.canonicalDigest, SchemaV2.definition.computedDigest),
-            (SchemaV3.version, SchemaV3.canonicalDigest, SchemaV3.definition.computedDigest),
-            (SchemaV4.version, SchemaV4.canonicalDigest, SchemaV4.definition.computedDigest),
-            (SchemaV5.version, SchemaV5.canonicalDigest, SchemaV5.definition.computedDigest),
-            (SchemaV6.version, SchemaV6.canonicalDigest, SchemaV6.definition.computedDigest),
-            (SchemaV7.version, SchemaV7.canonicalDigest, SchemaV7.definition.computedDigest),
-        ]
-        XCTAssertEqual(migrations.map(\.version), Array(1 ... 7))
-        for migration in migrations {
-            XCTAssertEqual(
-                migration.computed,
-                migration.frozen,
-                "migration V\(migration.version) is immutable; append a new version instead of changing its program"
-            )
-        }
-    }
 }
 
 #if canImport(Darwin) || canImport(Glibc)

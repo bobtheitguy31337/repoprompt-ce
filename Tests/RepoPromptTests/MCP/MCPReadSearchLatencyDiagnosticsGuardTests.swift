@@ -811,26 +811,20 @@
 
         func testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices() throws {
             let connectionID = UUID().uuidString
+            let invocationID = UUID().uuidString.lowercased()
             let identity = MCPRequestTimelineIdentity(
                 jsonRPCRequestID: .string("request-7"),
                 connectionID: connectionID,
                 connectionGeneration: 2,
+                appInvocationID: invocationID,
                 requestOrdinal: 11
             )
-            let invocationID = try XCTUnwrap(identity.appInvocationID)
-            XCTAssertEqual(
-                invocationID,
-                MCPRequestTimelineIdentity.deterministicAppInvocationID(
-                    jsonRPCRequestID: .string("request-7"),
-                    connectionID: connectionID,
-                    connectionGeneration: 2,
-                    requestOrdinal: 11
-                )
-            )
+            XCTAssertEqual(identity.appInvocationID, invocationID)
             let otherConnectionIdentity = MCPRequestTimelineIdentity(
                 jsonRPCRequestID: .string("request-7"),
                 connectionID: UUID().uuidString,
                 connectionGeneration: 2,
+                appInvocationID: UUID().uuidString.lowercased(),
                 requestOrdinal: 11
             )
             XCTAssertNotEqual(invocationID, otherConnectionIdentity.appInvocationID)

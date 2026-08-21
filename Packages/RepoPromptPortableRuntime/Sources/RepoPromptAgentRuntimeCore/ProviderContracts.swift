@@ -56,6 +56,9 @@ public struct ProviderInteractionPayload: Codable, Hashable, Sendable {
 /// Native frame identifiers are retained only as opaque delivery tokens; the
 /// authority owns durable interaction IDs, transcript revisions, and events.
 public enum ProviderRuntimeEvent: Sendable, Equatable {
+    /// Adapter-owned durable delivery identity. Native adapters should preserve
+    /// this token/sequence when replaying a frame after an ambiguous outcome.
+    indirect case framed(providerEventID: String, providerSequence: Int64, event: ProviderRuntimeEvent)
     case providerIdentity(String)
     case assistantDelta(String)
     case assistantFinal(String)
@@ -213,6 +216,7 @@ public protocol AgentProviderDispatcher: Sendable {
         onProviderSessionIdentity: @escaping @Sendable (String) async -> Void
     ) async throws -> ProviderExecutionResult
     func cancel(runID: UUID) async throws
+    func hasActiveRun(_ runID: UUID) async -> Bool
     func executeStreaming(
         _ request: ProviderExecutionRequest,
         onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
@@ -226,6 +230,10 @@ public protocol AgentProviderDispatcher: Sendable {
 public extension AgentProviderDispatcher {
     func prepareRun(kind _: ProviderKind, runID _: UUID) async {}
     func forgetRun(runID _: UUID) async {}
+    func hasActiveRun(_: UUID) async -> Bool {
+        false
+    }
+
     func complete(kind: ProviderKind, model: String?, prompt: String, workingDirectory: String, maximumBytes: Int = 8_388_608, runID: UUID? = nil) async throws -> String {
         try await execute(kind: kind, model: model, prompt: prompt, workingDirectory: workingDirectory, maximumBytes: maximumBytes, runID: runID).output
     }

@@ -288,9 +288,20 @@ final class RepoPromptMCPAdapterTests: XCTestCase {
             configuration: .init(namespace: descriptor)
         )
         let store = try await host.storeForRecovery()
-        let authority = RepoPromptHeadlessAuthority(store: store)
+        let eventHub = ServiceEventHub()
+        let authority = RepoPromptHeadlessAuthority(store: store, eventHub: eventHub)
         try await authority.recover()
-        await host.installRecoveredAuthority(authority)
+        let metadata = try await store.metadata()
+        let dispatcher = OrderedEventOutboxDispatcher(store: store, hub: eventHub)
+        try await dispatcher.drainStartupWatermark(
+            .init(storeID: metadata.storeID, globalSequence: metadata.nextGlobalSequence - 1)
+        )
+        await dispatcher.start()
+        await host.installRecoveredAuthority(
+            authority,
+            eventHub: eventHub,
+            eventOutboxDispatcher: dispatcher
+        )
         let serving = try await host.makeMCPService(
             portalSettings: PortalDesktopSettingsService(store: store)
         )
