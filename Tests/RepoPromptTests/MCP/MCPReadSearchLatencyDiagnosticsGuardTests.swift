@@ -247,6 +247,7 @@
                 jsonRPCRequestID: .number(77),
                 connectionID: childConnectionID.uuidString,
                 connectionGeneration: 4,
+                appInvocationID: UUID().uuidString.lowercased(),
                 requestOrdinal: 9
             )
             MCPApplyEditsRebaseProbeRecorder.recordApplyEditsInvocation(
@@ -373,6 +374,7 @@
                     jsonRPCRequestID: .number(78),
                     connectionID: target.connectionID.uuidString,
                     connectionGeneration: 4,
+                    appInvocationID: UUID().uuidString.lowercased(),
                     requestOrdinal: 10
                 )
             )
@@ -407,6 +409,7 @@
                 jsonRPCRequestID: .number(79),
                 connectionID: childConnectionID.uuidString,
                 connectionGeneration: 4,
+                appInvocationID: UUID().uuidString.lowercased(),
                 requestOrdinal: 11
             )
             MCPApplyEditsRebaseProbeRecorder.recordApplyEditsInvocation(
@@ -2069,6 +2072,7 @@
                 jsonRPCRequestID: .string("wi8"),
                 connectionID: UUID().uuidString,
                 connectionGeneration: 1,
+                appInvocationID: UUID().uuidString.lowercased(),
                 requestOrdinal: 1
             )
             let correlation = try XCTUnwrap(
