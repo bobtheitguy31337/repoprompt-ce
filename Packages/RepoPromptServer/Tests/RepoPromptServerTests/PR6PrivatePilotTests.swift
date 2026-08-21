@@ -341,6 +341,8 @@ final class PrivatePilotPortalAssetTests: XCTestCase {
         XCTAssertTrue(script.contains("app.setAttribute(\"aria-hidden\", \"true\")"))
         XCTAssertTrue(script.contains("finally {\n        clearSecrets();"))
         XCTAssertTrue(script.contains("if (state.route !== nextRoute) disposeSensitiveInputs();"))
+        XCTAssertTrue(script.contains("window.RepoPromptPortalTest = Object.freeze({"))
+        XCTAssertTrue(script.contains("if (!window.__REPOPROMPT_PORTAL_TEST_HOOK__?.deferStart) start();"))
         XCTAssertTrue(script.contains("owner-only operator-setup-token file"))
         XCTAssertTrue(script.contains("never written to server logs"))
         XCTAssertFalse(script.contains("localStorage"))

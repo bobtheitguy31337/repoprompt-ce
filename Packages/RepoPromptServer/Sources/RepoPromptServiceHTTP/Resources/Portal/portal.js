@@ -8311,6 +8311,6 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     });
   }
 
-  start();
+  if (!window.__REPOPROMPT_PORTAL_TEST_HOOK__?.deferStart) start();
   })();
 }
