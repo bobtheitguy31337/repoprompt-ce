@@ -114,18 +114,24 @@ final class PortalOperatorOnboardingTests: XCTestCase {
         XCTAssertNil(configuration.portalPort)
     }
 
-    func testMutualTLSKeepsPasswordLoginAndBindsHttpPortal() throws {
+    func testMutualTLSBrowserPortalRequiresExplicitTrustedProxyTopology() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let configuration = try RepoPromptServerConfiguration.environment([
+        var environment = [
             "REPOPROMPT_STATE_DB": directory.appendingPathComponent("repoprompt.sqlite").path,
             "REPOPROMPT_ENABLED_PROVIDERS": "",
             "REPOPROMPT_TLS_CERT_FILE": directory.appendingPathComponent("server.crt").path,
             "REPOPROMPT_TLS_KEY_FILE": directory.appendingPathComponent("server.key").path,
             "REPOPROMPT_TLS_CLIENT_CA_FILE": directory.appendingPathComponent("ca.crt").path,
-            "REPOPROMPT_OPERATOR_CERT_IDENTITY": "operator.internal"
-        ])
+            "REPOPROMPT_OPERATOR_CERT_IDENTITY": "operator.internal",
+        ]
+        XCTAssertThrowsError(try RepoPromptServerConfiguration.environment(environment))
+
+        environment["REPOPROMPT_PORTAL_PORT"] = "9081"
+        environment["REPOPROMPT_PUBLIC_ORIGIN"] = "https://pilot.example.test"
+        environment["REPOPROMPT_TRUSTED_PROXY_CIDRS"] = "127.0.0.0/8"
+        let configuration = try RepoPromptServerConfiguration.environment(environment)
         XCTAssertTrue(configuration.usesMutualTLS)
         XCTAssertEqual(configuration.portalPort, 9081)
     }

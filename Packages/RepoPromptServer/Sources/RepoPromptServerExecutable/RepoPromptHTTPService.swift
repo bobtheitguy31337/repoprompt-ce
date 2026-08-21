@@ -96,6 +96,9 @@ public struct RepoPromptHTTPService: Sendable {
     private let portalDesktopSettings: PortalDesktopSettingsService
     private let portalPeerCertificateDER: Data?
     private let portalPasswordLoginEnabled: Bool
+    private let portalNetworkPolicy: PortalNetworkPolicy?
+    private let allowLoopbackSetupWithoutToken: Bool
+    private let portalIdentityDigestKey: Data
 
     public init(
         authority: RepoPromptHeadlessAuthority,
@@ -115,6 +118,8 @@ public struct RepoPromptHTTPService: Sendable {
         portalDesktopSettings: PortalDesktopSettingsService? = nil,
         portalPeerCertificateDER: Data? = nil,
         portalPasswordLoginEnabled: Bool = true,
+        portalNetworkPolicy: PortalNetworkPolicy? = nil,
+        allowLoopbackSetupWithoutToken: Bool = false,
         mutationGate: AuthorityMutationGate
     ) {
         self.authority = authority
@@ -136,6 +141,9 @@ public struct RepoPromptHTTPService: Sendable {
         self.portalDesktopSettings = portalDesktopSettings ?? PortalDesktopSettingsService(store: store)
         self.portalPeerCertificateDER = portalPeerCertificateDER
         self.portalPasswordLoginEnabled = portalPasswordLoginEnabled
+        self.portalNetworkPolicy = portalNetworkPolicy
+        self.allowLoopbackSetupWithoutToken = allowLoopbackSetupWithoutToken
+        portalIdentityDigestKey = eventSigningKey.secret
         self.readiness = readiness ?? RepoPromptReadinessService(
             authority: authority,
             store: store,
@@ -184,11 +192,57 @@ public struct RepoPromptHTTPService: Sendable {
         } }
         router.post("/portal/api/v1/login") { request, context in await portalRespond(request) {
             try validatePortalMutation(request)
-            return try await completePortalLogin(request: request)
+            return try await completePortalLogin(request: request, context: context)
         } }
         router.post("/portal/api/v1/logout") { request, context in await portalRespond(request) {
             try validatePortalMutation(request)
-            return try await completePortalLogout(request: request)
+            return try await completePortalLogout(request: request, context: context)
+        } }
+        router.post("/portal/api/v1/account/password") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            let input = try await JSONDecoder.serviceDecoder.decode(PortalPasswordChangeRequest.self, from: bodyData(request))
+            guard input.newPassword == input.passwordConfirmation else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Password confirmation does not match")
+            }
+            let correlationID = UUID()
+            let replacement = try await store.changeOperatorPassword(
+                username: principal.externalActor.username,
+                currentPassword: input.currentPassword,
+                newPassword: input.newPassword,
+                clientIdentityDigest: principal.clientIdentityDigest,
+                correlationID: correlationID
+            )
+            return portalSessionResponse(token: replacement)
+        } }
+        router.get("/portal/api/v1/account/sessions") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(request: request, context: context)
+            return try await portalJSON(store.operatorSessions(currentToken: operatorSessionToken(from: request)))
+        } }
+        router.post("/portal/api/v1/account/sessions/revoke-all") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            let currentToken = operatorSessionToken(from: request)
+            let revoked = try await store.revokeAllOperatorSessions(
+                username: principal.externalActor.username,
+                reason: "operatorRevokeAll",
+                exceptToken: currentToken,
+                auditActor: principal.actorID,
+                auditChannel: "portal",
+                clientIdentityDigest: principal.clientIdentityDigest,
+                correlationID: UUID()
+            )
+            return try portalJSON(["revoked": revoked])
+        } }
+        router.get("/portal/api/v1/operations") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(request: request, context: context)
+            let currentReadiness = await readiness.snapshot(forceRefresh: true)
+            return try await portalJSON(PortalOperationsResponse(
+                readiness: currentReadiness,
+                maintenance: durabilityOperations?.snapshot(),
+                receipts: store.maintenanceReceipts(limit: 50),
+                securityAudit: store.operatorSecurityAudit(limit: 100)
+            ))
         } }
         router.get("/portal/api/v1/bootstrap") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(request: request, context: context)
@@ -813,6 +867,11 @@ public struct RepoPromptHTTPService: Sendable {
                 "repoprompt_event_outbox_max_attempts \(operational?.eventOutboxMaximumAttemptCount ?? 0)",
                 "repoprompt_authority_transitions_nonfinal \(operational?.nonfinalAuthorityTransitionCount ?? 0)",
                 "repoprompt_provider_event_receipts \(operational?.providerEventReceiptCount ?? 0)",
+                "repoprompt_operator_sessions_active \(operational?.activeOperatorSessionCount ?? 0)",
+                "repoprompt_auth_throttle_blocked \(operational?.blockedAuthenticationBucketCount ?? 0)",
+                "repoprompt_security_audit_events \(operational?.securityAuditCount ?? 0)",
+                "repoprompt_maintenance_receipts \(operational?.maintenanceReceiptCount ?? 0)",
+                "repoprompt_last_successful_backup_timestamp_seconds \(operational?.lastSuccessfulBackupAt?.timeIntervalSince1970 ?? 0)",
                 "repoprompt_active_sessions \(currentReadiness.activeSessionCount)",
                 "repoprompt_degraded_projects \(currentReadiness.degradedProjectIDs.count)",
                 "repoprompt_mutations_in_flight \(currentReadiness.drain.inFlightMutations)",
@@ -1374,6 +1433,7 @@ public struct RepoPromptHTTPService: Sendable {
 
     private struct PortalAuthenticatedPrincipal {
         let actorID: String
+        let clientIdentityDigest: String
         let providerAttribution: ProviderMutationAttribution
         let settingsAttribution: SettingsMutationAttribution
         let externalActor: ExternalActor
@@ -1397,6 +1457,23 @@ public struct RepoPromptHTTPService: Sendable {
         let password: String
     }
 
+    private struct PortalPasswordChangeRequest: Decodable {
+        let currentPassword: String
+        let newPassword: String
+        let passwordConfirmation: String
+    }
+
+    private struct PortalOperationsResponse: Encodable {
+        let readiness: RepoPromptReadinessSnapshot
+        let maintenance: DurabilityMaintenanceSnapshot?
+        let receipts: [MaintenanceReceiptRecord]
+        let securityAudit: [OperatorSecurityAuditRecord]
+    }
+
+    private struct PortalRateLimitError: Error {
+        let retryAfterSeconds: Int
+    }
+
     private func portalAuthStatus(request: Request, context: RepoPromptRequestContext) async throws -> PortalAuthStatusResponse {
         let hasAccount = try await store.hasOperatorAccount()
         let needsSetup = portalPasswordLoginEnabled && !hasAccount
@@ -1414,35 +1491,89 @@ public struct RepoPromptHTTPService: Sendable {
             throw ServiceAPIError(code: .invalidRequest, message: "Password setup is not enabled for this server")
         }
         let input = try JSONDecoder.serviceDecoder.decode(PortalSetupRequest.self, from: try await bodyData(request))
+        let identity = try portalNetworkIdentity(request: request, context: context)
+        let clientDigest = keyedPortalDigest(label: "client", value: identity.clientAddress)
+        let usernameDigest = keyedPortalDigest(label: "username", value: SQLiteServiceStore.defaultOperatorUsername)
+        try await requireOperatorAuthenticationAdmission(
+            scope: .setup, clientIdentityDigest: clientDigest, usernameDigest: usernameDigest
+        )
         guard input.password == input.passwordConfirmation else {
             throw ServiceAPIError(code: .invalidRequest, message: "Password confirmation does not match")
         }
-        try await store.createOperatorAccount(
-            password: input.password,
-            setupToken: input.setupToken,
-            allowMissingSetupToken: isLoopback(context)
+        let correlationID = UUID()
+        do {
+            try await store.createOperatorAccount(
+                password: input.password,
+                setupToken: input.setupToken,
+                allowMissingSetupToken: allowLoopbackSetupWithoutToken && isLoopbackAddress(identity.clientAddress),
+                clientIdentityDigest: clientDigest,
+                correlationID: correlationID
+            )
+            _ = try await store.recordOperatorAuthenticationResult(
+                scope: .setup, clientIdentityDigest: clientDigest, usernameDigest: usernameDigest, succeeded: true
+            )
+        } catch {
+            let admission = try await store.recordOperatorAuthenticationResult(
+                scope: .setup, clientIdentityDigest: clientDigest, usernameDigest: usernameDigest, succeeded: false
+            )
+            try? await store.appendOperatorSecurityAudit(
+                operation: "setup", outcome: admission.allowed ? "failure" : "rateLimited",
+                actor: "anonymous", channel: "portal", clientIdentityDigest: clientDigest,
+                correlationID: correlationID, detailCode: "setupRejected"
+            )
+            if let retry = admission.retryAfterSeconds { throw PortalRateLimitError(retryAfterSeconds: retry) }
+            throw error
+        }
+        let token = try await store.createOperatorSession(
+            clientIdentityDigest: clientDigest, correlationID: correlationID
         )
-        let token = try await store.createOperatorSession()
         return portalSessionResponse(token: token, status: .created)
     }
 
-    private func completePortalLogin(request: Request) async throws -> Response {
+    private func completePortalLogin(request: Request, context: RepoPromptRequestContext) async throws -> Response {
         guard portalPasswordLoginEnabled else {
             throw ServiceAPIError(code: .invalidRequest, message: "Password login is not enabled for this server")
         }
         let input = try JSONDecoder.serviceDecoder.decode(PortalLoginRequest.self, from: try await bodyData(request))
         let username = (input.username?.isEmpty == false ? input.username : nil) ?? SQLiteServiceStore.defaultOperatorUsername
-        guard try await store.verifyOperatorPassword(username: username, password: input.password) else {
-            throw ServiceAPIError(code: .internalAuthFailed, message: "Operator username or password is incorrect")
+        let identity = try portalNetworkIdentity(request: request, context: context)
+        let clientDigest = keyedPortalDigest(label: "client", value: identity.clientAddress)
+        let usernameDigest = keyedPortalDigest(label: "username", value: username.lowercased())
+        try await requireOperatorAuthenticationAdmission(
+            scope: .login, clientIdentityDigest: clientDigest, usernameDigest: usernameDigest
+        )
+        let correlationID = UUID()
+        if let token = try await store.authenticateOperatorAndCreateSession(
+            username: username,
+            password: input.password,
+            clientIdentityDigest: clientDigest,
+            usernameDigest: usernameDigest,
+            correlationID: correlationID
+        ) {
+            return portalSessionResponse(token: token)
         }
-        let token = try await store.createOperatorSession(username: username)
-        return portalSessionResponse(token: token)
+        let admission = try await store.recordOperatorAuthenticationResult(
+            scope: .login, clientIdentityDigest: clientDigest, usernameDigest: usernameDigest, succeeded: false
+        )
+        try await store.appendOperatorSecurityAudit(
+            operation: "login", outcome: admission.allowed ? "failure" : "rateLimited",
+            actor: "anonymous", channel: "portal", clientIdentityDigest: clientDigest,
+            correlationID: correlationID, detailCode: "invalidCredentials"
+        )
+        if let retry = admission.retryAfterSeconds { throw PortalRateLimitError(retryAfterSeconds: retry) }
+        throw ServiceAPIError(code: .internalAuthFailed, message: "Operator username or password is incorrect")
     }
 
-    private func completePortalLogout(request: Request) async throws -> Response {
+    private func completePortalLogout(request: Request, context: RepoPromptRequestContext) async throws -> Response {
+        let identity = try portalNetworkIdentity(request: request, context: context)
+        let clientDigest = keyedPortalDigest(label: "client", value: identity.clientAddress)
         if let token = operatorSessionToken(from: request) {
             try await store.deleteOperatorSession(token: token)
         }
+        try await store.appendOperatorSecurityAudit(
+            operation: "logout", outcome: "success", actor: "operator", channel: "portal",
+            clientIdentityDigest: clientDigest, correlationID: UUID()
+        )
         var response = try portalJSON(["ok": true])
         response.headers[.setCookie] = "rpce_operator_session=; Path=/portal; HttpOnly; SameSite=Strict; Secure; Max-Age=0"
         return response
@@ -1462,12 +1593,9 @@ public struct RepoPromptHTTPService: Sendable {
             .map { String($0.dropFirst("rpce_operator_session=".count)) }
     }
 
-    private func isLoopback(_ context: RepoPromptRequestContext) -> Bool {
-        guard let ip = context.channel.remoteAddress?.ipAddress else { return false }
-        return ip == "127.0.0.1" || ip == "::1" || ip == "0:0:0:0:0:0:0:1"
-    }
-
     private func authenticatePortal(request: Request, context: RepoPromptRequestContext) async throws -> PortalAuthenticatedPrincipal {
+        let identity = try portalNetworkIdentity(request: request, context: context)
+        let clientIdentityDigest = keyedPortalDigest(label: "client", value: identity.clientAddress)
         if let token = operatorSessionToken(from: request),
            let username = try await store.operatorSessionUsername(token: token)
         {
@@ -1475,6 +1603,7 @@ public struct RepoPromptHTTPService: Sendable {
             let actorLabel = "\(username) portal"
             return PortalAuthenticatedPrincipal(
                 actorID: actorID,
+                clientIdentityDigest: clientIdentityDigest,
                 providerAttribution: ProviderMutationAttribution(actorID: actorID, actorLabel: actorLabel, channel: "portal-password"),
                 settingsAttribution: SettingsMutationAttribution(actorID: actorID, actorLabel: actorLabel, channel: "portal-password"),
                 externalActor: ExternalActor(userID: actorID, username: username, displayName: actorLabel)
@@ -1510,6 +1639,7 @@ public struct RepoPromptHTTPService: Sendable {
         let actorLabel = "\(role.rawValue) portal"
         return PortalAuthenticatedPrincipal(
             actorID: actorID,
+            clientIdentityDigest: clientIdentityDigest,
             providerAttribution: ProviderMutationAttribution(actorID: actorID, actorLabel: actorLabel, channel: "portal-mtls"),
             settingsAttribution: SettingsMutationAttribution(actorID: actorID, actorLabel: actorLabel, channel: "portal-mtls"),
             externalActor: ExternalActor(userID: actorID, username: actorLabel, displayName: actorLabel)
@@ -1518,6 +1648,68 @@ public struct RepoPromptHTTPService: Sendable {
 
     private func portalIdempotencyKey(principal: PortalAuthenticatedPrincipal, operationID: UUID) -> String {
         "portal:\(principal.actorID):\(operationID.uuidString.lowercased())"
+    }
+
+    private func portalNetworkIdentity(
+        request: Request,
+        context: RepoPromptRequestContext
+    ) throws -> PortalRequestNetworkIdentity {
+        let policy = try portalNetworkPolicy ?? PortalNetworkPolicy(.directTLS)
+        // The production runner always supplies a policy and a socket peer. The fallback
+        // exists only for in-process router compositions that predate network policy.
+        let immediatePeer = context.channel.remoteAddress?.ipAddress
+            ?? (portalNetworkPolicy == nil ? "127.0.0.1" : nil)
+        do {
+            return try policy.resolve(
+                immediatePeer: immediatePeer,
+                forwarded: request.headers[.init("Forwarded")!],
+                forwardedFor: request.headers[.init("X-Forwarded-For")!],
+                forwardedProto: request.headers[.init("X-Forwarded-Proto")!],
+                forwardedHost: request.headers[.init("X-Forwarded-Host")!],
+                realIP: request.headers[.init("X-Real-IP")!]
+            )
+        } catch {
+            throw ServiceAPIError(
+                code: .internalAuthFailed,
+                message: "Portal proxy identity could not be validated",
+                retryable: false
+            )
+        }
+    }
+
+    private func keyedPortalDigest(label: String, value: String) -> String {
+        HMAC<SHA256>.authenticationCode(
+            for: Data("\(label)\u{0}\(value)".utf8),
+            using: SymmetricKey(data: portalIdentityDigestKey)
+        ).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func requireOperatorAuthenticationAdmission(
+        scope: OperatorAuthenticationScope,
+        clientIdentityDigest: String,
+        usernameDigest: String
+    ) async throws {
+        let admission = try await store.operatorAuthenticationAdmission(
+            scope: scope,
+            clientIdentityDigest: clientIdentityDigest,
+            usernameDigest: usernameDigest
+        )
+        guard admission.allowed else {
+            try? await store.appendOperatorSecurityAudit(
+                operation: scope.rawValue,
+                outcome: "rateLimited",
+                actor: "anonymous",
+                channel: "portal",
+                clientIdentityDigest: clientIdentityDigest,
+                correlationID: UUID(),
+                detailCode: "durableThrottle"
+            )
+            throw PortalRateLimitError(retryAfterSeconds: admission.retryAfterSeconds ?? 1)
+        }
+    }
+
+    private func isLoopbackAddress(_ value: String) -> Bool {
+        value == "127.0.0.1" || value == "::1" || value == "0:0:0:0:0:0:0:1"
     }
 
     private func providerSettingsID(_ context: RepoPromptRequestContext) throws -> ProviderSettingsID {
@@ -1598,6 +1790,14 @@ public struct RepoPromptHTTPService: Sendable {
     }
 
     private func portalError(_ error: Error) -> Response {
+        if let rateLimit = error as? PortalRateLimitError {
+            var response = (try? portalJSON(
+                ServiceAPIError(code: .rateLimited, message: "Too many authentication attempts", retryable: true),
+                status: .tooManyRequests
+            )) ?? Response(status: .tooManyRequests)
+            response.headers[.init("Retry-After")!] = String(rateLimit.retryAfterSeconds)
+            return response
+        }
         let apiError = error as? ServiceAPIError ?? ServiceAPIError(code: .dependencyUnavailable, message: "Portal dependency failed", retryable: true)
         let status: HTTPResponse.Status = switch apiError.code {
         case .invalidRequest: .badRequest

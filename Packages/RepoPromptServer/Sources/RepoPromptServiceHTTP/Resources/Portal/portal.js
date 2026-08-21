@@ -32,6 +32,8 @@
     "context-builder",
     "portal-appearance",
     "advanced",
+    "operator-account",
+    "operations",
     "mcp-server",
     "mcp-tools",
     "workspace-approvals",
@@ -91,6 +93,8 @@
       directConfigurations: {},
     },
     generatedAt: null,
+    operatorSessions: [],
+    operations: null,
     route: "home",
     loading: false,
     loadPromise: null,
@@ -354,6 +358,7 @@
     return (
       path === "api/v1/desktop-settings" ||
       /^api\/v1\/settings\//.test(path) ||
+      /^api\/v1\/account(?:\/|$)/.test(path) ||
       /^api\/v1\/projects\/[^/]+\/settings\//.test(path) ||
       /^api\/v1\/provider-settings\//.test(path) ||
       /^api\/v1\/provider-auth-flows\//.test(path) ||
@@ -726,13 +731,19 @@
     setLoading(true);
     state.loadPromise = (async () => {
       try {
-        const [bootstrap, providerCatalog, desktopSettings] = await Promise.all(
-          [
-            api("api/v1/bootstrap"),
-            api(`api/v1/provider-settings${refresh ? "?refresh=true" : ""}`),
-            api("api/v1/desktop-settings"),
-          ],
-        );
+        const [
+          bootstrap,
+          providerCatalog,
+          desktopSettings,
+          operatorSessions,
+          operations,
+        ] = await Promise.all([
+          api("api/v1/bootstrap"),
+          api(`api/v1/provider-settings${refresh ? "?refresh=true" : ""}`),
+          api("api/v1/desktop-settings"),
+          api("api/v1/account/sessions"),
+          api("api/v1/operations"),
+        ]);
         if (!providerCatalog || !Array.isArray(providerCatalog.providers)) {
           throw new PortalError("The provider catalog response is incomplete.");
         }
@@ -746,6 +757,10 @@
         state.bootstrap.workflows ||= [];
         state.providers = providerCatalog.providers;
         state.desktopSettings = desktopSettings;
+        state.operatorSessions = Array.isArray(operatorSessions)
+          ? operatorSessions
+          : [];
+        state.operations = operations;
         reconcileAgentSelection();
         await loadTypedSettings();
         state.generatedAt =
@@ -1538,6 +1553,8 @@
         "context-builder": "Context Builder",
         "portal-appearance": "Portal Appearance",
         advanced: "Advanced",
+        "operator-account": "Operator Account",
+        operations: "Operations",
         "mcp-server": "MCP Server",
         "mcp-tools": "Tools",
         "workspace-approvals": "Workspace Approvals",
@@ -1560,6 +1577,8 @@
         "context-builder": renderTypedContextBuilder,
         "portal-appearance": renderPortalAppearance,
         advanced: renderAdvanced,
+        "operator-account": renderOperatorAccount,
+        operations: renderOperations,
         "mcp-server": renderMCPServer,
         "mcp-tools": renderMCPTools,
         "workspace-approvals": renderWorkspaceApprovals,
@@ -4167,6 +4186,255 @@
       "Choose browser-native theme and text density without copying macOS preference keys.",
       "appearance",
       [card, boundaries],
+    );
+  }
+
+  async function refreshPrivatePilotState() {
+    const [operatorSessions, operations] = await Promise.all([
+      api("api/v1/account/sessions"),
+      api("api/v1/operations"),
+    ]);
+    state.operatorSessions = Array.isArray(operatorSessions)
+      ? operatorSessions
+      : [];
+    state.operations = operations;
+    renderRoute();
+  }
+
+  function privatePilotPasswordInput(label, autocomplete) {
+    const input = document.createElement("input");
+    input.type = "password";
+    input.autocomplete = autocomplete;
+    input.dataset.sensitive = "true";
+    input.setAttribute("aria-label", label);
+    return input;
+  }
+
+  function renderOperatorAccount() {
+    const passwordCard = desktopCard(
+      "Change Operator Password",
+      "A successful change revokes every existing session and issues exactly one replacement session to this browser.",
+    );
+    const currentPassword = privatePilotPasswordInput(
+      "Current password",
+      "current-password",
+    );
+    const newPassword = privatePilotPasswordInput("New password", "new-password");
+    const confirmation = privatePilotPasswordInput(
+      "Confirm new password",
+      "new-password",
+    );
+    const save = element("button", "primary-button", "Change Password");
+    save.type = "button";
+    save.addEventListener("click", async () => {
+      if (!currentPassword.value || !newPassword.value) {
+        toast("Enter the current and new passwords.", true);
+        return;
+      }
+      if (newPassword.value !== confirmation.value) {
+        toast("Password confirmation does not match.", true);
+        return;
+      }
+      setDisabledReason(save, true, "Password change is in progress.");
+      try {
+        await api("api/v1/account/password", {
+          method: "POST",
+          body: JSON.stringify({
+            currentPassword: currentPassword.value,
+            newPassword: newPassword.value,
+            passwordConfirmation: confirmation.value,
+          }),
+        });
+        currentPassword.value = "";
+        newPassword.value = "";
+        confirmation.value = "";
+        await refreshPrivatePilotState();
+        toast("Operator password changed and prior sessions revoked.");
+      } catch (error) {
+        toast(error.message, true);
+      } finally {
+        setDisabledReason(save, false);
+      }
+    });
+    passwordCard.append(
+      desktopRow(
+        "Current Password",
+        "Required to authorize an online password change.",
+        currentPassword,
+      ),
+      desktopRow(
+        "New Password",
+        "Use a unique password held only by approved pilot operators.",
+        newPassword,
+      ),
+      desktopRow(
+        "Confirm Password",
+        "Re-enter the new password exactly.",
+        confirmation,
+      ),
+      save,
+    );
+
+    const sessions = desktopCard(
+      "Operator Sessions",
+      "Session inventory is durable across restarts. Expired and revoked rows remain visible for operator review.",
+    );
+    if (!state.operatorSessions.length) {
+      sessions.append(element("p", "card-subtitle", "No sessions are recorded."));
+    } else {
+      state.operatorSessions.forEach((session) => {
+        const status = session.current
+          ? "Current"
+          : session.revokedAt
+            ? `Revoked ${formatDate(session.revokedAt)}`
+            : "Active";
+        sessions.append(
+          desktopRow(
+            `${session.username}${session.current ? " · this browser" : ""}`,
+            `Issued ${formatDate(session.issuedAt)} · Last seen ${formatDate(session.lastSeenAt)} · Expires ${formatDate(session.expiresAt)}`,
+            element("span", "read-only-value", status),
+          ),
+        );
+      });
+    }
+    const revoke = element(
+      "button",
+      "danger-button",
+      "Revoke Other Sessions",
+    );
+    revoke.type = "button";
+    revoke.addEventListener("click", async () => {
+      const accepted = await confirmAction({
+        title: "Revoke other operator sessions?",
+        message:
+          "Every operator session except this browser will be revoked immediately. This action is recorded in the security audit.",
+        label: "Revoke Sessions",
+        returnFocus: revoke,
+      });
+      if (!accepted) return;
+      setDisabledReason(revoke, true, "Session revocation is in progress.");
+      try {
+        const result = await api("api/v1/account/sessions/revoke-all", {
+          method: "POST",
+        });
+        await refreshPrivatePilotState();
+        toast(`Revoked ${result?.revoked ?? 0} other session(s).`);
+      } catch (error) {
+        toast(error.message, true);
+      } finally {
+        setDisabledReason(revoke, false);
+      }
+    });
+    sessions.append(revoke);
+
+    settingsPage(
+      "Operator Account",
+      "Manage the single private-pilot operator credential and durable browser sessions.",
+      "key",
+      [passwordCard, sessions],
+      recommendation(
+        "shield",
+        "Offline recovery is intentionally not exposed in the browser",
+        "Use the maintenance-lease-protected operator reset-password CLI with password input over a file descriptor.",
+      ),
+    );
+  }
+
+  function renderOperations() {
+    const snapshot = state.operations;
+    if (!snapshot) {
+      settingsPage(
+        "Operations",
+        "Loading private-pilot readiness and audit evidence…",
+        "server",
+        [],
+      );
+      return;
+    }
+    const readiness = snapshot.readiness || {};
+    const operational = readiness.operational || {};
+    const checks = desktopCard(
+      "Readiness",
+      `Observed ${formatDate(readiness.observedAt)} · ${readiness.ready ? "Ready" : "Not ready"}`,
+    );
+    (readiness.checks || []).forEach((check) =>
+      checks.append(
+        desktopRow(
+          humanize(check.name),
+          check.detail,
+          element(
+            "span",
+            "read-only-value",
+            check.ready ? "Ready" : "Blocked",
+          ),
+        ),
+      ),
+    );
+
+    const durability = informationalCard(
+      "Durability & Capacity",
+      "Low-cardinality operational state from the SQLite authority and bounded maintenance loop.",
+      [
+        ["Schema", operational.migrationsValid ? "V9 verified" : "Migration check failed"],
+        ["Store integrity", operational.integrityValid ? "Valid" : "Check failed"],
+        ["Activation", operational.activationState || "Unknown"],
+        ["Agent sessions", `${readiness.activeSessionCount ?? 0} / ${readiness.maximumActiveSessions ?? 0}`],
+        ["Operator sessions", String(operational.activeOperatorSessionCount ?? 0)],
+        ["Blocked auth buckets", String(operational.blockedAuthenticationBucketCount ?? 0)],
+        ["Pending outbox", String(operational.eventOutboxPendingCount ?? 0)],
+        ["Nonfinal transitions", String(operational.nonfinalAuthorityTransitionCount ?? 0)],
+        ["Last successful backup", formatDate(operational.lastSuccessfulBackupAt)],
+        ["Maintenance", snapshot.maintenance?.lastErrorCode ? `Error: ${snapshot.maintenance.lastErrorCode}` : "Healthy"],
+      ],
+    );
+
+    const receipts = desktopCard(
+      "Maintenance Receipts",
+      "Backup and migration evidence stored in the authority database. Digests and fingerprints are evidence, not credentials.",
+    );
+    if (!(snapshot.receipts || []).length) {
+      receipts.append(element("p", "card-subtitle", "No maintenance receipts have been recorded."));
+    }
+    (snapshot.receipts || []).forEach((receipt) =>
+      receipts.append(
+        desktopRow(
+          `${humanize(receipt.operation)} · ${receipt.outcome}`,
+          `Schema ${receipt.sourceSchemaVersion} · Sequence ${receipt.sourceGlobalSequence} · ${formatDate(receipt.createdAt)}`,
+          element(
+            "span",
+            "read-only-value digest-value",
+            (receipt.archiveSHA256 || "").slice(0, 16),
+          ),
+        ),
+      ),
+    );
+
+    const audit = desktopCard(
+      "Security Audit",
+      "Secret-free operator security outcomes, newest first. Correlation IDs support incident review without exposing credentials.",
+    );
+    if (!(snapshot.securityAudit || []).length) {
+      audit.append(element("p", "card-subtitle", "No security events have been recorded."));
+    }
+    (snapshot.securityAudit || []).forEach((entry) =>
+      audit.append(
+        desktopRow(
+          `${humanize(entry.operation)} · ${entry.outcome}`,
+          `${entry.actor} via ${entry.channel} · ${formatDate(entry.createdAt)}${entry.detailCode ? ` · ${entry.detailCode}` : ""}`,
+          element(
+            "span",
+            "read-only-value digest-value",
+            (entry.correlationID || "").slice(0, 8),
+          ),
+        ),
+      ),
+    );
+
+    settingsPage(
+      "Operations",
+      "Review readiness, durability, backup receipts, and secret-free security audit evidence.",
+      "server",
+      [checks, durability, receipts, audit],
     );
   }
 

@@ -436,10 +436,12 @@ public actor RepoPromptAuthorityHost {
             if swept == .completed { recordShutdownAction(.durabilitySweepFinished) }
         }
 
-        if let eventOutboxDispatcherValue {
-            let drained = await runShutdownPhase(.eventOutboxDrain, budget: budget) {
-                await eventOutboxDispatcherValue.stop(drain: true)
-            }
+        if let eventOutboxDrain = configuration.shutdownHooks.operationOverride(.eventOutboxDrain)
+            ?? eventOutboxDispatcherValue.map({ dispatcher in
+                { @Sendable in await dispatcher.stop(drain: true) }
+            })
+        {
+            let drained = await runShutdownPhase(.eventOutboxDrain, budget: budget, operation: eventOutboxDrain)
             workSettled = workSettled && drained == .completed
             clean = clean && drained == .completed
             if drained == .completed { recordShutdownAction(.eventOutboxDrained) }

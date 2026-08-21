@@ -94,12 +94,13 @@ private struct RestoreActivationRequest: Decodable {
     let targetNamespaceKind: String
     let targetDatabaseIdentityDigest: String
     let missingExternalOptionalAssetIDs: [String]?
+    let maintenanceReceipt: RestoreMaintenanceReceiptV1?
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, acknowledged, backupSequence, backupCreatedAt
         case sourceNamespaceKind, sourceDatabaseIdentityDigest
         case targetNamespaceKind, targetDatabaseIdentityDigest
-        case missingExternalOptionalAssetIDs
+        case missingExternalOptionalAssetIDs, maintenanceReceipt
         case restoredFromStoreID = "restoredFromStoreId"
         case backupManifestSHA256 = "backupManifestSha256"
     }
@@ -160,6 +161,20 @@ public extension RepoPromptAuthorityHostFactory {
                             message: "Restore activation request is invalid or does not match this store"
                         )
                     }
+                    if let receipt = request.maintenanceReceipt {
+                        guard receipt.source.storeID == request.restoredFromStoreID,
+                              receipt.source.nextGlobalSequence == request.backupSequence,
+                              receipt.manifestSHA256 == request.backupManifestSHA256,
+                              receipt.archiveSHA256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+                              receipt.sidecarSHA256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+                              receipt.verifierFingerprint?.isEmpty == false
+                        else {
+                            throw ServiceAPIError(
+                                code: .invalidRequest,
+                                message: "Restore maintenance receipt evidence is invalid"
+                            )
+                        }
+                    }
                     _ = try await store.activateRestoredNamespace(
                         from: request.restoredFromStoreID,
                         backupSequence: request.backupSequence,
@@ -172,6 +187,22 @@ public extension RepoPromptAuthorityHostFactory {
                         activationToken: token,
                         instanceID: instanceID
                     )
+                    if let receipt = request.maintenanceReceipt,
+                       try await store.metadata().schemaVersion >= 9
+                    {
+                        try await store.recordMaintenanceReceipt(
+                            operation: "restorePrepare",
+                            outcome: "success",
+                            archiveSHA256: receipt.archiveSHA256,
+                            manifestSHA256: receipt.manifestSHA256,
+                            source: receipt.source,
+                            verifierFingerprint: receipt.verifierFingerprint,
+                            recipientFingerprints: receipt.recipientFingerprints,
+                            sidecarSHA256: receipt.sidecarSHA256,
+                            toolVersion: receipt.toolVersion,
+                            toolDigest: receipt.toolDigest
+                        )
+                    }
                     metadata = try await store.metadata()
                     try FileManager.default.removeItem(at: requestURL)
                 }

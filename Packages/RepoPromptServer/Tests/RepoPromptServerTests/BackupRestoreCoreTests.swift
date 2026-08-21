@@ -93,6 +93,14 @@ final class BackupRestoreCoreTests: XCTestCase {
         XCTAssertEqual(request.targetDatabaseIdentityDigest, targetDigest)
         XCTAssertEqual(request.sourceNamespaceKind, request.targetNamespaceKind)
         XCTAssertEqual(request.missingExternalOptionalAssetIDs, ["provider.codex.binary"])
+        XCTAssertEqual(request.maintenanceReceipt?.source, currentEvidence)
+        XCTAssertEqual(request.maintenanceReceipt?.archiveSHA256, verified.sidecar.archiveSHA256)
+        XCTAssertEqual(request.maintenanceReceipt?.manifestSHA256, verified.sidecar.manifestSHA256)
+        XCTAssertEqual(
+            request.maintenanceReceipt?.sidecarSHA256,
+            BackupCryptography.sha256(try Data(contentsOf: BackupRestoreService.sidecarURL(for: archive)))
+        )
+        XCTAssertFalse(request.maintenanceReceipt?.verifierFingerprint?.isEmpty ?? true)
         try await store.close(clean: false)
     }
 
@@ -203,7 +211,7 @@ final class BackupRestoreCoreTests: XCTestCase {
         try await fixture.store.close(clean: false)
     }
 
-    func testVerifiedBackupGatesLeaseBoundV6Migration() async throws {
+    func testVerifiedBackupGatesLeaseBoundMigrationToLatest() async throws {
         let root = try StoreMigrationTestSupport.temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let namespace = try StoreMigrationTestSupport.namespace(root: root)
@@ -243,7 +251,7 @@ final class BackupRestoreCoreTests: XCTestCase {
             verifiedBackup: archive,
             identityFileURL: identity
         )
-        XCTAssertEqual(migrated.schemaVersion, 7)
+        XCTAssertEqual(migrated.schemaVersion, 9)
         let observation = await session.observation()
         XCTAssertTrue(observation.phases.contains(.migrating))
         try await session.close(clean: true)

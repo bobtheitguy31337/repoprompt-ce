@@ -164,6 +164,20 @@ public actor AuthorityMaintenanceSession {
         phases.append(.backingUp)
         do {
             let sidecar = try await service.create(request: request, store: store)
+            if try await store.metadata().schemaVersion >= 9 {
+                try await store.recordMaintenanceReceipt(
+                    operation: "backupCreate",
+                    outcome: "success",
+                    archiveSHA256: sidecar.archiveSHA256,
+                    manifestSHA256: sidecar.manifestSHA256,
+                    source: sidecar.source,
+                    verifierFingerprint: sidecar.verification?.verifierFingerprint,
+                    recipientFingerprints: sidecar.recipientFingerprints,
+                    sidecarSHA256: BackupRestoreService.sidecarDigest(sidecar),
+                    toolVersion: sidecar.toolVersion,
+                    toolDigest: sidecar.toolDigest
+                )
+            }
             phaseValue = .ready
             phases.append(.ready)
             return sidecar
@@ -172,6 +186,83 @@ public actor AuthorityMaintenanceSession {
             phases.append(.ready)
             throw error
         }
+    }
+
+    public func verifyBackup(
+        service: BackupRestoreService,
+        archiveURL: URL,
+        identityFileURL: URL
+    ) async throws -> VerifiedBackupArchive {
+        guard phaseValue == .ready, let store else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Authority maintenance session is not open")
+        }
+        phaseValue = .backingUp
+        phases.append(.backingUp)
+        do {
+            let verified = try await service.verify(
+                archiveURL: archiveURL,
+                identityFileURL: identityFileURL
+            )
+            let metadata = try await store.metadata()
+            guard verified.manifest.namespaceKind == configuration.namespace.servingMode.rawValue,
+                  verified.manifest.databaseIdentityDigest == configuration.namespace.namespaceID,
+                  verified.manifest.source.storeID == metadata.storeID
+            else {
+                throw ServiceAPIError(
+                    code: .namespacePurposeMismatch,
+                    message: "Verified backup does not belong to the leased source namespace",
+                    retryable: false
+                )
+            }
+            if metadata.schemaVersion >= 9 {
+                let sidecar = verified.sidecar
+                try await store.recordMaintenanceReceipt(
+                    operation: "backupVerify",
+                    outcome: "success",
+                    archiveSHA256: sidecar.archiveSHA256,
+                    manifestSHA256: sidecar.manifestSHA256,
+                    source: sidecar.source,
+                    verifierFingerprint: sidecar.verification?.verifierFingerprint,
+                    recipientFingerprints: sidecar.recipientFingerprints,
+                    sidecarSHA256: BackupRestoreService.sidecarDigest(sidecar),
+                    toolVersion: sidecar.verification?.maintenanceToolVersion ?? sidecar.toolVersion,
+                    toolDigest: sidecar.verification?.maintenanceToolDigest ?? sidecar.toolDigest
+                )
+            }
+            phaseValue = .ready
+            phases.append(.ready)
+            return verified
+        } catch {
+            phaseValue = .ready
+            phases.append(.ready)
+            throw error
+        }
+    }
+
+    public func resetOperatorPassword(_ password: String) async throws {
+        guard phaseValue == .ready, let store else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Authority maintenance session is not open")
+        }
+        try await store.resetOperatorPasswordOffline(newPassword: password)
+    }
+
+    public func issueOperatorSetupToken() async throws -> String {
+        guard phaseValue == .ready, let store else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Authority maintenance session is not open")
+        }
+        return try await store.issueOperatorSetupToken(channel: "offline")
+    }
+
+    public func revokeAllOperatorSessions() async throws -> Int {
+        guard phaseValue == .ready, let store else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Authority maintenance session is not open")
+        }
+        return try await store.revokeAllOperatorSessions(
+            reason: "offlineRevokeAll",
+            auditActor: "operator-recovery",
+            auditChannel: "offline",
+            correlationID: UUID()
+        )
     }
 
     public func migrate(

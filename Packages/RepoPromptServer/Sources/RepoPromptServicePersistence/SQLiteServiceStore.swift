@@ -438,7 +438,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 message: "Authority store metadata is missing or ambiguous"
             )
         }
-        if metadataVersion > SchemaV8.version {
+        if metadataVersion > SchemaV9.version {
             throw ServiceAPIError(
                 code: .forwardSchemaUnsupported,
                 message: "Authority store schema is newer than this binary",
@@ -446,7 +446,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             )
         }
         try await validateMigrationLedger(metadataVersion: metadataVersion)
-        guard metadataVersion == SchemaV8.version else {
+        guard metadataVersion == SchemaV9.version else {
             throw ServiceAPIError(
                 code: .migrationRequired,
                 message: "Authority store requires offline migration before serving",
@@ -465,6 +465,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             allowDatabaseRebind: allowPendingRestoreRebind && restoreRequestExists
         )
         try await SchemaV8.validate(using: database)
+        try await SchemaV9.validate(using: database)
     }
 
     private enum ExistingStorePreflight {
@@ -2773,6 +2774,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             databaseIdentityDigest: databaseIdentityDigest
         )
         try await applySchemaV8()
+        try await applySchemaV9(verifiedBackup: nil)
     }
 
     public func migrateToLatest(
@@ -2788,9 +2790,13 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 retryable: false
             )
         }
-        guard !verifiedBackup.archiveSHA256.isEmpty,
-              !verifiedBackup.manifestSHA256.isEmpty,
-              !verifiedBackup.verifierFingerprint.isEmpty
+        guard verifiedBackup.archiveSHA256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+              verifiedBackup.manifestSHA256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+              verifiedBackup.sidecarSHA256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+              verifiedBackup.toolDigest.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+              !verifiedBackup.verifierFingerprint.isEmpty,
+              !verifiedBackup.recipientFingerprints.isEmpty,
+              !verifiedBackup.toolVersion.isEmpty
         else {
             throw ServiceAPIError(
                 code: .invalidRequest,
@@ -2800,13 +2806,13 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
 
         do {
             var version = before.schemaVersion
-            if version > SchemaV8.version {
+            if version > SchemaV9.version {
                 throw ServiceAPIError(
                     code: .forwardSchemaUnsupported,
                     message: "Authority store schema is newer than this maintenance tool"
                 )
             }
-            if version == SchemaV8.version {
+            if version == SchemaV9.version {
                 try await validateNamespaceIdentity(
                     requestedKind: namespaceKind,
                     requestedDatabaseIdentityDigest: databaseIdentityDigest,
@@ -2826,7 +2832,13 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 )
                 version = SchemaV7.version
             }
-            if version < SchemaV8.version { try await applySchemaV8() }
+            if version < SchemaV8.version {
+                try await applySchemaV8()
+                version = SchemaV8.version
+            }
+            if version < SchemaV9.version {
+                try await applySchemaV9(verifiedBackup: verifiedBackup)
+            }
         } catch let error as SQLiteError {
             switch error.reason {
             case .busy, .busyInRecovery, .busyInSnapshot, .busyTimeout, .locked,
@@ -2897,7 +2909,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         ).first?.column("schema_version")?.integer else {
             throw ServiceAPIError(code: .authorityPurposeMismatch, message: "Authority metadata is missing")
         }
-        if version > SchemaV8.version {
+        if version > SchemaV9.version {
             throw ServiceAPIError(
                 code: .forwardSchemaUnsupported,
                 message: "Authority store schema is newer than this maintenance tool"
@@ -3111,6 +3123,43 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             )
         }
         try await SchemaV8.validate(using: database)
+    }
+
+    private func applySchemaV9(verifiedBackup: VerifiedMigrationBackup?) async throws {
+        try await transaction(.bulk(estimatedEncodedBytes: 0)) {
+            try await executeMigrationStatements(SchemaV9.statements)
+            _ = try await database.query(
+                "INSERT INTO operator_session_metadata(session_id,username,issued_at,last_seen_at,correlation_id) SELECT session_id,username,CASE WHEN typeof(created_at) IN ('real','integer') THEN CAST(created_at AS REAL) ELSE CAST(strftime('%s',created_at) AS REAL) END,CASE WHEN typeof(created_at) IN ('real','integer') THEN CAST(created_at AS REAL) ELSE CAST(strftime('%s',created_at) AS REAL) END,? FROM operator_sessions",
+                [.text(UUID().uuidString.lowercased())]
+            )
+            try await hitFault(.afterMigrationStatement)
+            if let verifiedBackup {
+                let recipients = try encodeText(verifiedBackup.recipientFingerprints.sorted())
+                _ = try await database.query(
+                    "INSERT INTO maintenance_receipts(receipt_id,operation,outcome,archive_sha256,manifest_sha256,source_store_id,source_schema_version,source_global_sequence,verifier_fingerprint,recipient_fingerprints_json,sidecar_sha256,tool_version,tool_digest,correlation_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [
+                        .text(UUID().uuidString.lowercased()), .text("migrationVerify"), .text("success"),
+                        .text(verifiedBackup.archiveSHA256), .text(verifiedBackup.manifestSHA256),
+                        .text(verifiedBackup.source.storeID.uuidString.lowercased()),
+                        .integer(verifiedBackup.source.schemaVersion),
+                        .integer(Int(verifiedBackup.source.nextGlobalSequence)),
+                        .text(verifiedBackup.verifierFingerprint), .text(recipients),
+                        .text(verifiedBackup.sidecarSHA256), .text(verifiedBackup.toolVersion),
+                        .text(verifiedBackup.toolDigest), .text(UUID().uuidString.lowercased()),
+                        .float(Date().timeIntervalSince1970),
+                    ]
+                )
+                try await hitFault(.afterMigrationStatement)
+            }
+            _ = try await database.query("UPDATE service_metadata SET schema_version=9 WHERE fixed_id=1")
+            try await hitFault(.afterMigrationStatement)
+            try await insertMigration(
+                version: 9,
+                description: "operator authentication throttling, security audit, session metadata, and maintenance receipts",
+                digest: SchemaV9.canonicalDigest
+            )
+        }
+        try await SchemaV9.validate(using: database)
     }
 
     private func executeMigrationStatements(_ statements: [String]) async throws {
