@@ -29,7 +29,8 @@ public extension SQLiteServiceStore {
         expectedRevision: Int64,
         audit: ProviderConnectionAuditMutation? = nil
     ) async throws -> DirectProviderConfiguration {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(value, additional: retainedProviderAuditBytes(audit))
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             guard value.providerID.isDirectAPI, value.revision == expectedRevision + 1 else {
                 throw ServiceAPIError(code: .invalidRequest, message: "Direct provider configuration revision is invalid")
             }
@@ -96,7 +97,8 @@ public extension SQLiteServiceStore {
         models: [ProviderModelCatalogEntry],
         expectedRevision: Int64
     ) async throws -> ProviderModelCatalogSnapshot {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(models)
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             let observed = Int64(try await database.query(
                 "SELECT revision FROM provider_model_catalogs WHERE provider_id=?",
                 [.text(providerID.rawValue)]

@@ -348,7 +348,19 @@ private extension SQLiteServiceStore {
         audit: ServerSettingsAuditMutation
     ) async throws -> StoredSettingsDocument<Value> {
         try validateSettingsAudit(audit, domain: repository.domain, scopeID: scopeID)
-        return try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            document.value,
+            additional: checkedRetainedByteSum(
+                scopeID.utf8.count,
+                sourceFence?.1.utf8.count ?? 0,
+                audit.operation.utf8.count,
+                audit.attribution.actorID.utf8.count,
+                audit.attribution.actorLabel.utf8.count,
+                audit.attribution.channel.utf8.count,
+                audit.payloadDigest.utf8.count
+            )
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             let observed = try await settingsRevision(repository, scopeID: scopeID)
             guard observed == expectedRevision, document.revision == expectedRevision + 1 else {
                 throw ServiceAPIError(code: .staleRevision, message: "Typed settings revision is stale", currentRevision: observed)

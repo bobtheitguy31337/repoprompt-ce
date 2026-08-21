@@ -5,7 +5,8 @@ import SQLiteNIO
 
 extension SQLiteServiceStore: OwnedResourceRepository {
     public func reserveOwnedResource(_ record: OwnedResourceRecord) async throws {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(record)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let externalID = record.externalID,
                let existing = try await ownedResource(externalID: externalID, kind: record.kind)
             {
@@ -92,7 +93,11 @@ extension SQLiteServiceStore: OwnedResourceRepository {
         authority: ActiveOwnedWorktreeSnapshot,
         contentDigest: String
     ) async throws -> OwnedResourceRecord {
-        try await transaction {
+        let retainedBytes = authority.physicalPath.utf8.count
+            + authority.sourceRoot.utf8.count
+            + authority.branch.utf8.count
+            + contentDigest.utf8.count
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             guard let current = try await database.query(
                 "SELECT * FROM owned_resources WHERE resource_id=?",
                 [.text(resourceID.uuidString)]
@@ -151,7 +156,8 @@ extension SQLiteServiceStore: OwnedResourceRepository {
         contentDigest: String?,
         cleanupError: String?
     ) async throws -> OwnedResourceRecord {
-        try await transaction {
+        let retainedBytes = (contentDigest?.utf8.count ?? 0) + (cleanupError?.utf8.count ?? 0)
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             guard let current = try await database.query(
                 "SELECT * FROM owned_resources WHERE resource_id=?",
                 [.text(resourceID.uuidString)]
@@ -225,7 +231,11 @@ extension SQLiteServiceStore: OwnedResourceRepository {
         conflictArtifactPath: String?,
         errorCode: String?
     ) async throws -> WorktreeMergeLeaseRecord {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            expectedStates.map(\.rawValue).sorted()
+                + [state.rawValue, conflictArtifactPath ?? "", errorCode ?? ""]
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             guard let row = try await database.query("SELECT * FROM worktree_merge_leases WHERE lease_id=?", [.text(leaseID.uuidString)]).first else {
                 throw ServiceAPIError(code: .notFound, message: "Merge lease was not found")
             }

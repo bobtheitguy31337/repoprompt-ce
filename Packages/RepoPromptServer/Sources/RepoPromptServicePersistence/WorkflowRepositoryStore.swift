@@ -5,7 +5,8 @@ import SQLiteNIO
 
 public extension SQLiteServiceStore {
     func authorityStore_bootstrapWorkflowRepository(builtins: [WorkflowSnapshot], now: Date = Date()) async throws {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(builtins)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             _ = try await database.query(
                 "INSERT OR IGNORE INTO workflow_repository_state(fixed_id,collection_revision,include_session_cleanup_guidance,updated_at) VALUES(1,0,1,?)",
                 [.float(now.timeIntervalSince1970)]
@@ -72,7 +73,15 @@ public extension SQLiteServiceStore {
         audit: ServerSettingsAuditMutation
     ) async throws -> ServerWorkflowRepositorySnapshot {
         try validateWorkflowAudit(audit)
-        return try await transaction {
+        let auditBytes = try retainedInputBytes([
+            audit.operation,
+            audit.attribution.actorID,
+            audit.attribution.actorLabel,
+            audit.attribution.channel,
+            audit.payloadDigest,
+        ])
+        let retainedBytes = try retainedInputBytes(snapshot, additional: auditBytes)
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             let observed = Int64(try await database.query(
                 "SELECT collection_revision FROM workflow_repository_state WHERE fixed_id=1"
             ).first?.column("collection_revision")?.integer ?? 0)
@@ -141,7 +150,14 @@ public extension SQLiteServiceStore {
         audit: ServerSettingsAuditMutation
     ) async throws -> ServerWorkflowRepositorySnapshot {
         try validateWorkflowAudit(audit)
-        return try await transaction {
+        let retainedBytes = try retainedInputBytes([
+            audit.operation,
+            audit.attribution.actorID,
+            audit.attribution.actorLabel,
+            audit.attribution.channel,
+            audit.payloadDigest,
+        ])
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             let now = Date()
             let observed = Int64(try await database.query(
                 "SELECT collection_revision FROM workflow_repository_state WHERE fixed_id=1"

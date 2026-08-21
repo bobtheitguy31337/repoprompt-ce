@@ -64,19 +64,15 @@ final class ServingMigrationRefusalTests: XCTestCase {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: directory) }
             let path = directory.appendingPathComponent("state.sqlite").path
-            let initialized = try await SQLiteServiceStore.open(storage: .file(path))
-            _ = try await initialized.database.query(
-                "UPDATE service_metadata SET schema_version=? WHERE fixed_id=1",
-                [.integer(pendingVersion)]
+            try await StoreMigrationTestSupport.makeHistoricalStore(
+                at: URL(fileURLWithPath: path),
+                throughVersion: pendingVersion
             )
-            _ = try await initialized.database.query(
-                "DELETE FROM schema_migrations WHERE version>?",
-                [.integer(pendingVersion)]
-            )
-            let ledgerBefore = try await initialized.database.query(
+            let initialized = try await SQLiteDatabaseExecutor.open(storage: .file(path: path))
+            let ledgerBefore = try await initialized.query(
                 "SELECT version,digest FROM schema_migrations ORDER BY version"
             ).map(Self.ledgerRow)
-            try await initialized.close(clean: false)
+            try await initialized.close()
             let bytesBefore = try Data(contentsOf: URL(fileURLWithPath: path))
 
             do {

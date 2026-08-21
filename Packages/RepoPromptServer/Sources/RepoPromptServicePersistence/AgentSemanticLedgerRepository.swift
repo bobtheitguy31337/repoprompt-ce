@@ -5,7 +5,8 @@ import SQLiteNIO
 
 public extension SQLiteServiceStore {
     func authorityStore_prepareAgentSubmission(_ record: AgentSubmissionRecord) async throws -> AgentSubmissionRecord {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(record)
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let existing = try await agentSubmission(actorID: record.actorID, targetKey: record.targetKey, operation: record.operation, publicKey: record.publicKey) {
                 guard existing.requestDigest == record.requestDigest else {
                     throw ServiceAPIError(code: .idempotencyConflict, message: "Submission key was reused with different content")
@@ -62,7 +63,29 @@ public extension SQLiteServiceStore {
         receipt: SubmissionReceipt,
         newSession: PreparedNewAgentSession? = nil
     ) async throws -> NewAgentSessionAcceptanceEvents? {
-        try await transaction {
+        var additionalBytes = try checkedRetainedByteSum(
+            retainedEncodedBytes(turn),
+            retainedEncodedBytes(nextDefaults),
+            retainedEncodedBytes(runPresentation),
+            retainedEncodedBytes(receipt)
+        )
+        let retainedBytes: Int
+        if let newSession {
+            additionalBytes = try checkedRetainedByteSum(
+                additionalBytes,
+                retainedEncodedBytes(record),
+                retainedEncodedBytes(newSession.agent),
+                retainedEncodedBytes(newSession.expectedProjectRootIDs),
+                retainedEncodedBytes(newSession.initialSelection),
+                retainedEncodedBytes(newSession.initialPermissions),
+                retainedEncodedBytes(newSession.initialCollaboration),
+                retainedEncodedBytes(newSession.initialWorktrees)
+            )
+            retainedBytes = try sessionRetainedBytes(newSession.snapshot, additional: additionalBytes)
+        } else {
+            retainedBytes = try retainedInputBytes(record, additional: additionalBytes)
+        }
+        return try await transaction(.bulk(estimatedEncodedBytes: retainedBytes)) {
             guard let current = try await agentSubmission(submissionID: record.submissionID), current.state == .preparing else {
                 throw ServiceAPIError(code: .idempotencyConflict, message: "Submission is not preparing")
             }
@@ -126,7 +149,8 @@ public extension SQLiteServiceStore {
     }
 
     func authorityStore_upsertRunPresentation(_ snapshot: RunPresentationSnapshot) async throws {
-        try await transaction { try await upsertRunPresentationInTransaction(snapshot) }
+        let retainedBytes = try retainedInputBytes(snapshot)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) { try await upsertRunPresentationInTransaction(snapshot) }
     }
 
     func authorityStore_runPresentation(sessionID: UUID) async throws -> RunPresentationSnapshot? {
@@ -135,7 +159,8 @@ public extension SQLiteServiceStore {
     }
 
     func upsertSemanticTurn(_ record: SemanticTurnRecord) async throws {
-        try await transaction { try await upsertSemanticTurnInTransaction(record) }
+        let retainedBytes = try retainedInputBytes(record)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) { try await upsertSemanticTurnInTransaction(record) }
     }
 
     func authorityStore_semanticTurn(runID: UUID) async throws -> SemanticTurnRecord? {

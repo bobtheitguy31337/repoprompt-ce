@@ -14,6 +14,77 @@ enum StoreMigrationTestSupport {
         "repoprompt-service-schema-v6-typed-settings-agent-composer-semantic-acceptance",
     ]
 
+    struct FrozenLegacyColumn: Codable, Sendable {
+        let table: String
+        let column: String
+        let definition: String
+    }
+
+    struct FrozenSchemaVersionProgram: Codable, Sendable {
+        let version: Int
+        let ledgerDigest: String
+        let transformationID: String
+        let statements: [String]
+        let operatorStatements: [String]?
+        let legacyColumns: [FrozenLegacyColumn]?
+        let dataStatements: [String]?
+    }
+
+    struct FrozenV6Program: Codable, Sendable {
+        let programID: String
+        let sourceCommit: String
+        let sourceKind: String
+        let ledgerDigest: String
+        let transformationID: String
+        let programDigest: String
+        let statementsDigest: String
+        let statements: [String]
+    }
+
+    private struct FrozenHistoricalPrograms: Codable, Sendable {
+        let formatVersion: Int
+        let baseSourceCommit: String
+        let baseProgramDigest: String
+        let baseStatementsDigest: String
+        let versions1Through5: [FrozenSchemaVersionProgram]
+        let v6Programs: [FrozenV6Program]
+    }
+
+    private static let frozenHistoricalPrograms: FrozenHistoricalPrograms = {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/Migrations/historical-schema-programs-v1.json")
+        do {
+            return try JSONDecoder().decode(FrozenHistoricalPrograms.self, from: Data(contentsOf: url))
+        } catch {
+            fatalError("Frozen historical migration program fixture is invalid: \(error)")
+        }
+    }()
+
+    static var frozenFormatVersion: Int {
+        frozenHistoricalPrograms.formatVersion
+    }
+
+    static var frozenBaseSourceCommit: String {
+        frozenHistoricalPrograms.baseSourceCommit
+    }
+
+    static var frozenVersions1Through5: [FrozenSchemaVersionProgram] {
+        frozenHistoricalPrograms.versions1Through5
+    }
+
+    static var historicalV6Programs: [FrozenV6Program] {
+        frozenHistoricalPrograms.v6Programs
+    }
+
+    static var frozenBaseProgramDigest: String {
+        frozenHistoricalPrograms.baseProgramDigest
+    }
+
+    static var frozenBaseStatementsDigest: String {
+        frozenHistoricalPrograms.baseStatementsDigest
+    }
+
     static func temporaryDirectory(_ name: String = #function) throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("rp-pr4-\(name)-\(UUID().uuidString)", isDirectory: true)
@@ -21,32 +92,83 @@ enum StoreMigrationTestSupport {
         return url
     }
 
-    /// Constructs a genuine historical V6 database from the immutable V1–V5
-    /// programs and the DDL that belonged to the selected prototype label. It
-    /// deliberately never opens a V7 store and relabels it as history.
+    /// Constructs a V6 database only from checked-in V1–V6 programs. Historical
+    /// labels select a frozen source program; the current label executes the
+    /// current immutable V1–V6 definitions without ever creating or relabeling
+    /// a V7 store.
     static func makeV6Store(at databaseURL: URL, digest: String = knownV6Digests[0]) async throws {
-        guard knownV6Digests.contains(digest) else {
-            // Unknown-digest refusal tests still need a structurally authentic
-            // V6 store; use the oldest DDL shape while preserving the bad label.
-            return try await makeV6Store(at: databaseURL, ledgerDigest: digest, fixtureDigest: knownV6Digests[4])
+        if digest == knownV6Digests[0] {
+            return try await makeStore(
+                at: databaseURL,
+                throughVersion: 6,
+                ledgerDigestOverride: digest,
+                historicalV6Program: nil
+            )
         }
-        try await makeV6Store(at: databaseURL, ledgerDigest: digest, fixtureDigest: digest)
+        let program = historicalV6Programs
+            .filter { $0.ledgerDigest == digest }
+            .sorted { $0.programID < $1.programID }
+            .last
+            ?? historicalV6Programs.first { $0.programID == "typed-settings" }
+        try await makeStore(
+            at: databaseURL,
+            throughVersion: 6,
+            ledgerDigestOverride: digest,
+            historicalV6Program: program
+        )
     }
 
-    private static func makeV6Store(
+    static func makeV6Store(at databaseURL: URL, programID: String) async throws {
+        guard let program = historicalV6Programs.first(where: { $0.programID == programID }) else {
+            throw CocoaError(.fileReadNoSuchFile)
+        }
+        try await makeStore(
+            at: databaseURL,
+            throughVersion: 6,
+            ledgerDigestOverride: program.ledgerDigest,
+            historicalV6Program: program
+        )
+    }
+
+    static func makeHistoricalStore(at databaseURL: URL, throughVersion: Int) async throws {
+        precondition((1 ... 6).contains(throughVersion))
+        let program = throughVersion == 6
+            ? historicalV6Programs.first(where: { $0.programID == "typed-settings" })
+            : nil
+        try await makeStore(
+            at: databaseURL,
+            throughVersion: throughVersion,
+            ledgerDigestOverride: program?.ledgerDigest,
+            historicalV6Program: program
+        )
+    }
+
+    private static func makeStore(
         at databaseURL: URL,
-        ledgerDigest: String,
-        fixtureDigest: String
+        throughVersion: Int,
+        ledgerDigestOverride: String?,
+        historicalV6Program: FrozenV6Program?
     ) async throws {
         let database = try await SQLiteDatabaseExecutor.open(storage: .file(path: databaseURL.path))
         let transactionID = UUID()
         try await database.beginTransaction(transactionID)
         do {
             try await SQLiteExecutionContext.$transactionID.withValue(transactionID) {
-                for statement in SchemaV1.statements + SchemaV1.operatorStatements {
+                let historical = historicalV6Program != nil || throughVersion < 6
+                let frozenVersions = frozenHistoricalPrograms.versions1Through5
+                let v1Statements = historical ? frozenVersions[0].statements : SchemaV1.statements
+                let operatorStatements = historical ? (frozenVersions[0].operatorStatements ?? []) : SchemaV1.operatorStatements
+                for statement in v1Statements + operatorStatements {
                     _ = try await database.query(statement)
                 }
-                for legacyColumn in SchemaV1.legacyColumns {
+                let legacyColumns: [FrozenLegacyColumn] = if historical {
+                    frozenVersions[0].legacyColumns ?? []
+                } else {
+                    SchemaV1.legacyColumns.map {
+                        FrozenLegacyColumn(table: $0.table, column: $0.column, definition: $0.definition)
+                    }
+                }
+                for legacyColumn in legacyColumns {
                     let columns = Set(try await database.query("PRAGMA table_info(\(legacyColumn.table))")
                         .compactMap { $0.column("name")?.string })
                     if !columns.contains(legacyColumn.column) {
@@ -59,14 +181,25 @@ enum StoreMigrationTestSupport {
                     "INSERT INTO service_metadata(fixed_id,store_id,schema_version,created_at,last_clean_shutdown,current_boot_epoch,next_global_sequence,replay_floor) VALUES(1,?,1,CURRENT_TIMESTAMP,0,1,1,0)",
                     [.text(UUID().uuidString)]
                 )
-                try await insertLedger(database, version: 1, digest: SchemaV1.digest)
+                try await insertLedger(database, version: 1, digest: historical ? frozenVersions[0].ledgerDigest : SchemaV1.digest)
 
-                for (version, statements, digest) in [
+                guard throughVersion > 1 else { return }
+
+                let currentPrograms: [(Int, [String], String)] = [
                     (2, SchemaV2.statements + SchemaV2.dataStatements, SchemaV2.digest),
                     (3, SchemaV3.statements, SchemaV3.digest),
                     (4, SchemaV4.statements, SchemaV4.digest),
                     (5, SchemaV5.statements, SchemaV5.digest),
-                ] {
+                ]
+                for version in 2 ... min(throughVersion, 5) {
+                    let program: (version: Int, statements: [String], digest: String)
+                    if historical {
+                        let frozen = frozenVersions[version - 1]
+                        program = (version, frozen.statements + (frozen.dataStatements ?? []), frozen.ledgerDigest)
+                    } else {
+                        program = currentPrograms[version - 2]
+                    }
+                    let (version, statements, digest) = program
                     for statement in statements { _ = try await database.query(statement) }
                     _ = try await database.query(
                         "UPDATE service_metadata SET schema_version=? WHERE fixed_id=1",
@@ -75,23 +208,20 @@ enum StoreMigrationTestSupport {
                     try await insertLedger(database, version: version, digest: digest)
                 }
 
-                for statement in historicalV6Statements(for: fixtureDigest) {
+                guard throughVersion == 6 else { return }
+                for statement in historicalV6Program?.statements ?? SchemaV6.statements {
                     _ = try await database.query(statement)
                 }
-                if fixtureDigest != knownV6Digests[0] {
-                    // Earlier prototype stores used the Goblin-era acknowledgement
-                    // column. Keeping both source and destination permits explicit
-                    // copy-if-nil and source-column removal evidence during V7.
-                    _ = try await database.query(
-                        "ALTER TABLE collaboration_metadata ADD COLUMN goblin_acknowledgement_json TEXT"
-                    )
-                }
                 _ = try await database.query("UPDATE service_metadata SET schema_version=6 WHERE fixed_id=1")
-                try await insertLedger(database, version: 6, digest: ledgerDigest)
+                try await insertLedger(
+                    database,
+                    version: 6,
+                    digest: ledgerDigestOverride ?? SchemaV6.digest
+                )
             }
             try await database.commitTransaction(transactionID)
         } catch {
-            await database.rollbackTransaction(transactionID)
+            try? await database.rollbackTransaction(transactionID)
             try? await database.close()
             throw error
         }
@@ -107,35 +237,6 @@ enum StoreMigrationTestSupport {
             "INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP)",
             [.text("v\(version)"), .integer(version), .text("historical fixture v\(version)"), .text(digest)]
         )
-    }
-
-    private static func historicalV6Statements(for digest: String) -> [String] {
-        let typedBase = Array(SchemaV6.statements[0 ... 1]) + Array(SchemaV6.statements[6 ... 17])
-        let composer = Array(SchemaV6.statements[18...])
-        switch digest {
-        case knownV6Digests[0]:
-            return SchemaV6.statements
-        case knownV6Digests[1]:
-            return SchemaV6.statements.filter { !$0.contains("mcp_show_model_presets") }
-        case knownV6Digests[2]:
-            return SchemaV6.statements.filter {
-                !$0.contains("mcp_disabled_tools") && !$0.contains("mcp_show_model_presets")
-            }
-        case knownV6Digests[3]:
-            return SchemaV6.statements.filter {
-                !$0.contains("workspace_approval_settings")
-                    && !$0.contains("mcp_disabled_tools")
-                    && !$0.contains("mcp_show_model_presets")
-            }
-        case knownV6Digests[4]:
-            return typedBase
-        case knownV6Digests[5]:
-            return composer
-        case knownV6Digests[6]:
-            return typedBase + composer
-        default:
-            return typedBase
-        }
     }
 
     static func namespace(

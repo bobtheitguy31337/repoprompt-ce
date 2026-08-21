@@ -469,7 +469,7 @@ final class BackupRestoreCoreTests: XCTestCase {
         let fixture = try await makeBackupFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
-        for mode: mode_t in [0o400, 0o640, 0o700] {
+        for mode: mode_t in [0o400, 0o640, 0o700, 0o1600, 0o2600, 0o4600, 0o6600] {
             XCTAssertEqual(chmod(fixture.identity.path, mode), 0)
             do {
                 _ = try await fixture.service.verify(
@@ -488,6 +488,64 @@ final class BackupRestoreCoreTests: XCTestCase {
             identityFileURL: fixture.identity
         )
         try await fixture.store.close(clean: false)
+    }
+
+    func testEveryNestedRestoreDirectoryBoundaryIsFsyncedBeforePublication() async throws {
+        let root = try StoreMigrationTestSupport.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let state = root.appendingPathComponent("state", isDirectory: true)
+        let nested = state.appendingPathComponent("one/two/three", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try Data("nested durable payload".utf8).write(to: nested.appendingPathComponent("payload.bin"))
+        let store = try await SQLiteServiceStore.open(
+            storage: .file(state.appendingPathComponent("repoprompt.sqlite").path)
+        )
+        let recipients = try StoreMigrationTestSupport.recipientsFile(
+            in: root,
+            values: [StoreMigrationTestSupport.defaultRecipient]
+        )
+        let identity = try StoreMigrationTestSupport.identityFile(in: root)
+        let archive = root.appendingPathComponent("nested.tar.age")
+        let evidence = RestoreDurabilityEvidence()
+        let service = BackupRestoreService(
+            envelope: CopyingBackupEnvelope(),
+            toolVersion: "RepoPromptServerTests/1",
+            toolDigest: String(repeating: "a", count: 64),
+            restorePublicationFaultInjector: { point in evidence.record("publish:\(point)") },
+            restoreDirectorySyncObserver: { url in evidence.record("sync:\(url.path)") }
+        )
+        _ = try await service.create(
+            request: .init(
+                outputURL: archive,
+                recipientsFileURL: recipients,
+                roots: [.init(logicalID: "", url: state)],
+                namespaceKind: "server",
+                databaseIdentityDigest: String(repeating: "1", count: 64)
+            ),
+            store: store
+        )
+        let target = root.appendingPathComponent("restored", isDirectory: true)
+        _ = try await service.prepareRestore(.init(
+            archiveURL: archive,
+            identityFileURL: identity,
+            targetRootURL: target,
+            targetNamespaceKind: "server",
+            targetDatabaseIdentityDigest: String(repeating: "2", count: 64)
+        ))
+
+        let events = evidence.values
+        let publication = try XCTUnwrap(events.firstIndex(of: "publish:after-incomplete-marker"))
+        for suffix in ["/one", "/one/two", "/one/two/three"] {
+            let sync = try XCTUnwrap(events.firstIndex(where: {
+                $0.hasPrefix("sync:") && $0.hasSuffix(suffix)
+            }), "missing successful fsync evidence for \(suffix)")
+            XCTAssertLessThan(sync, publication, "\(suffix) was not durable before publication")
+        }
+        XCTAssertEqual(
+            try Data(contentsOf: target.appendingPathComponent("one/two/three/payload.bin")),
+            Data("nested durable payload".utf8)
+        )
+        try await store.close(clean: false)
     }
 
     func testMissingOptionalProviderAssetsDisableAndDegradeOnActivation() async throws {
@@ -779,3 +837,20 @@ final class RealAgeBackupIntegrationTests: XCTestCase {
 
 private struct InjectedRestoreFailure: Error {}
 private struct InjectedRestorePublicationFailure: Error {}
+
+private final class RestoreDurabilityEvidence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    var values: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func record(_ value: String) {
+        lock.lock()
+        storage.append(value)
+        lock.unlock()
+    }
+}

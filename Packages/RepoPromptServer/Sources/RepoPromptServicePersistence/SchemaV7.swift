@@ -13,19 +13,26 @@ enum SchemaV7 {
     static let version = 7
     /// Legacy PR4 ledger alias accepted for exact-head compatibility.
     static let digest = "repoprompt-service-schema-v7-compatibility-audit-namespace-identity-v1"
-    static let transformationID = "prototype-v6-ledger-normalization-v1"
+    static let transformationID = "prototype-v6-ledger-normalization-v2"
     static let legacyCanonicalDigest = "sha256:d0bef377110aa4d336cbe11493a2bb9e3b0b24c64de828bcbf75decc166f9f3a"
-    static let canonicalDigest = "sha256:6d2aaea9c3017685d7e2a7016c59811da7b7920d160d047da6ad0f4b54e726a6"
+    static let preHistoricalProgramCanonicalDigest = "sha256:6d2aaea9c3017685d7e2a7016c59811da7b7920d160d047da6ad0f4b54e726a6"
+    static let preCollaborationRebuildCanonicalDigest = "sha256:8c70e39d6d6c3027cedf56f5ab93515d3456830194cd06db48922d5357e411e5"
+    static let canonicalDigest = "sha256:fccefb0613a49662654d45c26a518303fa519497b5a862eb9f62e5316bc3742c"
     static var definition: MigrationDefinition {
         let planEvidence = prototypeNormalizationPlans.keys.sorted().compactMap { observed -> String? in
             guard let plan = prototypeNormalizationPlans[observed] else { return nil }
             return "prototype-v6:\(observed):\(plan.id):ddl=\(plan.appliesFinalV6DDL):legacy-json=\(plan.rewritesLegacyJSONKeys)"
         }
+        let historicalFinalV6Program =
+            SchemaV1.operatorStatements.map { "historical-final-v6-ddl:\($0)" }
+                + SchemaV6.statements.map { "historical-final-v6-ddl:\($0)" }
+                + SchemaV1.legacyColumns.map { "historical-final-v6-\($0.identity)" }
+                + collaborationRebuildProgramEvidence
         return MigrationDefinition(
             version: version,
             transformationID: transformationID,
             statements: statements,
-            transformationSteps: planEvidence + [
+            transformationSteps: planEvidence + historicalFinalV6Program + [
                 "current-v6-canonical:\(SchemaV6.canonicalDigest):prototype-v6-current-audit-only",
                 "final-v6-shape:\(finalV6ShapeDigest)",
                 "legacy-json:goblinUserId->userId",
@@ -43,6 +50,20 @@ enum SchemaV7 {
         "CREATE TABLE schema_compatibility_audit(source_version INTEGER NOT NULL CHECK(source_version = 6),observed_digest TEXT NOT NULL,normalization_id TEXT NOT NULL,target_version INTEGER NOT NULL CHECK(target_version = 7),schema_shape_digest TEXT NOT NULL,applied_at REAL NOT NULL,PRIMARY KEY(source_version,observed_digest,normalization_id))",
         "CREATE TABLE authority_namespace_identity(fixed_id INTEGER PRIMARY KEY CHECK(fixed_id = 1),namespace_kind TEXT NOT NULL CHECK(namespace_kind IN ('server', 'directHeadless')),database_identity_digest TEXT NOT NULL,created_at REAL NOT NULL)",
     ]
+
+    static let collaborationRebuildCreateStatement = "CREATE TABLE collaboration_metadata_v7_rebuild(session_id TEXT PRIMARY KEY REFERENCES sessions(session_id),schema_version INTEGER NOT NULL,visibility TEXT NOT NULL,collaborative_steering_enabled INTEGER NOT NULL,controller_user_id TEXT NOT NULL,policy_revision INTEGER NOT NULL,controller_revision INTEGER NOT NULL,membership_revision INTEGER NOT NULL,collaboration_acknowledgement_json TEXT,updated_at TEXT NOT NULL)"
+    static let collaborationRebuildDropStatement = "DROP TABLE collaboration_metadata"
+    static let collaborationRebuildRenameStatement = "ALTER TABLE collaboration_metadata_v7_rebuild RENAME TO collaboration_metadata"
+    static let collaborationRebuildProgramEvidence = [
+        collaborationRebuildCreateStatement,
+        "INSERT collaboration_metadata_v7_rebuild SELECT acknowledgement=COALESCE(current,legacy)|current|legacy|NULL",
+        collaborationRebuildDropStatement,
+        collaborationRebuildRenameStatement,
+    ]
+
+    static func collaborationRebuildCopyStatement(acknowledgementExpression: String) -> String {
+        "INSERT INTO collaboration_metadata_v7_rebuild(session_id,schema_version,visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision,collaboration_acknowledgement_json,updated_at) SELECT session_id,schema_version,visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision,\(acknowledgementExpression),updated_at FROM collaboration_metadata"
+    }
 
     static let knownPrototypeV6Digests: Set<String> = [
         "repoprompt-service-schema-v6-typed-mcp-show-model-presets",
@@ -216,9 +237,16 @@ enum SchemaV7 {
         let material = observed.joined(separator: "\n")
         let digest = SHA256.hash(data: Data(material.utf8)).map { String(format: "%02x", $0) }.joined()
         guard observed == finalV6ShapeManifest, digest == finalV6ShapeDigest else {
+            let mismatchIndex = zip(observed, finalV6ShapeManifest).enumerated()
+                .first(where: { $0.element.0 != $0.element.1 })?.offset
+                ?? min(observed.count, finalV6ShapeManifest.count)
+            let actual = mismatchIndex < observed.count ? observed[mismatchIndex] : "<missing>"
+            let expected = mismatchIndex < finalV6ShapeManifest.count
+                ? finalV6ShapeManifest[mismatchIndex]
+                : "<none>"
             throw ServiceAPIError(
                 code: .persistenceUnavailable,
-                message: "Schema v6 shape does not match the frozen migration manifest",
+                message: "Schema v6 shape does not match the frozen migration manifest at \(mismatchIndex): expected \(expected), observed \(actual)",
                 retryable: false
             )
         }

@@ -339,6 +339,7 @@ public actor BackupRestoreService {
     private let toolVersion: String
     private let toolDigest: String
     private let restorePublicationFaultInjector: (@Sendable (String) throws -> Void)?
+    private let restoreDirectorySyncObserver: (@Sendable (URL) -> Void)?
 
     public init(
         envelope: any BackupEnvelopeEncrypting,
@@ -349,18 +350,21 @@ public actor BackupRestoreService {
         self.toolVersion = toolVersion
         self.toolDigest = toolDigest
         restorePublicationFaultInjector = nil
+        restoreDirectorySyncObserver = nil
     }
 
     init(
         envelope: any BackupEnvelopeEncrypting,
         toolVersion: String,
         toolDigest: String,
-        restorePublicationFaultInjector: @escaping @Sendable (String) throws -> Void
+        restorePublicationFaultInjector: @escaping @Sendable (String) throws -> Void,
+        restoreDirectorySyncObserver: (@Sendable (URL) -> Void)? = nil
     ) {
         self.envelope = envelope
         self.toolVersion = toolVersion
         self.toolDigest = toolDigest
         self.restorePublicationFaultInjector = restorePublicationFaultInjector
+        self.restoreDirectorySyncObserver = restoreDirectorySyncObserver
     }
 
     public func create(
@@ -585,6 +589,8 @@ public actor BackupRestoreService {
                 withIntermediateDirectories: false,
                 attributes: [.posixPermissions: 0o700]
             )
+            try syncRestoreDirectory(target)
+            try syncRestoreDirectory(target.deletingLastPathComponent())
         }
 
         struct ExternalPublication {
@@ -619,12 +625,16 @@ public actor BackupRestoreService {
                 withIntermediateDirectories: false,
                 attributes: [.posixPermissions: 0o700]
             )
+            try syncRestoreDirectory(staging)
+            try syncRestoreDirectory(staging.deletingLastPathComponent())
             externalPublications[logicalID] = .init(logicalID: logicalID, target: externalTarget, staging: staging)
         }
 
         let staging = target.deletingLastPathComponent()
             .appendingPathComponent(".\(target.lastPathComponent).restore-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        try syncRestoreDirectory(staging)
+        try syncRestoreDirectory(staging.deletingLastPathComponent())
         var published = false
         var publishedExternalRoots: [URL] = []
         defer {
@@ -635,7 +645,7 @@ public actor BackupRestoreService {
                 }
                 for url in publishedExternalRoots.reversed() {
                     try? FileManager.default.removeItem(at: url)
-                    try? BackupFileSafety.syncDirectory(url.deletingLastPathComponent())
+                    try? syncRestoreDirectory(url.deletingLastPathComponent())
                 }
             }
         }
@@ -660,21 +670,23 @@ public actor BackupRestoreService {
                 relativePath = String(asset.archivePath.dropFirst(prefix.count))
             }
             let destination = try BackupFileSafety.safeDestination(root: root, relativePath: relativePath)
-            try FileManager.default.createDirectory(
-                at: destination.deletingLastPathComponent(),
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
+            try BackupFileSafety.createDurableDirectoryHierarchy(
+                root: root,
+                directory: destination.deletingLastPathComponent(),
+                afterSync: { [restoreDirectorySyncObserver] url in
+                    restoreDirectorySyncObserver?(url)
+                }
             )
             try data.write(to: destination, options: .withoutOverwriting)
             guard chmod(destination.path, mode_t(asset.mode)) == 0 else {
                 throw ServiceAPIError(code: .persistenceUnavailable, message: "Unable to restore asset permissions")
             }
             try BackupFileSafety.syncFile(destination)
-            try BackupFileSafety.syncDirectory(destination.deletingLastPathComponent())
+            try syncRestoreDirectory(destination.deletingLastPathComponent())
         }
-        try BackupFileSafety.syncDirectory(staging)
+        try syncRestoreDirectory(staging)
         for publication in externalPublications.values {
-            try BackupFileSafety.syncDirectory(publication.staging)
+            try syncRestoreDirectory(publication.staging)
         }
 
         let restoreRequest = RestoreNamespaceRequestV1(
@@ -709,7 +721,7 @@ public actor BackupRestoreService {
         for publication in externalPublications.values.sorted(by: { $0.logicalID < $1.logicalID }) {
             try FileManager.default.moveItem(at: publication.staging, to: publication.target)
             publishedExternalRoots.append(publication.target)
-            try BackupFileSafety.syncDirectory(publication.target.deletingLastPathComponent())
+            try syncRestoreDirectory(publication.target.deletingLastPathComponent())
             try restorePublicationFaultInjector?("after-external-move:\(publication.logicalID)")
         }
         let names = try FileManager.default.contentsOfDirectory(atPath: staging.path)
@@ -725,13 +737,18 @@ public actor BackupRestoreService {
             )
             try restorePublicationFaultInjector?("after-move:\(name)")
         }
-        try BackupFileSafety.syncDirectory(target)
+        try syncRestoreDirectory(target)
         try FileManager.default.removeItem(at: incomplete)
-        try BackupFileSafety.syncDirectory(target)
+        try syncRestoreDirectory(target)
         try FileManager.default.removeItem(at: staging)
         published = true
-        try BackupFileSafety.syncDirectory(target.deletingLastPathComponent())
+        try syncRestoreDirectory(target.deletingLastPathComponent())
         return verified.manifest
+    }
+
+    private func syncRestoreDirectory(_ directory: URL) throws {
+        try BackupFileSafety.syncDirectory(directory)
+        restoreDirectorySyncObserver?(directory.standardizedFileURL)
     }
 
     public static func sidecarURL(for archiveURL: URL) -> URL {
@@ -941,7 +958,7 @@ private enum BackupFileSafety {
         guard values.isSymbolicLink != true,
               attributes[.type] as? FileAttributeType == .typeRegular,
               let permissions = attributes[.posixPermissions] as? NSNumber,
-              permissions.intValue & 0o777 == 0o600
+              permissions.intValue & 0o7777 == 0o600
         else {
             throw ServiceAPIError(code: .invalidRequest, message: "age identity file must be a private regular file")
         }
@@ -993,6 +1010,47 @@ private enum BackupFileSafety {
         guard fd >= 0 else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Unable to open backup parent directory") }
         defer { _ = close(fd) }
         guard fsync(fd) == 0 else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Unable to sync backup parent directory") }
+    }
+
+    /// Creates each absent restore ancestor separately and durably records both
+    /// the new directory inode and the parent entry that names it. The callback
+    /// runs only after the corresponding real fsync succeeds.
+    static func createDurableDirectoryHierarchy(
+        root: URL,
+        directory: URL,
+        afterSync: (URL) -> Void
+    ) throws {
+        let standardizedRoot = root.standardizedFileURL
+        let standardizedDirectory = directory.standardizedFileURL
+        guard standardizedDirectory.path == standardizedRoot.path
+            || standardizedDirectory.path.hasPrefix(standardizedRoot.path + "/")
+        else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Restore directory escapes target")
+        }
+
+        let relative = standardizedDirectory.path.dropFirst(standardizedRoot.path.count)
+        var current = standardizedRoot
+        for component in relative.split(separator: "/") {
+            let next = current.appendingPathComponent(String(component), isDirectory: true)
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: next.path, isDirectory: &isDirectory) {
+                let values = try next.resourceValues(forKeys: [.isSymbolicLinkKey])
+                guard isDirectory.boolValue, values.isSymbolicLink != true else {
+                    throw ServiceAPIError(code: .invalidRequest, message: "Restore directory boundary is unsafe")
+                }
+            } else {
+                try FileManager.default.createDirectory(
+                    at: next,
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                try syncDirectory(next)
+                afterSync(next.standardizedFileURL)
+                try syncDirectory(current)
+                afterSync(current.standardizedFileURL)
+            }
+            current = next
+        }
     }
 
     static func validateArchivePath(_ path: String) throws {

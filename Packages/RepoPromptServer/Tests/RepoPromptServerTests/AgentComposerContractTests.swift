@@ -840,6 +840,142 @@ final class AgentTurnIntentCompilerTests: XCTestCase {
 }
 
 final class AgentSubmissionCoordinatorTests: XCTestCase {
+    func testOversizedPreparedProjectRootFenceIsRejectedBeforeBeginOrAdmission() async throws {
+        let store = try await SQLiteServiceStore.openForExecutorSaturationTesting(
+            storage: .memory,
+            capacity: 32,
+            reservedControlCapacity: 16,
+            maximumAdmissionWaiters: 32,
+            maximumProducerEncodedBytes: 1_048_576
+        )
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let identity = testIdentity()
+        let sessionID = UUID()
+        let submissionID = UUID()
+        let actor = ExternalActor(userID: "actor-1", username: "actor", displayName: "Actor")
+        let config = testConfiguration(at: now)
+        let session = SessionSnapshot(
+            sessionID: sessionID,
+            projectID: UUID(),
+            parentSessionID: nil,
+            rootSessionID: sessionID,
+            creator: actor,
+            provider: .codex,
+            model: "fake",
+            visibility: .privateSession,
+            state: .idle,
+            runGeneration: 1,
+            turnEpoch: 1,
+            revision: 1,
+            transcript: [],
+            interactions: [],
+            cursor: .init(storeID: UUID(), globalSequence: 0)
+        )
+        let record = AgentSubmissionRecord(
+            submissionID: submissionID,
+            actorID: actor.userID,
+            targetKey: sessionID.uuidString,
+            operation: "startSession",
+            publicKey: submissionID.uuidString.lowercased(),
+            requestDigest: "request-digest",
+            state: .preparing,
+            sessionID: sessionID,
+            identity: identity,
+            preparedJSON: Data("prepared".utf8),
+            compiledInputJSON: Data("compiled".utf8),
+            createdAt: now,
+            updatedAt: now
+        )
+        let receipt = SubmissionReceipt(
+            submissionID: submissionID,
+            acceptedAt: now,
+            operation: "startSession",
+            sessionID: sessionID,
+            sessionRevision: 1,
+            requestAnchorID: identity.requestAnchorID,
+            runID: identity.runID,
+            generation: identity.generation,
+            turnEpoch: identity.turnEpoch,
+            runPhase: "preparing",
+            runStartedAt: now,
+            selectedConfiguration: .init(
+                catalogRevision: config.catalogRevision,
+                providerID: config.providerID,
+                modelID: config.modelID,
+                effortID: config.effortID,
+                permissionID: config.permissionID
+            ),
+            session: session
+        )
+        let prepared = PreparedNewAgentSession(
+            snapshot: session,
+            agent: .init(
+                agentID: sessionID,
+                sessionID: sessionID,
+                rootSessionID: sessionID,
+                parentAgentID: nil,
+                role: "root",
+                state: .idle,
+                revision: 1
+            ),
+            initialSelection: .init(sessionID: sessionID, entries: [], revision: 1),
+            initialPermissions: .init(
+                sessionID: sessionID,
+                mode: "workspace-write",
+                providerSettings: [:],
+                revision: 1,
+                updatedActor: actor
+            ),
+            initialCollaboration: .init(
+                sessionID: sessionID,
+                visibility: .privateSession,
+                collaborativeSteeringEnabled: false,
+                controllerUserID: actor.userID,
+                policyRevision: 1,
+                controllerRevision: 1,
+                membershipRevision: 1
+            ),
+            expectedProjectRevision: 1,
+            expectedProjectRootIDs: Array(repeating: UUID(), count: 30_000),
+            sessionCorrelationID: UUID(),
+            agentCorrelationID: UUID()
+        )
+        do {
+            _ = try await store.authorityStore_commitAgentSubmission(
+                record: record,
+                turn: .init(
+                    sessionID: sessionID,
+                    identity: identity,
+                    firstSequence: 1,
+                    lastSequence: 1,
+                    canonicalUserTurnJSON: Data("{}".utf8),
+                    effectiveConfiguration: config,
+                    createdAt: now,
+                    acceptedAt: now
+                ),
+                nextDefaults: .init(sessionID: sessionID, revision: 1, configuration: config, updatedAt: now),
+                runPresentation: .init(
+                    sessionID: sessionID,
+                    runID: identity.runID,
+                    generation: 1,
+                    turnEpoch: 1,
+                    phase: .preparing,
+                    phaseRevision: 1,
+                    runStartedAt: now
+                ),
+                receipt: receipt,
+                newSession: prepared
+            )
+            XCTFail("prepared project-root fence must be bounded before BEGIN")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .rateLimited)
+        }
+        let metrics = await store.database.metrics()
+        XCTAssertEqual(metrics.queuedByClass.values.reduce(0, +), 0)
+        XCTAssertEqual(metrics.waitingByClass.values.reduce(0, +), 0)
+        try await store.close(clean: false)
+    }
+
     func testAtomicAcceptanceStoresExactReceiptAndReplaysPreparedWinner() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let now = Date(timeIntervalSince1970: 1_700_000_000), identity = testIdentity(), sessionID = UUID(), submissionID = UUID()

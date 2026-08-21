@@ -35,7 +35,13 @@ enum MigrationLedgerPolicy {
             SchemaV4.version: [SchemaV4.digest, SchemaV4.legacyCanonicalDigest, SchemaV4.canonicalDigest],
             SchemaV5.version: [SchemaV5.digest, SchemaV5.legacyCanonicalDigest, SchemaV5.canonicalDigest],
             SchemaV6.version: SchemaV7.knownPrototypeV6Digests.union([SchemaV6.legacyCanonicalDigest, SchemaV6.canonicalDigest]),
-            SchemaV7.version: [SchemaV7.digest, SchemaV7.legacyCanonicalDigest, SchemaV7.canonicalDigest],
+            SchemaV7.version: [
+                SchemaV7.digest,
+                SchemaV7.legacyCanonicalDigest,
+                SchemaV7.preHistoricalProgramCanonicalDigest,
+                SchemaV7.preCollaborationRebuildCanonicalDigest,
+                SchemaV7.canonicalDigest,
+            ],
         ]
     }
 

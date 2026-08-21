@@ -48,6 +48,27 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     private var closed = false
     private var faultInjectionEnabled = false
 
+    /// Closed admission vocabulary for every store-owned transaction. The
+    /// transaction body remains a private implementation detail of this actor;
+    /// package clients cannot supply SQL or a suspension-capable closure.
+    enum StoreTransactionWorkload {
+        case interactive(estimatedEncodedBytes: Int)
+        case bulk(estimatedEncodedBytes: Int)
+
+        var operationClass: SQLiteOperationClass {
+            switch self {
+            case .interactive: .interactive
+            case .bulk: .bulk
+            }
+        }
+
+        var estimatedEncodedBytes: Int {
+            switch self {
+            case let .interactive(bytes), let .bulk(bytes): bytes
+            }
+        }
+    }
+
     private init(database: SQLiteDatabaseExecutor, eventSigningKey: PersistenceEventSigningKey?, faultInjector: PersistenceFaultInjector, storagePath: String?) {
         self.database = database
         self.eventSigningKey = eventSigningKey
@@ -67,13 +88,70 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         Task { try? await database.close() }
     }
 
-    public static func open(storage: Storage, eventSigningKey: PersistenceEventSigningKey? = nil, faultInjector: PersistenceFaultInjector = .none) async throws -> SQLiteServiceStore {
+    public static func open(
+        storage: Storage,
+        eventSigningKey: PersistenceEventSigningKey? = nil
+    ) async throws -> SQLiteServiceStore {
+        try await open(storage: storage, eventSigningKey: eventSigningKey, faultInjector: .none)
+    }
+
+    static func open(
+        storage: Storage,
+        eventSigningKey: PersistenceEventSigningKey? = nil,
+        faultInjector: PersistenceFaultInjector
+    ) async throws -> SQLiteServiceStore {
+        try await openConfigured(
+            storage: storage,
+            eventSigningKey: eventSigningKey,
+            faultInjector: faultInjector,
+            executorCapacity: SQLiteDatabaseExecutor.defaultCapacity,
+            executorReservedControlCapacity: SQLiteDatabaseExecutor.defaultReservedControlCapacity,
+            executorMaximumAdmissionWaiters: SQLiteDatabaseExecutor.defaultMaximumAdmissionWaiters,
+            executorMaximumProducerEncodedBytes: SQLiteDatabaseExecutor.defaultMaximumProducerEncodedBytes
+        )
+    }
+
+    /// Test-only package seam for exercising the production store surface at a
+    /// smaller but proportionally identical scheduler capacity.
+    static func openForExecutorSaturationTesting(
+        storage: Storage,
+        capacity: Int,
+        reservedControlCapacity: Int,
+        maximumAdmissionWaiters: Int,
+        maximumProducerEncodedBytes: Int
+    ) async throws -> SQLiteServiceStore {
+        try await openConfigured(
+            storage: storage,
+            eventSigningKey: nil,
+            faultInjector: .none,
+            executorCapacity: capacity,
+            executorReservedControlCapacity: reservedControlCapacity,
+            executorMaximumAdmissionWaiters: maximumAdmissionWaiters,
+            executorMaximumProducerEncodedBytes: maximumProducerEncodedBytes
+        )
+    }
+
+    private static func openConfigured(
+        storage: Storage,
+        eventSigningKey: PersistenceEventSigningKey?,
+        faultInjector: PersistenceFaultInjector,
+        executorCapacity: Int,
+        executorReservedControlCapacity: Int,
+        executorMaximumAdmissionWaiters: Int,
+        executorMaximumProducerEncodedBytes: Int
+    ) async throws -> SQLiteServiceStore {
         if try servingFileState(storage) == .existingSQLite {
             try await preflightExistingStore(storage: storage, validation: .current)
         }
         let location: SQLiteConnection.Storage = switch storage { case .memory: .memory
         case let .file(path): .file(path: path) }
-        let database = try await SQLiteDatabaseExecutor.open(storage: location)
+        let database = try await SQLiteDatabaseExecutor.open(
+            storage: location,
+            capacity: executorCapacity,
+            reservedControlCapacity: executorReservedControlCapacity,
+            maximumAdmissionWaiters: executorMaximumAdmissionWaiters,
+            maximumProducerEncodedBytes: executorMaximumProducerEncodedBytes
+        )
         let store = SQLiteServiceStore(
             database: database,
             eventSigningKey: eventSigningKey,
@@ -111,7 +189,22 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     public static func openForMaintenance(
         storage: Storage,
         eventSigningKey: PersistenceEventSigningKey? = nil,
-        faultInjector: PersistenceFaultInjector = .none,
+        requestedNamespaceKind: String? = nil,
+        requestedDatabaseIdentityDigest: String? = nil
+    ) async throws -> SQLiteServiceStore {
+        try await openForMaintenance(
+            storage: storage,
+            eventSigningKey: eventSigningKey,
+            faultInjector: .none,
+            requestedNamespaceKind: requestedNamespaceKind,
+            requestedDatabaseIdentityDigest: requestedDatabaseIdentityDigest
+        )
+    }
+
+    static func openForMaintenance(
+        storage: Storage,
+        eventSigningKey: PersistenceEventSigningKey? = nil,
+        faultInjector: PersistenceFaultInjector,
         requestedNamespaceKind: String? = nil,
         requestedDatabaseIdentityDigest: String? = nil
     ) async throws -> SQLiteServiceStore {
@@ -182,7 +275,24 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     public static func openForServing(
         storage: Storage,
         eventSigningKey: PersistenceEventSigningKey? = nil,
-        faultInjector: PersistenceFaultInjector = .none,
+        namespaceKind: String = "server",
+        databaseIdentityDigest: String? = nil,
+        allowPendingRestoreRebind: Bool = false
+    ) async throws -> SQLiteServiceStore {
+        try await openForServing(
+            storage: storage,
+            eventSigningKey: eventSigningKey,
+            faultInjector: .none,
+            namespaceKind: namespaceKind,
+            databaseIdentityDigest: databaseIdentityDigest,
+            allowPendingRestoreRebind: allowPendingRestoreRebind
+        )
+    }
+
+    static func openForServing(
+        storage: Storage,
+        eventSigningKey: PersistenceEventSigningKey? = nil,
+        faultInjector: PersistenceFaultInjector,
         namespaceKind: String = "server",
         databaseIdentityDigest: String? = nil,
         allowPendingRestoreRebind: Bool = false
@@ -469,8 +579,9 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         correlationID: UUID,
         payload: Data
     ) async throws -> EventEnvelope {
-        try await transaction {
-            try await appendEvent(
+        let retainedBytes = try checkedRetainedByteSum(payload.count, retainedEncodedBytes(actor))
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            return try await appendEvent(
                 projectID: projectID,
                 sessionID: nil,
                 rootSessionID: nil,
@@ -497,7 +608,16 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         idempotencyResponse: Data? = nil,
         idempotencyStatus: Int? = nil
     ) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(
+                retainedEncodedBytes(rootIdentities),
+                idempotencyResponse?.count ?? 0,
+                retainedEncodedBytes(actor),
+                retainedIdempotencyBytes(idempotency)
+            )
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             if let expectedRevision {
                 let observed = try await Int64(database.query(
@@ -551,7 +671,16 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         idempotencyResponse: Data? = nil,
         initialSelection: SelectionSnapshot? = nil
     ) async throws -> EventEnvelope {
-        return try await transaction(operationClass: .bulk) {
+        let retainedBytes = try sessionRetainedBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(
+                idempotencyResponse?.count ?? 0,
+                retainedEncodedBytes(initialSelection),
+                retainedEncodedBytes(actor),
+                retainedIdempotencyBytes(idempotency)
+            )
+        )
+        return try await transaction(.bulk(estimatedEncodedBytes: retainedBytes)) {
             try await persistSessionInTransaction(snapshot, eventType: eventType, actor: actor, correlationID: correlationID, idempotency: idempotency, idempotencyResponse: idempotencyResponse, initialSelection: initialSelection)
         }
     }
@@ -568,7 +697,19 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         initialCollaboration: CollaborationMetadataSnapshot,
         initialWorktrees: [WorktreeBindingSnapshot] = []
     ) async throws -> (session: EventEnvelope, agent: EventEnvelope, worktrees: [EventEnvelope]) {
-        return try await transaction(operationClass: .bulk) {
+        let retainedBytes = try sessionRetainedBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(
+                retainedEncodedBytes(agent),
+                retainedEncodedBytes(actor),
+                retainedIdempotencyBytes(idempotency),
+                retainedEncodedBytes(initialSelection),
+                retainedEncodedBytes(initialPermissions),
+                retainedEncodedBytes(initialCollaboration),
+                retainedEncodedBytes(initialWorktrees)
+            )
+        )
+        return try await transaction(.bulk(estimatedEncodedBytes: retainedBytes)) {
             try await persistNewSessionInTransaction(snapshot, agent: agent, actor: actor, correlationID: correlationID, agentCorrelationID: agentCorrelationID, idempotency: idempotency, initialSelection: initialSelection, initialPermissions: initialPermissions, initialCollaboration: initialCollaboration, initialWorktrees: initialWorktrees)
         }
     }
@@ -618,7 +759,11 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func persistImportedProject(_ snapshot: ProjectSnapshot, sourceDigest: String, actor: ExternalActor) async throws -> Bool {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(sourceDigest.utf8.count, retainedEncodedBytes(actor))
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if try await importAuditExists(kind: "legacy.project", digest: sourceDigest) { return false }
             if try await project(id: snapshot.projectID) != nil {
                 throw ServiceAPIError(code: .idempotencyConflict, message: "Legacy import project ID already exists with different provenance")
@@ -640,7 +785,11 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func persistImportedSession(_ snapshot: SessionSnapshot, sourceDigest: String, actor: ExternalActor) async throws -> Bool {
-        return try await transaction(operationClass: .bulk) {
+        let retainedBytes = try sessionRetainedBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(sourceDigest.utf8.count, retainedEncodedBytes(actor))
+        )
+        return try await transaction(.bulk(estimatedEncodedBytes: retainedBytes)) {
             if try await importAuditExists(kind: "legacy.session", digest: sourceDigest) { return false }
             if try await session(id: snapshot.sessionID) != nil {
                 throw ServiceAPIError(code: .idempotencyConflict, message: "Legacy import session ID already exists with different provenance")
@@ -673,13 +822,13 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             throw ServiceAPIError(code: .quiescing, message: "JSON import requires a new, cleanly stopped, or resumable import store")
         }
         if !resumable, !completed {
-            try await transaction { try await recordImportAudit(kind: "legacy.import.started", digest: sourceDigest) }
+            try await transaction(.interactive(estimatedEncodedBytes: sourceDigest.utf8.count)) { try await recordImportAudit(kind: "legacy.import.started", digest: sourceDigest) }
         }
     }
 
     public func completeLegacyImport(sourceDigest: String) async throws {
         guard try await !importAuditExists(kind: "legacy.import.completed", digest: sourceDigest) else { return }
-        try await transaction { try await recordImportAudit(kind: "legacy.import.completed", digest: sourceDigest) }
+        try await transaction(.interactive(estimatedEncodedBytes: sourceDigest.utf8.count)) { try await recordImportAudit(kind: "legacy.import.completed", digest: sourceDigest) }
     }
 
     public func project(id: UUID) async throws -> ProjectSnapshot? {
@@ -706,7 +855,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     /// transaction so adapters never observe an impossible lifecycle/interaction
     /// combination assembled across two revisions.
     public func authorityStore_sessionWithInteractions(id: UUID) async throws -> SessionSnapshot? {
-        try await transaction {
+        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
             guard let base = try await session(id: id) else { return nil }
             let currentInteractions = try await interactions(sessionID: id)
             return base.replacing(interactions: currentInteractions)
@@ -722,7 +871,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_allSessionsWithInteractions() async throws -> [SessionSnapshot] {
-        try await transaction {
+        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
             let sessions = try await allSessions()
             var result: [SessionSnapshot] = []
             for base in sessions {
@@ -734,7 +883,8 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistAgent(_ snapshot: AgentSnapshot, projectID: UUID, actor: ExternalActor?, correlationID: UUID, eventType: EventType) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(snapshot, additional: retainedEncodedBytes(actor))
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             try await persistAgentInTransaction(snapshot, projectID: projectID, actor: actor, correlationID: correlationID, eventType: eventType)
         }
     }
@@ -749,9 +899,16 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         guard [.toolStarted, .toolUpdated, .toolCompleted, .toolFailed].contains(eventType) else {
             throw ServiceAPIError(code: .invalidRequest, message: "Tool invocation requires a tool event type")
         }
-        let run = try await latestRun(sessionID: session.sessionID)
-        return try await transaction(operationClass: .bulk) {
-            try await appendEvent(
+        let retainedBytes = try sessionRetainedBytes(
+            session,
+            additional: checkedRetainedByteSum(
+                retainedEncodedBytes(snapshot),
+                retainedEncodedBytes(actor)
+            )
+        )
+        return try await transaction(.bulk(estimatedEncodedBytes: retainedBytes)) {
+            let run = try await latestRun(sessionID: session.sessionID)
+            return try await appendEvent(
                 projectID: session.projectID,
                 sessionID: session.sessionID,
                 agentID: session.sessionID,
@@ -786,10 +943,12 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistRun(_ snapshot: ProviderRunSnapshot) async throws {
+        let encodedBytes = try encoder.encode(snapshot).count
         _ = try await database.query(
             "INSERT INTO runs(run_id,session_id,schema_version,provider_kind,provider_session_id,state,generation,turn_epoch,start_reason,end_reason,started_at,ended_at) VALUES(?,?,1,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET provider_session_id=excluded.provider_session_id,state=excluded.state,turn_epoch=excluded.turn_epoch,end_reason=excluded.end_reason,ended_at=excluded.ended_at",
             [.text(snapshot.runID.uuidString), .text(snapshot.sessionID.uuidString), .text(snapshot.provider.rawValue), snapshot.providerSessionID.map(SQLiteData.text) ?? .null, .text(snapshot.state), .integer(Int(snapshot.generation)), .integer(Int(snapshot.turnEpoch)), .text(snapshot.startReason), snapshot.endReason.map(SQLiteData.text) ?? .null, .float(snapshot.startedAt.timeIntervalSince1970), snapshot.endedAt.map { .float($0.timeIntervalSince1970) } ?? .null],
-            operationClass: .control
+            operationClass: .control,
+            estimatedEncodedBytes: encodedBytes
         )
     }
 
@@ -828,7 +987,11 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistSelection(_ snapshot: SelectionSnapshot, projectID: UUID, rootSessionID: UUID, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput? = nil) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(retainedEncodedBytes(actor), retainedIdempotencyBytes(idempotency))
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             _ = try await database.query(
                 "INSERT INTO session_selections(session_id,schema_version,allowed_roots_json,selection_json,selection_revision,binding_revision,transactional_commit_id) VALUES(?,1,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET selection_json=excluded.selection_json,selection_revision=excluded.selection_revision,binding_revision=excluded.binding_revision,transactional_commit_id=excluded.transactional_commit_id",
@@ -864,7 +1027,11 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         actor: ExternalActor,
         correlationID: UUID
     ) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(retainedEncodedBytes(session), retainedEncodedBytes(actor))
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             _ = try await database.query(
                 "INSERT INTO session_contexts(session_id,schema_version,prompt_text,selection_revision,context_revision,frozen_context_json,updated_at) VALUES(?,1,?,?,?,'{}',CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET prompt_text=excluded.prompt_text,selection_revision=excluded.selection_revision,context_revision=excluded.context_revision,updated_at=CURRENT_TIMESTAMP",
                 [
@@ -894,7 +1061,8 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     /// or emitting a transcript event. Desktop updates this in memory on every
     /// usage frame; Linux persists the same fields so the portal ring can poll.
     public func authorityStore_upsertContextUsage(_ usage: ContextUsageWireSnapshot, sessionID: UUID) async throws {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(usage)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             guard let base = try await session(id: sessionID) else { return }
             let next = base.replacing(contextUsage: usage.merging(onto: base.contextUsage))
             _ = try await database.query(
@@ -910,7 +1078,11 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistSelectionTemplate(_ snapshot: ProjectSelectionTemplateSnapshot, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(retainedEncodedBytes(actor), retainedIdempotencyBytes(idempotency))
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             _ = try await database.query(
                 "INSERT INTO project_selection_templates(template_id,project_id,schema_version,selection_json,revision,transactional_commit_id) VALUES(?,?,1,?,?,?) ON CONFLICT(template_id) DO UPDATE SET selection_json=excluded.selection_json,revision=excluded.revision,transactional_commit_id=excluded.transactional_commit_id",
@@ -923,7 +1095,8 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistPermissions(_ snapshot: ExecutionPermissionSnapshot, projectID: UUID, rootSessionID: UUID, correlationID: UUID, idempotency: IdempotencyInput? = nil) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(snapshot, additional: retainedIdempotencyBytes(idempotency))
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             try await upsertPermissions(snapshot)
             let event = try await appendEvent(projectID: projectID, sessionID: snapshot.sessionID, rootSessionID: rootSessionID, runID: nil, sessionSequence: nil, type: .permissionUpdated, generation: nil, turnEpoch: nil, actor: snapshot.updatedActor, correlationID: correlationID, payload: encoder.encode(snapshot))
@@ -953,14 +1126,24 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_installInitialPolicies(permissions: ExecutionPermissionSnapshot, collaboration: CollaborationMetadataSnapshot) async throws {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(permissions, additional: try encoder.encode(collaboration).count)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if try await self.permissions(sessionID: permissions.sessionID) == nil { try await upsertPermissions(permissions) }
             if try await self.collaboration(sessionID: collaboration.sessionID) == nil { try await upsertCollaboration(collaboration) }
         }
     }
 
     public func authorityStore_persistCollaboration(_ metadata: CollaborationMetadataSnapshot, session: SessionSnapshot, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput, idempotencyResponse: Data? = nil) async throws -> [EventEnvelope] {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            metadata,
+            additional: checkedRetainedByteSum(
+                retainedEncodedBytes(session),
+                retainedEncodedBytes(actor),
+                retainedIdempotencyBytes(idempotency),
+                idempotencyResponse?.count ?? 0
+            )
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             try await upsertCollaboration(metadata)
             let payload = try encoder.encode(metadata)
@@ -972,7 +1155,15 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistInteraction(_ snapshot: InteractionSnapshot, session: SessionSnapshot, actor: ExternalActor?, correlationID: UUID, idempotency: IdempotencyInput? = nil) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(
+                retainedEncodedBytes(session),
+                retainedEncodedBytes(actor),
+                retainedIdempotencyBytes(idempotency)
+            )
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             let actorJSON = try actor.map(encodeText)
             _ = try await database.query(
@@ -987,7 +1178,8 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistInteractionDeliveryState(_ snapshot: InteractionSnapshot, sessionID: UUID, actor: ExternalActor?) async throws {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(snapshot, additional: retainedEncodedBytes(actor))
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             let actorJSON = try actor.map(encodeText)
             _ = try await database.query(
                 "UPDATE interactions SET state=?,payload_json=?,settled_at=?,settled_actor_json=?,revision=? WHERE interaction_id=? AND session_id=?",
@@ -1013,7 +1205,8 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistOracleChat(_ chat: OracleChatState) async throws {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(chat)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             _ = try await database.query(
                 "INSERT INTO oracle_chats(chat_id,session_id,schema_version,chat_json,revision,created_at,updated_at) VALUES(?,?,1,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(chat_id) DO UPDATE SET chat_json=excluded.chat_json,revision=excluded.revision,updated_at=CURRENT_TIMESTAMP",
                 [.text(chat.chatID.uuidString), .text(chat.sessionID.uuidString), .text(encodeText(chat)), .integer(Int(chat.revision))]
@@ -1022,7 +1215,11 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistWorktree(_ snapshot: WorktreeBindingSnapshot, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput? = nil) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(retainedEncodedBytes(actor), retainedIdempotencyBytes(idempotency))
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             try await ensureUniqueActiveWorktree(snapshot)
             _ = try await database.query(
@@ -1044,7 +1241,8 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         actor: ExternalActor,
         correlationID: UUID
     ) async throws -> [EventEnvelope] {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(snapshots, additional: retainedEncodedBytes(actor))
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             var events: [EventEnvelope] = []
             for snapshot in snapshots {
                 try await ensureUniqueActiveWorktree(snapshot)
@@ -1080,7 +1278,11 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         actor: ExternalActor,
         correlationID: UUID
     ) async throws -> [EventEnvelope] {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            snapshots,
+            additional: checkedRetainedByteSum(retainedEncodedBytes(session), retainedEncodedBytes(actor))
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             var events: [EventEnvelope] = []
             let activeKeys = snapshots.compactMap { snapshot -> String? in
                 guard snapshot.ownershipState == .active, let sessionID = snapshot.sessionID else { return nil }
@@ -1117,7 +1319,16 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistWorktreeBinding(_ worktree: WorktreeBindingSnapshot, selection: SelectionSnapshot, session: SessionSnapshot, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput) async throws -> (worktree: EventEnvelope, selection: EventEnvelope) {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            worktree,
+            additional: checkedRetainedByteSum(
+                retainedEncodedBytes(selection),
+                retainedEncodedBytes(session),
+                retainedEncodedBytes(actor),
+                retainedIdempotencyBytes(idempotency)
+            )
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             try await ensureUniqueActiveWorktree(worktree)
             _ = try await database.query(
@@ -1144,7 +1355,11 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistArtifact(_ snapshot: ArtifactSnapshot, storageReference: String, actor: ExternalActor?, correlationID: UUID) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(storageReference.utf8.count, retainedEncodedBytes(actor))
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             _ = try await database.query(
                 "INSERT INTO artifacts(artifact_id,project_id,session_id,schema_version,kind,logical_name,content_digest,storage_reference,size,created_sequence,created_at,retention_state) VALUES(?,?,?,1,?,?,?,?,?,?,CURRENT_TIMESTAMP,?)",
                 [.text(snapshot.artifactID.uuidString), .text(snapshot.projectID.uuidString), snapshot.sessionID.map { .text($0.uuidString) } ?? .null, .text(snapshot.kind), .text(snapshot.logicalName), .text(snapshot.contentDigest), .text(storageReference), .integer(Int(snapshot.size)), .integer(Int(snapshot.createdCursor.globalSequence)), .text(snapshot.retentionState)]
@@ -1165,7 +1380,8 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_installWorkflows(_ workflows: [WorkflowSnapshot]) async throws {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(workflows)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             for workflow in workflows {
                 _ = try await database.query("INSERT INTO workflows(workflow_id,schema_version,source,name,definition_json,content_digest,enabled) VALUES(?,1,?,?,?,?,?) ON CONFLICT(workflow_id) DO UPDATE SET source=excluded.source,name=excluded.name,definition_json=excluded.definition_json,content_digest=excluded.content_digest,enabled=excluded.enabled", [.text(workflow.workflowID), .text(workflow.source), .text(workflow.name), .text(workflow.definition), .text(workflow.contentDigest), .integer(workflow.enabled ? 1 : 0)])
             }
@@ -1180,7 +1396,12 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func persistProcessFamily(runID: UUID, leader: PersistedProcessIdentity, connectionGeneration: Int64 = 1, containmentMode: String = "process-group", state: String = "running") async throws {
-        try await transaction {
+        let retainedBytes = leader.bootID.utf8.count
+            + leader.executablePath.utf8.count
+            + leader.helperTokenDigest.utf8.count
+            + containmentMode.utf8.count
+            + state.utf8.count
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             let executableDigest = PersistenceCryptography.bodyDigest(Data(leader.executablePath.utf8))
             _ = try await database.query(
                 "INSERT INTO process_families(run_id,schema_version,leader_pid,pgid,process_start_time,boot_id,executable_digest,executable_path,helper_token_digest,connection_generation,containment_mode,state) VALUES(?,1,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET leader_pid=excluded.leader_pid,pgid=excluded.pgid,process_start_time=excluded.process_start_time,boot_id=excluded.boot_id,executable_digest=excluded.executable_digest,executable_path=excluded.executable_path,helper_token_digest=excluded.helper_token_digest,connection_generation=excluded.connection_generation,containment_mode=excluded.containment_mode,state=excluded.state",
@@ -1191,7 +1412,10 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func persistProcessMembers(runID: UUID, members: [PersistedProcessIdentity], terminalState: String? = nil) async throws {
-        try await transaction {
+        let retainedBytes = members.reduce(terminalState?.utf8.count ?? 0) {
+            $0 + $1.bootID.utf8.count + $1.executablePath.utf8.count + $1.helperTokenDigest.utf8.count
+        }
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             try await persistProcessMembersWithoutTransaction(runID: runID, members: members, terminalState: terminalState)
         }
     }
@@ -1216,7 +1440,10 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func updateProcessFamilyState(runID: UUID, state: String, members: [PersistedProcessIdentity] = []) async throws {
-        try await transaction {
+        let retainedBytes = members.reduce(state.utf8.count) {
+            $0 + $1.bootID.utf8.count + $1.executablePath.utf8.count + $1.helperTokenDigest.utf8.count
+        }
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             _ = try await database.query("UPDATE process_families SET state=? WHERE run_id=?", [.text(state), .text(runID.uuidString)])
             if !members.isEmpty {
                 try await persistProcessMembersWithoutTransaction(runID: runID, members: members, terminalState: state)
@@ -1235,7 +1462,8 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func consumeAuthorizationDecision(_ decision: AuthorizationDecision) async throws {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(decision)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             let scope = decision.sessionID.map { "session:\($0.uuidString)" }
                 ?? decision.projectID.map { "project:\($0.uuidString)" }
                 ?? "global"
@@ -1267,7 +1495,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_checkpoint() async throws {
-        _ = try await database.query("PRAGMA wal_checkpoint(TRUNCATE)")
+        _ = try await database.query("PRAGMA wal_checkpoint(TRUNCATE)", operationClass: .control)
     }
 
     public func enforceEventRetention(policy: EventRetentionPolicy = .init(), now: Date = Date()) async throws -> UUID? {
@@ -1288,7 +1516,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     func archiveEvents(through sequence: Int64) async throws -> UUID? {
-        try await transaction {
+        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
             let meta = try await metadata()
             let bounded = min(sequence, meta.nextGlobalSequence - 1)
             guard bounded > meta.replayFloor else { return nil }
@@ -1380,7 +1608,11 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         let projects = try await allProjects().map { replacingCursor($0, cursor: restoredCursor) }
         let sessions = try await allSessions().map { replacingCursor($0, cursor: restoredCursor) }
         let tokenDigest = PersistenceCryptography.bodyDigest(activationToken)
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            projects,
+            additional: encoder.encode(sessions).count + digest.utf8.count + activationToken.count
+        )
+        try await transaction(.bulk(estimatedEncodedBytes: retainedBytes)) {
             _ = try await database.query(
                 "UPDATE service_metadata SET restored_from_store_id=store_id,store_id=?,restore_backup_sequence=?,restore_digest=?,replay_floor=?,next_global_sequence=?,last_clean_shutdown=0,activation_state='restore_prepared',activation_generation=activation_generation+1,activation_token_digest=?,activation_instance_id=NULL WHERE fixed_id=1",
                 [.text(fresh.uuidString), .integer(Int(backupSequence)), .text(digest), .integer(Int(restoredFloor)), .integer(Int(restoredFloor + 1)), .text(tokenDigest)]
@@ -1406,7 +1638,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func activateRestoredStore(activationToken: Data, instanceID: UUID) async throws -> UUID {
-        try await transaction {
+        try await transaction(.interactive(estimatedEncodedBytes: activationToken.count)) {
             let row = try await requireRow(database.query("SELECT store_id,activation_state,activation_token_digest FROM service_metadata WHERE fixed_id=1"))
             guard row.column("activation_state")?.string == "restore_prepared",
                   row.column("activation_token_digest")?.string == PersistenceCryptography.bodyDigest(activationToken)
@@ -1481,7 +1713,17 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         let restoredCursor = ServiceCursor(storeID: fresh, globalSequence: restoredFloor)
         let projects = try await allProjects().map { replacingCursor($0, cursor: restoredCursor) }
         let sessions = try await allSessions().map { replacingCursor($0, cursor: restoredCursor) }
-        return try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            projects,
+            additional: encoder.encode(sessions).count
+                + missingExternalOptionalAssetIDs.reduce(activationToken.count) { $0 + $1.utf8.count }
+                + manifestDigest.utf8.count
+                + sourceNamespaceKind.utf8.count
+                + sourceDatabaseIdentityDigest.utf8.count
+                + targetNamespaceKind.utf8.count
+                + targetDatabaseIdentityDigest.utf8.count
+        )
+        return try await transaction(.bulk(estimatedEncodedBytes: retainedBytes)) {
             _ = try await database.query(
                 "UPDATE service_metadata SET restored_from_store_id=store_id,store_id=?,restore_backup_sequence=?,restore_digest=?,replay_floor=?,next_global_sequence=?,last_clean_shutdown=0,activation_state='active',activation_generation=activation_generation+1,activation_token_digest=NULL,activation_instance_id=? WHERE fixed_id=1 AND store_id=?",
                 [.text(fresh.uuidString), .integer(Int(backupSequence)), .text(manifestDigest), .integer(Int(restoredFloor)), .integer(Int(restoredFloor + 1)), .text(instanceID.uuidString), .text(priorStoreID.uuidString)]
@@ -1740,7 +1982,13 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         expectedRevision: Int64,
         audit: ProviderConnectionAuditMutation? = nil
     ) async throws -> StoredProviderConnection {
-        try await transaction {
+        let retainedBytes = try checkedRetainedByteSum(
+            value.record.providerID.rawValue.utf8.count,
+            value.record.accountLabel?.utf8.count ?? 0,
+            value.record.detail?.utf8.count ?? 0,
+            retainedProviderAuditBytes(audit)
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             try Self.validateProviderConnection(value)
             let observed = try await Int64(database.query("SELECT revision FROM provider_connections WHERE provider_id=?", [.text(value.record.providerID.rawValue)]).first?.column("revision")?.integer ?? 0)
             guard observed == expectedRevision, value.record.revision == expectedRevision + 1 else {
@@ -1774,7 +2022,19 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         expectedRevision: Int64,
         audit: ProviderConnectionAuditMutation? = nil
     ) async throws {
-        try await transaction {
+        var retainedInputs = [providerID.rawValue]
+        if let audit {
+            retainedInputs += [
+                audit.operation,
+                audit.attribution.actorID,
+                audit.attribution.actorLabel,
+                audit.attribution.channel,
+                audit.authenticationMethod?.rawValue ?? "",
+                audit.result,
+            ]
+        }
+        let retainedBytes = try retainedInputBytes(retainedInputs)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             let current = try await database.query("SELECT connection_id,revision FROM provider_connections WHERE provider_id=?", [.text(providerID.rawValue)]).first
             let observed = Int64(current?.column("revision")?.integer ?? 0)
             guard observed == expectedRevision else {
@@ -1797,7 +2057,12 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_appendProviderConnectionAudit(providerID: ProviderSettingsID, connectionID: UUID?, operation: String, attribution: ProviderMutationAttribution, authenticationMethod: ProviderAuthenticationMethod?, result: String) async throws {
-        try await transaction {
+        let retainedBytes = operation.utf8.count
+            + attribution.actorID.utf8.count
+            + attribution.actorLabel.utf8.count
+            + attribution.channel.utf8.count
+            + result.utf8.count
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             try await appendProviderConnectionAuditInTransaction(
                 providerID: providerID,
                 connectionID: connectionID,
@@ -1945,7 +2210,8 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         _ snapshot: OperatorDesktopSettingsRecord,
         expectedRevision: Int64
     ) async throws -> OperatorDesktopSettingsRecord {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(snapshot)
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             let observed = Int64(try await database.query(
                 "SELECT revision FROM portal_desktop_settings WHERE fixed_id=1"
             ).first?.column("revision")?.integer ?? 0)
@@ -1987,7 +2253,8 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         expectedRevision: Int64,
         audit: ProviderConnectionAuditMutation? = nil
     ) async throws -> ProviderSettingsPreference {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(value, additional: retainedProviderAuditBytes(audit))
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             let observed = try await Int64(database.query(
                 "SELECT revision FROM provider_settings WHERE provider_id=?",
                 [.text(value.providerID.rawValue)]
@@ -2256,7 +2523,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     private func applySchemaV1() async throws {
-        try await transaction {
+        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
             try await executeMigrationStatements(SchemaV1.statements)
             try await addLegacyFoundationColumns()
             try await executeMigrationStatements(SchemaV1.operatorStatements)
@@ -2268,7 +2535,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     private func applySchemaV2() async throws {
-        try await transaction {
+        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
             try await executeMigrationStatements(SchemaV2.statements)
             try await executeMigrationStatements(SchemaV2.dataStatements)
             try await insertMigration(version: 2, description: "owned resources, immutable archives, protected checkpoints, and restore activation", digest: SchemaV2.canonicalDigest)
@@ -2297,7 +2564,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         description: String,
         digest: String
     ) async throws {
-        try await transaction {
+        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
             try await executeMigrationStatements(statements)
             _ = try await database.query("UPDATE service_metadata SET schema_version=? WHERE fixed_id=1", [.integer(version)])
             try await insertMigration(version: version, description: description, digest: digest)
@@ -2320,6 +2587,19 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         guard namespaceKind == "server" || namespaceKind == "directHeadless" else {
             throw ServiceAPIError(code: .invalidRequest, message: "Namespace kind must be server or directHeadless")
         }
+        guard databaseIdentityDigest.range(
+            of: "^[0-9a-f]{64}$",
+            options: .regularExpression
+        ) != nil else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "Database identity digest must be a lowercase SHA-256 digest"
+            )
+        }
+        let retainedBytes = try checkedRetainedByteSum(
+            namespaceKind.utf8.count,
+            databaseIdentityDigest.utf8.count
+        )
         guard let observedDigest = try await database.query(
             "SELECT digest FROM schema_migrations WHERE version=6"
         ).first?.column("digest")?.string,
@@ -2332,10 +2612,11 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             )
         }
 
-        try await transaction {
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if normalizationPlan.appliesFinalV6DDL {
                 // Historical prototype fixtures may receive only the frozen,
                 // idempotent final-v6 shape and legacy JSON-key normalization.
+                try await executeMigrationStatements(SchemaV1.operatorStatements)
                 try await executeMigrationStatements(SchemaV6.statements)
                 try await addLegacyFoundationColumns()
             }
@@ -2389,6 +2670,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     private func rewriteLegacyPersistedJSONKeys() async throws {
+        try await normalizeLegacyCollaborationMetadataShape()
         let replacements = [
             (#""goblinUserId""#, #""userId""#),
             (#""goblin-explicit-selection""#, #""explicit-selection""#),
@@ -2410,19 +2692,40 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 }
             }
         }
-        let collaborationColumns = Set((try await database.query("PRAGMA table_info(collaboration_metadata)")).compactMap { $0.column("name")?.string })
-        if collaborationColumns.contains("goblin_acknowledgement_json") {
-            if collaborationColumns.contains("collaboration_acknowledgement_json") {
-                _ = try await database.query(
-                    "UPDATE collaboration_metadata SET collaboration_acknowledgement_json = goblin_acknowledgement_json WHERE collaboration_acknowledgement_json IS NULL AND goblin_acknowledgement_json IS NOT NULL"
-                )
-                try await hitFault(.afterMigrationStatement)
-            }
-            _ = try await database.query("ALTER TABLE collaboration_metadata DROP COLUMN goblin_acknowledgement_json")
-            try await hitFault(.afterMigrationStatement)
-        }
     }
 
+    private func normalizeLegacyCollaborationMetadataShape() async throws {
+        let canonicalColumns = [
+            "session_id", "schema_version", "visibility", "collaborative_steering_enabled",
+            "controller_user_id", "policy_revision", "controller_revision", "membership_revision",
+            "collaboration_acknowledgement_json", "updated_at",
+        ]
+        let observed = try await database.query("PRAGMA table_info(collaboration_metadata)")
+            .compactMap { $0.column("name")?.string }
+        guard observed != canonicalColumns else { return }
+        let columns = Set(observed)
+        let acknowledgementExpression: String
+        if columns.contains("collaboration_acknowledgement_json"),
+           columns.contains("goblin_acknowledgement_json")
+        {
+            acknowledgementExpression = "COALESCE(collaboration_acknowledgement_json,goblin_acknowledgement_json)"
+        } else if columns.contains("collaboration_acknowledgement_json") {
+            acknowledgementExpression = "collaboration_acknowledgement_json"
+        } else if columns.contains("goblin_acknowledgement_json") {
+            acknowledgementExpression = "goblin_acknowledgement_json"
+        } else {
+            acknowledgementExpression = "NULL"
+        }
+        let statements = [
+            SchemaV7.collaborationRebuildCreateStatement,
+            SchemaV7.collaborationRebuildCopyStatement(
+                acknowledgementExpression: acknowledgementExpression
+            ),
+            SchemaV7.collaborationRebuildDropStatement,
+            SchemaV7.collaborationRebuildRenameStatement,
+        ]
+        try await executeMigrationStatements(statements)
+    }
 
     private func integrityCheck() async throws {
         let result = try await database.query("PRAGMA quick_check").first?.columns.first?.data.string
@@ -2438,34 +2741,107 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         try await faultInjector.hit(point)
     }
 
-    /// Persistence-module implementation detail. This closure is never exposed
-    /// by the package's public API: external callers submit only typed store
-    /// commands. Keeping it actor-isolated and non-escaping prevents arbitrary
-    /// client SQL or client-provided suspension from entering an open transaction.
+    func retainedInputBytes<T: Encodable>(_ value: T, additional: Int = 0) throws -> Int {
+        try checkedRetainedByteSum(encoder.encode(value).count, additional)
+    }
+
+    func retainedEncodedBytes<T: Encodable>(_ value: T?) throws -> Int {
+        try value.map { try encoder.encode($0).count } ?? 0
+    }
+
+    func retainedIdempotencyBytes(_ value: IdempotencyInput?) throws -> Int {
+        guard let value else { return 0 }
+        return try checkedRetainedByteSum(
+            value.actorID.utf8.count,
+            value.operation.utf8.count,
+            value.key.utf8.count,
+            value.requestDigest.utf8.count
+        )
+    }
+
+    func retainedProviderAuditBytes(_ value: ProviderConnectionAuditMutation?) throws -> Int {
+        guard let value else { return 0 }
+        return try checkedRetainedByteSum(
+            value.operation.utf8.count,
+            value.attribution.actorID.utf8.count,
+            value.attribution.actorLabel.utf8.count,
+            value.attribution.channel.utf8.count,
+            value.authenticationMethod?.rawValue.utf8.count ?? 0,
+            value.result.utf8.count
+        )
+    }
+
+    func checkedRetainedByteSum(_ values: Int...) throws -> Int {
+        var total = 0
+        for value in values {
+            let (next, overflow) = total.addingReportingOverflow(value)
+            guard value >= 0, !overflow,
+                  next <= SQLiteDatabaseExecutor.defaultMaximumProducerEncodedBytes
+            else {
+                throw ServiceAPIError(
+                    code: .rateLimited,
+                    message: "SQLite typed operation exceeds the encoded producer-memory bound",
+                    retryable: true
+                )
+            }
+            total = next
+        }
+        return total
+    }
+
+    /// Persistence-module implementation detail. The closed workload value is
+    /// mandatory at every call site, and neither this closure nor raw SQL is
+    /// exposed outside this module. Only reviewed store implementation code can
+    /// suspend inside an open transaction; package clients submit typed commands.
     func transaction<T>(
-        operationClass: SQLiteOperationClass = .interactive,
+        _ workload: StoreTransactionWorkload,
         _ body: () async throws -> T
     ) async throws -> T {
         let transactionID = UUID()
         var committed = false
-        try await database.beginTransaction(transactionID)
+        try await database.beginTransaction(
+            transactionID,
+            operationClass: workload.operationClass,
+            estimatedEncodedBytes: workload.estimatedEncodedBytes
+        )
         do {
             return try await SQLiteExecutionContext.$transactionID.withValue(transactionID) {
-                try await SQLiteExecutionContext.$operationClass.withValue(operationClass) {
+                try await SQLiteExecutionContext.$operationClass.withValue(workload.operationClass) {
                     try await hitFault(.afterTransactionBegin)
                     let result = try await body()
                     try await hitFault(.beforeTransactionCommit)
                     try await database.commitTransaction(transactionID)
                     committed = true
-                    try Task.checkCancellation()
+                    // Once COMMIT succeeds the durable result must be reported;
+                    // surfacing late cancellation would invite an unsafe retry.
                     return result
                 }
             }
         } catch let existing as ExistingIdempotency {
-            if !committed { await database.rollbackTransaction(transactionID) }
+            if !committed {
+                do {
+                    try await database.rollbackTransaction(transactionID)
+                } catch {
+                    throw ServiceAPIError(
+                        code: .persistenceUnavailable,
+                        message: "SQLite transaction rollback could not be confirmed",
+                        retryable: false
+                    )
+                }
+            }
             throw existing
         } catch {
-            if !committed { await database.rollbackTransaction(transactionID) }
+            if !committed {
+                do {
+                    try await database.rollbackTransaction(transactionID)
+                } catch {
+                    throw ServiceAPIError(
+                        code: .persistenceUnavailable,
+                        message: "SQLite transaction rollback could not be confirmed",
+                        retryable: false
+                    )
+                }
+            }
             throw error
         }
     }
@@ -2476,6 +2852,18 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         let json: String
         let digest: String
         let encodedBytes: Int
+    }
+
+    func sessionRetainedBytes(_ snapshot: SessionSnapshot, additional: Int = 0) throws -> Int {
+        for entry in snapshot.transcript {
+            guard try encoder.encode(entry).count <= SQLiteDatabaseExecutor.maximumBulkEncodedBytes else {
+                throw ServiceAPIError(
+                    code: .invalidRequest,
+                    message: "Transcript entry exceeds the durable bulk batch limit"
+                )
+            }
+        }
+        return try retainedInputBytes(snapshot, additional: additional)
     }
 
     /// Lossless provider transcript ingestion inside the owning session
@@ -2508,7 +2896,8 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             for value in values {
                 _ = try await database.query(
                     "INSERT OR IGNORE INTO transcript_entries(session_id,entry_id,schema_version,session_sequence,entry_json,content_digest) VALUES(?,?,1,?,?,?)",
-                    [.text(snapshot.sessionID.uuidString), .text(value.entryID.uuidString), .integer(Int(value.sessionSequence)), .text(value.json), .text(value.digest)]
+                    [.text(snapshot.sessionID.uuidString), .text(value.entryID.uuidString), .integer(Int(value.sessionSequence)), .text(value.json), .text(value.digest)],
+                    estimatedEncodedBytes: value.encodedBytes
                 )
             }
         }
