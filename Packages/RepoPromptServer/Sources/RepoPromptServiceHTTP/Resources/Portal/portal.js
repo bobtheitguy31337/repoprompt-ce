@@ -1,6 +1,144 @@
 "use strict";
 
-(() => {
+function resetAuthenticatedPortalState(
+  state,
+  document,
+  location,
+  {
+    passwordLoginEnabled = true,
+    title = "Sign in",
+    copy = "Enter the operator password to open the portal.",
+    errorMessage = "",
+  } = {},
+) {
+  document.querySelectorAll("input[data-sensitive]").forEach((input) => {
+    input.value = "";
+    input.removeAttribute("value");
+  });
+
+  state.authenticationGeneration =
+    (Number(state.authenticationGeneration) || 0) + 1;
+  state.operatorAuthenticated = false;
+  state.passwordLoginEnabled = passwordLoginEnabled;
+  state.providers = [];
+  state.bootstrap = null;
+  state.desktopSettings = null;
+  state.settingsMutation = null;
+  state.domainMutations = {};
+  state.settingsFeedback = {
+    activeCount: 0,
+    outcome: null,
+    message: "No changes saved yet",
+  };
+  state.typedSettings = {
+    agentModels: null,
+    directAgentPermissions: null,
+    subagentPermissions: null,
+    contextBuilder: null,
+    modelPresets: null,
+    advanced: null,
+    workspaceApprovals: null,
+    mcpDisabledTools: null,
+    showModelPresets: null,
+    selectionPresets: null,
+    workflows: null,
+    selections: {},
+    directConfigurations: {},
+  };
+  state.generatedAt = null;
+  state.operatorSessions = [];
+  state.operations = null;
+  state.activeFlow = null;
+  state.pollTimer = null;
+  state.pollPromise = null;
+  state.confirmResolver = null;
+  state.confirmReturnFocus = null;
+  state.settingsDrawerReturnFocus = null;
+  state.focusAfterRoute = false;
+  state.agent = {
+    selectedProjectID: null,
+    selectedSessionID: null,
+    newSessionMode: false,
+    searchText: "",
+    transcriptItems: [],
+    transcriptPage: null,
+    transcriptPromise: null,
+    transcriptPromiseSessionID: null,
+    mutationPromise: null,
+    pollTimer: null,
+    selectionGeneration:
+      (Number(state.agent?.selectionGeneration) || 0) + 1,
+    retryOperation: null,
+  };
+
+  [
+    "project-list",
+    "session-list",
+    "transcript-list",
+    "settings-content",
+    "toast-region",
+  ].forEach((id) => document.getElementById(id)?.replaceChildren());
+  const composer = document.getElementById("composer-text");
+  if (composer) composer.value = "";
+  const search = document.getElementById("session-search");
+  if (search) search.value = "";
+  const metadata = document.getElementById("session-metadata");
+  if (metadata) metadata.textContent = "";
+  const sessionTitle = document.getElementById("active-session-title");
+  if (sessionTitle) sessionTitle.textContent = "Select a session";
+  const workspaceName = document.getElementById("active-workspace-name");
+  if (workspaceName) workspaceName.textContent = "RepoPrompt Server";
+  const caption = document.getElementById("service-caption");
+  if (caption) caption.textContent = "Authentication required";
+
+  const app = document.getElementById("app");
+  if (app) {
+    app.hidden = true;
+    app.inert = true;
+    app.setAttribute("aria-hidden", "true");
+  }
+  const gate = document.getElementById("auth-gate");
+  if (gate) gate.hidden = false;
+  const form = document.getElementById("auth-form");
+  if (form) form.hidden = !passwordLoginEnabled;
+  const tokenField = document.getElementById("auth-token-field");
+  if (tokenField) tokenField.hidden = true;
+  const confirmField = document.getElementById("auth-confirm-field");
+  if (confirmField) confirmField.hidden = true;
+  const authTitle = document.getElementById("auth-title");
+  if (authTitle) authTitle.textContent = title;
+  const authCopy = document.getElementById("auth-copy");
+  if (authCopy) authCopy.textContent = copy;
+  const authSubmit = document.getElementById("auth-submit");
+  if (authSubmit) authSubmit.textContent = "Sign in";
+  const authPassword = document.getElementById("auth-password");
+  if (authPassword) authPassword.autocomplete = "current-password";
+  const authError = document.getElementById("auth-error");
+  if (authError) {
+    authError.textContent = errorMessage;
+    authError.hidden = !errorMessage;
+  }
+  if (location && location.hash !== "#home") location.hash = "#home";
+}
+
+async function terminatePortalSession(request, reset) {
+  let failure = null;
+  try {
+    await request();
+  } catch (error) {
+    failure = error;
+  } finally {
+    reset(failure);
+  }
+  return failure === null;
+}
+
+if (typeof module === "object" && module.exports) {
+  module.exports = { resetAuthenticatedPortalState, terminatePortalSession };
+}
+
+if (typeof window !== "undefined" && typeof document !== "undefined") {
+  (() => {
   const providerOrder = [
     "codex",
     "claudeCompatible",
@@ -107,6 +245,10 @@
     settingsDrawerReturnFocus: null,
     focusAfterRoute: false,
     initialized: false,
+    operatorAuthenticated: false,
+    passwordLoginEnabled: true,
+    authenticationGeneration: 0,
+    logoutPromise: null,
     agent: {
       selectedProjectID: null,
       selectedSessionID: null,
@@ -705,14 +847,25 @@
 
   async function mutateDomain(domain, control, operation, applyResult) {
     if (state.domainMutations[domain]) return state.domainMutations[domain];
+    const authenticationGeneration = state.authenticationGeneration;
     if (control) setDisabledReason(control, true, "Saving…");
     state.domainMutations[domain] = (async () => {
       try {
         const result = await operation();
+        if (
+          !state.operatorAuthenticated ||
+          authenticationGeneration !== state.authenticationGeneration
+        )
+          return null;
         applyResult(result);
         renderRoute();
         return result;
       } catch (error) {
+        if (
+          !state.operatorAuthenticated ||
+          authenticationGeneration !== state.authenticationGeneration
+        )
+          return null;
         toast(error.message, true);
         if (error.code === "staleRevision") {
           await loadSettingsDomain(domain);
@@ -728,6 +881,7 @@
 
   async function loadAll(refresh = false) {
     if (state.loadPromise) return state.loadPromise;
+    const authenticationGeneration = state.authenticationGeneration;
     setLoading(true);
     state.loadPromise = (async () => {
       try {
@@ -744,6 +898,11 @@
           api("api/v1/account/sessions"),
           api("api/v1/operations"),
         ]);
+        if (
+          !state.operatorAuthenticated ||
+          authenticationGeneration !== state.authenticationGeneration
+        )
+          return;
         if (!providerCatalog || !Array.isArray(providerCatalog.providers)) {
           throw new PortalError("The provider catalog response is incomplete.");
         }
@@ -763,6 +922,21 @@
         state.operations = operations;
         reconcileAgentSelection();
         await loadTypedSettings();
+        if (
+          !state.operatorAuthenticated ||
+          authenticationGeneration !== state.authenticationGeneration
+        ) {
+          if (!state.operatorAuthenticated) {
+            const authError = document.getElementById("auth-error");
+            resetAuthenticatedPortalState(state, document, location, {
+              passwordLoginEnabled: state.passwordLoginEnabled,
+              title: document.getElementById("auth-title").textContent,
+              copy: document.getElementById("auth-copy").textContent,
+              errorMessage: authError.hidden ? "" : authError.textContent,
+            });
+          }
+          return;
+        }
         state.generatedAt =
           providerCatalog.generatedAt || new Date().toISOString();
         document.getElementById("service-caption").textContent =
@@ -779,6 +953,11 @@
           announce("Server state refreshed");
         }
       } catch (error) {
+        if (
+          !state.operatorAuthenticated ||
+          authenticationGeneration !== state.authenticationGeneration
+        )
+          return;
         const offline = error.network || navigator.onLine === false;
         document.getElementById("service-caption").textContent = offline
           ? "Server connection unavailable"
@@ -1519,6 +1698,18 @@
   function clearAuthenticationSecrets() {
     const form = document.getElementById("auth-form");
     if (form) disposeSensitiveInputs(form);
+  }
+
+  function activateAuthenticatedPortal(status) {
+    clearAuthenticationSecrets();
+    state.authenticationGeneration += 1;
+    state.operatorAuthenticated = true;
+    state.passwordLoginEnabled = status?.passwordLoginEnabled !== false;
+    const app = document.getElementById("app");
+    app.hidden = false;
+    app.inert = false;
+    app.removeAttribute("aria-hidden");
+    document.getElementById("auth-gate").hidden = true;
   }
 
   function renderRoute() {
@@ -4198,15 +4389,50 @@
   }
 
   async function refreshPrivatePilotState() {
+    const authenticationGeneration = state.authenticationGeneration;
     const [operatorSessions, operations] = await Promise.all([
       api("api/v1/account/sessions"),
       api("api/v1/operations"),
     ]);
+    if (
+      !state.operatorAuthenticated ||
+      authenticationGeneration !== state.authenticationGeneration
+    )
+      return;
     state.operatorSessions = Array.isArray(operatorSessions)
       ? operatorSessions
       : [];
     state.operations = operations;
     renderRoute();
+  }
+
+  async function logoutOperator(control) {
+    if (state.logoutPromise) return state.logoutPromise;
+    const passwordLoginEnabled = state.passwordLoginEnabled;
+    setDisabledReason(control, true, "Logout is in progress.");
+    state.logoutPromise = terminatePortalSession(
+      () => api("api/v1/logout", { method: "POST" }),
+      (failure) => {
+        clearPollTimer();
+        clearAgentPoll();
+        resetAuthenticatedPortalState(state, document, location, {
+          passwordLoginEnabled,
+          title: failure ? "Sign in again" : "Signed out",
+          copy: failure
+            ? passwordLoginEnabled
+              ? "Local portal state was cleared because the server response could not be confirmed. Sign in again before continuing."
+              : "Local portal state was cleared because the server response could not be confirmed. Restore the connection and reload to verify the operator certificate."
+            : passwordLoginEnabled
+              ? "The portal session has ended. Sign in to continue."
+              : "The portal session has ended. Reload to verify the operator certificate and continue.",
+          errorMessage: failure
+            ? "Logout could not be confirmed. No authenticated portal state remains in this page."
+            : "",
+        });
+        state.logoutPromise = null;
+      },
+    );
+    return state.logoutPromise;
   }
 
   function privatePilotPasswordInput(label, autocomplete) {
@@ -4335,11 +4561,20 @@
     });
     sessions.append(revoke);
 
+    const portalSession = desktopCard(
+      "Portal Session",
+      "End this browser session and remove all authenticated portal state from this page.",
+    );
+    const logout = element("button", "danger-button", "Logout");
+    logout.type = "button";
+    logout.addEventListener("click", () => logoutOperator(logout));
+    portalSession.append(logout);
+
     settingsPage(
       "Operator Account",
       "Manage the single private-pilot operator credential and durable browser sessions.",
       "key",
-      [passwordCard, sessions],
+      [passwordCard, sessions, portalSession],
       recommendation(
         "shield",
         "Offline recovery is intentionally not exposed in the browser",
@@ -7828,15 +8063,22 @@
     try {
       status = await api("api/v1/auth/status");
     } catch (failure) {
-      clearAuthenticationSecrets();
-      gate.hidden = true;
-      return true;
+      resetAuthenticatedPortalState(state, document, location, {
+        passwordLoginEnabled: false,
+        title: "Operator access unavailable",
+        copy: "The portal could not verify operator access. Restore the server connection and reload.",
+        errorMessage: failure.message,
+      });
+      return false;
     }
+    state.passwordLoginEnabled = status.passwordLoginEnabled !== false;
     if (status.authenticated) {
-      clearAuthenticationSecrets();
-      gate.hidden = true;
+      activateAuthenticatedPortal(status);
       return true;
     }
+    resetAuthenticatedPortalState(state, document, location, {
+      passwordLoginEnabled: status.passwordLoginEnabled,
+    });
     gate.hidden = false;
     if (!status.passwordLoginEnabled) {
       document.getElementById("auth-title").textContent = "Operator certificate required";
@@ -7885,7 +8127,7 @@
               body: JSON.stringify({ password }),
             });
           }
-          gate.hidden = true;
+          activateAuthenticatedPortal(status);
           resolve(true);
         } catch (failure) {
           error.hidden = false;
@@ -7908,16 +8150,21 @@
       selectSession,
       beginNewSession,
       submitComposer,
+      logoutOperator,
       disposeSensitiveInputs,
+      resetAuthenticatedPortalState: (options) =>
+        resetAuthenticatedPortalState(state, document, location, options),
       whenIdle: async () => {
         await state.loadPromise;
         await state.settingsMutation;
         await Promise.all(Object.values(state.domainMutations).filter(Boolean));
         await state.agent.transcriptPromise;
         await state.agent.mutationPromise;
+        await state.logoutPromise;
       },
     });
   }
 
   start();
-})();
+  })();
+}

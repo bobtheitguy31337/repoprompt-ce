@@ -313,6 +313,7 @@ final class PrivatePilotPortalAssetTests: XCTestCase {
             "api/v1/account/password",
             "api/v1/account/sessions",
             "api/v1/account/sessions/revoke-all",
+            "api/v1/logout",
             "api/v1/operations",
         ] {
             XCTAssertTrue(script.contains(path), "missing private-pilot portal path: \(path)")
@@ -321,6 +322,13 @@ final class PrivatePilotPortalAssetTests: XCTestCase {
         XCTAssertTrue(html.contains("id=\"auth-token\" name=\"setupToken\" type=\"password\""))
         XCTAssertGreaterThanOrEqual(html.components(separatedBy: "data-sensitive=\"true\"").count - 1, 3)
         XCTAssertTrue(script.contains("function clearAuthenticationSecrets()"))
+        XCTAssertTrue(script.contains("const logout = element(\"button\", \"danger-button\", \"Logout\")"))
+        XCTAssertTrue(script.contains("logout.addEventListener(\"click\", () => logoutOperator(logout))"))
+        XCTAssertTrue(script.contains("() => api(\"api/v1/logout\", { method: \"POST\" })"))
+        XCTAssertTrue(script.contains("state.logoutPromise = terminatePortalSession("))
+        XCTAssertTrue(script.contains("resetAuthenticatedPortalState(state, document, location"))
+        XCTAssertTrue(script.contains("state.operatorAuthenticated = false"))
+        XCTAssertTrue(script.contains("app.setAttribute(\"aria-hidden\", \"true\")"))
         XCTAssertTrue(script.contains("finally {\n          clearAuthenticationSecrets();"))
         XCTAssertTrue(script.contains("if (state.route !== nextRoute) disposeSensitiveInputs();"))
         XCTAssertTrue(script.contains("owner-only operator-setup-token file"))
