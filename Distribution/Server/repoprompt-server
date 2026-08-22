@@ -54,7 +54,7 @@ load_environment() {
     key="${line%%=*}"
     value="${line#*=}"
     case "$key" in
-      REPOPROMPT_SERVER_IMAGE|REPOPROMPT_CONTAINER_NAME|REPOPROMPT_PROFILE|REPOPROMPT_TOPOLOGY|REPOPROMPT_HOSTNAME|REPOPROMPT_SERVER_PUBLIC_ORIGIN|REPOPROMPT_BIND_HOST|REPOPROMPT_BIND_PORT|REPOPROMPT_HEALTH_PORT|REPOPROMPT_PORTAL_HOST|REPOPROMPT_PORTAL_PORT|REPOPROMPT_PUBLIC_ORIGIN|REPOPROMPT_TRUSTED_PROXY_CIDRS|REPOPROMPT_TLS_CERT_FILE|REPOPROMPT_TLS_KEY_FILE|REPOPROMPT_ENABLED_PROVIDERS|REPOPROMPT_ENABLED_DIRECT_PROVIDERS|REPOPROMPT_PROVIDER_VAULT_KEY_ID|REPOPROMPT_DATA_DIR|REPOPROMPT_SECRETS_DIR|REPOPROMPT_BACKUP_DIR|REPOPROMPT_PROVIDER_DIR)
+      REPOPROMPT_SERVER_IMAGE|REPOPROMPT_CONTAINER_NAME|REPOPROMPT_PROFILE|REPOPROMPT_TOPOLOGY|REPOPROMPT_HOSTNAME|REPOPROMPT_SERVER_PUBLIC_ORIGIN|REPOPROMPT_BIND_HOST|REPOPROMPT_BIND_PORT|REPOPROMPT_HEALTH_PORT|REPOPROMPT_PORTAL_HOST|REPOPROMPT_PORTAL_PORT|REPOPROMPT_PUBLIC_ORIGIN|REPOPROMPT_TRUSTED_PROXY_CIDRS|REPOPROMPT_TLS_CERT_FILE|REPOPROMPT_TLS_KEY_FILE|REPOPROMPT_ENABLED_PROVIDERS|REPOPROMPT_ENABLED_DIRECT_PROVIDERS|REPOPROMPT_PROVIDER_VAULT_KEY_ID|REPOPROMPT_PROJECT_SOURCE_POLICY_FILE|REPOPROMPT_DATA_DIR|REPOPROMPT_SECRETS_DIR|REPOPROMPT_BACKUP_DIR|REPOPROMPT_PROVIDER_DIR)
         export "$key=$value"
         ;;
       *) die "Unknown configuration key: $key" ;;
@@ -123,6 +123,12 @@ validate_config() {
   validate_absolute_directory REPOPROMPT_BACKUP_DIR "${REPOPROMPT_BACKUP_DIR:-}"
   validate_absolute_directory REPOPROMPT_PROVIDER_DIR "${REPOPROMPT_PROVIDER_DIR:-}"
   validate_disjoint_directories "$REPOPROMPT_DATA_DIR" "$REPOPROMPT_SECRETS_DIR" "$REPOPROMPT_BACKUP_DIR" "$REPOPROMPT_PROVIDER_DIR"
+  if [[ -n "${REPOPROMPT_PROJECT_SOURCE_POLICY_FILE:-}" ]]; then
+    [[ "$REPOPROMPT_PROJECT_SOURCE_POLICY_FILE" == /data/project-source.policy.json ]] ||
+      die "Project source policy must use /data/project-source.policy.json"
+    [[ -f "$REPOPROMPT_DATA_DIR/project-source.policy.json" && ! -L "$REPOPROMPT_DATA_DIR/project-source.policy.json" ]] ||
+      die "Project source policy must be a regular non-symlink file under the Server data directory"
+  fi
   [[ "$SCRIPT_DIR" != "$REPOPROMPT_DATA_DIR" && "$SCRIPT_DIR" != "$REPOPROMPT_DATA_DIR"/* ]] ||
     die "The installation directory must not be inside the live data directory"
   local unique
@@ -396,14 +402,18 @@ project_onboarding() {
   load_environment
   cat <<EOF
 Project source root: $REPOPROMPT_DATA_DIR/projects
+Project source policy: $REPOPROMPT_DATA_DIR/project-source.policy.json
 Portal: $REPOPROMPT_SERVER_PUBLIC_ORIGIN/portal/
 
-1. Complete operator setup and provider Test Connection first.
-2. Add a project in the Portal. For host-managed sources, place each checkout
-   below the project source root and keep ownership compatible with service UID 65532.
-3. For server-managed Git onboarding, mount an explicit source-policy file and
-   reviewed SSH credentials; it is disabled by default in this bundle.
-4. Confirm /health/ready and one bounded project read before starting agent work.
+1. Complete operator setup first. Provider configuration is independent.
+2. For host-managed sources, place each checkout below the project source root
+   with service UID 65532 access. Admit only a configured-root alias from the
+   source policy through POST /portal/api/v1/projects/source-operations.
+3. Set REPOPROMPT_PROJECT_SOURCE_POLICY_FILE=/data/project-source.policy.json,
+   then rerun up. Physical paths never belong in the portal request.
+4. Server-managed Git remains disabled unless that same policy and reviewed SSH
+   credentials explicitly allow it.
+5. Confirm /health/ready and one bounded project read before starting agent work.
 EOF
 }
 

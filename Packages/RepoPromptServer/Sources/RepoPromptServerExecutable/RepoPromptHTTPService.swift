@@ -262,6 +262,20 @@ public struct RepoPromptHTTPService: Sendable {
             let bootstrap = try await portalBootstrap()
             return try portalJSON(bootstrap)
         } }
+        router.post("/portal/api/v1/projects/source-operations") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request, context: context)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(ProjectSourceOperationInput.self, from: data)
+            let result = try await authority.createProjectFromSource(
+                input: input,
+                externalActor: principal.externalActor,
+                idempotencyKey: portalIdempotencyKey(principal: principal, operationID: input.operationID),
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            let project = try await authority.projectSnapshot(projectID: result.projectID)
+            return try portalJSON(RepoPromptPortalSessionProjection.project(project), status: .created)
+        } }
         router.get("/portal/api/v1/sessions/:id/transcript") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(request: request, context: context)
             let sessionID = try context.parameters.require("id", as: UUID.self)

@@ -107,6 +107,73 @@ final class PortalOperatorOnboardingTests: XCTestCase {
         }
     }
 
+    func testAuthenticatedPortalAdmitsConfiguredRootWithoutProjectPathDisclosure() async throws {
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".test-portal-source-\(UUID().uuidString)", isDirectory: true)
+        let cloneRoot = directory.appendingPathComponent("projects", isDirectory: true)
+        let configuredRoot = cloneRoot.appendingPathComponent("acceptance-source", isDirectory: true)
+        try FileManager.default.createDirectory(at: configuredRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let configuredPath = configuredRoot.path
+        let policyData = try JSONSerialization.data(withJSONObject: [
+            "schemaVersion": 1,
+            "configuredRoots": [["alias": "acceptance", "path": configuredPath, "writable": false]],
+            "git": [
+                "remoteRules": [],
+                "allowedRefPatterns": [],
+                "deniedRefPatterns": [],
+                "maximumCloneBytes": 8_388_608,
+                "maximumCloneSeconds": 5,
+                "maximumConcurrentClones": 1,
+                "maximumOutputBytes": 16_384,
+            ],
+        ])
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let sourceService = try ProjectSourceProvisioningService(
+            cloneRoot: cloneRoot.path,
+            policy: ProjectSourcePolicy.decode(policyData),
+            credentials: ProjectSourceGitCredentials(),
+            resources: store,
+            git: RejectingPortalProjectSourceGitRunner()
+        )
+        let authority = RepoPromptHeadlessAuthority(store: store, projectSourceService: sourceService)
+        let setupToken = try await store.issueOperatorSetupToken()
+        try await store.createOperatorAccount(password: "operator-password", setupToken: setupToken)
+        let sessionToken = try await store.createOperatorSession()
+        let service = try await Self.service(store: store, authority: authority)
+        let app = Application(router: service.internalRouter())
+        let input = ProjectSourceOperationInput(
+            operationID: UUID(),
+            expectedRevision: 0,
+            name: "Acceptance project",
+            logicalName: "source",
+            source: .configuredRoot(alias: "acceptance")
+        )
+
+        try await app.test(.router) { client in
+            var headers = Self.portalMutationHeaders()
+            headers[.cookie] = "rpce_operator_session=\(sessionToken)"
+            try await client.execute(
+                uri: "/portal/api/v1/projects/source-operations",
+                method: .post,
+                headers: headers,
+                body: ByteBuffer(data: try JSONEncoder.serviceEncoder.encode(input))
+            ) { response in
+                XCTAssertEqual(response.status, .created)
+                let data = Data(response.body.readableBytesView)
+                let project = try JSONDecoder.serviceDecoder.decode(PortalProjectSummary.self, from: data)
+                XCTAssertEqual(project.name, "Acceptance project")
+                XCTAssertEqual(project.rootNames, ["source"])
+                XCTAssertFalse(String(decoding: data, as: UTF8.self).contains(configuredRoot.path))
+            }
+        }
+
+        let projects = await authority.projectSnapshots()
+        XCTAssertEqual(projects.count, 1)
+        XCTAssertEqual(projects.first?.roots.first?.canonicalPath, configuredRoot.path)
+    }
+
     func testPortalLogoutCommitsTokenMetadataAndAuditBeforeClearingCookie() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
@@ -309,9 +376,10 @@ final class PortalOperatorOnboardingTests: XCTestCase {
 
     private static func service(
         store: SQLiteServiceStore,
-        setupTokenURL: URL? = nil
+        setupTokenURL: URL? = nil,
+        authority: RepoPromptHeadlessAuthority? = nil
     ) async throws -> RepoPromptHTTPService {
-        let authority = RepoPromptHeadlessAuthority(store: store)
+        let authority = authority ?? RepoPromptHeadlessAuthority(store: store)
         return RepoPromptHTTPService(
             authority: authority,
             store: store,
@@ -346,5 +414,11 @@ final class PortalOperatorOnboardingTests: XCTestCase {
 
     private struct LoginBody: Encodable {
         let password: String
+    }
+}
+
+private actor RejectingPortalProjectSourceGitRunner: ProjectSourceGitRunning {
+    func run(_: ProjectSourceGitInvocation) async throws -> String {
+        throw ServiceAPIError(code: .dependencyUnavailable, message: "Git is not used by this configured-root test")
     }
 }

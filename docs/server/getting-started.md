@@ -99,7 +99,8 @@ sudo repoprompt-server setup-token \
 
 Open the portal, create the operator password, paste the token, and immediately
 delete the exported copy. The Server atomically consumes the token and deletes
-its internal token file after successful setup.
+its internal token file before returning the authenticated setup response. Login
+then creates a separate 12-hour, HTTP-only, secure operator session.
 
 Useful commands:
 
@@ -144,10 +145,60 @@ sudo repoprompt-server project-onboarding
 ```
 
 For host-managed sources, place reviewed checkouts below
-`/var/lib/repoprompt-server/projects` with service UID/GID 65532 access, then add
-the project in the portal. Server-managed Git cloning remains disabled until an
-operator explicitly mounts a source-policy file and reviewed SSH credentials.
-Confirm one bounded project read before agent work.
+`/var/lib/repoprompt-server/projects` with service UID/GID 65532 access. Admit a
+checkout by alias, never by a browser-supplied physical path:
+
+1. Write `/var/lib/repoprompt-server/project-source.policy.json` as a regular,
+   non-symlink file. A minimal read-only configured-root policy is:
+
+   ```json
+   {
+     "schemaVersion": 1,
+     "configuredRoots": [
+       {"alias": "product", "path": "/data/projects/product", "writable": false}
+     ],
+     "git": {
+       "remoteRules": [],
+       "allowedRefPatterns": [],
+       "deniedRefPatterns": [],
+       "maximumCloneBytes": 8388608,
+       "maximumCloneSeconds": 60,
+       "maximumConcurrentClones": 1,
+       "maximumOutputBytes": 16384
+     }
+   }
+   ```
+
+2. Set this exact container path in `/opt/repoprompt-server/.env`, then restart:
+
+   ```text
+   REPOPROMPT_PROJECT_SOURCE_POLICY_FILE=/data/project-source.policy.json
+   ```
+
+   ```bash
+   sudo repoprompt-server up
+   ```
+
+3. From an authenticated operator client, send
+   `POST /portal/api/v1/projects/source-operations` with the CSRF/origin headers
+   used by the portal and an alias-only request:
+
+   ```json
+   {
+     "schemaVersion": 1,
+     "operationId": "<new-uuid>",
+     "expectedRevision": 0,
+     "name": "Product",
+     "logicalName": "source",
+     "source": {"type": "configuredRoot", "alias": "product"}
+   }
+   ```
+
+The response and portal workspace list expose only the logical root name. The
+Server resolves and pins the policy-owned path through its existing project
+source authority. Server-managed Git remains disabled until that same policy
+and reviewed SSH credentials explicitly allow it. Confirm one bounded project
+read before agent work.
 
 ## 6. Back up before changes
 
