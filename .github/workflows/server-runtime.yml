@@ -103,8 +103,10 @@ jobs:
           swift build --product repoprompt-mcp --disable-automatic-resolution
 
   container:
-    name: Non-publishing Server container build
-    needs: package
+    # The Dockerfile performs its own Ubuntu release build. Keep this acceptance
+    # independent so an unrelated package/helper failure cannot suppress the
+    # standalone install evidence.
+    name: Standalone Server container acceptance
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
