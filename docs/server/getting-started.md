@@ -109,7 +109,8 @@ sudo repoprompt-server logs --tail 200
 sudo repoprompt-server validate
 ```
 
-`status` includes the authoritative readiness JSON. Do not expose the loopback
+`status` reports Compose state and succeeds only when the authoritative,
+content-free readiness probe returns HTTP success. Do not expose the loopback
 health port through a firewall or reverse proxy.
 
 ## 4. Configure a provider

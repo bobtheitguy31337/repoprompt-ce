@@ -179,14 +179,14 @@ initialize() {
   note "RepoPrompt Server state and owner-only secrets are initialized."
 }
 
-readiness_document() {
-  curl -fsS --max-time 5 "http://127.0.0.1:$REPOPROMPT_HEALTH_PORT/health/ready"
+readiness_probe() {
+  curl -fsS --max-time 5 --output /dev/null "http://127.0.0.1:$REPOPROMPT_HEALTH_PORT/health/ready"
 }
 
 wait_ready() {
-  local deadline=$((SECONDS + ${REPOPROMPT_READY_TIMEOUT_SECONDS:-120})) document
+  local deadline=$((SECONDS + ${REPOPROMPT_READY_TIMEOUT_SECONDS:-120}))
   while ((SECONDS < deadline)); do
-    if document="$(readiness_document 2>/dev/null)" && [[ "$document" == *'"ready":true'* ]]; then
+    if readiness_probe 2>/dev/null; then
       return 0
     fi
     sleep 2
@@ -335,8 +335,8 @@ upgrade_server() {
 show_status() {
   load_environment
   compose ps
-  if readiness_document; then
-    printf '\n'
+  if readiness_probe; then
+    note "Core readiness: ready."
   else
     note "Core readiness is unavailable."
     return 1

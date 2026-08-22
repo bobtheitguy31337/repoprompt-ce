@@ -23,6 +23,7 @@ DATA_DIR="$TMP_ROOT/data"
 SECRETS_DIR="$TMP_ROOT/secrets"
 BACKUP_DIR="$TMP_ROOT/backups"
 PROVIDER_DIR="$TMP_ROOT/providers"
+TOPOLOGY_ROOT="$TMP_ROOT/topology-validation"
 INSTALL_LOG="$TMP_ROOT/install.log"
 TOKEN_ONE="$TMP_ROOT/setup-token-one"
 TOKEN_TWO="$TMP_ROOT/setup-token-two"
@@ -110,6 +111,55 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   docker build --tag "$IMAGE" -f "$ROOT/Dockerfile.server" "$ROOT"
 fi
 
+validate_topology() {
+  local topology="$1" hostname="$2" bind_port="$3" health_port="$4" portal_port="$5" cidrs="$6"
+  local root="$TOPOLOGY_ROOT/$topology"
+  local command=(
+    "$ROOT/Distribution/Server/install.sh"
+    --image "$IMAGE"
+    --allow-unpinned-image
+    --hostname "$hostname"
+    --bind-port "$bind_port"
+    --health-port "$health_port"
+    --install-dir "$root/install"
+    --bin-dir "$root/bin"
+    --data-dir "$root/data"
+    --secrets-dir "$root/secrets"
+    --backup-dir "$root/backups"
+    --provider-dir "$root/providers"
+    --no-start
+  )
+  if [[ "$topology" == trusted-proxy ]]; then
+    command+=(
+      --topology trusted-proxy
+      --public-origin "https://$hostname"
+      --portal-port "$portal_port"
+      --trusted-proxy-cidrs "$cidrs"
+    )
+  fi
+  "${command[@]}" >/dev/null
+  REPOPROMPT_SERVER_ENV_FILE="$root/install/.env" REPOPROMPT_ALLOW_UNPINNED_IMAGE=1 \
+    "$root/install/repoprompt-server" validate >/dev/null
+  grep -Fqx "REPOPROMPT_TOPOLOGY=$topology" "$root/install/.env"
+}
+
+phase topology-validation
+DIRECT_BIND_PORT="$(free_port)"
+DIRECT_HEALTH_PORT="$(free_port)"
+while [[ "$DIRECT_HEALTH_PORT" == "$DIRECT_BIND_PORT" ]]; do DIRECT_HEALTH_PORT="$(free_port)"; done
+PROXY_BIND_PORT="$(free_port)"
+PROXY_HEALTH_PORT="$(free_port)"
+PROXY_PORTAL_PORT="$(free_port)"
+while [[ "$PROXY_HEALTH_PORT" == "$PROXY_BIND_PORT" ]]; do PROXY_HEALTH_PORT="$(free_port)"; done
+while [[ "$PROXY_PORTAL_PORT" == "$PROXY_BIND_PORT" || "$PROXY_PORTAL_PORT" == "$PROXY_HEALTH_PORT" ]]; do PROXY_PORTAL_PORT="$(free_port)"; done
+validate_topology direct-tls localhost "$DIRECT_BIND_PORT" "$DIRECT_HEALTH_PORT" off ''
+validate_topology trusted-proxy proxy.example "$PROXY_BIND_PORT" "$PROXY_HEALTH_PORT" "$PROXY_PORTAL_PORT" 127.0.0.1/32
+grep -Fqx 'REPOPROMPT_PORTAL_PORT=off' "$TOPOLOGY_ROOT/direct-tls/install/.env"
+grep -Fqx 'REPOPROMPT_PUBLIC_ORIGIN=' "$TOPOLOGY_ROOT/direct-tls/install/.env"
+grep -Fqx "REPOPROMPT_PORTAL_PORT=$PROXY_PORTAL_PORT" "$TOPOLOGY_ROOT/trusted-proxy/install/.env"
+grep -Fqx 'REPOPROMPT_PUBLIC_ORIGIN=https://proxy.example' "$TOPOLOGY_ROOT/trusted-proxy/install/.env"
+grep -Fqx 'REPOPROMPT_TRUSTED_PROXY_CIDRS=127.0.0.1/32' "$TOPOLOGY_ROOT/trusted-proxy/install/.env"
+
 install_command=(
   "$ROOT/Distribution/Server/install.sh"
   --image "$IMAGE"
@@ -138,7 +188,7 @@ grep -Fq "$(tr -d '\n' < "$TOKEN_ONE")" "$INSTALL_LOG" && { printf 'Setup token 
 grep -Fq "$(grep '^AGE-SECRET-KEY-' "$SECRETS_DIR/backup-age-identity.txt")" "$INSTALL_LOG" && { printf 'Backup identity leaked to install log.\n' >&2; exit 1; }
 phase fresh-readiness
 curl -kfsS --max-time 5 "https://127.0.0.1:$BIND_PORT/portal/" | grep -q 'RepoPrompt'
-curl -fsS --max-time 5 "http://127.0.0.1:$HEALTH_PORT/health/ready" | grep -q '"ready":true'
+curl -fsS --max-time 5 --output /dev/null "http://127.0.0.1:$HEALTH_PORT/health/ready"
 
 # Re-running the complete installation command must preserve configuration,
 # state, secrets, the live container, and the outstanding one-use setup token.
