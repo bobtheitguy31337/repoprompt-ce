@@ -26,6 +26,52 @@ PROVIDER_DIR="$TMP_ROOT/providers"
 INSTALL_LOG="$TMP_ROOT/install.log"
 TOKEN_ONE="$TMP_ROOT/setup-token-one"
 TOKEN_TWO="$TMP_ROOT/setup-token-two"
+CURRENT_PHASE=bootstrap
+
+phase() {
+  CURRENT_PHASE="$1"
+  printf 'Standalone acceptance phase: %s\n' "$CURRENT_PHASE"
+}
+
+diagnose_failure() {
+  local status="$1"
+  printf 'Standalone acceptance failed during phase %q (exit %s).\n' "$CURRENT_PHASE" "$status" >&2
+  if [[ -s "$INSTALL_LOG" ]]; then
+    printf '%s\n' 'Secret-safe installer diagnostics:' >&2
+    awk '
+      /^ERROR:/ ||
+      /^Configuration is valid\.$/ ||
+      /^RepoPrompt Server state and owner-only secrets are initialized\.$/ ||
+      /^RepoPrompt Server did not become ready before the timeout$/
+    ' "$INSTALL_LOG" >&2 || true
+  fi
+  if docker inspect repoprompt-server >/dev/null 2>&1; then
+    docker inspect --format \
+      'Container state: status={{.State.Status}} exit_code={{.State.ExitCode}} oom_killed={{.State.OOMKilled}} restart_count={{.RestartCount}}' \
+      repoprompt-server >&2 || true
+    printf '%s\n' 'Secret-safe structured Server events:' >&2
+    docker logs --tail 100 repoprompt-server 2>&1 | python3 -c '
+import json
+import sys
+
+for raw in sys.stdin:
+    try:
+        entry = json.loads(raw)
+    except (TypeError, ValueError):
+        continue
+    fields = entry.get("fields") if isinstance(entry.get("fields"), dict) else {}
+    projected = {
+        key: entry[key]
+        for key in ("timestamp", "level", "event", "outcome")
+        if isinstance(entry.get(key), str)
+    }
+    if isinstance(fields.get("errorType"), str):
+        projected["errorType"] = fields["errorType"]
+    if projected:
+        print(json.dumps(projected, sort_keys=True, separators=(",", ":")))
+' >&2 || true
+  fi
+}
 
 cleanup() {
   if [[ -x "$INSTALL_DIR/repoprompt-server" && -f "$INSTALL_DIR/.env" ]]; then
@@ -34,7 +80,17 @@ cleanup() {
   fi
   rm -rf "$TMP_ROOT"
 }
-trap cleanup EXIT
+
+finish() {
+  local status=$?
+  trap - EXIT
+  if ((status != 0)); then
+    diagnose_failure "$status"
+  fi
+  cleanup
+  exit "$status"
+}
+trap finish EXIT
 
 free_port() {
   python3 - <<'PY'
@@ -49,6 +105,7 @@ BIND_PORT="$(free_port)"
 HEALTH_PORT="$(free_port)"
 while [[ "$HEALTH_PORT" == "$BIND_PORT" ]]; do HEALTH_PORT="$(free_port)"; done
 
+phase image
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   docker build --tag "$IMAGE" -f "$ROOT/Dockerfile.server" "$ROOT"
 fi
@@ -68,7 +125,9 @@ install_command=(
   --provider-dir "$PROVIDER_DIR"
 )
 
+phase fresh-install
 "${install_command[@]}" >"$INSTALL_LOG" 2>&1
+phase fresh-token-export
 REPOPROMPT_SERVER_ENV_FILE="$INSTALL_DIR/.env" REPOPROMPT_ALLOW_UNPINNED_IMAGE=1 \
   "$INSTALL_DIR/repoprompt-server" setup-token --output "$TOKEN_ONE"
 [[ "$(stat -c '%a' "$TOKEN_ONE")" == 600 ]] || { printf 'Setup token mode is not 0600.\n' >&2; exit 1; }
@@ -77,12 +136,15 @@ VAULT_DIGEST_ONE="$(sha256sum "$SECRETS_DIR/provider-vault.key" | cut -d' ' -f1)
 AGE_DIGEST_ONE="$(sha256sum "$SECRETS_DIR/backup-age-identity.txt" | cut -d' ' -f1)"
 grep -Fq "$(tr -d '\n' < "$TOKEN_ONE")" "$INSTALL_LOG" && { printf 'Setup token leaked to install log.\n' >&2; exit 1; }
 grep -Fq "$(grep '^AGE-SECRET-KEY-' "$SECRETS_DIR/backup-age-identity.txt")" "$INSTALL_LOG" && { printf 'Backup identity leaked to install log.\n' >&2; exit 1; }
+phase fresh-readiness
 curl -kfsS --max-time 5 "https://127.0.0.1:$BIND_PORT/portal/" | grep -q 'RepoPrompt'
 curl -fsS --max-time 5 "http://127.0.0.1:$HEALTH_PORT/health/ready" | grep -q '"ready":true'
 
 # Re-running the complete installation command must preserve configuration,
 # state, secrets, the live container, and the outstanding one-use setup token.
+phase idempotent-rerun
 "${install_command[@]}" >>"$INSTALL_LOG" 2>&1
+phase idempotent-state
 REPOPROMPT_SERVER_ENV_FILE="$INSTALL_DIR/.env" REPOPROMPT_ALLOW_UNPINNED_IMAGE=1 \
   "$INSTALL_DIR/repoprompt-server" setup-token --output "$TOKEN_TWO"
 TOKEN_DIGEST_TWO="$(sha256sum "$TOKEN_TWO" | cut -d' ' -f1)"
@@ -94,6 +156,7 @@ TOKEN_DIGEST_TWO="$(sha256sum "$TOKEN_TWO" | cut -d' ' -f1)"
   exit 1
 }
 
+phase provider-and-backup
 REPOPROMPT_SERVER_ENV_FILE="$INSTALL_DIR/.env" REPOPROMPT_ALLOW_UNPINNED_IMAGE=1 \
   "$INSTALL_DIR/repoprompt-server" provider-check
 REPOPROMPT_SERVER_ENV_FILE="$INSTALL_DIR/.env" REPOPROMPT_ALLOW_UNPINNED_IMAGE=1 \
@@ -103,12 +166,14 @@ REPOPROMPT_SERVER_ENV_FILE="$INSTALL_DIR/.env" REPOPROMPT_ALLOW_UNPINNED_IMAGE=1
   exit 1
 }
 
+phase preserving-uninstall
 REPOPROMPT_SERVER_ENV_FILE="$INSTALL_DIR/.env" REPOPROMPT_ALLOW_UNPINNED_IMAGE=1 \
   "$INSTALL_DIR/repoprompt-server" uninstall >/dev/null
 [[ -d "$DATA_DIR" && -f "$SECRETS_DIR/provider-vault.key" && -f "$BACKUP_DIR/acceptance.age" ]] || {
   printf 'Preserving uninstall removed operator state.\n' >&2
   exit 1
 }
+phase explicit-destroy
 REPOPROMPT_SERVER_ENV_FILE="$INSTALL_DIR/.env" REPOPROMPT_ALLOW_UNPINNED_IMAGE=1 \
   "$INSTALL_DIR/repoprompt-server" uninstall --destroy-data --confirm DESTROY-REPOPROMPT-DATA >/dev/null
 [[ ! -e "$DATA_DIR" && -f "$SECRETS_DIR/backup-age-identity.txt" && -f "$BACKUP_DIR/acceptance.age" ]] || {
