@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${REPOPROMPT_SERVER_ENV_FILE:-$SCRIPT_DIR/.env}"
+COMPOSE_FILE="$SCRIPT_DIR/compose.yaml"
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+note() {
+  printf '%s\n' "$*" >&2
+}
+
+usage() {
+  cat <<'EOF'
+Usage: repoprompt-server COMMAND [options]
+
+Lifecycle:
+  validate                 Validate Ubuntu/Docker prerequisites and configuration
+  init                     Pull the pinned image and generate owner-only secrets
+  up                       Initialize, start, and wait for readiness
+  status                   Show Compose state and the core readiness document
+  logs [compose options]   Show Server logs (defaults to --tail 200)
+  setup-token --output F   Atomically export the one-use setup token to mode 0600
+  provider-check           Check admitted provider binaries and show live-test guidance
+  project-onboarding       Show the project mount and portal onboarding steps
+
+Maintenance:
+  backup [NAME.age]        Stop, create, leased-verify, and restart
+  verify NAME.age          Stop, leased-verify, and restart
+  restore NAME.age --confirm-empty-target
+                           Restore only into an empty data root and activate once
+  upgrade IMAGE@sha256:DIGEST
+                           Take a verified backup, pin the new image, and restart
+  rollback-info            Explain the recorded previous-image/restore boundary
+  uninstall [--destroy-data --confirm DESTROY-REPOPROMPT-DATA]
+                           Preserve data by default; explicit destroy keeps backups
+EOF
+}
+
+require_file() {
+  [[ -f "$1" ]] || die "Required file is missing: $1"
+}
+
+load_environment() {
+  require_file "$ENV_FILE"
+  local line key value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    [[ "$line" == *=* ]] || die "Invalid configuration line in $ENV_FILE"
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      REPOPROMPT_SERVER_IMAGE|REPOPROMPT_CONTAINER_NAME|REPOPROMPT_PROFILE|REPOPROMPT_TOPOLOGY|REPOPROMPT_HOSTNAME|REPOPROMPT_SERVER_PUBLIC_ORIGIN|REPOPROMPT_BIND_HOST|REPOPROMPT_BIND_PORT|REPOPROMPT_HEALTH_PORT|REPOPROMPT_PORTAL_HOST|REPOPROMPT_PORTAL_PORT|REPOPROMPT_PUBLIC_ORIGIN|REPOPROMPT_TRUSTED_PROXY_CIDRS|REPOPROMPT_TLS_CERT_FILE|REPOPROMPT_TLS_KEY_FILE|REPOPROMPT_ENABLED_PROVIDERS|REPOPROMPT_ENABLED_DIRECT_PROVIDERS|REPOPROMPT_PROVIDER_VAULT_KEY_ID|REPOPROMPT_DATA_DIR|REPOPROMPT_SECRETS_DIR|REPOPROMPT_BACKUP_DIR|REPOPROMPT_PROVIDER_DIR)
+        export "$key=$value"
+        ;;
+      *) die "Unknown configuration key: $key" ;;
+    esac
+  done < "$ENV_FILE"
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command is unavailable: $1"
+}
+
+compose() {
+  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+}
+
+validate_absolute_directory() {
+  local label="$1" value="$2"
+  [[ "$value" =~ ^/[A-Za-z0-9._/-]+$ && "$value" != "/" ]] ||
+    die "$label must be a safe absolute path other than /"
+}
+
+validate_disjoint_directories() {
+  local left right
+  for left in "$@"; do
+    for right in "$@"; do
+      [[ "$left" == "$right" ]] && continue
+      [[ "$left" != "$right"/* ]] || die "Persistent directories must not contain one another: $left and $right"
+    done
+  done
+}
+
+validate_port() {
+  local label="$1" value="$2"
+  [[ "$value" =~ ^[0-9]+$ ]] && ((value >= 1 && value <= 65535)) ||
+    die "$label must be an integer from 1 through 65535"
+}
+
+validate_config() {
+  load_environment
+  if [[ "${REPOPROMPT_SERVER_ACCEPT_NON_UBUNTU:-0}" != "1" ]]; then
+    [[ "$(uname -s)" == Linux && -f /etc/os-release ]] || die "The standalone bundle supports Ubuntu 24.04 only"
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    [[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" == 24.04 ]] || die "The standalone bundle supports Ubuntu 24.04 only"
+  fi
+  require_command docker
+  require_command curl
+  docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
+  [[ "${REPOPROMPT_SERVER_IMAGE:-}" =~ ^[A-Za-z0-9._/@:-]+$ ]] || die "REPOPROMPT_SERVER_IMAGE is invalid"
+  if [[ "${REPOPROMPT_ALLOW_UNPINNED_IMAGE:-0}" != "1" ]]; then
+    [[ "$REPOPROMPT_SERVER_IMAGE" =~ @sha256:[a-f0-9]{64}$ ]] ||
+      die "REPOPROMPT_SERVER_IMAGE must be pinned by sha256 digest"
+  fi
+  [[ "${REPOPROMPT_HOSTNAME:-}" =~ ^[A-Za-z0-9.-]+$ ]] || die "REPOPROMPT_HOSTNAME is invalid"
+  [[ "${REPOPROMPT_SERVER_PUBLIC_ORIGIN:-}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] ||
+    die "REPOPROMPT_SERVER_PUBLIC_ORIGIN must be an HTTPS origin without a path"
+  local origin_authority origin_host expected_origin
+  origin_authority="${REPOPROMPT_SERVER_PUBLIC_ORIGIN#https://}"
+  origin_host="${origin_authority%%:*}"
+  [[ "$origin_host" == "$REPOPROMPT_HOSTNAME" ]] || die "Public origin hostname must match REPOPROMPT_HOSTNAME"
+  validate_port REPOPROMPT_BIND_PORT "${REPOPROMPT_BIND_PORT:-}"
+  validate_port REPOPROMPT_HEALTH_PORT "${REPOPROMPT_HEALTH_PORT:-}"
+  [[ "$REPOPROMPT_BIND_PORT" != "$REPOPROMPT_HEALTH_PORT" ]] || die "Bind and health ports must differ"
+  validate_absolute_directory REPOPROMPT_DATA_DIR "${REPOPROMPT_DATA_DIR:-}"
+  validate_absolute_directory REPOPROMPT_SECRETS_DIR "${REPOPROMPT_SECRETS_DIR:-}"
+  validate_absolute_directory REPOPROMPT_BACKUP_DIR "${REPOPROMPT_BACKUP_DIR:-}"
+  validate_absolute_directory REPOPROMPT_PROVIDER_DIR "${REPOPROMPT_PROVIDER_DIR:-}"
+  validate_disjoint_directories "$REPOPROMPT_DATA_DIR" "$REPOPROMPT_SECRETS_DIR" "$REPOPROMPT_BACKUP_DIR" "$REPOPROMPT_PROVIDER_DIR"
+  [[ "$SCRIPT_DIR" != "$REPOPROMPT_DATA_DIR" && "$SCRIPT_DIR" != "$REPOPROMPT_DATA_DIR"/* ]] ||
+    die "The installation directory must not be inside the live data directory"
+  local unique
+  unique="$(printf '%s\n' "$REPOPROMPT_DATA_DIR" "$REPOPROMPT_SECRETS_DIR" "$REPOPROMPT_BACKUP_DIR" "$REPOPROMPT_PROVIDER_DIR" | sort -u | wc -l | tr -d ' ')"
+  [[ "$unique" == "4" ]] || die "Data, secrets, backups, and providers must use distinct directories"
+  [[ "${REPOPROMPT_ENABLED_PROVIDERS:-}" =~ ^(codex|claudeCompatible|openCodeACP|cursorACP|grokBuildACP)?(,(codex|claudeCompatible|openCodeACP|cursorACP|grokBuildACP))*$ ]] ||
+    die "REPOPROMPT_ENABLED_PROVIDERS contains an unsupported provider"
+  [[ "${REPOPROMPT_ENABLED_DIRECT_PROVIDERS:-}" =~ ^(openAIAPI|anthropicAPI|openRouter|customOpenAICompatible|gemini|azure|deepseek|fireworks|xAI|groq|zAI|ollama)?(,(openAIAPI|anthropicAPI|openRouter|customOpenAICompatible|gemini|azure|deepseek|fireworks|xAI|groq|zAI|ollama))*$ ]] ||
+    die "REPOPROMPT_ENABLED_DIRECT_PROVIDERS contains an unsupported provider"
+  [[ "${REPOPROMPT_TRUSTED_PROXY_CIDRS:-}" =~ ^[0-9A-Fa-f:.,/]*$ ]] || die "Trusted-proxy CIDRs are invalid"
+  case "${REPOPROMPT_TOPOLOGY:-}" in
+    direct-tls)
+      [[ "${REPOPROMPT_PORTAL_PORT:-}" == "off" ]] || die "Direct TLS requires REPOPROMPT_PORTAL_PORT=off"
+      [[ -z "${REPOPROMPT_PUBLIC_ORIGIN:-}" && -z "${REPOPROMPT_TRUSTED_PROXY_CIDRS:-}" ]] ||
+        die "Direct TLS must not configure Server trusted-proxy variables"
+      if [[ "$REPOPROMPT_BIND_PORT" == 443 ]]; then
+        expected_origin="https://$REPOPROMPT_HOSTNAME"
+      else
+        expected_origin="https://$REPOPROMPT_HOSTNAME:$REPOPROMPT_BIND_PORT"
+      fi
+      [[ "$REPOPROMPT_SERVER_PUBLIC_ORIGIN" == "$expected_origin" ]] ||
+        die "Direct-TLS public origin must match the configured bind port"
+      if [[ "$REPOPROMPT_HOSTNAME" != "localhost" && "$REPOPROMPT_HOSTNAME" != "repoprompt" ]]; then
+        [[ "${REPOPROMPT_TLS_CERT_FILE:-}" == "/secrets/tls/server.crt" && "${REPOPROMPT_TLS_KEY_FILE:-}" == "/secrets/tls/server.key" ]] ||
+          die "A public direct-TLS hostname requires installer-managed certificate and key files"
+      fi
+      ;;
+    trusted-proxy)
+      validate_port REPOPROMPT_PORTAL_PORT "${REPOPROMPT_PORTAL_PORT:-}"
+      [[ "${REPOPROMPT_PORTAL_HOST:-}" == "127.0.0.1" || "${REPOPROMPT_PORTAL_HOST:-}" == "::1" ]] ||
+        die "Trusted-proxy portal backend must bind to loopback"
+      [[ "${REPOPROMPT_PUBLIC_ORIGIN:-}" == "$REPOPROMPT_SERVER_PUBLIC_ORIGIN" ]] ||
+        die "Trusted-proxy public origin must match the operator origin"
+      [[ -n "${REPOPROMPT_TRUSTED_PROXY_CIDRS:-}" ]] || die "Trusted-proxy CIDRs are required"
+      ;;
+    *) die "REPOPROMPT_TOPOLOGY must be direct-tls or trusted-proxy" ;;
+  esac
+  if [[ -n "${REPOPROMPT_TLS_CERT_FILE:-}" || -n "${REPOPROMPT_TLS_KEY_FILE:-}" ]]; then
+    [[ "${REPOPROMPT_TLS_CERT_FILE:-}" == "/secrets/tls/server.crt" && "${REPOPROMPT_TLS_KEY_FILE:-}" == "/secrets/tls/server.key" ]] ||
+      die "TLS files must use the installer-managed /secrets/tls paths"
+    require_file "$REPOPROMPT_SECRETS_DIR/tls/server.crt"
+    require_file "$REPOPROMPT_SECRETS_DIR/tls/server.key"
+  fi
+  compose config --quiet
+}
+
+initialize() {
+  validate_config
+  mkdir -p "$REPOPROMPT_DATA_DIR" "$REPOPROMPT_SECRETS_DIR" "$REPOPROMPT_BACKUP_DIR" "$REPOPROMPT_PROVIDER_DIR"
+  if ! docker image inspect "$REPOPROMPT_SERVER_IMAGE" >/dev/null 2>&1; then
+    compose pull server
+  fi
+  compose --profile tools run --rm init >/dev/null
+  note "RepoPrompt Server state and owner-only secrets are initialized."
+}
+
+readiness_document() {
+  curl -fsS --max-time 5 "http://127.0.0.1:$REPOPROMPT_HEALTH_PORT/health/ready"
+}
+
+wait_ready() {
+  local deadline=$((SECONDS + ${REPOPROMPT_READY_TIMEOUT_SECONDS:-120})) document
+  while ((SECONDS < deadline)); do
+    if document="$(readiness_document 2>/dev/null)" && [[ "$document" == *'"ready":true'* ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  compose ps >&2 || true
+  compose logs --tail 80 server >&2 || true
+  die "RepoPrompt Server did not become ready before the timeout"
+}
+
+start_server() {
+  initialize
+  compose up -d server
+  wait_ready
+  note "RepoPrompt Server is ready at $REPOPROMPT_SERVER_PUBLIC_ORIGIN/portal/"
+  note "Export the one-use setup token with: repoprompt-server setup-token --output /secure/path"
+}
+
+server_running() {
+  [[ -n "$(compose ps --status running -q server 2>/dev/null)" ]]
+}
+
+with_server_stopped() {
+  local was_running=0 status
+  if server_running; then
+    was_running=1
+    compose stop server >/dev/null
+  fi
+  set +e
+  "$@"
+  status=$?
+  set -e
+  if ((was_running)); then
+    compose up -d server >/dev/null
+    wait_ready
+  fi
+  return "$status"
+}
+
+container_archive_path() {
+  local name="$1"
+  [[ "$name" == "$(basename "$name")" && "$name" == *.age && "$name" != .* ]] ||
+    die "Backup name must be a simple .age filename"
+  printf '/backups/%s\n' "$name"
+}
+
+backup_create_stopped() {
+  local name="$1" archive
+  archive="$(container_archive_path "$name")"
+  compose run --rm server backup create \
+    --database /data/state/repoprompt.sqlite \
+    --recipients-file /secrets/backup-recipients.txt \
+    --output "$archive" || return $?
+  compose run --rm server backup verify "$archive" \
+    --identity-file /secrets/backup-age-identity.txt \
+    --database /data/state/repoprompt.sqlite || return $?
+}
+
+backup_create() {
+  load_environment
+  local name="${1:-repoprompt-$(date -u +%Y%m%dT%H%M%SZ).age}"
+  container_archive_path "$name" >/dev/null
+  with_server_stopped backup_create_stopped "$name"
+  note "Created and leased-verified $REPOPROMPT_BACKUP_DIR/$name"
+}
+
+backup_verify_stopped() {
+  local archive
+  archive="$(container_archive_path "$1")"
+  compose run --rm server backup verify "$archive" \
+    --identity-file /secrets/backup-age-identity.txt \
+    --database /data/state/repoprompt.sqlite
+}
+
+backup_verify() {
+  load_environment
+  [[ $# == 1 ]] || die "verify requires one .age filename"
+  container_archive_path "$1" >/dev/null
+  require_file "$REPOPROMPT_BACKUP_DIR/$1"
+  require_file "$REPOPROMPT_BACKUP_DIR/$1.sidecar.json"
+  with_server_stopped backup_verify_stopped "$1"
+}
+
+write_restore_override() {
+  local output="$1"
+  cat > "$output" <<'EOF'
+services:
+  server:
+    environment:
+      REPOPROMPT_RESTORE_ACTIVATION_TOKEN_FILE: /secrets/restore-activation-token
+EOF
+}
+
+restore_backup() {
+  load_environment
+  [[ $# == 2 && "$2" == "--confirm-empty-target" ]] ||
+    die "restore requires NAME.age --confirm-empty-target"
+  local name="$1" archive override
+  archive="$(container_archive_path "$name")"
+  require_file "$REPOPROMPT_BACKUP_DIR/$name"
+  require_file "$REPOPROMPT_BACKUP_DIR/$name.sidecar.json"
+  ! server_running || die "Restore requires the installation to be stopped"
+  initialize
+  [[ -z "$(find "$REPOPROMPT_DATA_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
+    die "Restore target is not empty; in-place restore is intentionally unsupported"
+  compose run --rm server restore prepare "$archive" \
+    --identity-file /secrets/backup-age-identity.txt \
+    --target /data/state \
+    --namespace-kind server
+  compose --profile tools run --rm init -ceu \
+    'umask 077; head -c 32 /dev/urandom > /secrets/.restore-activation-token.tmp; chown 65532:65532 /secrets/.restore-activation-token.tmp; chmod 0600 /secrets/.restore-activation-token.tmp; mv /secrets/.restore-activation-token.tmp /secrets/restore-activation-token' >/dev/null
+  override="$SCRIPT_DIR/.restore-activation.compose.yaml"
+  write_restore_override "$override"
+  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" -f "$override" up -d server
+  wait_ready
+  compose --profile tools run --rm init -ceu 'rm -f /secrets/restore-activation-token' >/dev/null
+  rm -f "$override"
+  compose up -d --force-recreate server
+  wait_ready
+  note "Restore activated and the one-use activation token was removed."
+}
+
+replace_image() {
+  local image="$1" temporary
+  temporary="$(mktemp "$(dirname "$ENV_FILE")/.env.image.XXXXXX")"
+  awk -v image="$image" 'BEGIN { done=0 } /^REPOPROMPT_SERVER_IMAGE=/ { print "REPOPROMPT_SERVER_IMAGE=" image; done=1; next } { print } END { if (!done) print "REPOPROMPT_SERVER_IMAGE=" image }' "$ENV_FILE" > "$temporary"
+  chmod --reference="$ENV_FILE" "$temporary" 2>/dev/null || chmod 0600 "$temporary"
+  mv "$temporary" "$ENV_FILE"
+}
+
+upgrade_server() {
+  load_environment
+  [[ $# == 1 ]] || die "upgrade requires IMAGE@sha256:DIGEST"
+  local next="$1" previous="$REPOPROMPT_SERVER_IMAGE" backup_name
+  [[ "$next" =~ ^[A-Za-z0-9._/@:-]+@sha256:[a-f0-9]{64}$ ]] || die "Upgrade image must be digest pinned"
+  [[ "$next" != "$previous" ]] || die "Requested image is already configured"
+  backup_name="pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ).age"
+  backup_create "$backup_name"
+  printf '%s\n' "$previous" > "$SCRIPT_DIR/.previous-image"
+  printf '%s\n' "$backup_name" > "$SCRIPT_DIR/.previous-backup"
+  chmod 0600 "$SCRIPT_DIR/.previous-image" "$SCRIPT_DIR/.previous-backup"
+  replace_image "$next"
+  note "If upgraded startup fails, do not point the previous image at live data; use rollback-info and restore the pre-upgrade backup into an empty target."
+  start_server
+}
+
+show_status() {
+  load_environment
+  compose ps
+  if readiness_document; then
+    printf '\n'
+  else
+    note "Core readiness is unavailable."
+    return 1
+  fi
+}
+
+export_setup_token() {
+  load_environment
+  [[ $# == 2 && "$1" == "--output" ]] || die "setup-token requires --output FILE"
+  local output="$2" parent temporary
+  [[ "$output" == /* ]] || die "Setup-token output must be an absolute path"
+  parent="$(dirname "$output")"
+  [[ -d "$parent" ]] || die "Setup-token output directory does not exist: $parent"
+  [[ ! -e "$output" && ! -L "$output" ]] || die "Refusing to replace existing setup-token output: $output"
+  umask 077
+  temporary="$(mktemp "$parent/.repoprompt-setup-token.XXXXXX")"
+  trap 'rm -f "$temporary"' EXIT
+  compose exec -T server sh -ceu 'test -f /data/state/operator-setup-token; cat /data/state/operator-setup-token' > "$temporary"
+  [[ -s "$temporary" ]] || die "Setup token is unavailable; setup may already be complete"
+  chmod 0600 "$temporary"
+  mv "$temporary" "$output"
+  trap - EXIT
+  note "Setup token exported to $output with mode 0600; delete it immediately after portal setup."
+}
+
+provider_check() {
+  load_environment
+  wait_ready
+  local providers="${REPOPROMPT_ENABLED_PROVIDERS:-}" provider path failures=0
+  if [[ -z "$providers" ]]; then
+    note "Core Server readiness passed; no CLI provider runtime is deployment-admitted."
+    note "Mount reviewed provider binaries, admit them in .env, then rerun this command."
+    return 0
+  fi
+  IFS=',' read -r -a provider_list <<< "$providers"
+  for provider in "${provider_list[@]}"; do
+    case "$provider" in
+      codex) path=/opt/repoprompt/providers/codex ;;
+      claudeCompatible) path=/opt/repoprompt/providers/claude ;;
+      openCodeACP) path=/opt/repoprompt/providers/opencode ;;
+      cursorACP) path=/opt/repoprompt/providers/cursor-agent ;;
+      grokBuildACP) path=/opt/repoprompt/providers/grok ;;
+      *) die "Unknown configured provider: $provider" ;;
+    esac
+    if compose exec -T server test -x "$path"; then
+      printf '%s: executable-ready (%s)\n' "$provider" "$path"
+    else
+      printf '%s: unavailable (%s)\n' "$provider" "$path" >&2
+      failures=$((failures + 1))
+    fi
+  done
+  note "Executable readiness is only the deployment gate. Complete authentication and run Test Connection in Portal > Settings > Providers."
+  ((failures == 0))
+}
+
+project_onboarding() {
+  load_environment
+  cat <<EOF
+Project source root: $REPOPROMPT_DATA_DIR/projects
+Portal: $REPOPROMPT_SERVER_PUBLIC_ORIGIN/portal/
+
+1. Complete operator setup and provider Test Connection first.
+2. Add a project in the Portal. For host-managed sources, place each checkout
+   below the project source root and keep ownership compatible with service UID 65532.
+3. For server-managed Git onboarding, mount an explicit source-policy file and
+   reviewed SSH credentials; it is disabled by default in this bundle.
+4. Confirm /health/ready and one bounded project read before starting agent work.
+EOF
+}
+
+rollback_info() {
+  load_environment
+  local image backup
+  image="$(cat "$SCRIPT_DIR/.previous-image" 2>/dev/null || true)"
+  backup="$(cat "$SCRIPT_DIR/.previous-backup" 2>/dev/null || true)"
+  cat <<EOF
+Previous image: ${image:-not recorded}
+Pre-upgrade backup: ${backup:-not recorded}
+
+RepoPrompt Server does not perform an in-place image downgrade after an upgrade
+has started: startup may have committed a forward-only schema migration. Stop the
+new service, create a fresh empty installation pinned to the compatible previous
+image, restore the recorded pre-upgrade archive with its original custody secrets,
+and validate readiness before changing traffic.
+EOF
+}
+
+safe_destroy_directory() {
+  local path="$1"
+  validate_absolute_directory destroy-path "$path"
+  [[ ! -L "$path" ]] || die "Refusing to destroy a symbolic-link path: $path"
+  [[ -d "$path" ]] || return 0
+  find "$path" -mindepth 1 -xdev -delete
+  rmdir "$path" 2>/dev/null || true
+  [[ ! -e "$path" ]] || die "Unable to fully destroy data path; check for nested mounts: $path"
+}
+
+uninstall_server() {
+  load_environment
+  compose down --remove-orphans
+  if [[ $# == 0 ]]; then
+    note "Containers removed. Data, secrets, backups, providers, and configuration were preserved."
+    return 0
+  fi
+  [[ $# == 3 && "$1" == "--destroy-data" && "$2" == "--confirm" && "$3" == "DESTROY-REPOPROMPT-DATA" ]] ||
+    die "Destruction requires --destroy-data --confirm DESTROY-REPOPROMPT-DATA"
+  safe_destroy_directory "$REPOPROMPT_DATA_DIR"
+  note "Live data destroyed. Custody secrets, backup archives, provider binaries, and installation configuration were preserved."
+}
+
+main() {
+  local command="${1:-}"
+  [[ -n "$command" ]] || { usage; exit 2; }
+  shift
+  case "$command" in
+    validate) [[ $# == 0 ]] || die "validate takes no arguments"; validate_config; note "Configuration is valid." ;;
+    init) [[ $# == 0 ]] || die "init takes no arguments"; initialize ;;
+    up) [[ $# == 0 ]] || die "up takes no arguments"; start_server ;;
+    status) [[ $# == 0 ]] || die "status takes no arguments"; show_status ;;
+    logs) load_environment; if [[ $# == 0 ]]; then compose logs --tail 200 server; else compose logs "$@" server; fi ;;
+    setup-token) export_setup_token "$@" ;;
+    provider-check) [[ $# == 0 ]] || die "provider-check takes no arguments"; provider_check ;;
+    project-onboarding) [[ $# == 0 ]] || die "project-onboarding takes no arguments"; project_onboarding ;;
+    backup) [[ $# -le 1 ]] || die "backup accepts at most one filename"; backup_create "$@" ;;
+    verify) backup_verify "$@" ;;
+    restore) restore_backup "$@" ;;
+    upgrade) upgrade_server "$@" ;;
+    rollback-info) [[ $# == 0 ]] || die "rollback-info takes no arguments"; rollback_info ;;
+    uninstall) uninstall_server "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; die "Unknown command: $command" ;;
+  esac
+}
+
+main "$@"

@@ -1,5 +1,29 @@
 # Backup, restore, and key-rotation runbook
 
+Standalone bundle operators should use the wrapper commands below. The raw
+Server commands remain the authority and are documented afterward for custom
+supervisors.
+
+```bash
+repoprompt-server backup
+repoprompt-server verify repoprompt-<timestamp>.age
+```
+
+Restore is accepted only for an installation whose data root has no children:
+
+```bash
+repoprompt-server restore repoprompt-<timestamp>.age --confirm-empty-target
+```
+
+Before restore, provision the original separately custodied Server secrets at
+the configured secrets directory. The wrapper prepares the restore, creates a
+one-use 256-bit activation token without printing it, starts once with the token,
+waits for readiness, deletes the token, and recreates the service without the
+activation environment. It never empties or overwrites an existing namespace.
+
+An image downgrade is not an in-place restore strategy. Restore the pre-upgrade
+archive into a fresh data root under the compatible digest-pinned image.
+
 All database-touching commands require the authority namespace maintenance lease. Stop the server using the deployment supervisor and verify no serving process owns the namespace before maintenance; do not delete lock files manually.
 
 ## Create

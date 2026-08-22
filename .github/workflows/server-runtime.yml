@@ -6,6 +6,7 @@ on:
       - "Packages/RepoPromptServer/**"
       - "Packages/RepoPromptPortableRuntime/**"
       - "Dockerfile.server"
+      - "Distribution/Server/**"
       - "Package.swift"
       - "Package.resolved"
       - "Makefile"
@@ -14,6 +15,7 @@ on:
       - "Scripts/package_app.sh"
       - "Scripts/build_swiftpm_release_products.sh"
       - "Scripts/validate_private_headless_helper.sh"
+      - "Scripts/test_server_standalone_docker.sh"
       - "Scripts/test_conductor_lifecycle.py"
       - ".github/workflows/server-runtime.yml"
   push:
@@ -23,6 +25,7 @@ on:
       - "Packages/RepoPromptServer/**"
       - "Packages/RepoPromptPortableRuntime/**"
       - "Dockerfile.server"
+      - "Distribution/Server/**"
       - "Package.swift"
       - "Package.resolved"
       - "Makefile"
@@ -31,6 +34,7 @@ on:
       - "Scripts/package_app.sh"
       - "Scripts/build_swiftpm_release_products.sh"
       - "Scripts/validate_private_headless_helper.sh"
+      - "Scripts/test_server_standalone_docker.sh"
       - "Scripts/test_conductor_lifecycle.py"
       - ".github/workflows/server-runtime.yml"
 
@@ -113,3 +117,8 @@ jobs:
 
       - name: Assert private-pilot distribution remains disabled
         run: test "$(docker image inspect --format '{{ index .Config.Labels "io.repoprompt.distribution" }}' repoprompt-server-private-pilot:test)" = "private-pilot-non-publishing"
+
+      - name: Exercise standalone Ubuntu install lifecycle
+        env:
+          REPOPROMPT_SERVER_ACCEPTANCE_IMAGE: repoprompt-server-private-pilot:test
+        run: Scripts/test_server_standalone_docker.sh

@@ -1,0 +1,128 @@
+name: repoprompt-server
+
+services:
+  server:
+    image: ${REPOPROMPT_SERVER_IMAGE:?Set REPOPROMPT_SERVER_IMAGE in .env}
+    container_name: ${REPOPROMPT_CONTAINER_NAME:-repoprompt-server}
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 40s
+    environment:
+      HOME: /data/provider-homes
+      REPOPROMPT_PROFILE: ${REPOPROMPT_PROFILE:-default}
+      REPOPROMPT_STATE_DB: /data/state/repoprompt.sqlite
+      REPOPROMPT_ARTIFACT_DIR: /data/artifacts
+      REPOPROMPT_PROJECT_DIR: /data/projects
+      REPOPROMPT_WORKTREE_DIR: /data/worktrees
+      REPOPROMPT_CACHE_DIR: /data/cache
+      REPOPROMPT_PROVIDER_HOME_DIR: /data/provider-homes
+      REPOPROMPT_PROVIDER_VAULT_MASTER_KEY_FILE: /secrets/provider-vault.key
+      REPOPROMPT_PROVIDER_VAULT_KEY_ID: ${REPOPROMPT_PROVIDER_VAULT_KEY_ID:-provider-vault-v1}
+      REPOPROMPT_BIND_HOST: ${REPOPROMPT_BIND_HOST:-0.0.0.0}
+      REPOPROMPT_BIND_PORT: ${REPOPROMPT_BIND_PORT:-9443}
+      REPOPROMPT_HEALTH_PORT: ${REPOPROMPT_HEALTH_PORT:-9080}
+      REPOPROMPT_PORTAL_HOST: ${REPOPROMPT_PORTAL_HOST:-127.0.0.1}
+      REPOPROMPT_PORTAL_PORT: ${REPOPROMPT_PORTAL_PORT:-off}
+      REPOPROMPT_PUBLIC_ORIGIN: ${REPOPROMPT_PUBLIC_ORIGIN:-}
+      REPOPROMPT_TRUSTED_PROXY_CIDRS: ${REPOPROMPT_TRUSTED_PROXY_CIDRS:-}
+      REPOPROMPT_TLS_CERT_FILE: ${REPOPROMPT_TLS_CERT_FILE:-}
+      REPOPROMPT_TLS_KEY_FILE: ${REPOPROMPT_TLS_KEY_FILE:-}
+      REPOPROMPT_ENABLED_PROVIDERS: ${REPOPROMPT_ENABLED_PROVIDERS:-}
+      REPOPROMPT_ENABLED_DIRECT_PROVIDERS: ${REPOPROMPT_ENABLED_DIRECT_PROVIDERS:-}
+      REPOPROMPT_CODEX_EXECUTABLE: /opt/repoprompt/providers/codex
+      REPOPROMPT_CLAUDE_EXECUTABLE: /opt/repoprompt/providers/claude
+      REPOPROMPT_OPENCODE_EXECUTABLE: /opt/repoprompt/providers/opencode
+      REPOPROMPT_CURSOR_EXECUTABLE: /opt/repoprompt/providers/cursor-agent
+      REPOPROMPT_GROK_EXECUTABLE: /opt/repoprompt/providers/grok
+    volumes:
+      - type: bind
+        source: ${REPOPROMPT_DATA_DIR:?Set REPOPROMPT_DATA_DIR in .env}
+        target: /data
+      - type: bind
+        source: ${REPOPROMPT_BACKUP_DIR:?Set REPOPROMPT_BACKUP_DIR in .env}
+        target: /backups
+      - type: bind
+        source: ${REPOPROMPT_SECRETS_DIR:?Set REPOPROMPT_SECRETS_DIR in .env}
+        target: /secrets
+        read_only: true
+      - type: bind
+        source: ${REPOPROMPT_PROVIDER_DIR:?Set REPOPROMPT_PROVIDER_DIR in .env}
+        target: /opt/repoprompt/providers
+        read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,mode=1777
+      - /var/tmp:rw,noexec,nosuid,nodev,mode=1777
+      # Override the image's default-path VOLUME declarations. This bundle
+      # persists only /data and must not leave anonymous volumes behind.
+      - /var/lib/repoprompt/state:rw,noexec,nosuid,nodev,mode=0700,uid=65532,gid=65532
+      - /var/lib/repoprompt/artifacts:rw,noexec,nosuid,nodev,mode=0700,uid=65532,gid=65532
+      - /srv/repoprompt/projects:rw,noexec,nosuid,nodev,mode=0700,uid=65532,gid=65532
+      - /srv/repoprompt/worktrees:rw,noexec,nosuid,nodev,mode=0700,uid=65532,gid=65532
+      - /var/cache/repoprompt:rw,noexec,nosuid,nodev,mode=0700,uid=65532,gid=65532
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --max-time 3 http://127.0.0.1:$${REPOPROMPT_HEALTH_PORT}/health/ready >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      start_period: 15s
+      retries: 6
+
+  init:
+    image: ${REPOPROMPT_SERVER_IMAGE:?Set REPOPROMPT_SERVER_IMAGE in .env}
+    profiles: ["tools"]
+    user: "0:0"
+    network_mode: none
+    entrypoint: ["/bin/sh"]
+    command:
+      - -ceu
+      - |
+        umask 077
+        install -d -m 0700 -o 65532 -g 65532 /data /backups /secrets
+        install -d -m 0755 /opt/repoprompt/providers
+        if [ ! -e /secrets/provider-vault.key ]; then
+          head -c 32 /dev/urandom > /secrets/.provider-vault.key.tmp
+          chown 65532:65532 /secrets/.provider-vault.key.tmp
+          chmod 0600 /secrets/.provider-vault.key.tmp
+          mv /secrets/.provider-vault.key.tmp /secrets/provider-vault.key
+        fi
+        if [ ! -e /secrets/backup-age-identity.txt ]; then
+          rm -f /secrets/.backup-age-identity.txt.tmp /secrets/.backup-recipients.txt.tmp
+          /usr/local/libexec/repoprompt/age-keygen -o /secrets/.backup-age-identity.txt.tmp >/dev/null 2>&1
+          /usr/local/libexec/repoprompt/age-keygen -y /secrets/.backup-age-identity.txt.tmp > /secrets/.backup-recipients.txt.tmp 2>/dev/null
+          chown 65532:65532 /secrets/.backup-age-identity.txt.tmp /secrets/.backup-recipients.txt.tmp
+          chmod 0600 /secrets/.backup-age-identity.txt.tmp /secrets/.backup-recipients.txt.tmp
+          mv /secrets/.backup-age-identity.txt.tmp /secrets/backup-age-identity.txt
+          mv /secrets/.backup-recipients.txt.tmp /secrets/backup-recipients.txt
+        elif [ ! -e /secrets/backup-recipients.txt ]; then
+          rm -f /secrets/.backup-recipients.txt.tmp
+          /usr/local/libexec/repoprompt/age-keygen -y /secrets/backup-age-identity.txt > /secrets/.backup-recipients.txt.tmp 2>/dev/null
+          chown 65532:65532 /secrets/.backup-recipients.txt.tmp
+          chmod 0600 /secrets/.backup-recipients.txt.tmp
+          mv /secrets/.backup-recipients.txt.tmp /secrets/backup-recipients.txt
+        fi
+        find /secrets -maxdepth 1 -type f -exec chown 65532:65532 {} +
+        find /secrets -maxdepth 1 -type f -exec chmod 0600 {} +
+        if [ -d /secrets/tls ]; then
+          chown 65532:65532 /secrets/tls /secrets/tls/server.crt /secrets/tls/server.key
+          chmod 0700 /secrets/tls
+          chmod 0644 /secrets/tls/server.crt
+          chmod 0600 /secrets/tls/server.key
+        fi
+        chown 65532:65532 /data /backups /secrets
+    volumes:
+      - type: bind
+        source: ${REPOPROMPT_DATA_DIR:?Set REPOPROMPT_DATA_DIR in .env}
+        target: /data
+      - type: bind
+        source: ${REPOPROMPT_BACKUP_DIR:?Set REPOPROMPT_BACKUP_DIR in .env}
+        target: /backups
+      - type: bind
+        source: ${REPOPROMPT_SECRETS_DIR:?Set REPOPROMPT_SECRETS_DIR in .env}
+        target: /secrets
+      - type: bind
+        source: ${REPOPROMPT_PROVIDER_DIR:?Set REPOPROMPT_PROVIDER_DIR in .env}
+        target: /opt/repoprompt/providers

@@ -3,6 +3,7 @@
 [![CI](https://github.com/repoprompt/repoprompt-ce/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/repoprompt/repoprompt-ce/actions/workflows/ci.yml?query=branch%3Amain)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![Platform: macOS 26+](https://img.shields.io/badge/platform-macOS%2026%2B-black)
+![Server: Ubuntu 24.04](https://img.shields.io/badge/server-Ubuntu%2024.04-E95420)
 
 **A free, open-source native macOS app and agent orchestrator for context engineering.**
 
@@ -101,6 +102,14 @@ another Mac or redistributed.
 - macOS 26 or later
 - Xcode 26, or matching Command Line Tools with the macOS 26 SDK. The Finder
   debug launcher and local production installer require the full Xcode app.
+
+### Standalone Ubuntu Server
+
+RepoPrompt Server has a separate Ubuntu 24.04 Docker Compose lifecycle; it does
+not require the macOS app. See
+[`docs/server/getting-started.md`](docs/server/getting-started.md). The repository
+currently validates but does not publish the Server image, so clean-host
+installation requires a separately approved official digest-pinned image.
 
 ### Develop in Xcode
 

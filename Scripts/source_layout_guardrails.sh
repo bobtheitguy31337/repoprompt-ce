@@ -167,6 +167,10 @@ server_import_guard() {
   [[ -f "$server_root/Package.resolved" ]] || fail "Server package lockfile missing"
   [[ -f "Dockerfile.server" ]] || fail "canonical Server Dockerfile missing"
   [[ -f ".github/workflows/server-runtime.yml" ]] || fail "Server CI workflow missing"
+  [[ -f "Distribution/Server/compose.yaml" ]] || fail "standalone Server Compose bundle missing"
+  [[ -x "Distribution/Server/install.sh" ]] || fail "standalone Server installer missing or not executable"
+  [[ -x "Distribution/Server/repoprompt-server" ]] || fail "standalone Server operator command missing or not executable"
+  [[ -x "Scripts/test_server_standalone_docker.sh" ]] || fail "standalone Server Docker acceptance missing or not executable"
 
   grep -qF '.package(path: "../RepoPromptPortableRuntime")' "$manifest" || \
     fail "RepoPromptServer must consume the sibling portable package through ../RepoPromptPortableRuntime"
@@ -252,7 +256,9 @@ PY
   fi
   if ! grep -q 'Packages/RepoPromptServer/\*\*' .github/workflows/server-runtime.yml || \
      ! grep -q 'Packages/RepoPromptPortableRuntime/\*\*' .github/workflows/server-runtime.yml || \
-     ! grep -q 'Dockerfile.server' .github/workflows/server-runtime.yml; then
+     ! grep -q 'Dockerfile.server' .github/workflows/server-runtime.yml || \
+     ! grep -q 'Distribution/Server/\*\*' .github/workflows/server-runtime.yml || \
+     ! grep -q 'test_server_standalone_docker.sh' .github/workflows/server-runtime.yml; then
     fail "Server CI path ownership is incomplete"
   fi
 
@@ -1001,6 +1007,7 @@ allowed_tracked_docs=(
   "docs/server/README.md"
   "docs/server/backup-format-and-custody.md"
   "docs/server/backup-restore-runbook.md"
+  "docs/server/getting-started.md"
   "docs/server/operations-runbook.md"
   "docs/server/private-pilot-custody-record.md"
   "docs/server/private-pilot-security.md"
