@@ -1,28 +1,6 @@
 "use strict";
 
 (() => {
-  const providerOrder = [
-    "codex",
-    "claudeCompatible",
-    "claudeGLM",
-    "claudeKimi",
-    "claudeCustom",
-    "openCodeACP",
-    "cursorACP",
-    "grokBuildACP",
-    "openAIAPI",
-    "anthropicAPI",
-    "openRouter",
-    "customOpenAICompatible",
-    "gemini",
-    "azure",
-    "deepseek",
-    "fireworks",
-    "xAI",
-    "groq",
-    "zAI",
-    "ollama",
-  ];
   const supportedRoutes = new Set([
     "overview",
     "cli-providers",
@@ -431,11 +409,7 @@
   }
 
   function orderedProviders() {
-    return providerOrder
-      .map((id) =>
-        state.providers.find((provider) => provider.providerID === id),
-      )
-      .filter(Boolean);
+    return state.providers.slice();
   }
 
   function replaceProvider(provider) {
@@ -928,56 +902,36 @@
     installIcons(list);
   }
 
-  function sessionDepths(sessions) {
-    const byID = new Map(
-      sessions.map((session) => [session.sessionId, session]),
-    );
-    const depthByID = new Map();
-    function resolve(session, visiting = new Set()) {
-      if (depthByID.has(session.sessionId))
-        return depthByID.get(session.sessionId);
-      if (!session.parentSessionId || !byID.has(session.parentSessionId)) {
-        depthByID.set(session.sessionId, 0);
-        return 0;
-      }
-      if (visiting.has(session.sessionId)) {
-        depthByID.set(session.sessionId, 0);
-        return 0;
-      }
-      visiting.add(session.sessionId);
-      const depth = Math.min(
-        6,
-        resolve(byID.get(session.parentSessionId), visiting) + 1,
-      );
-      visiting.delete(session.sessionId);
-      depthByID.set(session.sessionId, depth);
-      return depth;
-    }
-    sessions.forEach((session) => resolve(session));
-    return depthByID;
-  }
-
   function renderSessions() {
     const list = document.getElementById("session-list");
     list.replaceChildren();
     const query = state.agent.searchText.trim().toLowerCase();
-    let sessions = (state.bootstrap?.sessions || []).filter(
+    const projectSessions = (state.bootstrap?.sessions || []).filter(
       (session) => session.projectId === state.agent.selectedProjectID,
     );
-    const depthByID = sessionDepths(sessions);
-    sessions = sessions
-      .filter((session) => {
-        if (!query) return true;
-        return [session.title, session.provider, session.model]
+    let sessions = projectSessions;
+    if (query) {
+      const byID = new Map(
+        projectSessions.map((session) => [session.sessionId, session]),
+      );
+      const visibleIDs = new Set();
+      projectSessions.forEach((session) => {
+        const matches = [session.title, session.provider, session.model]
           .filter(Boolean)
           .some((value) => String(value).toLowerCase().includes(query));
-      })
-      .sort(
-        (left, right) =>
-          new Date(right.lastActivityAt || 0) -
-            new Date(left.lastActivityAt || 0) ||
-          left.sessionId.localeCompare(right.sessionId),
+        if (!matches) return;
+        let cursor = session;
+        while (cursor && !visibleIDs.has(cursor.sessionId)) {
+          visibleIDs.add(cursor.sessionId);
+          cursor = cursor.parentSessionId
+            ? byID.get(cursor.parentSessionId)
+            : null;
+        }
+      });
+      sessions = projectSessions.filter((session) =>
+        visibleIDs.has(session.sessionId),
       );
+    }
     document.getElementById("session-count").textContent = String(
       sessions.length,
     );
@@ -993,7 +947,7 @@
       );
     }
     sessions.forEach((session) => {
-      const depth = depthByID.get(session.sessionId) || 0;
+      const depth = session.sidebarDepth || 0;
       const displayState = session.agentControl?.displayState || session.state;
       const button = element("button", `session-row depth-${depth}`);
       button.type = "button";

@@ -110,6 +110,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
     public let runGeneration: Int64
     public let turnEpoch: Int64
     public let lastActivityAt: Date?
+    public let sidebarDepth: Int
     public let runPresentation: RunPresentationWireSnapshot?
     public let agentControl: AgentSessionActionSnapshotWire?
     public let contextUsage: ContextUsageWireSnapshot?
@@ -127,6 +128,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         runGeneration: Int64,
         turnEpoch: Int64,
         lastActivityAt: Date?,
+        sidebarDepth: Int = 0,
         runPresentation: RunPresentationWireSnapshot? = nil,
         agentControl: AgentSessionActionSnapshotWire? = nil,
         contextUsage: ContextUsageWireSnapshot? = nil
@@ -143,9 +145,30 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         self.runGeneration = runGeneration
         self.turnEpoch = turnEpoch
         self.lastActivityAt = lastActivityAt
+        self.sidebarDepth = sidebarDepth
         self.runPresentation = runPresentation
         self.agentControl = agentControl
         self.contextUsage = contextUsage
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decode(UUID.self, forKey: .sessionID)
+        projectID = try container.decode(UUID.self, forKey: .projectID)
+        parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
+        title = try container.decode(String.self, forKey: .title)
+        provider = try container.decode(ProviderKind.self, forKey: .provider)
+        providerSettingsID = try container.decodeIfPresent(ProviderSettingsID.self, forKey: .providerSettingsID)
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        state = try container.decode(SessionLifecycleState.self, forKey: .state)
+        revision = try container.decode(Int64.self, forKey: .revision)
+        runGeneration = try container.decode(Int64.self, forKey: .runGeneration)
+        turnEpoch = try container.decode(Int64.self, forKey: .turnEpoch)
+        lastActivityAt = try container.decodeIfPresent(Date.self, forKey: .lastActivityAt)
+        sidebarDepth = try container.decodeIfPresent(Int.self, forKey: .sidebarDepth) ?? 0
+        runPresentation = try container.decodeIfPresent(RunPresentationWireSnapshot.self, forKey: .runPresentation)
+        agentControl = try container.decodeIfPresent(AgentSessionActionSnapshotWire.self, forKey: .agentControl)
+        contextUsage = try container.decodeIfPresent(ContextUsageWireSnapshot.self, forKey: .contextUsage)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -154,7 +177,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         case parentSessionID = "parentSessionId"
         case title, provider
         case providerSettingsID = "providerSettingsId"
-        case model, state, revision, runGeneration, turnEpoch, lastActivityAt
+        case model, state, revision, runGeneration, turnEpoch, lastActivityAt, sidebarDepth
         case runPresentation, agentControl, contextUsage
     }
 }

@@ -527,6 +527,89 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertFalse(encoded.contains("actor"))
     }
 
+    func testPortalSidebarUsesDesktopThreadOrderingAndDepth() throws {
+        let actor = ExternalActor(userID: "portal-user", username: "alice", displayName: "Alice")
+        let projectID = UUID()
+        let storeID = UUID()
+        let parentID = UUID()
+        let olderChildID = UUID()
+        let newerChildID = UUID()
+        let grandchildID = UUID()
+        let unrelatedRootID = UUID()
+
+        func session(
+            _ sessionID: UUID,
+            parentSessionID: UUID?,
+            rootSessionID: UUID,
+            activity: TimeInterval
+        ) -> SessionSnapshot {
+            SessionSnapshot(
+                sessionID: sessionID,
+                projectID: projectID,
+                parentSessionID: parentSessionID,
+                rootSessionID: rootSessionID,
+                creator: actor,
+                provider: .codex,
+                model: "gpt-5.6-sol",
+                visibility: .privateSession,
+                state: .completed,
+                runGeneration: 1,
+                turnEpoch: 1,
+                revision: 1,
+                transcript: [
+                    TranscriptEntry(
+                        entryID: UUID(),
+                        sessionSequence: 1,
+                        kind: .human,
+                        content: sessionID.uuidString,
+                        actor: actor,
+                        timestamp: Date(timeIntervalSince1970: activity)
+                    ),
+                ],
+                interactions: [],
+                cursor: ServiceCursor(storeID: storeID, globalSequence: Int64(activity))
+            )
+        }
+
+        let sessions = [
+            session(parentID, parentSessionID: nil, rootSessionID: parentID, activity: 10),
+            session(olderChildID, parentSessionID: parentID, rootSessionID: parentID, activity: 20),
+            session(newerChildID, parentSessionID: parentID, rootSessionID: parentID, activity: 40),
+            session(grandchildID, parentSessionID: newerChildID, rootSessionID: parentID, activity: 30),
+            session(unrelatedRootID, parentSessionID: nil, rootSessionID: unrelatedRootID, activity: 35),
+        ]
+
+        let projected = RepoPromptPortalSessionProjection.sidebarSessions(sessions, controls: [:])
+
+        XCTAssertEqual(
+            projected.map(\.sessionID),
+            [parentID, newerChildID, grandchildID, olderChildID, unrelatedRootID]
+        )
+        XCTAssertEqual(projected.map(\.sidebarDepth), [0, 1, 2, 1, 0])
+
+        var legacyObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder.serviceEncoder.encode(projected[0])) as? [String: Any]
+        )
+        legacyObject.removeValue(forKey: "sidebarDepth")
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+        let legacySummary = try JSONDecoder.serviceDecoder.decode(PortalSessionSummary.self, from: legacyData)
+        XCTAssertEqual(legacySummary.sidebarDepth, 0)
+
+        let cycleA = UUID()
+        let cycleB = UUID()
+        let missingParent = UUID()
+        let malformed = RepoPromptPortalSessionProjection.sidebarSessions(
+            [
+                session(cycleA, parentSessionID: cycleB, rootSessionID: cycleA, activity: 70),
+                session(cycleB, parentSessionID: cycleA, rootSessionID: cycleA, activity: 60),
+                session(missingParent, parentSessionID: UUID(), rootSessionID: missingParent, activity: 50),
+            ],
+            controls: [:]
+        )
+        XCTAssertEqual(malformed.map(\.sessionID), [cycleA, cycleB, missingParent])
+        XCTAssertEqual(malformed.map(\.sidebarDepth), [0, 0, 0])
+    }
+
     func testPortalFollowupContractOnlyMapsTextAndExpectedRevision() throws {
         let request = PortalSendMessageRequest(operationID: UUID(), expectedRevision: 9, text: "  keep both auth methods  ")
         let command = try RepoPromptPortalSessionProjection.validatedSendCommand(request)

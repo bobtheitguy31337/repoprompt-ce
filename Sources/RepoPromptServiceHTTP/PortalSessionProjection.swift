@@ -31,7 +31,8 @@ enum RepoPromptPortalSessionProjection {
 
     static func project(
         _ session: SessionSnapshot,
-        agentControl: AgentSessionActionSnapshotWire? = nil
+        agentControl: AgentSessionActionSnapshotWire? = nil,
+        sidebarDepth: Int = 0
     ) -> PortalSessionSummary {
         PortalSessionSummary(
             sessionID: session.sessionID,
@@ -46,10 +47,90 @@ enum RepoPromptPortalSessionProjection {
             runGeneration: session.runGeneration,
             turnEpoch: session.turnEpoch,
             lastActivityAt: session.transcript.last?.timestamp,
+            sidebarDepth: sidebarDepth,
             runPresentation: session.runPresentation,
             agentControl: agentControl,
             contextUsage: session.contextUsage
         )
+    }
+
+    /// Desktop keeps every sub-agent session adjacent to its parent and lets
+    /// the freshest row in a subtree determine where that whole thread sits.
+    /// Project the same ordering here so browser clients do not invent a
+    /// second session-list state machine.
+    static func sidebarSessions(
+        _ sessions: [SessionSnapshot],
+        controls: [UUID: AgentSessionActionSnapshotWire]
+    ) -> [PortalSessionSummary] {
+        let base = sessions.sorted { left, right in
+            let leftActivity = left.transcript.last?.timestamp ?? .distantPast
+            let rightActivity = right.transcript.last?.timestamp ?? .distantPast
+            if leftActivity != rightActivity { return leftActivity > rightActivity }
+            return left.sessionID.uuidString < right.sessionID.uuidString
+        }
+        let indexByID = Dictionary(uniqueKeysWithValues: base.enumerated().map { ($0.element.sessionID, $0.offset) })
+        var childrenByParent: [UUID: [Int]] = [:]
+        var childIndices = Set<Int>()
+
+        for (index, session) in base.enumerated() {
+            guard let parentID = session.parentSessionID,
+                  parentID != session.sessionID,
+                  let parentIndex = indexByID[parentID],
+                  base[parentIndex].projectID == session.projectID
+            else { continue }
+
+            var visited: Set<UUID> = [session.sessionID]
+            var cursor: UUID? = parentID
+            var cycle = false
+            while let current = cursor {
+                guard visited.insert(current).inserted else {
+                    cycle = true
+                    break
+                }
+                cursor = indexByID[current].flatMap { base[$0].parentSessionID }
+            }
+            guard !cycle else { continue }
+            childrenByParent[parentID, default: []].append(index)
+            childIndices.insert(index)
+        }
+
+        var subtreePriorityByIndex: [Int: Int] = [:]
+        func subtreePriority(_ index: Int) -> Int {
+            if let cached = subtreePriorityByIndex[index] { return cached }
+            var priority = index
+            if let children = childrenByParent[base[index].sessionID] {
+                for child in children {
+                    priority = min(priority, subtreePriority(child))
+                }
+            }
+            subtreePriorityByIndex[index] = priority
+            return priority
+        }
+
+        var result: [PortalSessionSummary] = []
+        result.reserveCapacity(base.count)
+        func emit(_ index: Int, depth: Int) {
+            let session = base[index]
+            result.append(project(
+                session,
+                agentControl: controls[session.sessionID],
+                sidebarDepth: min(depth, 6)
+            ))
+            let children = childrenByParent[session.sessionID] ?? []
+            for child in children.sorted() {
+                emit(child, depth: depth + 1)
+            }
+        }
+
+        let roots = base.indices.filter { !childIndices.contains($0) }
+        for root in roots.sorted(by: {
+            let left = subtreePriority($0)
+            let right = subtreePriority($1)
+            return left == right ? $0 < $1 : left < right
+        }) {
+            emit(root, depth: 0)
+        }
+        return result
     }
 
     static func title(for session: SessionSnapshot) -> String {

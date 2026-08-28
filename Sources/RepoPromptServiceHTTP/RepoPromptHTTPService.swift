@@ -1976,9 +1976,10 @@ public struct RepoPromptHTTPService: Sendable {
             actor: principal.externalActor,
             composerAvailable: composerCatalog != nil
         )
-        let sessions = snapshots.map {
-            RepoPromptPortalSessionProjection.project($0, agentControl: controls[$0.sessionID])
-        }
+        let sessions = RepoPromptPortalSessionProjection.sidebarSessions(
+            snapshots,
+            controls: controls
+        )
         let workflowRepository = try await authority.workflowRepositorySnapshot()
         let workflows = try await authority.workflowSnapshots().map {
             PortalWorkflowSummary(
