@@ -33,22 +33,7 @@ RUN --mount=type=cache,target=/root/.cache/org.swift.swiftpm \
     install -m 0644 "$bin_path/RepoPromptCE_RepoPromptServiceHTTP.resources/"* /out/usr/local/bin/RepoPromptCE_RepoPromptServiceHTTP.resources/
 
 FROM swift:6.2.4-noble-slim
-ARG REPOPROMPT_COMMIT=unknown
-ARG REPOPROMPT_VERSION=0.1.0
-ARG SOURCE_DATE_EPOCH=1970-01-01T00:00:00Z
 ARG ADMIN_NODE_VERSION
-LABEL org.opencontainers.image.title="RepoPromptServer" \
-      org.opencontainers.image.description="Durable internal RepoPrompt Agent and Workspace authority" \
-      org.opencontainers.image.source="https://github.com/RepoPrompt/repoprompt-ce" \
-      org.opencontainers.image.version="$REPOPROMPT_VERSION" \
-      org.opencontainers.image.revision="$REPOPROMPT_COMMIT" \
-      org.opencontainers.image.created="$SOURCE_DATE_EPOCH" \
-      io.repoprompt.protocol-version="1" \
-      io.repoprompt.schema-version="6" \
-      io.repoprompt.runtime-uid="65532" \
-      io.repoprompt.port.internal-api="9443/tcp;mtls" \
-      io.repoprompt.port.portal="9081/tcp;http-password" \
-      io.repoprompt.port.health="9080/tcp;loopback-only"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git tini util-linux && rm -rf /var/lib/apt/lists/* && \
     groupadd --gid 65532 repoprompt && useradd --uid 65532 --gid 65532 --home-dir /home/repoprompt --create-home --shell /usr/sbin/nologin repoprompt && \
     install -d -o 65532 -g 65532 /var/lib/repoprompt/state /var/lib/repoprompt/artifacts /srv/repoprompt/projects /srv/repoprompt/worktrees /var/cache/repoprompt
@@ -57,6 +42,21 @@ COPY --from=admin-runtime /usr/local/bin/node /usr/local/bin/node
 COPY Sandbox/Server/provider-cli-manager.sh /usr/local/libexec/repoprompt/provider-cli-manager
 RUN chmod 0555 /usr/local/libexec/repoprompt/provider-cli-manager && \
     test "$(/usr/local/bin/node --version)" = "v${ADMIN_NODE_VERSION}"
+ARG REPOPROMPT_COMMIT=unknown
+ARG REPOPROMPT_VERSION=0.1.0
+ARG REPOPROMPT_CREATED=1970-01-01T00:00:00Z
+LABEL org.opencontainers.image.title="RepoPromptServer" \
+      org.opencontainers.image.description="Durable internal RepoPrompt Agent and Workspace authority" \
+      org.opencontainers.image.source="https://github.com/RepoPrompt/repoprompt-ce" \
+      org.opencontainers.image.version="$REPOPROMPT_VERSION" \
+      org.opencontainers.image.revision="$REPOPROMPT_COMMIT" \
+      org.opencontainers.image.created="$REPOPROMPT_CREATED" \
+      io.repoprompt.protocol-version="1" \
+      io.repoprompt.schema-version="6" \
+      io.repoprompt.runtime-uid="65532" \
+      io.repoprompt.port.internal-api="9443/tcp;mtls" \
+      io.repoprompt.port.portal="9081/tcp;http-password" \
+      io.repoprompt.port.health="9080/tcp;loopback-only"
 ENV REPOPROMPT_STATE_DB="/var/lib/repoprompt/state/repoprompt.sqlite" \
     REPOPROMPT_ARTIFACT_DIR="/var/lib/repoprompt/artifacts" \
     REPOPROMPT_PROJECT_DIR="/srv/repoprompt/projects" \
