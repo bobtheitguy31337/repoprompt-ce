@@ -5,6 +5,7 @@ import NIOCore
 import NIOSSL
 import RepoPromptAgentRuntimeCore
 import RepoPromptHeadlessRuntime
+import RepoPromptPortalProtocol
 import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 

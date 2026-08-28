@@ -4,8 +4,10 @@ FROM node:${ADMIN_NODE_VERSION}-bookworm-slim AS admin-runtime
 
 FROM swift:6.2.4-noble AS build
 WORKDIR /src
+ENV REPOPROMPT_SERVER_TESTS=0
 COPY Package.swift Package.resolved ./
 COPY Sources/RepoPromptServiceProtocol Sources/RepoPromptServiceProtocol
+COPY Sources/RepoPromptPortalProtocol Sources/RepoPromptPortalProtocol
 COPY Sources/RepoPromptShared Sources/RepoPromptShared
 COPY Sources/RepoPromptDomainRuntime Sources/RepoPromptDomainRuntime
 COPY Sources/RepoPromptC Sources/RepoPromptC
@@ -21,11 +23,9 @@ COPY Sources/RepoPromptLinuxSupport Sources/RepoPromptLinuxSupport
 COPY Sources/RepoPromptServiceHTTP Sources/RepoPromptServiceHTTP
 COPY Sources/RepoPromptMCPAdapter Sources/RepoPromptMCPAdapter
 COPY Sources/RepoPromptServerExecutable Sources/RepoPromptServerExecutable
-COPY Tests/RepoPromptDomainRuntimeTests Tests/RepoPromptDomainRuntimeTests
-COPY Tests/RepoPromptServerTests Tests/RepoPromptServerTests
 RUN --mount=type=cache,target=/root/.cache/org.swift.swiftpm \
     --mount=type=cache,target=/src/.build \
-    REPOPROMPT_SERVER_ONLY=1 swift build --disable-automatic-resolution -c release --product RepoPromptServer && \
+    swift build --disable-automatic-resolution -c release --product RepoPromptServer && \
     bin_path="$(swift build -c release --show-bin-path)" && \
     install -D -m 0755 "$bin_path/RepoPromptServer" /out/usr/local/bin/RepoPromptServer && \
     cp -a "$bin_path/RepoPromptCE_RepoPromptWorkspaceRuntimeCore.resources" /out/usr/local/bin/ && \

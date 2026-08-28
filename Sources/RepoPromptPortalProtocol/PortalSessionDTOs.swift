@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptServiceProtocol
 
 /// Browser-safe project projection for the standalone portal.
 public struct PortalProjectSummary: Codable, Hashable, Sendable {

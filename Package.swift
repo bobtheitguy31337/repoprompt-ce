@@ -124,6 +124,7 @@ let swift6LanguageMode: [SwiftSetting] = [
 ]
 
 let serverOnlyFromEnvironment = environment["REPOPROMPT_SERVER_ONLY"] == "1"
+let serverTestsEnabled = environment["REPOPROMPT_SERVER_TESTS"] != "0"
 #if os(Linux)
     let serverOnly = true
 #else
@@ -141,6 +142,7 @@ private func makeServerPackage() -> Package {
             .library(name: "RepoPromptWorkspaceRuntimeCore", targets: ["RepoPromptWorkspaceRuntimeCore"]),
             .library(name: "RepoPromptHeadlessRuntime", targets: ["RepoPromptHeadlessRuntime"]),
             .library(name: "RepoPromptServiceProtocol", targets: ["RepoPromptServiceProtocol"]),
+            .library(name: "RepoPromptPortalProtocol", targets: ["RepoPromptPortalProtocol"]),
             .library(name: "RepoPromptServicePersistence", targets: ["RepoPromptServicePersistence"]),
             .library(name: "RepoPromptServiceHTTP", targets: ["RepoPromptServiceHTTP"]),
             .library(name: "RepoPromptMCPAdapter", targets: ["RepoPromptMCPAdapter"])
@@ -174,6 +176,7 @@ private func makeServerPackage() -> Package {
             .target(name: "RepoPromptShared", dependencies: [.product(name: "Crypto", package: "swift-crypto")], path: "Sources/RepoPromptShared", swiftSettings: swift6LanguageMode),
             .target(name: "RepoPromptDomainRuntime", dependencies: ["RepoPromptShared", "RepoPromptC", "RepoPromptCodeMapCore", .product(name: "Crypto", package: "swift-crypto"), .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk")], path: "Sources/RepoPromptDomainRuntime", swiftSettings: swift6LanguageMode),
             .target(name: "RepoPromptServiceProtocol", dependencies: [.product(name: "Crypto", package: "swift-crypto")], path: "Sources/RepoPromptServiceProtocol", swiftSettings: swift6LanguageMode),
+            .target(name: "RepoPromptPortalProtocol", dependencies: ["RepoPromptServiceProtocol"], path: "Sources/RepoPromptPortalProtocol", swiftSettings: swift6LanguageMode),
             .target(name: "RepoPromptAgentRuntimeCore", dependencies: ["RepoPromptServiceProtocol"], path: "Sources/RepoPromptAgentRuntimeCore", swiftSettings: swift6LanguageMode),
             .target(name: "CSwiftPCRE2", path: "Sources/CSwiftPCRE2", exclude: ["deps/sljit/sljit_src/sljitNativeARM_64.c", "deps/sljit/sljit_src/sljitSerialize.c", "deps/sljit/sljit_src/sljitUtils.c", "deps/sljit/sljit_src/sljitNativeX86_common.c", "deps/sljit/sljit_src/sljitNativeX86_64.c", "deps/sljit/sljit_src/sljitNativeX86_32.c", "deps/sljit/sljit_src/allocator_src/sljitWXExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitProtExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorCore.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorApple.c"], publicHeadersPath: "include", cSettings: [.headerSearchPath("include"), .headerSearchPath("src"), .define("PCRE2_CODE_UNIT_WIDTH", to: "8"), .define("HAVE_CONFIG_H")]),
             .target(name: "RepoPromptRegexCore", dependencies: ["CSwiftPCRE2"], path: "Sources/RepoPromptRegexCore", swiftSettings: swift6LanguageMode),
@@ -204,12 +207,13 @@ private func makeServerPackage() -> Package {
             .target(name: "RepoPromptWorkspaceRuntimeCore", dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptCodeMapCore", "RepoPromptC"], path: "Sources/RepoPromptWorkspaceRuntimeCore", resources: [.copy("Resources")], swiftSettings: swift6LanguageMode),
             .target(name: "RepoPromptServicePersistence", dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", .product(name: "Crypto", package: "swift-crypto"), .product(name: "SQLiteNIO", package: "sqlite-nio")], path: "Sources/RepoPromptServicePersistence", swiftSettings: swift6LanguageMode),
             .target(name: "RepoPromptHeadlessRuntime", dependencies: ["RepoPromptServiceProtocol", "RepoPromptServicePersistence", "RepoPromptAgentRuntimeCore", "RepoPromptWorkspaceRuntimeCore", "RepoPromptDomainRuntime", "RepoPromptLinuxSupport", "RepoPromptC", .product(name: "NIOCore", package: "swift-nio"), .product(name: "NIOPosix", package: "swift-nio"), .product(name: "NIOHTTP1", package: "swift-nio"), .product(name: "NIOSSL", package: "swift-nio-ssl")], path: "Sources/RepoPromptHeadlessRuntime", swiftSettings: swift6LanguageMode),
-            .target(name: "RepoPromptServiceHTTP", dependencies: ["RepoPromptServiceProtocol", "RepoPromptServicePersistence", "RepoPromptHeadlessRuntime", "RepoPromptAgentRuntimeCore", "RepoPromptDomainRuntime", "RepoPromptMCPAdapter", .product(name: "Crypto", package: "swift-crypto"), .product(name: "Hummingbird", package: "hummingbird"), .product(name: "HummingbirdTLS", package: "hummingbird"), .product(name: "NIOSSL", package: "swift-nio-ssl"), .product(name: "X509", package: "swift-certificates")], path: "Sources/RepoPromptServiceHTTP", resources: [.process("Resources")], swiftSettings: swift6LanguageMode),
+            .target(name: "RepoPromptServiceHTTP", dependencies: ["RepoPromptServiceProtocol", "RepoPromptPortalProtocol", "RepoPromptServicePersistence", "RepoPromptHeadlessRuntime", "RepoPromptAgentRuntimeCore", "RepoPromptDomainRuntime", "RepoPromptMCPAdapter", .product(name: "Crypto", package: "swift-crypto"), .product(name: "Hummingbird", package: "hummingbird"), .product(name: "HummingbirdTLS", package: "hummingbird"), .product(name: "NIOSSL", package: "swift-nio-ssl"), .product(name: "X509", package: "swift-certificates")], path: "Sources/RepoPromptServiceHTTP", resources: [.process("Resources")], swiftSettings: swift6LanguageMode),
             .target(name: "RepoPromptMCPAdapter", dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptHeadlessRuntime", "RepoPromptDomainRuntime", .product(name: "MCP", package: "swift-sdk"), .product(name: "Logging", package: "swift-log")], path: "Sources/RepoPromptMCPAdapter", swiftSettings: swift6LanguageMode),
-            .executableTarget(name: "RepoPromptServerExecutable", dependencies: ["RepoPromptServiceHTTP", "RepoPromptHeadlessRuntime", "RepoPromptServicePersistence", "RepoPromptMCPAdapter"], path: "Sources/RepoPromptServerExecutable", swiftSettings: swift6LanguageMode),
+            .executableTarget(name: "RepoPromptServerExecutable", dependencies: ["RepoPromptServiceHTTP", "RepoPromptHeadlessRuntime", "RepoPromptServicePersistence", "RepoPromptMCPAdapter"], path: "Sources/RepoPromptServerExecutable", swiftSettings: swift6LanguageMode)
+        ] + (serverTestsEnabled ? [
             .testTarget(name: "RepoPromptDomainRuntimeTests", dependencies: ["RepoPromptDomainRuntime", .product(name: "MCP", package: "swift-sdk")], path: "Tests/RepoPromptDomainRuntimeTests", swiftSettings: swift6LanguageMode),
-            .testTarget(name: "RepoPromptServerTests", dependencies: ["RepoPromptServiceProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptWorkspaceRuntimeCore", "RepoPromptServicePersistence", "RepoPromptHeadlessRuntime", "RepoPromptServiceHTTP", "RepoPromptMCPAdapter", .product(name: "Crypto", package: "swift-crypto"), .product(name: "HummingbirdTesting", package: "hummingbird"), .product(name: "NIOSSL", package: "swift-nio-ssl"), .product(name: "X509", package: "swift-certificates")], path: "Tests/RepoPromptServerTests", resources: [.copy("Fixtures")], swiftSettings: swift6LanguageMode)
-        ],
+            .testTarget(name: "RepoPromptServerTests", dependencies: ["RepoPromptServiceProtocol", "RepoPromptPortalProtocol", "RepoPromptAgentRuntimeCore", "RepoPromptWorkspaceRuntimeCore", "RepoPromptServicePersistence", "RepoPromptHeadlessRuntime", "RepoPromptServiceHTTP", "RepoPromptMCPAdapter", .product(name: "Crypto", package: "swift-crypto"), .product(name: "HummingbirdTesting", package: "hummingbird"), .product(name: "NIOSSL", package: "swift-nio-ssl"), .product(name: "X509", package: "swift-certificates")], path: "Tests/RepoPromptServerTests", resources: [.copy("Fixtures")], swiftSettings: swift6LanguageMode)
+        ] : []),
         swiftLanguageModes: [.v5]
     )
 }
@@ -231,6 +235,7 @@ private func makeServerPackage() -> Package {
                 .library(name: "RepoPromptWorkspaceRuntimeCore", targets: ["RepoPromptWorkspaceRuntimeCore"]),
                 .library(name: "RepoPromptHeadlessRuntime", targets: ["RepoPromptHeadlessRuntime"]),
                 .library(name: "RepoPromptServiceProtocol", targets: ["RepoPromptServiceProtocol"]),
+                .library(name: "RepoPromptPortalProtocol", targets: ["RepoPromptPortalProtocol"]),
                 .library(name: "RepoPromptServicePersistence", targets: ["RepoPromptServicePersistence"]),
                 .library(name: "RepoPromptServiceHTTP", targets: ["RepoPromptServiceHTTP"]),
                 .library(name: "RepoPromptMCPAdapter", targets: ["RepoPromptMCPAdapter"])
@@ -317,6 +322,12 @@ private func makeServerPackage() -> Package {
                     swiftSettings: swift6LanguageMode
                 ),
                 .target(
+                    name: "RepoPromptPortalProtocol",
+                    dependencies: ["RepoPromptServiceProtocol"],
+                    path: "Sources/RepoPromptPortalProtocol",
+                    swiftSettings: swift6LanguageMode
+                ),
+                .target(
                     name: "RepoPromptAgentRuntimeCore",
                     dependencies: ["RepoPromptServiceProtocol"],
                     path: "Sources/RepoPromptAgentRuntimeCore",
@@ -366,6 +377,7 @@ private func makeServerPackage() -> Package {
                     name: "RepoPromptServiceHTTP",
                     dependencies: [
                         "RepoPromptServiceProtocol",
+                        "RepoPromptPortalProtocol",
                         "RepoPromptServicePersistence",
                         "RepoPromptHeadlessRuntime",
                         "RepoPromptAgentRuntimeCore",
@@ -439,6 +451,7 @@ private func makeServerPackage() -> Package {
                     name: "RepoPromptServerTests",
                     dependencies: [
                         "RepoPromptServiceProtocol",
+                        "RepoPromptPortalProtocol",
                         "RepoPromptAgentRuntimeCore",
                         "RepoPromptWorkspaceRuntimeCore",
                         "RepoPromptServicePersistence",

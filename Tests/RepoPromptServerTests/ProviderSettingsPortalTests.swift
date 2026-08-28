@@ -3,6 +3,7 @@ import Hummingbird
 import HummingbirdTesting
 @testable import RepoPromptAgentRuntimeCore
 import RepoPromptHeadlessRuntime
+import RepoPromptPortalProtocol
 @testable import RepoPromptServiceHTTP
 @testable import RepoPromptServicePersistence
 import RepoPromptServiceProtocol

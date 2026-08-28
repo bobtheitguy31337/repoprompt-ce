@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAgentRuntimeCore
 import RepoPromptDomainRuntime
+import RepoPromptPortalProtocol
 import RepoPromptServiceProtocol
 
 enum RepoPromptPortalSessionProjection {

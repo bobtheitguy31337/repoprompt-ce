@@ -4,6 +4,7 @@ import Hummingbird
 import HummingbirdTesting
 import NIOCore
 import RepoPromptHeadlessRuntime
+import RepoPromptPortalProtocol
 @testable import RepoPromptServiceHTTP
 @testable import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
