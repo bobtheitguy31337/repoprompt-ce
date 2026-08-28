@@ -150,6 +150,15 @@ public enum AgentSessionPresentationPolicy {
             retry = denied("no_retryable_run", "There is no failed run to retry.")
         }
 
+        let archive: AgentSessionActionWire
+        if let denial = commonDenial() {
+            archive = denial
+        } else if active {
+            archive = denied("run_active", "An active session cannot be archived.")
+        } else {
+            archive = .init(allowed: true, expectedSessionRevision: facts.sessionRevision)
+        }
+
         return .init(
             displayState: display,
             statusText: status,
@@ -157,7 +166,8 @@ public enum AgentSessionPresentationPolicy {
             steer: steer,
             resume: resume,
             cancel: cancel,
-            retry: retry
+            retry: retry,
+            archive: archive
         )
     }
 

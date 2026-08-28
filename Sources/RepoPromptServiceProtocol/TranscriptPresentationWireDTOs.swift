@@ -50,6 +50,7 @@ public struct AgentSessionActionSnapshotWire: Codable, Hashable, Sendable {
     public let resume: AgentSessionActionWire
     public let cancel: AgentSessionActionWire
     public let retry: AgentSessionActionWire
+    public let archive: AgentSessionActionWire
 
     public init(
         displayState: AgentSessionDisplayStateWire,
@@ -58,7 +59,12 @@ public struct AgentSessionActionSnapshotWire: Codable, Hashable, Sendable {
         steer: AgentSessionActionWire,
         resume: AgentSessionActionWire,
         cancel: AgentSessionActionWire,
-        retry: AgentSessionActionWire
+        retry: AgentSessionActionWire,
+        archive: AgentSessionActionWire = .init(
+            allowed: false,
+            reasonCode: "archive_unavailable",
+            reasonText: "Archive availability was not provided by this server."
+        )
     ) {
         self.displayState = displayState
         self.statusText = statusText
@@ -67,6 +73,40 @@ public struct AgentSessionActionSnapshotWire: Codable, Hashable, Sendable {
         self.resume = resume
         self.cancel = cancel
         self.retry = retry
+        self.archive = archive
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        displayState = try container.decode(AgentSessionDisplayStateWire.self, forKey: .displayState)
+        statusText = try container.decode(String.self, forKey: .statusText)
+        submitTurn = try container.decode(AgentSessionActionWire.self, forKey: .submitTurn)
+        steer = try container.decode(AgentSessionActionWire.self, forKey: .steer)
+        resume = try container.decode(AgentSessionActionWire.self, forKey: .resume)
+        cancel = try container.decode(AgentSessionActionWire.self, forKey: .cancel)
+        retry = try container.decode(AgentSessionActionWire.self, forKey: .retry)
+        archive = try container.decodeIfPresent(AgentSessionActionWire.self, forKey: .archive)
+            ?? .init(
+                allowed: false,
+                reasonCode: "archive_unavailable",
+                reasonText: "Archive availability was not provided by this server."
+            )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(displayState, forKey: .displayState)
+        try container.encode(statusText, forKey: .statusText)
+        try container.encode(submitTurn, forKey: .submitTurn)
+        try container.encode(steer, forKey: .steer)
+        try container.encode(resume, forKey: .resume)
+        try container.encode(cancel, forKey: .cancel)
+        try container.encode(retry, forKey: .retry)
+        try container.encode(archive, forKey: .archive)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case displayState, statusText, submitTurn, steer, resume, cancel, retry, archive
     }
 }
 

@@ -563,8 +563,13 @@ public struct RepoPromptHTTPService: Sendable {
                 }
                 command = .retrySession(sourceRunID: sourceRunID, fromTranscriptEntryID: nil)
             case "archive":
-                guard let expectedRevision = input.expectedRevision else {
-                    throw ServiceAPIError(code: .invalidRequest, message: "Session revision is required")
+                guard control.archive.allowed,
+                      let expectedRevision = control.archive.expectedSessionRevision
+                else {
+                    throw ServiceAPIError(
+                        code: .invalidRequest,
+                        message: control.archive.reasonText ?? "This session cannot be archived"
+                    )
                 }
                 command = .archiveSession(expectedRevision: expectedRevision)
             default:

@@ -65,6 +65,8 @@ final class AgentSessionPresentationPolicyTests: XCTestCase {
         XCTAssertTrue(control.submitTurn.allowed)
         XCTAssertEqual(control.submitTurn.expectedSessionRevision, 9)
         XCTAssertFalse(control.retry.allowed)
+        XCTAssertTrue(control.archive.allowed)
+        XCTAssertEqual(control.archive.expectedSessionRevision, 9)
     }
 
     func testActiveReadyRunSteersAndCancelsButDoesNotSubmitFollowup() {
@@ -99,6 +101,8 @@ final class AgentSessionPresentationPolicyTests: XCTestCase {
         XCTAssertTrue(control.cancel.allowed)
         XCTAssertEqual(control.cancel.expectedRunID, runID)
         XCTAssertEqual(control.cancel.expectedGeneration, 3)
+        XCTAssertFalse(control.archive.allowed)
+        XCTAssertEqual(control.archive.reasonCode, "run_active")
     }
 
     func testWaitingInteractionBlocksTextButKeepsCancelAvailable() {
@@ -130,6 +134,37 @@ final class AgentSessionPresentationPolicyTests: XCTestCase {
         XCTAssertEqual(control.submitTurn.reasonCode, "waiting_for_interaction")
         XCTAssertEqual(control.steer.reasonCode, "waiting_for_interaction")
         XCTAssertTrue(control.cancel.allowed)
+        XCTAssertFalse(control.archive.allowed)
+    }
+
+    func testLegacyActionSnapshotDecodesArchiveAsUnavailable() throws {
+        let control = AgentSessionPresentationPolicy.evaluate(.init(
+            isRootSession: true,
+            sessionRevision: 4,
+            lifecycleState: .completed,
+            isController: true,
+            composerAvailable: true,
+            providerAvailable: true,
+            supportsResume: true,
+            supportsSteering: true,
+            activeRunID: nil,
+            activeGeneration: nil,
+            activeTurnEpoch: nil,
+            steeringReady: false,
+            runPresentation: nil
+        ))
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder.serviceEncoder.encode(control)) as? [String: Any]
+        )
+        object.removeValue(forKey: "archive")
+
+        let decoded = try JSONDecoder.serviceDecoder.decode(
+            AgentSessionActionSnapshotWire.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+
+        XCTAssertFalse(decoded.archive.allowed)
+        XCTAssertEqual(decoded.archive.reasonCode, "archive_unavailable")
     }
 }
 

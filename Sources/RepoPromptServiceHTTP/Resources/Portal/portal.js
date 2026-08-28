@@ -836,13 +836,7 @@
     if (
       !sessions.some((item) => item.sessionId === state.agent.selectedSessionID)
     ) {
-      state.agent.selectedSessionID =
-        [...sessions].sort(
-          (left, right) =>
-            new Date(right.lastActivityAt || 0) -
-              new Date(left.lastActivityAt || 0) ||
-            left.sessionId.localeCompare(right.sessionId),
-        )[0]?.sessionId || null;
+      state.agent.selectedSessionID = sessions[0]?.sessionId || null;
       state.agent.newSessionMode = !state.agent.selectedSessionID;
     }
   }
@@ -1058,17 +1052,13 @@
     });
     const archive = document.getElementById("agent-archive-button");
     const canArchive = Boolean(
-      session &&
-        !state.agent.newSessionMode &&
-        ["completed", "failed", "canceled", "interrupted"].includes(
-          session.state,
-        ),
+      session && !state.agent.newSessionMode && control?.archive?.allowed,
     );
     archive.hidden = !canArchive;
     setDisabledReason(
       archive,
       !canArchive,
-      "Only a finished session can be archived.",
+      control?.archive?.reasonText || "This session cannot be archived.",
     );
     if (state.agent.newSessionMode) {
       title.textContent = "New chat";
@@ -1595,7 +1585,9 @@
             body: JSON.stringify({
               operationId: operationID,
               expectedRevision:
-                action === "archive" ? selectedSession()?.revision : undefined,
+                action === "archive"
+                  ? selectedSession()?.agentControl?.archive?.expectedSessionRevision
+                  : undefined,
             }),
           },
         );
