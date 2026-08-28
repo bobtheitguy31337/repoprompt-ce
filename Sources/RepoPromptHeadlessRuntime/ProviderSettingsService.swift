@@ -989,7 +989,7 @@ public actor ProviderSettingsService {
               let configuration = configurations[kind],
               let source = configuration.credentialSourceDirectory
         else {
-            return .init(valid: false, detail: "The dedicated CLI credential directory is unavailable")
+            return .init(valid: false, detail: "The CLI login is unavailable")
         }
 
         if providerID == .claudeCompatible {
@@ -1014,7 +1014,7 @@ public actor ProviderSettingsService {
                 }
                 return loggedIn
                     ? .init(valid: true, detail: "Claude Code account authorization verified")
-                    : .init(valid: false, detail: "Claude Code is not authenticated; run 'claude login' in the dedicated server account")
+                    : .init(valid: false, detail: "Claude Code is not authenticated; run 'claude login' for the RepoPrompt service account")
             } catch {
                 return .init(valid: false, detail: "Claude Code authentication status could not be verified")
             }
@@ -1033,7 +1033,7 @@ public actor ProviderSettingsService {
                 valid: valid,
                 detail: valid
                     ? "\(name) ACP account preflight completed"
-                    : "\(name) could not initialize ACP with the dedicated server account"
+                    : "\(name) could not initialize ACP with the RepoPrompt service account"
             )
         }
 

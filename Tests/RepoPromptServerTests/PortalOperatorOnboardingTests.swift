@@ -167,6 +167,139 @@ final class PortalOperatorOnboardingTests: XCTestCase {
         }
     }
 
+    func testOperatorProjectLifecycleAndSessionArchiveUseSharedAuthority() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let token = try await store.issueOperatorSetupToken()
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        try await authority.recover()
+        let service = RepoPromptHTTPService(
+            authority: authority,
+            store: store,
+            authenticator: InternalRequestAuthenticator(keys: [], store: store),
+            eventSigningKey: InternalSigningKey(
+                keyID: "response",
+                role: .sync,
+                direction: InternalHMACDirection.repoPromptToClient,
+                secret: Data("response-secret-32-bytes-long!!".utf8)
+            ),
+            portalPasswordLoginEnabled: true
+        )
+        let app = Application(router: service.internalRouter())
+        try await app.test(.router) { client in
+            var cookie = ""
+            try await client.execute(
+                uri: "/portal/api/v1/setup",
+                method: .post,
+                headers: Self.portalMutationHeaders(),
+                body: ByteBuffer(data: try JSONEncoder.serviceEncoder.encode(SetupBody(
+                    password: "operator-password",
+                    passwordConfirmation: "operator-password",
+                    setupToken: token
+                )))
+            ) { response in
+                XCTAssertEqual(response.status, .created)
+                cookie = try XCTUnwrap(response.headers[.setCookie])
+            }
+            var headers = Self.portalMutationHeaders()
+            headers[.cookie] = cookie.split(separator: ";").first.map(String.init)
+
+            let unavailableCreate = PortalCreateProjectRequest(
+                operationID: UUID(),
+                name: "Unavailable Clone",
+                logicalName: "repo",
+                remote: "https://github.com/repoprompt/repoprompt-ce.git",
+                ref: "main"
+            )
+            try await client.execute(
+                uri: "/portal/api/v1/projects",
+                method: .post,
+                headers: headers,
+                body: ByteBuffer(data: try JSONEncoder.serviceEncoder.encode(unavailableCreate))
+            ) { response in
+                XCTAssertEqual(response.status, .unprocessableContent)
+                let error = try JSONDecoder.serviceDecoder.decode(
+                    ServiceAPIError.self,
+                    from: Data(response.body.readableBytesView)
+                )
+                XCTAssertEqual(error.code, .capabilityMissing)
+            }
+
+            let actor = ExternalActor(
+                userID: "operator:\(SQLiteServiceStore.defaultOperatorUsername)",
+                username: SQLiteServiceStore.defaultOperatorUsername,
+                displayName: "\(SQLiteServiceStore.defaultOperatorUsername) portal"
+            )
+            let project = try await authority.createProject(
+                input: .init(name: "Original", roots: []),
+                externalActor: actor,
+                idempotencyKey: UUID().uuidString,
+                requestDigest: CanonicalSigning.bodyDigest(Data("project".utf8))
+            )
+            let session = try await authority.createSession(
+                input: .init(
+                    projectID: project.projectID,
+                    provider: .codex,
+                    providerSettingsID: .codex,
+                    model: "gpt-5.6-sol",
+                    visibility: .privateSession,
+                    startImmediately: false
+                ),
+                externalActor: actor,
+                idempotencyKey: UUID().uuidString,
+                requestDigest: CanonicalSigning.bodyDigest(Data("session".utf8))
+            )
+
+            let rename = PortalRenameProjectRequest(
+                operationID: UUID(),
+                expectedRevision: project.revision,
+                name: "Renamed"
+            )
+            var renamed: PortalProjectSummary?
+            try await client.execute(
+                uri: "/portal/api/v1/projects/\(project.projectID.uuidString)",
+                method: .patch,
+                headers: headers,
+                body: ByteBuffer(data: try JSONEncoder.serviceEncoder.encode(rename))
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                renamed = try JSONDecoder.serviceDecoder.decode(
+                    PortalProjectSummary.self,
+                    from: Data(response.body.readableBytesView)
+                )
+            }
+            XCTAssertEqual(renamed?.name, "Renamed")
+
+            let archive = PortalSessionActionRequest(
+                operationID: UUID(),
+                expectedRevision: session.revision
+            )
+            try await client.execute(
+                uri: "/portal/api/v1/sessions/\(session.sessionID.uuidString)/actions/archive",
+                method: .post,
+                headers: headers,
+                body: ByteBuffer(data: try JSONEncoder.serviceEncoder.encode(archive))
+            ) { response in
+                XCTAssertEqual(response.status, .accepted)
+            }
+            let archived = try await authority.sessionSnapshot(sessionID: session.sessionID)
+            XCTAssertEqual(archived.state, .archived)
+
+            let remove = PortalRemoveProjectRequest(
+                operationID: UUID(),
+                expectedRevision: try XCTUnwrap(renamed).revision
+            )
+            try await client.execute(
+                uri: "/portal/api/v1/projects/\(project.projectID.uuidString)",
+                method: .delete,
+                headers: headers,
+                body: ByteBuffer(data: try JSONEncoder.serviceEncoder.encode(remove))
+            ) { response in
+                XCTAssertEqual(response.status, .noContent)
+            }
+        }
+    }
+
     private static func service(store: SQLiteServiceStore) async throws -> RepoPromptHTTPService {
         let authority = RepoPromptHeadlessAuthority(store: store)
         return RepoPromptHTTPService(

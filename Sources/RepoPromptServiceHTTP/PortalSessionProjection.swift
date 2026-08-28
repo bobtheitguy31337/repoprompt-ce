@@ -24,7 +24,8 @@ enum RepoPromptPortalSessionProjection {
             projectID: project.projectID,
             name: project.name,
             state: project.state,
-            rootNames: project.roots.map(\.logicalName)
+            rootNames: project.roots.map(\.logicalName),
+            revision: project.revision
         )
     }
 

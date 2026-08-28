@@ -214,10 +214,10 @@ dev-test:
 	./conductor test$(if $(TEST_PRODUCT), --test-product $(TEST_PRODUCT))$(if $(FILTER), --filter $(FILTER))
 
 dev-server-build:
-	REPOPROMPT_SERVER_ONLY=1 ./conductor swift-build --product RepoPromptServer
+	REPOPROMPT_SERVER_ONLY=1 swift build --disable-automatic-resolution --product RepoPromptServer
 
 dev-server-test:
-	REPOPROMPT_SERVER_ONLY=1 ./conductor test$(if $(FILTER), --filter $(FILTER), --filter RepoPromptServerTests)
+	REPOPROMPT_SERVER_ONLY=1 swift test --disable-automatic-resolution$(if $(FILTER), --filter "$(FILTER)", --filter RepoPromptServerTests)
 
 dev-provider-test:
 	./conductor provider-test$(if $(TEST_PRODUCT), --test-product $(TEST_PRODUCT))$(if $(FILTER), --filter $(FILTER))

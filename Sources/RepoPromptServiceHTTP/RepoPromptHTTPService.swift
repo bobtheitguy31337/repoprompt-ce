@@ -121,6 +121,74 @@ public struct RepoPromptHTTPService: Sendable {
             let bootstrap = try await portalBootstrap(principal: principal)
             return try portalJSON(bootstrap)
         } }
+        router.post("/portal/api/v1/projects") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(PortalCreateProjectRequest.self, from: data)
+            let result = try await authority.createProjectFromSource(
+                input: .init(
+                    operationID: input.operationID,
+                    expectedRevision: 0,
+                    name: input.name,
+                    logicalName: input.logicalName,
+                    source: .gitClone(remote: input.remote, ref: input.ref)
+                ),
+                externalActor: principal.externalActor,
+                idempotencyKey: portalIdempotencyKey(principal: principal, operationID: input.operationID),
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            return try portalJSON(result, status: .created)
+        } }
+        router.post("/portal/api/v1/projects/:id/repositories") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(PortalAddProjectRepositoryRequest.self, from: data)
+            let result = try await authority.addProjectRepository(
+                projectID: projectID,
+                input: .init(
+                    expectedRevision: input.expectedRevision,
+                    logicalName: input.logicalName,
+                    source: .init(remote: input.remote, ref: input.ref)
+                ),
+                externalActor: principal.externalActor,
+                idempotencyKey: portalIdempotencyKey(principal: principal, operationID: input.operationID),
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            return try portalJSON(result, status: .created)
+        } }
+        router.patch("/portal/api/v1/projects/:id") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(PortalRenameProjectRequest.self, from: data)
+            let snapshot = try await authority.renameProject(
+                projectID: projectID,
+                input: .init(expectedRevision: input.expectedRevision, name: input.name),
+                actor: principal.externalActor,
+                idempotencyKey: portalIdempotencyKey(principal: principal, operationID: input.operationID),
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            return try portalJSON(RepoPromptPortalSessionProjection.project(snapshot))
+        } }
+        router.delete("/portal/api/v1/projects/:id") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(PortalRemoveProjectRequest.self, from: data)
+            try await authority.removeProject(
+                projectID: projectID,
+                expectedRevision: input.expectedRevision,
+                actor: principal.externalActor,
+                idempotencyKey: portalIdempotencyKey(principal: principal, operationID: input.operationID),
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            return portalEmpty()
+        } }
         router.get("/portal/api/v1/projects/:id/composer-catalog") { request, context in await portalRespond(request) {
             let principal = try await authenticatePortal(request: request, context: context)
             let projectID = try context.parameters.require("id", as: UUID.self)
@@ -489,6 +557,11 @@ public struct RepoPromptHTTPService: Sendable {
                     )
                 }
                 command = .retrySession(sourceRunID: sourceRunID, fromTranscriptEntryID: nil)
+            case "archive":
+                guard let expectedRevision = input.expectedRevision else {
+                    throw ServiceAPIError(code: .invalidRequest, message: "Session revision is required")
+                }
+                command = .archiveSession(expectedRevision: expectedRevision)
             default:
                 throw ServiceAPIError(code: .notFound, message: "Session action not found")
             }
@@ -1924,7 +1997,8 @@ public struct RepoPromptHTTPService: Sendable {
             workflows: workflows,
             tools: RepoPromptPortalSessionProjection.tools(),
             workflowRepositoryRevision: workflowRepository.revision,
-            includeSessionCleanupGuidance: workflowRepository.includeSessionCleanupGuidance
+            includeSessionCleanupGuidance: workflowRepository.includeSessionCleanupGuidance,
+            projectSources: await authority.projectSourceCapabilities()
         )
     }
 

@@ -729,6 +729,25 @@
     return state.domainMutations[domain];
   }
 
+  async function mutateProjects(control, operation, successMessage) {
+    if (state.domainMutations.projects) return state.domainMutations.projects;
+    if (control) setDisabledReason(control, true, "Saving…");
+    state.domainMutations.projects = (async () => {
+      try {
+        await operation();
+        await loadAll(false);
+        toast(successMessage);
+      } catch (error) {
+        toast(error.message, true);
+        if (error.code === "staleRevision") await loadAll(false);
+        else renderRoute();
+      } finally {
+        state.domainMutations.projects = null;
+      }
+    })();
+    return state.domainMutations.projects;
+  }
+
   async function loadAll(refresh = false) {
     if (state.loadPromise) return state.loadPromise;
     setLoading(true);
@@ -1083,6 +1102,20 @@
         control?.[operation]?.reasonText || "Action unavailable",
       );
     });
+    const archive = document.getElementById("agent-archive-button");
+    const canArchive = Boolean(
+      session &&
+        !state.agent.newSessionMode &&
+        ["completed", "failed", "canceled", "interrupted"].includes(
+          session.state,
+        ),
+    );
+    archive.hidden = !canArchive;
+    setDisabledReason(
+      archive,
+      !canArchive,
+      "Only a finished session can be archived.",
+    );
     if (state.agent.newSessionMode) {
       title.textContent = "New chat";
       metadata.replaceChildren(
@@ -1590,7 +1623,7 @@
     if (
       state.agent.mutationPromise ||
       !state.agent.selectedSessionID ||
-      !["resume", "retry", "cancel"].includes(action)
+      !["resume", "retry", "cancel", "archive"].includes(action)
     )
       return null;
     const operationID = window.crypto?.randomUUID?.();
@@ -1605,7 +1638,11 @@
           `api/v1/sessions/${encodeURIComponent(state.agent.selectedSessionID)}/actions/${action}`,
           {
             method: "POST",
-            body: JSON.stringify({ operationId: operationID }),
+            body: JSON.stringify({
+              operationId: operationID,
+              expectedRevision:
+                action === "archive" ? selectedSession()?.revision : undefined,
+            }),
           },
         );
         await loadTranscript({ silent: true });
@@ -1620,6 +1657,18 @@
       }
     })();
     return state.agent.mutationPromise;
+  }
+
+  async function requestArchiveSession(button) {
+    const session = selectedSession();
+    if (!session) return;
+    const accepted = await confirmAction({
+      title: `Archive ${session.title || "this session"}?`,
+      message: "The session will remain in the project history but cannot receive new messages.",
+      label: "Archive",
+      returnFocus: button,
+    });
+    if (accepted) await submitAgentAction("archive");
   }
 
   function mergeTranscriptItems(items, prepend = false) {
@@ -2592,16 +2641,6 @@
     return choices;
   }
 
-  function informationalCard(title, detail, rows = []) {
-    const card = desktopCard(title, detail);
-    rows.forEach(([label, value, rowDetail = ""]) =>
-      card.append(
-        desktopRow(label, rowDetail, element("span", "read-only-value", value)),
-      ),
-    );
-    return card;
-  }
-
   function settingsPage(title, subtitle, icon, cards = [], banner = null) {
     const content = document.getElementById("settings-content");
     disposeSensitiveInputs(content);
@@ -2617,7 +2656,7 @@
     content.replaceChildren(
       pageHeader(
         "CLI Providers",
-        "Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, Cursor, or Grok Build to use the dedicated server account for each installed CLI.",
+        "Install and connect Claude Code, Codex, OpenCode, Cursor, or Grok Build for Agent Mode.",
         "terminal",
       ),
     );
@@ -2806,7 +2845,7 @@
     const card = desktopCard(
       "CLI installation",
       installed
-        ? `${version}. Installed for the RepoPrompt server user and reinstalled automatically after app deployment.`
+        ? `${version}. Installed on this server and reinstalled automatically after app deployment.`
         : "Install the current release directly from the provider. The CLI is not part of the RepoPrompt app image.",
     );
     const actions = element("div", "form-actions");
@@ -2826,7 +2865,7 @@
         setDisabledReason(
           install,
           true,
-          "This provider is not available for this server deployment.",
+          "This provider is not available in this RepoPrompt installation.",
         );
       else
         install.addEventListener("click", () =>
@@ -2898,20 +2937,20 @@
     const methods = provider.capabilities.authenticationMethods || [];
     const guidance = {
       claudeCompatible: [
-        "Connect the Claude Code CLI account installed for this server user.",
-        "If the account is not signed in, an operator can run claude login inside the isolated server account. Compatible backends below use their own API keys and do not require this login.",
+        "Connect the installed Claude Code CLI.",
+        "If Claude Code is not signed in, run claude login for the RepoPrompt service account. Compatible backends below use their own API keys and do not require this login.",
       ],
       openCodeACP: [
-        "Connect the OpenCode CLI account installed for this server user.",
-        "If authentication is missing, an operator can run opencode auth login inside the isolated server account.",
+        "Connect the installed OpenCode CLI.",
+        "If OpenCode is not signed in, run opencode auth login for the RepoPrompt service account.",
       ],
       cursorACP: [
-        "Connect the Cursor CLI account installed for this server user.",
-        "If authentication is missing, an operator can complete Cursor login inside the isolated server account.",
+        "Connect the installed Cursor CLI.",
+        "If Cursor is not signed in, complete its login for the RepoPrompt service account.",
       ],
       grokBuildACP: [
-        "Connect the Grok Build CLI account installed for this server user.",
-        "If authentication is missing, an operator can complete Grok Build login inside the isolated server account.",
+        "Connect the installed Grok Build CLI.",
+        "If Grok Build is not signed in, complete its login for the RepoPrompt service account.",
       ],
     }[provider.providerID];
     const card = desktopCard("Connection", guidance[0]);
@@ -2921,7 +2960,7 @@
     const message = element(
       "div",
       "inline-message info",
-      "The portal records use of the server user's CLI account; it never receives or copies the provider's login files.",
+      "RepoPrompt checks the CLI's existing login without receiving or copying its credentials.",
     );
     message.setAttribute("role", "status");
     const actions = element("div", "form-actions");
@@ -2954,7 +2993,7 @@
     const originalLabel = button.textContent;
     button.textContent = "Connecting…";
     setDisabledReason(button, true, "Connection request is in progress.");
-    message.textContent = "Checking the mounted CLI account…";
+    message.textContent = "Checking the CLI login…";
     try {
       const updated = await api(
         `api/v1/provider-settings/${encodeURIComponent(provider.providerID)}/connect`,
@@ -2980,18 +3019,18 @@
 
   function providerActionUnavailableReason(provider) {
     if (!provider.deploymentAllowed)
-      return "This provider is not available for this server deployment.";
+      return "This provider is not available in this RepoPrompt installation.";
     if (provider.cli?.installed === false)
       return "Install the provider CLI to continue.";
     if (provider.providerID === "claudeCustom")
-      return "Custom endpoint credentials remain an operator-managed boundary because this Claude-compatible backend does not advertise a safe endpoint validator.";
+      return "This custom endpoint cannot be connected until RepoPrompt can validate it safely.";
     if (
       ["claudeCompatible", "openCodeACP", "cursorACP"].includes(
         provider.providerID,
       )
     )
-      return "The dedicated CLI credential directory is not mounted or is unavailable. Complete sign-in in the isolated server account, then refresh.";
-    return "No connection method is available for this provider on the server.";
+      return "The CLI login is unavailable. Sign in for the RepoPrompt service account, then refresh.";
+    return "No connection method is available for this provider.";
   }
 
   function connectedProviderSummary(provider) {
@@ -3011,7 +3050,7 @@
     const account =
       summary.accountLabel ||
       provider.connection?.accountLabel ||
-      (external ? "Dedicated server CLI account" : "Connected account");
+      (external ? "RepoPrompt service account" : "Connected account");
     rows.append(element("dt", "", "Account"), element("dd", "", account));
     if (provider.providerID === "codex" || summary.planLabel)
       rows.append(
@@ -3025,7 +3064,7 @@
         "",
         summary.authenticationLabel ||
           (external
-            ? "Mounted CLI login"
+            ? "CLI login"
             : humanize(
                 summary.method || provider.connection?.authenticationMethod,
               )),
@@ -3037,7 +3076,7 @@
       "inline-message info",
       external
         ? provider.connection?.detail ||
-            "The dedicated CLI account passed server validation."
+            "The CLI login passed validation."
         : "Connection is ready.",
     );
     const test = element("button", "secondary-button", "Test Connection");
@@ -3058,7 +3097,7 @@
       const accepted = await confirmAction({
         title: `${removalLabel} ${provider.displayName}?`,
         message: external
-          ? "New agent runs will stop using this mounted account. The operator-managed CLI login files are not modified."
+          ? "New agent runs will stop using this login. The CLI's sign-in files are not modified."
           : "The stored connection will be removed and new agent runs will no longer use it.",
         label: removalLabel,
         returnFocus: remove,
@@ -3100,7 +3139,7 @@
         toggleSetting(
           "codexMemoriesEnabled",
           "Local Memories",
-          "Allow Codex to generate and use memories in its isolated server home.",
+          "Allow Codex to generate and use local memories.",
           false,
         ),
       );
@@ -3483,7 +3522,7 @@
     select.addEventListener("change", () => savePromptDelivery(select));
     return desktopRow(
       "Sys Prompt Packaging",
-      "Replace Claude Code's native system prompt, wrap RepoPrompt instructions in the user message, or keep the native prompt. Writes the typed Direct Agents store.",
+      "Choose how RepoPrompt instructions are delivered to Claude Code.",
       select,
     );
   }
@@ -3655,7 +3694,7 @@
     if (!snapshot) {
       settingsPage(
         "Agent Models",
-        "Loading typed routing settings…",
+        "Loading model settings…",
         "model",
         [],
       );
@@ -3666,7 +3705,7 @@
       Boolean(projectID) && snapshot.projectMode === "projectOverride";
     const scope = desktopCard(
       "Scope",
-      "Global routing is shared by every project. An active project may inherit it or own a complete revisioned override.",
+      "Use the global model choices for every project, or override them for the active project.",
     );
     if (projectID) {
       const mode = typedSelect(
@@ -3836,7 +3875,7 @@
       : snapshot.globalProfile;
     const routes = desktopCard(
       projectOverride ? "Project Agent Routes" : "Global Agent Routes",
-      "Oracle and Context Builder fail closed when unassigned. Explore, engineer, pair, and design stay unassigned to track recommendations; an explicit pick is stored even when it matches a recommendation.",
+      "Oracle and Context Builder cannot run while unassigned. Agent roles follow recommendations until you choose a model explicitly.",
     );
     const form = element("form", "typed-settings-form");
     const targetControls = {};
@@ -3944,7 +3983,7 @@
 
     const providerDefaults = desktopCard(
       "Provider Defaults",
-      "Provider settings remain the exact runtime-backed defaults for explicit portal sessions and unassigned model fields.",
+      "Default model choices reported by connected providers.",
     );
     const stack = element("div", "provider-stack");
     orderedProviders()
@@ -3960,7 +3999,7 @@
     providerDefaults.append(stack);
     settingsPage(
       "Agent Models",
-      "Configure typed global/project routing for Oracle, Context Builder, and all four sub-agent roles.",
+      "Choose models for Oracle, Context Builder, and each agent role.",
       "model",
       [scope, recommendations, routes, providerDefaults],
       recommendation(
@@ -3978,13 +4017,13 @@
   function renderAgentPermissions() {
     const fallback = desktopCard(
       "Portal Session Default",
-      "Typed Direct Agents settings are the permission authority. The 3-mode fallback applies only to providers with no typed profile.",
+      "Fallback for API providers that do not have provider-specific permission settings.",
     );
     fallback.append(
       selectSetting(
         "serverDefaultExecutionMode",
         "Default Execution Mode",
-        "Session default only for API providers that have no typed Direct Agents profile. It does not replace Codex, Claude, OpenCode, or Cursor permissions.",
+        "Does not replace Codex, Claude, OpenCode, Cursor, or Grok Build permissions.",
         [
           ["readOnly", "Read Only"],
           ["workspaceWrite", "Workspace Write"],
@@ -4066,7 +4105,7 @@
       );
       const codexCard = desktopCard(
         "Codex Direct Agent",
-        "Independent sandbox, approval, and reviewer fields from the typed Direct Agents store.",
+        "Sandbox, approval, and reviewer settings for new Codex sessions.",
       );
       const derived = element(
         "span",
@@ -4124,7 +4163,7 @@
           toggleSetting(
             "codexMemoriesEnabled",
             "Local Memories",
-            "Allow Codex to generate and use memories in its isolated server home.",
+            "Allow Codex to generate and use local memories.",
             false,
           ),
           desktopRow(
@@ -4234,7 +4273,7 @@
     const subagentSnapshot = state.typedSettings.subagentPermissions;
     const subagents = desktopCard(
       "Sub-Agents",
-      "This revisioned policy is frozen into every child session before ProviderExecutionPolicy is created. Missing or corrupt settings fail closed to Safe Managed.",
+      "Choose how new sub-agents inherit or override provider permissions. Invalid settings fall back to Safe Managed.",
     );
     if (subagentSnapshot) {
       const form = element("form", "typed-settings-form");
@@ -4296,7 +4335,7 @@
       };
       Object.entries(controls).forEach(([name, control]) =>
         custom.append(
-          desktopRow(humanize(name), "Custom frozen launch mode.", control),
+          desktopRow(humanize(name), "Custom permission mode.", control),
         ),
       );
       const warning = element(
@@ -4349,13 +4388,13 @@
     }
     settingsPage(
       "Agent Permissions",
-      "Configure runtime-backed direct-agent and delegated sub-agent permissions.",
+      "Configure permissions for direct agents and delegated sub-agents.",
       "shield",
       [fallback, ...providerCards, subagents],
       recommendation(
         "shield",
         "Direct permissions apply to new sessions",
-        "Direct and sub-agent policies are consumed by the server runtime and frozen for new sessions.",
+        "Permission changes apply to new sessions.",
       ),
     );
   }
@@ -4373,7 +4412,7 @@
     }
     const preferences = desktopCard(
       "Workflow Runtime",
-      "SQLite is the server-native authoring authority. Definitions are path-free, revisioned, validated, and reloaded into runtime discovery.",
+      "Built-in and custom workflows available in Agent Mode.",
     );
     const cleanup = typedToggle(
       "Include Session Cleanup Guidance",
@@ -4428,7 +4467,7 @@
 
     const catalog = desktopCard(
       "Workflow Catalog",
-      "Feature, hide, clone, edit, and delete server-native definitions. Built-ins remain immutable; cloning creates a custom definition.",
+      "Feature or hide workflows, and clone built-ins to create editable custom versions.",
     );
     const featured = snapshot.workflows
       .filter((workflow) => workflow.featuredOrder !== null)
@@ -4737,7 +4776,7 @@
 
     const create = desktopCard(
       "New Custom Workflow",
-      "Create a path-free markdown definition in the server repository. Open Folder and Reveal remain desktop-only local filesystem actions.",
+      "Create a reusable custom workflow for Agent Mode.",
     );
     const createForm = element("form", "workflow-definition-form");
     const name = document.createElement("input");
@@ -4791,7 +4830,7 @@
     create.append(createForm);
     settingsPage(
       "Agent Workflows",
-      "Manage the server-native workflow repository and its runtime visibility.",
+      "Manage built-in and custom Agent Mode workflows.",
       "workflow",
       [preferences, picker, catalog, create],
     );
@@ -4802,7 +4841,7 @@
     if (!snapshot) {
       settingsPage(
         "Context Builder",
-        "Loading typed Context Builder settings…",
+        "Loading Context Builder settings…",
         "context",
         [],
       );
@@ -4813,7 +4852,7 @@
       Boolean(projectID) && snapshot.projectMode === "projectOverride";
     const scope = desktopCard(
       "Scope",
-      "Stored defaults resolve explicit invocation override → project override → global setting → typed default.",
+      "Project settings override global defaults for the active project.",
     );
     if (projectID) {
       const mode = typedSelect(
@@ -5018,7 +5057,7 @@
 
     settingsPage(
       "Context Builder",
-      "Configure typed global/project defaults for connected RepoPrompt MCP agents.",
+      "Configure Context Builder defaults globally or for the active project.",
       "context",
       [scope, settings],
     );
@@ -5061,20 +5100,11 @@
         density,
       ),
     );
-    const boundaries = informationalCard(
-      "Desktop Appearance Boundary",
-      "This page is browser-local chrome. Engine appearance, font scale, tooltips, and keyboard-shortcut persist live on Advanced and MCP app_settings. Headless apply of those keys is a no-op.",
-      [
-        ["File-change collapsing", "Intentionally omitted"],
-        ["Spell checking", "Browser-owned"],
-        ["@-mention menu and picker", "Desktop-only"],
-      ],
-    );
     settingsPage(
       "Appearance",
-      "Choose browser-native theme and text density without copying macOS preference keys.",
+      "Choose the portal theme and text size for this browser.",
       "appearance",
-      [card, boundaries],
+      [card],
     );
   }
 
@@ -5083,7 +5113,7 @@
     if (!snapshot) {
       settingsPage(
         "Advanced",
-        "Loading canonical server settings…",
+        "Loading advanced settings…",
         "sliders",
         [],
       );
@@ -5133,7 +5163,7 @@
           toggle.input.getAttribute("aria-label"),
           key === "codeMapsEnabled"
             ? "Disabling rejects code-map generation and suppresses tool admission."
-            : "Consumed by the canonical project scanner.",
+            : "Used when RepoPrompt scans project files.",
           toggle.toggle,
         ),
       ),
@@ -5155,65 +5185,13 @@
     card.append(
       desktopRow(
         "History Idle Threshold",
-        "0–1440 minutes; omitted history queries use this stored default. Explicit idle_threshold_minutes still fail closed outside that range.",
+        "Default idle threshold for history queries, from 0 to 1440 minutes.",
         history,
       ),
       desktopRow(
         "Global ignore defaults",
-        "App-wide gitignore-style patterns. Empty disables app-wide defaults; missing persist live-reads Desktop’s canonical list.",
+        "App-wide gitignore-style patterns. Leave empty to disable global defaults.",
         globalIgnoreDefaults,
-      ),
-    );
-    const appearance = desktopCard(
-      "App Appearance",
-      "Persisted for thin clients and MCP app_settings. Headless apply is a no-op. This is not the browser-local Portal Appearance cookie.",
-    );
-    const appearanceMode = typedSelect(
-      "App appearance mode",
-      [
-        ["System", "System"],
-        ["Light", "Light"],
-        ["Dark", "Dark"],
-      ],
-      settings.appearanceMode || "System",
-    );
-    const fontScale = typedSelect(
-      "App font scale",
-      [
-        ["14", "Normal (14)"],
-        ["16", "Large (16)"],
-        ["18", "Extra Large (18)"],
-      ],
-      String(settings.fontScaleBodySize || 14),
-    );
-    const showTooltips = typedToggle(
-      "Show tooltips",
-      settings.showTooltips !== false,
-    );
-    const enableKeyboardShortcuts = typedToggle(
-      "Enable keyboard shortcuts",
-      settings.enableKeyboardShortcuts !== false,
-    );
-    appearance.append(
-      desktopRow(
-        "Appearance mode",
-        "System, Light, or Dark. MCP ui.appearance_mode writes this same field.",
-        appearanceMode,
-      ),
-      desktopRow(
-        "Font scale",
-        "Desktop body sizes 14 / 16 / 18. MCP ui.font_scale writes this same field.",
-        fontScale,
-      ),
-      desktopRow(
-        "Show tooltips",
-        "Persisted for thin clients. Headless apply is a no-op.",
-        showTooltips.toggle,
-      ),
-      desktopRow(
-        "Enable keyboard shortcuts",
-        "Persisted for thin clients. Headless apply is a no-op.",
-        enableKeyboardShortcuts.toggle,
       ),
     );
     const packaging = desktopCard(
@@ -5290,7 +5268,7 @@
       ),
       desktopRow(
         "Prompt sections order",
-        "JSON array of each section once. Incomplete values live-read the Desktop default.",
+        "JSON array containing each prompt section once. Invalid or incomplete values use the default order.",
         sectionOrder,
       ),
       desktopRow(
@@ -5347,10 +5325,6 @@
                 codeMapsGloballyDisabled: !toggles.codeMapsEnabled.input.checked,
                 historyIdleThresholdMinutes,
                 globalIgnoreDefaults: globalIgnoreDefaults.value,
-                appearanceMode: appearanceMode.value,
-                fontScaleBodySize: Number(fontScale.value),
-                showTooltips: showTooltips.input.checked,
-                enableKeyboardShortcuts: enableKeyboardShortcuts.input.checked,
                 fileEditFormat: fileEdit.value,
                 customPlanningPrompt: planning.value,
                 modelTemperature,
@@ -5368,23 +5342,11 @@
       );
     });
     packaging.append(save);
-    const boundary = informationalCard(
-      "Desktop Utility Boundaries",
-      "These local desktop integrations have no safe or useful server-setting equivalent and remain input-free.",
-      [
-        ["Keyboard shortcut link", "Intentionally omitted"],
-        ["repoprompt:// URL opener", "macOS-only"],
-        [
-          "Saved prompt import/export/reset",
-          "File-panel utilities; the catalog persists on the server store",
-        ],
-      ],
-    );
     settingsPage(
       "Advanced",
-      "Configure only canonical settings consumed by shared-server runtime operations.",
+      "Configure scanning, history, and prompt packaging.",
       "sliders",
-      [card, appearance, packaging, boundary],
+      [card, packaging],
     );
   }
 
@@ -5397,7 +5359,7 @@
     }
     const status = desktopCard(
       "MCP Server",
-      "RepoPrompt's MCP surface is part of the shared service lifecycle. Browser users cannot start, stop, or reconfigure the process independently.",
+      "Live status and settings for RepoPrompt's shared MCP service.",
     );
     const toolsLink = element(
       "a",
@@ -5416,7 +5378,7 @@
     status.append(
       desktopRow(
         "Server Status",
-        "Deployment-managed and shared by connected agents.",
+        "Shared by connected agents.",
         element(
           "span",
           state.online ? "required-pill" : "connection-badge attention",
@@ -5430,7 +5392,7 @@
       ),
       desktopRow(
         "Tools",
-        "Canonical catalog advertised by this server build.",
+        "Available MCP tools.",
         toolsLink,
       ),
       desktopRow(
@@ -5439,37 +5401,11 @@
         element("code", "read-only-value", "context_builder"),
       ),
     );
-    const desktopBoundary = informationalCard(
-      "Desktop Management Boundary",
-      "Desktop RepoPrompt owns a per-window MCP process and can expose controls that are not meaningful for this deployment-managed service.",
-      [
-        [
-          "Start / stop / force stop",
-          "Deployment-managed",
-          "The sandbox service lifecycle is controlled by the deployment workflow.",
-        ],
-        [
-          "Auto-start",
-          "Always service-managed",
-          "There is no browser window lifecycle to follow.",
-        ],
-        [
-          "Connections dashboard",
-          "Not exposed",
-          "Client connection details remain server-operational data.",
-        ],
-        [
-          "Quick setup / CLI installer",
-          "Desktop-only",
-          "Installers modify a local user's tool configuration and filesystem.",
-        ],
-      ],
-    );
     settingsPage(
       "MCP Server",
-      "Inspect live shared-server MCP status and the desktop-only process-management boundary.",
+      "Manage RepoPrompt's shared MCP service.",
       "server",
-      [status, desktopBoundary],
+      [status],
     );
   }
 
@@ -5484,7 +5420,7 @@
     const enabledCount = tools.filter((tool) => !disabled.has(tool.name)).length;
     const card = desktopCard(
       "Advertised MCP Tools",
-      "Enable or disable individual MCP tools advertised by this server. Disabled names are omitted from the live catalog and fail closed on invoke.",
+      "Choose which MCP tools connected clients can use.",
     );
     const toolbar = element("div", "tool-catalog-toolbar");
     const searchLabel = element("label", "tool-search-field");
@@ -5554,7 +5490,7 @@
       recommendation(
         "check",
         `${enabledCount} of ${tools.length} enabled`,
-        "This list is generated from MCPDomainToolCatalog and writes the typed mcp.disabledTools store.",
+        "Disabled tools are removed from the catalog and cannot be invoked.",
       ),
     );
   }
@@ -5607,7 +5543,7 @@
     }
     const perOp = desktopCard(
       "Operation Permissions",
-      "Auto-approve specific operations globally. Unlisted operations stay fail-closed unless a trusted client Always Allow matches.",
+      "Auto-approve specific operations. Other operations still require approval unless allowed for a trusted client.",
     );
     workspaceApprovalOperations.forEach(([value, title, detail]) => {
       const toggle = typedToggle(title, operations.has(value));
@@ -5687,7 +5623,7 @@
     }
     settingsPage(
       "Workspace Approvals",
-      "Control automatic approval of the four workspace-management operations. Missing settings stay fail-closed.",
+      "Control automatic approval of workspace-management operations.",
       "shield",
       [master, perOp, trusted],
     );
@@ -5703,8 +5639,8 @@
     const card = desktopCard(
       "Oracle Model Presets",
       presetsGate?.settings?.showModelPresets
-        ? "This ordered revisioned collection is consumed by list_models, ask_oracle, and oracle_send. Disabled or unavailable targets fail explicitly."
-        : "Named presets are hidden from list_models until Use Oracle Model Presets for MCP is enabled on the MCP Server page. ask_oracle and oracle_send fail-closed on preset IDs while the gate is off.",
+        ? "These presets are available to list_models, ask_oracle, and oracle_send."
+        : "Enable Oracle Model Presets on the MCP Server page to make named presets available to MCP clients.",
     );
     const form = element("form", "typed-settings-form");
     const rowsContainer = element("div", "model-preset-rows");
@@ -6004,7 +5940,7 @@
     card.append(
       desktopRow(
         "Enabled",
-        "A direct provider becomes launchable only after deployment admission, validated connection, sanitized catalog, and registered runtime all agree.",
+        "Connect and validate this provider before using it in Agent Mode.",
         providerEnabledToggle(provider),
       ),
     );
@@ -6293,16 +6229,16 @@
         !dedicatedDirectProviderPage(provider.providerID),
     );
     const cards = providers.map(directProviderCard);
-    cards.push(
-      informationalCard(
-        "Unsupported Provider Boundaries",
-        "No inert credential or endpoint controls are rendered for protocols outside the completed backend truth contract.",
-        [["LM Studio", "Intentionally omitted local-network protocol"]],
-      ),
-    );
+    if (!cards.length)
+      cards.push(
+        desktopCard(
+          "No API providers available",
+          "This RepoPrompt installation does not currently offer a direct API provider.",
+        ),
+      );
     settingsPage(
       "API Providers",
-      "Configure every deployment-admitted direct HTTPS runtime. OpenRouter and custom OpenAI-compatible keep their dedicated pages. Credentials stay on the connection APIs.",
+      "Configure direct API providers for Agent Mode.",
       "cloud",
       cards,
     );
@@ -6316,15 +6252,14 @@
     const cards = provider
       ? [directProviderCard(provider)]
       : [
-          informationalCard(
-            "OpenRouter Deployment Boundary",
-            "This deployment does not advertise the complete OpenRouter runtime. Credential, token, header, and model controls remain input-free.",
-            [["Status", "Deployment-disabled"]],
+          desktopCard(
+            "OpenRouter unavailable",
+            "OpenRouter is not available in this RepoPrompt installation.",
           ),
         ];
     settingsPage(
       "OpenRouter",
-      "Configure fixed-host OpenRouter only when validation, catalog, vault, and execution truth are all advertised.",
+      "Configure OpenRouter for Agent Mode.",
       "cloud",
       cards,
     );
@@ -6339,18 +6274,14 @@
     const cards = provider
       ? [directProviderCard(provider)]
       : [
-          informationalCard(
-            "Custom API Deployment Boundary",
-            "This deployment does not advertise the hardened custom OpenAI-compatible runtime. Endpoint and credential controls remain input-free.",
-            [
-              ["Required policy", "Public HTTPS/443 + pinned-address egress"],
-              ["Status", "Deployment-disabled"],
-            ],
+          desktopCard(
+            "Custom API unavailable",
+            "Custom OpenAI-compatible APIs are not available in this RepoPrompt installation.",
           ),
         ];
     settingsPage(
       "Custom API",
-      "Configure a custom provider only through the completed SSRF-safe validation and request runtime.",
+      "Configure a custom OpenAI-compatible API for Agent Mode.",
       "sliders",
       cards,
     );
@@ -6391,86 +6322,232 @@
     if (!list.childElementCount)
       list.append(element("p", "empty-inline", "No models are advertised."));
     catalog.append(list);
-    const desktop = informationalCard(
-      "Desktop Per-Model Overrides",
-      "The desktop model registry can mutate capabilities that the shared-server DTO does not yet expose. OpenAI service tier belongs to API Providers, not this page.",
-      [
-        ["Allow Diff", "Per model", "Controls diff-based edit support."],
-        ["Streaming", "Per model", "Overrides streaming capability."],
-        [
-          "Responses API",
-          "Custom providers",
-          "Selects the OpenAI Responses transport when applicable.",
-        ],
-        ["Temperature", "Slider + reset", "Overrides the model temperature."],
-      ],
-    );
     settingsPage(
       "Model Config",
-      "Inspect live model capabilities and the desktop-only override boundary.",
+      "Inspect models and capabilities reported by connected providers.",
       "model",
-      [catalog, desktop],
+      [catalog],
     );
   }
 
   function renderManageWorkspaces() {
     const projects = state.bootstrap?.projects || [];
+    const cards = [];
+    const capabilities = state.bootstrap?.projectSources;
+    if (capabilities?.gitCloneEnabled) {
+      const create = desktopCard(
+        "New Project",
+        "Clone a Git repository into a new RepoPrompt project.",
+      );
+      const form = element("form", "typed-settings-form");
+      const name = document.createElement("input");
+      name.type = "text";
+      name.maxLength = 200;
+      name.placeholder = "Project name";
+      name.setAttribute("aria-label", "Project name");
+      const logicalName = document.createElement("input");
+      logicalName.type = "text";
+      logicalName.maxLength = 128;
+      logicalName.placeholder = "Repository name";
+      logicalName.setAttribute("aria-label", "Repository name");
+      const remote = document.createElement("input");
+      remote.type = "url";
+      remote.placeholder = "https://github.com/owner/repository.git";
+      remote.setAttribute("aria-label", "Git repository URL");
+      const ref = document.createElement("input");
+      ref.type = "text";
+      ref.maxLength = 256;
+      ref.value = "main";
+      ref.setAttribute("aria-label", "Git branch or ref");
+      const submit = element("button", "primary-button", "Create Project");
+      submit.type = "submit";
+      form.append(
+        desktopRow("Project Name", "Shown in Agent Mode.", name),
+        desktopRow("Repository Name", "Short name shown for this project root.", logicalName),
+        desktopRow("Git Repository", "HTTPS clone URL.", remote),
+        desktopRow("Branch or Ref", "Branch, tag, or commit to clone.", ref),
+        submit,
+      );
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const operationID = window.crypto?.randomUUID?.();
+        if (!operationID) {
+          toast("This browser cannot create secure operation identifiers.", true);
+          return;
+        }
+        mutateProjects(
+          submit,
+          () =>
+            api("api/v1/projects", {
+              method: "POST",
+              body: JSON.stringify({
+                operationId: operationID,
+                name: name.value.trim(),
+                logicalName: logicalName.value.trim(),
+                remote: remote.value.trim(),
+                ref: ref.value.trim(),
+              }),
+            }),
+          "Project created",
+        );
+      });
+      create.append(form);
+      cards.push(create);
+    }
+
     const card = desktopCard(
-      "Server Projects",
-      "Live projects provisioned for this shared service. Root paths are reduced to browser-safe root names.",
+      "Projects",
+      "Rename projects, add repositories, or remove projects that are no longer needed.",
     );
     const list = element("div", "workspace-project-list");
     projects.forEach((project) => {
       const roots = project.rootNames || [];
-      list.append(
-        desktopRow(
-          project.name || project.projectId,
-          roots.length ? roots.join(" · ") : "No roots advertised",
-          element("span", "required-pill", humanize(project.state)),
-        ),
+      const details = element("details", "desktop-provider-card workspace-project-editor");
+      const summary = document.createElement("summary");
+      const copy = element("span", "provider-name");
+      copy.append(
+        element("strong", "", project.name || project.projectId),
+        element("small", "", roots.length ? roots.join(" · ") : "No repositories"),
       );
+      summary.append(
+        iconNode("folder", "provider-glyph"),
+        copy,
+        element("span", "required-pill", humanize(project.state)),
+        iconNode("chevron"),
+      );
+      const body = element("div", "desktop-provider-body");
+      const renameForm = element("form", "typed-settings-form compact-form");
+      const projectName = document.createElement("input");
+      projectName.type = "text";
+      projectName.maxLength = 200;
+      projectName.value = project.name;
+      projectName.setAttribute("aria-label", `Project name for ${project.name}`);
+      const rename = element("button", "secondary-button", "Save Name");
+      rename.type = "submit";
+      renameForm.append(
+        desktopRow("Project Name", "Shown throughout Agent Mode.", projectName),
+        rename,
+      );
+      renameForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const operationID = window.crypto?.randomUUID?.();
+        if (!operationID) {
+          toast("This browser cannot create secure operation identifiers.", true);
+          return;
+        }
+        mutateProjects(
+          rename,
+          () =>
+            api(`api/v1/projects/${encodeURIComponent(project.projectId)}`, {
+              method: "PATCH",
+              body: JSON.stringify({
+                operationId: operationID,
+                expectedRevision: project.revision,
+                name: projectName.value.trim(),
+              }),
+            }),
+          "Project renamed",
+        );
+      });
+      body.append(renameForm);
+
+      if (capabilities?.gitCloneEnabled) {
+        const addForm = element("form", "typed-settings-form compact-form");
+        const repositoryName = document.createElement("input");
+        repositoryName.type = "text";
+        repositoryName.maxLength = 128;
+        repositoryName.placeholder = "Repository name";
+        repositoryName.setAttribute("aria-label", `New repository name for ${project.name}`);
+        const repositoryRemote = document.createElement("input");
+        repositoryRemote.type = "url";
+        repositoryRemote.placeholder = "https://github.com/owner/repository.git";
+        repositoryRemote.setAttribute("aria-label", `New Git repository URL for ${project.name}`);
+        const repositoryRef = document.createElement("input");
+        repositoryRef.type = "text";
+        repositoryRef.maxLength = 256;
+        repositoryRef.value = "main";
+        repositoryRef.setAttribute("aria-label", `New Git branch or ref for ${project.name}`);
+        const add = element("button", "secondary-button", "Add Repository");
+        add.type = "submit";
+        addForm.append(
+          element("h3", "desktop-subheading", "Add Repository"),
+          desktopRow("Repository Name", "Short name shown for this project root.", repositoryName),
+          desktopRow("Git Repository", "HTTPS clone URL.", repositoryRemote),
+          desktopRow("Branch or Ref", "Branch, tag, or commit to clone.", repositoryRef),
+          add,
+        );
+        addForm.addEventListener("submit", (event) => {
+          event.preventDefault();
+          const operationID = window.crypto?.randomUUID?.();
+          if (!operationID) {
+            toast("This browser cannot create secure operation identifiers.", true);
+            return;
+          }
+          mutateProjects(
+            add,
+            () =>
+              api(
+                `api/v1/projects/${encodeURIComponent(project.projectId)}/repositories`,
+                {
+                  method: "POST",
+                  body: JSON.stringify({
+                    operationId: operationID,
+                    expectedRevision: project.revision,
+                    logicalName: repositoryName.value.trim(),
+                    remote: repositoryRemote.value.trim(),
+                    ref: repositoryRef.value.trim(),
+                  }),
+                },
+              ),
+            "Repository added",
+          );
+        });
+        body.append(addForm);
+      }
+
+      const remove = element("button", "danger-button subtle", "Remove Project");
+      remove.type = "button";
+      remove.addEventListener("click", async () => {
+        const accepted = await confirmAction({
+          title: `Remove ${project.name}?`,
+          message: "The project must have no active sessions or worktrees. Managed repository data for this project may be removed.",
+          label: "Remove Project",
+          returnFocus: remove,
+        });
+        if (!accepted) return;
+        const operationID = window.crypto?.randomUUID?.();
+        if (!operationID) {
+          toast("This browser cannot create secure operation identifiers.", true);
+          return;
+        }
+        mutateProjects(
+          remove,
+          () =>
+            api(`api/v1/projects/${encodeURIComponent(project.projectId)}`, {
+              method: "DELETE",
+              body: JSON.stringify({
+                operationId: operationID,
+                expectedRevision: project.revision,
+              }),
+            }),
+          "Project removed",
+        );
+      });
+      body.append(remove);
+      details.append(summary, body);
+      list.append(details);
     });
     if (!projects.length)
       list.append(
-        element("p", "empty-inline", "No server projects are available."),
+        element("p", "empty-inline", "No projects are available."),
       );
     card.append(list);
-    const desktop = informationalCard(
-      "Desktop Workspace Management",
-      "Desktop RepoPrompt can select arbitrary local folders and manage window workspaces. A browser cannot safely mirror those local filesystem operations on the server.",
-      [
-        [
-          "Auto-restore",
-          "Desktop-only",
-          "Restores local windows and workspace state.",
-        ],
-        [
-          "Global storage / duplicate cleanup",
-          "Desktop-only",
-          "Manages the local workspace database.",
-        ],
-        [
-          "Create workspace / add folders",
-          "Operator-provisioned here",
-          "Server project roots are configured outside the portal.",
-        ],
-        [
-          "Switch / rename / hide / delete",
-          "No portal mutation API",
-          "The portal consumes project snapshots but does not own their lifecycle.",
-        ],
-        [
-          "Session worktrees",
-          "Per-session runtime API",
-          "Worktree behavior is selected when agents run; the removed portal defaults were never consumed.",
-        ],
-      ],
-    );
+    cards.push(card);
     settingsPage(
       "Manage Workspaces",
-      "Review live shared projects and the desktop-only local-workspace boundary.",
+      "Create and manage projects available to Agent Mode.",
       "folder",
-      [card, desktop],
+      cards,
     );
   }
 
@@ -6479,22 +6556,21 @@
     const project = selectedProject();
     const session = selectedSession();
     if (!project || !snapshot) {
-      const boundary = informationalCard(
-        "No Active Server Project",
-        "Selection presets are project-scoped and cannot be edited without an operator-provisioned project.",
-        [["Project lifecycle", "Operator / deployment boundary"]],
+      const empty = desktopCard(
+        "No Active Project",
+        "Choose a project before managing its selection presets.",
       );
       settingsPage(
         "Manage Presets",
         "Manage named file-selection presets for the active server project.",
         "listStar",
-        [boundary],
+        [empty],
       );
       return;
     }
     const card = desktopCard(
       `${project.name} Selection Presets`,
-      "Named presets capture logical root-confined selections. Apply and capture fence both the collection revision and live session selection revision.",
+      "Save and reuse file selections for this project.",
     );
     const list = element("div", "selection-preset-list");
     function orderedIDsWithMove(presetID, delta) {
@@ -6759,7 +6835,7 @@
 
   function liveRouteDetail(target) {
     if (target === "oracle" || target === "contextBuilder") {
-      return "Fail-closed when unassigned. Live-read from the typed Agent Models store.";
+      return "Must be assigned before it can run.";
     }
     return "Empty tracks the recommendation. An explicit pick stays stored.";
   }
@@ -6843,7 +6919,7 @@
     content.replaceChildren(
       pageHeader(
         "Agent Mode",
-        "Oracle reasons, Context Builder gathers files, and agents do the work. Each row links to the canonical page that owns the available server setting.",
+        "Oracle reasons, Context Builder gathers files, and agents do the work. Each row links to the page that owns those settings.",
         "agent",
       ),
     );
@@ -6860,7 +6936,7 @@
     const connected = mainCLIProviders.filter(isConnectedProvider);
     const routes = desktopCard(
       "Agent Setup",
-      "Canonical destinations and live shared-server status.",
+      "Configuration and connection status.",
     );
     function routeRow(title, detail, route, statusText) {
       const link = element("a", "overview-route-row");
@@ -6877,7 +6953,7 @@
     }
     routeRow(
       "Agent Models",
-      "Typed global/project routes plus server profile 202_608 recommendations.",
+      "Models for Oracle, Context Builder, and agent roles.",
       "agent-models",
       liveAgentModelsStatus(),
     );
@@ -6895,20 +6971,20 @@
     );
     routeRow(
       "Agent Workflows",
-      "Built-in and custom workflow catalog advertised by the server.",
+      "Built-in and custom workflows.",
       "agent-workflows",
       `${state.typedSettings.workflows?.workflows?.length || 0} managed`,
     );
     routeRow(
       "Agent Permissions",
-      "Typed Direct Agents plus Safe Managed, Inherit, and Custom sub-agent policy.",
+      "Direct-agent and sub-agent permissions.",
       "agent-permissions",
       liveDirectAgentStatus(),
     );
     content.append(routes);
     const liveRoutes = desktopCard(
       "Live routing",
-      "Effective Oracle, Context Builder, and role defaults from the typed Agent Models store.",
+      "Current model choices for Oracle, Context Builder, and agent roles.",
     );
     [
       ["oracle", "Oracle"],
@@ -6930,7 +7006,7 @@
 
     const livePermissions = desktopCard(
       "Live permissions",
-      "Effective Direct Agents and Sub-Agents policy from the typed permission store.",
+      "Current direct-agent and sub-agent permission policy.",
     );
     const permissionSettings =
       state.typedSettings.directAgentPermissions?.settings;
@@ -6964,7 +7040,7 @@
       [
         "Sub-Agents",
         liveSubagentStatus(),
-        "Safe Managed, Inherit, or Custom frozen into child sessions.",
+        "Safe Managed, Inherit, or Custom for new child sessions.",
       ],
     ].forEach(([title, status, detail]) => {
       livePermissions.append(
@@ -6975,7 +7051,7 @@
 
     const providerCard = desktopCard(
       "CLI Provider Status",
-      "The desktop overview summarizes every CLI provider in one place.",
+      "Installed and connected CLI providers.",
     );
     const providerList = element("div", "provider-status-list");
     mainCLIProviders.forEach((provider) => {
@@ -6999,48 +7075,6 @@
     providerCard.append(providerList);
     content.append(providerCard);
 
-    const defaults = desktopCard(
-      "Portal Session Default",
-      "Thin-client fallback for providers with no typed Direct Agents profile. Typed Codex, Claude, OpenCode, and Cursor permissions win.",
-    );
-    defaults.append(
-      selectSetting(
-        "serverDefaultExecutionMode",
-        "Execution Mode",
-        "Session default only when no typed permission profile applies.",
-        [
-          ["readOnly", "Read Only"],
-          ["workspaceWrite", "Workspace Write"],
-          ["fullAccess", "Full Access"],
-        ],
-        "workspaceWrite",
-      ),
-    );
-    content.append(defaults);
-
-    content.append(
-      informationalCard(
-        "Desktop-Only Overview Behaviors",
-        "These controls depend on desktop window/provider-conversation features that the portal session API does not implement.",
-        [
-          [
-            "Show chats created by MCP tools",
-            "Desktop Compose only",
-            "Controls visibility of local app chats before an agent runs.",
-          ],
-          [
-            "Provider Conversation Cleanup",
-            "Archive / Delete",
-            "Runs when desktop Agent Mode sessions are removed; portal deletion has no equivalent provider-conversation contract.",
-          ],
-          [
-            "Handoff Instructions",
-            "Multiline Save / Clear",
-            "App-wide text appended by the desktop titlebar Handoff action; the portal has no Handoff action.",
-          ],
-        ],
-      ),
-    );
     installIcons(content);
   }
 
@@ -7586,7 +7620,7 @@
       unavailable.append(
         iconNode("info"),
         document.createTextNode(
-          "No browser-manageable authentication operation is advertised. Configure this provider in its isolated server account.",
+          "No browser sign-in is available for this provider. Sign in with its CLI for the RepoPrompt service account.",
         ),
       );
       section.append(unavailable);
@@ -8273,6 +8307,8 @@
     else if (action === "agent-resume") submitAgentAction("resume");
     else if (action === "agent-retry") submitAgentAction("retry");
     else if (action === "agent-cancel") submitAgentAction("cancel");
+    else if (action === "agent-archive")
+      requestArchiveSession(event.target.closest("[data-action]"));
     else if (action === "load-earlier") {
       const pageToken =
         state.agent.transcriptPage?.presentation?.nextPageToken;

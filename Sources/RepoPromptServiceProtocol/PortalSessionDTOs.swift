@@ -6,17 +6,93 @@ public struct PortalProjectSummary: Codable, Hashable, Sendable {
     public let name: String
     public let state: ProjectLifecycleState
     public let rootNames: [String]
+    public let revision: Int64
 
-    public init(projectID: UUID, name: String, state: ProjectLifecycleState, rootNames: [String]) {
+    public init(projectID: UUID, name: String, state: ProjectLifecycleState, rootNames: [String], revision: Int64) {
         self.projectID = projectID
         self.name = name
         self.state = state
         self.rootNames = rootNames
+        self.revision = revision
     }
 
     private enum CodingKeys: String, CodingKey {
         case projectID = "projectId"
-        case name, state, rootNames
+        case name, state, rootNames, revision
+    }
+}
+
+public struct PortalCreateProjectRequest: Codable, Hashable, Sendable {
+    public let operationID: UUID
+    public let name: String
+    public let logicalName: String
+    public let remote: String
+    public let ref: String
+
+    public init(operationID: UUID, name: String, logicalName: String, remote: String, ref: String) {
+        self.operationID = operationID
+        self.name = name
+        self.logicalName = logicalName
+        self.remote = remote
+        self.ref = ref
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case operationID = "operationId"
+        case name, logicalName, remote, ref
+    }
+}
+
+public struct PortalAddProjectRepositoryRequest: Codable, Hashable, Sendable {
+    public let operationID: UUID
+    public let expectedRevision: Int64
+    public let logicalName: String
+    public let remote: String
+    public let ref: String
+
+    public init(operationID: UUID, expectedRevision: Int64, logicalName: String, remote: String, ref: String) {
+        self.operationID = operationID
+        self.expectedRevision = expectedRevision
+        self.logicalName = logicalName
+        self.remote = remote
+        self.ref = ref
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case operationID = "operationId"
+        case expectedRevision, logicalName, remote, ref
+    }
+}
+
+public struct PortalRenameProjectRequest: Codable, Hashable, Sendable {
+    public let operationID: UUID
+    public let expectedRevision: Int64
+    public let name: String
+
+    public init(operationID: UUID, expectedRevision: Int64, name: String) {
+        self.operationID = operationID
+        self.expectedRevision = expectedRevision
+        self.name = name
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case operationID = "operationId"
+        case expectedRevision, name
+    }
+}
+
+public struct PortalRemoveProjectRequest: Codable, Hashable, Sendable {
+    public let operationID: UUID
+    public let expectedRevision: Int64
+
+    public init(operationID: UUID, expectedRevision: Int64) {
+        self.operationID = operationID
+        self.expectedRevision = expectedRevision
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case operationID = "operationId"
+        case expectedRevision
     }
 }
 
@@ -149,6 +225,7 @@ public struct PortalBootstrapResponse: Codable, Sendable {
     public let tools: [PortalToolSummary]
     public let workflowRepositoryRevision: Int64
     public let includeSessionCleanupGuidance: Bool
+    public let projectSources: ProjectSourceCapabilities?
 
     public init(
         projects: [PortalProjectSummary],
@@ -156,7 +233,8 @@ public struct PortalBootstrapResponse: Codable, Sendable {
         workflows: [PortalWorkflowSummary],
         tools: [PortalToolSummary] = [],
         workflowRepositoryRevision: Int64 = 0,
-        includeSessionCleanupGuidance: Bool = true
+        includeSessionCleanupGuidance: Bool = true,
+        projectSources: ProjectSourceCapabilities? = nil
     ) {
         self.projects = projects
         self.sessions = sessions
@@ -164,10 +242,11 @@ public struct PortalBootstrapResponse: Codable, Sendable {
         self.tools = tools
         self.workflowRepositoryRevision = workflowRepositoryRevision
         self.includeSessionCleanupGuidance = includeSessionCleanupGuidance
+        self.projectSources = projectSources
     }
 
     private enum CodingKeys: String, CodingKey {
-        case projects, sessions, workflows, tools, workflowRepositoryRevision, includeSessionCleanupGuidance
+        case projects, sessions, workflows, tools, workflowRepositoryRevision, includeSessionCleanupGuidance, projectSources
     }
 
     public init(from decoder: Decoder) throws {
@@ -178,6 +257,7 @@ public struct PortalBootstrapResponse: Codable, Sendable {
         tools = try container.decodeIfPresent([PortalToolSummary].self, forKey: .tools) ?? []
         workflowRepositoryRevision = try container.decodeIfPresent(Int64.self, forKey: .workflowRepositoryRevision) ?? 0
         includeSessionCleanupGuidance = try container.decodeIfPresent(Bool.self, forKey: .includeSessionCleanupGuidance) ?? true
+        projectSources = try container.decodeIfPresent(ProjectSourceCapabilities.self, forKey: .projectSources)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -188,6 +268,7 @@ public struct PortalBootstrapResponse: Codable, Sendable {
         try container.encode(tools, forKey: .tools)
         try container.encode(workflowRepositoryRevision, forKey: .workflowRepositoryRevision)
         try container.encode(includeSessionCleanupGuidance, forKey: .includeSessionCleanupGuidance)
+        try container.encodeIfPresent(projectSources, forKey: .projectSources)
     }
 }
 
@@ -355,12 +436,15 @@ public struct PortalInteractionAnswerRequest: Codable, Hashable, Sendable {
 
 public struct PortalSessionActionRequest: Codable, Hashable, Sendable {
     public let operationID: UUID
+    public let expectedRevision: Int64?
 
-    public init(operationID: UUID) {
+    public init(operationID: UUID, expectedRevision: Int64? = nil) {
         self.operationID = operationID
+        self.expectedRevision = expectedRevision
     }
 
     private enum CodingKeys: String, CodingKey {
         case operationID = "operationId"
+        case expectedRevision
     }
 }

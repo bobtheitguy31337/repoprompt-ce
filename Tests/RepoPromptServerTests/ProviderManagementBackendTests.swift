@@ -640,7 +640,7 @@ final class ProviderManagementBackendTests: XCTestCase {
             XCTAssertEqual(error.code, .dependencyUnavailable)
             XCTAssertEqual(
                 error.message,
-                "Claude Code is not authenticated; run 'claude login' in the dedicated server account"
+                "Claude Code is not authenticated; run 'claude login' for the RepoPrompt service account"
             )
         }
         let stored = try await store.providerConnections()
