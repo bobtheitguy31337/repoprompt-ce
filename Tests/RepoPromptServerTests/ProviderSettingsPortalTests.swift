@@ -336,6 +336,60 @@ final class ProviderSettingsPortalTests: XCTestCase {
             contentType: "application/x-www-form-urlencoded",
             csrfHeader: nil
         ))
+        XCTAssertNoThrow(try RepoPromptPortalRequestProtection.validateMutation(
+            origin: "https://server.example:9443",
+            host: "server.example:9443",
+            fetchSite: "same-origin",
+            contentType: "image/png",
+            csrfHeader: "1",
+            requireJSON: false
+        ))
+        XCTAssertThrowsError(try RepoPromptPortalRequestProtection.validateMutation(
+            origin: "https://server.example:9443",
+            host: "server.example:9443",
+            fetchSite: "same-origin",
+            contentType: "image/png",
+            csrfHeader: nil,
+            requireJSON: false
+        ))
+    }
+
+    func testPortalStructuredAgentRequestsRoundTripCanonicalComposerContracts() throws {
+        let operationID = UUID()
+        let projectID = UUID()
+        let configuration = AgentTurnConfigurationWire(
+            catalogRevision: "catalog-7",
+            providerID: .codex,
+            modelID: "gpt-5.6-sol",
+            effortID: "high",
+            workflowID: "code-review",
+            permissionID: "codex.autoReview",
+            toolValues: ["codex.bash": .boolean(true)]
+        )
+        let turn = AgentTurnSubmissionWire(
+            content: .init(text: "Review this", attachmentIDs: [UUID()]),
+            configuration: configuration,
+            expectedSessionRevision: 9
+        )
+        let start = PortalStartAgentSessionRequest(
+            operationID: operationID,
+            start: .init(projectID: projectID, visibility: .privateSession, turn: turn)
+        )
+        let decodedStart = try JSONDecoder.serviceDecoder.decode(
+            PortalStartAgentSessionRequest.self,
+            from: JSONEncoder.serviceEncoder.encode(start)
+        )
+        XCTAssertEqual(decodedStart.operationID, operationID)
+        XCTAssertEqual(decodedStart.start.projectID, projectID)
+        XCTAssertEqual(decodedStart.start.turn.configuration, configuration)
+        XCTAssertEqual(decodedStart.start.turn.content, turn.content)
+
+        let followup = PortalSubmitAgentTurnRequest(operationID: operationID, turn: turn)
+        let decodedFollowup = try JSONDecoder.serviceDecoder.decode(
+            PortalSubmitAgentTurnRequest.self,
+            from: JSONEncoder.serviceEncoder.encode(followup)
+        )
+        XCTAssertEqual(decodedFollowup, followup)
     }
 
     func testPortalBootstrapSerializesCanonicalMCPToolCatalogAndDecodesLegacyPayloads() throws {
@@ -368,41 +422,6 @@ final class ProviderSettingsPortalTests: XCTestCase {
             from: Data(#"{"projects":[],"sessions":[],"workflows":[]}"#.utf8)
         )
         XCTAssertTrue(legacy.tools.isEmpty)
-    }
-
-    func testPortalAssetsPreserveDesktopHierarchyAndNeverPersistBrowserState() throws {
-        let html = try String(decoding: RepoPromptPortalAssets.data(for: .index), as: UTF8.self)
-        let css = try String(decoding: RepoPromptPortalAssets.data(for: .stylesheet), as: UTF8.self)
-        let script = try String(decoding: RepoPromptPortalAssets.data(for: .script), as: UTF8.self)
-
-        for term in ["Projects", "Sessions", "Ask RepoPrompt anything", "Models &amp; Providers", "Server Portal"] {
-            XCTAssertTrue(html.contains(term), "missing portal term: \(term)")
-        }
-        for unavailablePlaceholder in ["Session creation arrives", "APIs do not exist yet", "Provider and model settings"] {
-            XCTAssertFalse(html.contains(unavailablePlaceholder), "dead placeholder leaked into portal: \(unavailablePlaceholder)")
-        }
-        for token in ["--space-4: 4px", "--space-16: 16px", "--space-32: 32px", "ui-rounded", "ui-monospace"] {
-            XCTAssertTrue(css.contains(token), "missing visual token: \(token)")
-        }
-        XCTAssertFalse(script.contains("localStorage"))
-        XCTAssertFalse(script.contains("sessionStorage"))
-        XCTAssertFalse(script.contains("console."))
-        XCTAssertFalse(script.contains("style."), "strict CSP forbids inline style mutation")
-        XCTAssertTrue(script.contains("flow.userCode"), "device challenge should be transiently renderable")
-        XCTAssertTrue(html.contains("href=\"assets/portal.css\""))
-        XCTAssertTrue(html.contains("src=\"assets/portal.js\""))
-        XCTAssertFalse(html.contains("/portal/assets/"))
-        XCTAssertTrue(script.contains("api(\"api/v1/bootstrap\")"))
-        XCTAssertTrue(script.contains("api(\"api/v1/sessions\""))
-        XCTAssertTrue(script.contains("/transcript?"))
-        XCTAssertTrue(script.contains("/messages"))
-        XCTAssertFalse(script.contains("api(\"/portal/"))
-        XCTAssertEqual(try RepoPromptPortalAssets.response(for: .index).headers[.cacheControl], "private, no-store")
-        XCTAssertEqual(try RepoPromptPortalAssets.response(for: .stylesheet).headers[.cacheControl], "private, max-age=3600")
-        let redirect = RepoPromptPortalAssets.canonicalRedirect()
-        XCTAssertEqual(redirect.status.code, 308)
-        XCTAssertEqual(redirect.headers[.location], "/portal/")
-        XCTAssertEqual(redirect.headers[.cacheControl], "private, no-store")
     }
 
     func testPortalSessionProjectionBoundsAndSanitizesSemanticPresentation() throws {

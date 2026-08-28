@@ -2186,8 +2186,6 @@ input:disabled {
 .agent-detail-toolbar,
 .session-title-cluster,
 .session-metadata,
-.composer-footer,
-.new-session-options,
 .auth-choice {
   display: flex;
   align-items: center;
@@ -2787,18 +2785,96 @@ input:disabled {
 
 .composer-shell {
   width: min(calc(100% - 32px), 820px);
-  margin: 0 auto 16px;
-  padding: 9px 10px 8px;
+  margin: 0 auto 10px;
+}
+
+.composer-bubble {
+  padding: 8px 12px;
   border: 0.5px solid var(--border);
-  border-radius: 15px;
+  border-radius: 18px;
   background: var(--bg-control-strong);
   box-shadow: var(--shadow-card);
 }
 
+.composer-pills-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 0 12px 7px;
+  scrollbar-width: none;
+}
+
+.composer-pills-row::-webkit-scrollbar,
+.composer-chip-rail::-webkit-scrollbar {
+  display: none;
+}
+
+.composer-notice {
+  margin: 0 12px 8px;
+  padding: 9px 11px;
+  border: 0.5px solid color-mix(in srgb, var(--danger) 42%, var(--border));
+  border-radius: 10px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--danger) 9%, var(--bg-control));
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.composer-notice[hidden] {
+  display: none;
+}
+
+.composer-pill-menu,
+.composer-chip-menu {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.composer-pill-menu summary,
+.composer-chip-menu summary,
+.composer-status-pill {
+  min-height: 26px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  max-width: 250px;
+  padding: 4px 9px;
+  overflow: hidden;
+  border: 0.5px solid var(--separator);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--bg-control) 90%, transparent);
+  font-size: 10px;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: default;
+  list-style: none;
+}
+
+.composer-pill-menu summary::-webkit-details-marker,
+.composer-chip-menu summary::-webkit-details-marker {
+  display: none;
+}
+
+.composer-pill-menu[open] summary,
+.composer-chip-menu[open] summary {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+.composer-status-pill.mcp {
+  border: 0;
+  color: #c66a16;
+  background: rgb(198 106 22 / 10%);
+}
+
 .composer-context-usage {
   display: flex;
-  justify-content: flex-end;
-  padding: 0 4px 4px;
+  flex: 0 0 auto;
+  padding: 0 2px;
 }
 
 .composer-context-usage[hidden] {
@@ -2857,50 +2933,178 @@ input:disabled {
 
 .composer-shell textarea {
   width: 100%;
-  min-height: 62px;
+  min-height: 38px;
   max-height: 180px;
-  padding: 5px 6px;
-  resize: vertical;
+  box-sizing: border-box;
+  padding: 7px 5px 5px;
+  resize: none;
+  field-sizing: content;
   border: 0;
   outline: 0;
   color: var(--text);
   background: transparent;
 }
 
-.new-session-options {
-  align-items: end;
-  gap: 8px;
-  padding: 2px 3px 8px;
-  border-bottom: 0.5px solid var(--separator);
+.composer-divider {
+  height: 0.5px;
+  margin: 3px 0 2px;
+  background: var(--separator);
 }
 
-.new-session-options label {
-  min-width: 140px;
-  display: grid;
+.composer-control-strip {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: nowrap;
+  gap: 10px;
+  min-height: 38px;
+}
+
+.composer-chip-rail {
+  min-width: 0;
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 7px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+#composer-workflow-menu > summary { anchor-name: --composer-workflow-anchor; }
+#composer-provider-model-menu > summary { anchor-name: --composer-provider-model-anchor; }
+#composer-effort-menu > summary { anchor-name: --composer-effort-anchor; }
+#composer-tools-menu > summary { anchor-name: --composer-tools-anchor; }
+#composer-permission-menu > summary { anchor-name: --composer-permission-anchor; }
+#composer-workflow-menu > .composer-popover { position-anchor: --composer-workflow-anchor; }
+#composer-provider-model-menu > .composer-popover { position-anchor: --composer-provider-model-anchor; }
+#composer-effort-menu > .composer-popover { position-anchor: --composer-effort-anchor; }
+#composer-tools-menu > .composer-popover { position-anchor: --composer-tools-anchor; }
+#composer-permission-menu > .composer-popover { position-anchor: --composer-permission-anchor; }
+
+.composer-popover {
+  position: fixed;
+  inset: auto auto calc(anchor(top) + 7px) anchor(left);
+  position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+  z-index: 30;
+  margin: 0;
+  box-sizing: border-box;
+  min-width: 190px;
+  max-width: min(360px, calc(100vw - 32px));
+  max-height: 300px;
   gap: 3px;
+  overflow: auto;
+  padding: 7px;
+  border: 0.5px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-control-strong);
+  box-shadow: var(--shadow-card);
+}
+
+.composer-popover[popover]:not(:popover-open) { display: none; }
+.composer-popover[popover]:popover-open { display: grid; }
+.composer-model-popover { min-width: 260px; }
+.composer-tools-popover { min-width: 270px; }
+
+.composer-popover-group {
+  padding: 6px 7px 3px;
+  color: var(--text-tertiary);
+  font-size: 9px;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+.composer-option-button {
+  width: 100%;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text);
+  background: transparent;
+  text-align: left;
+}
+
+.composer-option-button:hover,
+.composer-option-button.selected { background: var(--accent-soft); }
+.composer-option-button.selected::after { content: "✓"; color: var(--accent); }
+.composer-option-button:disabled { opacity: 0.5; }
+
+.composer-tools-popover label {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 8px;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.composer-tools-popover select { min-width: 120px; max-width: 190px; }
+
+.composer-fixed-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.composer-icon-button,
+.composer-send-button {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+}
+
+.composer-icon-button {
   color: var(--text-secondary);
+  background: transparent;
+}
+
+.composer-attachment-strip {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 2px 3px 5px;
+}
+
+.composer-attachment-strip[hidden] { display: none; }
+
+.composer-attachment-chip {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 230px;
+  padding: 4px 6px 4px 9px;
+  border: 0.5px solid var(--separator);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  background: var(--bg-control);
   font-size: 10px;
 }
 
-.new-session-options select {
-  min-height: 28px;
-  padding: 2px 26px 2px 8px;
-  border: 0.5px solid var(--border);
-  border-radius: 6px;
-  color: var(--text);
-  background: var(--bg-control);
+.composer-attachment-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.new-session-options .field-help {
-  flex: 1;
-  margin-bottom: 4px;
-}
-
-.composer-footer {
-  justify-content: space-between;
-  gap: 12px;
-  min-height: 28px;
-  padding: 2px 3px 0 6px;
+.composer-attachment-chip button {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 50%;
+  color: var(--text-tertiary);
+  background: transparent;
 }
 
 .composer-message {
@@ -2909,15 +3113,14 @@ input:disabled {
 }
 
 .composer-send-button {
-  width: 28px;
-  height: 28px;
-  display: grid;
-  place-items: center;
-  border-radius: 50%;
   color: #fff;
   background: var(--accent);
 }
 
+.composer-send-button[data-mode="cancel"] { background: var(--danger); }
+
+.composer-icon-button [data-icon],
+.composer-icon-button svg,
 .composer-send-button [data-icon],
 .composer-send-button svg {
   width: 14px;
@@ -3000,14 +3203,6 @@ input:disabled {
     display: none;
   }
 
-  .new-session-options {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .new-session-options label {
-    width: 100%;
-  }
 }
 
 .typed-settings-form,

@@ -245,68 +245,121 @@
           </div>
 
           <form id="composer-form" class="composer-shell" data-agent-composer>
-            <div
-              id="composer-context-usage"
-              class="composer-context-usage"
-              hidden
-            >
-              <div
-                id="composer-context-usage-ring"
-                class="context-usage-ring"
-                role="meter"
-                aria-label="Context usage"
-                aria-valuemin="0"
-                aria-valuemax="100"
-                aria-valuenow="0"
-              >
-                <svg viewBox="0 0 18 18" aria-hidden="true">
-                  <circle class="context-usage-track" cx="9" cy="9" r="7"></circle>
-                  <circle
-                    id="composer-context-usage-progress"
-                    class="context-usage-progress"
-                    cx="9"
-                    cy="9"
-                    r="7"
-                  ></circle>
-                </svg>
-                <span id="composer-context-usage-percent">0</span>
+            <div class="composer-pills-row" aria-label="Composer context">
+              <details id="composer-workflow-menu" class="composer-pill-menu">
+                <summary id="composer-workflow-summary">Workflow · None</summary>
+                <div
+                  id="composer-workflow-options"
+                  class="composer-popover"
+                  role="menu"
+                ></div>
+              </details>
+              <span id="composer-mcp-pill" class="composer-status-pill mcp" hidden>MCP</span>
+              <div id="composer-context-usage" class="composer-context-usage" hidden>
+                <div
+                  id="composer-context-usage-ring"
+                  class="context-usage-ring"
+                  role="meter"
+                  aria-label="Context usage"
+                  aria-valuemin="0"
+                  aria-valuemax="100"
+                  aria-valuenow="0"
+                >
+                  <svg viewBox="0 0 18 18" aria-hidden="true">
+                    <circle class="context-usage-track" cx="9" cy="9" r="7"></circle>
+                    <circle
+                      id="composer-context-usage-progress"
+                      class="context-usage-progress"
+                      cx="9"
+                      cy="9"
+                      r="7"
+                    ></circle>
+                  </svg>
+                  <span id="composer-context-usage-percent">0</span>
+                </div>
               </div>
             </div>
-            <div id="new-session-options" class="new-session-options" hidden>
-              <label>
-                Provider
-                <select id="composer-provider" name="providerId"></select>
-              </label>
-              <label>
-                Model
-                <select id="composer-model" name="model"></select>
-              </label>
-              <span id="composer-capability-help" class="field-help"></span>
+            <div id="composer-notice" class="composer-notice" role="status" hidden></div>
+            <div class="composer-bubble">
+              <div
+                id="composer-attachments"
+                class="composer-attachment-strip"
+                aria-label="Selected attachments"
+                hidden
+              ></div>
+              <label class="sr-only" for="composer-text">Message</label>
+              <textarea
+                id="composer-text"
+                name="message"
+                rows="1"
+                maxlength="64000"
+                placeholder="Ask RepoPrompt anything…"
+              ></textarea>
+              <div class="composer-divider"></div>
+              <div class="composer-control-strip">
+                <div class="composer-chip-rail" aria-label="Composer controls">
+                  <details id="composer-provider-model-menu" class="composer-chip-menu">
+                    <summary id="composer-provider-model-summary">Provider · Model</summary>
+                    <div
+                      id="composer-provider-model-options"
+                      class="composer-popover composer-model-popover"
+                      role="menu"
+                    ></div>
+                  </details>
+                  <details id="composer-effort-menu" class="composer-chip-menu" hidden>
+                    <summary id="composer-effort-summary">Effort</summary>
+                    <div
+                      id="composer-effort-options"
+                      class="composer-popover"
+                      role="menu"
+                    ></div>
+                  </details>
+                  <details id="composer-tools-menu" class="composer-chip-menu" hidden>
+                    <summary>Tools</summary>
+                    <div
+                      id="composer-tools"
+                      class="composer-popover composer-tools-popover"
+                      aria-label="Provider tools"
+                    ></div>
+                  </details>
+                  <details id="composer-permission-menu" class="composer-chip-menu" hidden>
+                    <summary id="composer-permission-summary">Permissions</summary>
+                    <div
+                      id="composer-permission-options"
+                      class="composer-popover"
+                      role="menu"
+                    ></div>
+                  </details>
+                </div>
+                <div class="composer-fixed-actions">
+                  <input
+                    id="composer-attachment-input"
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp"
+                    multiple
+                    hidden
+                  />
+                  <button
+                    id="composer-attach"
+                    class="composer-icon-button"
+                    type="button"
+                    data-action="attach-composer-images"
+                    data-icon="attach"
+                    aria-label="Attach images"
+                  ></button>
+                  <button
+                    id="composer-submit"
+                    class="composer-send-button"
+                    type="submit"
+                    data-icon="send"
+                    aria-label="Send message"
+                  ></button>
+                </div>
+              </div>
             </div>
-            <label class="sr-only" for="composer-text">Message</label>
-            <textarea
-              id="composer-text"
-              name="message"
-              rows="3"
-              maxlength="64000"
-              placeholder="Ask RepoPrompt anything…"
-            ></textarea>
-            <div class="composer-footer">
-              <span
-                id="composer-message"
-                class="composer-message"
-                role="status"
-              >
-                Select a session or start a new chat.
-              </span>
-              <button
-                id="composer-submit"
-                class="composer-send-button"
-                type="submit"
-                data-icon="send"
-                aria-label="Send message"
-              ></button>
-            </div>
+            <span id="composer-message" class="sr-only" role="status">
+              Select a session or start a new chat.
+            </span>
           </form>
         </section>
       </main>
@@ -407,7 +460,7 @@
                 data-route="portal-appearance"
                 data-route-link
                 data-icon="appearance"
-                >Portal Appearance</a
+                >Appearance</a
               >
               <a
                 href="#settings/advanced"

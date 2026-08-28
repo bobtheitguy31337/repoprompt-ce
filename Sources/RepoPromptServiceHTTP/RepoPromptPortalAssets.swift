@@ -68,7 +68,8 @@ enum RepoPromptPortalRequestProtection {
         host: String?,
         fetchSite: String?,
         contentType: String?,
-        csrfHeader: String?
+        csrfHeader: String?,
+        requireJSON: Bool = true
     ) throws {
         guard let host, !host.isEmpty,
               origin == "https://\(host)"
@@ -78,10 +79,13 @@ enum RepoPromptPortalRequestProtection {
         if let fetchSite, fetchSite.lowercased() != "same-origin" {
             throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Cross-site portal mutation is not allowed")
         }
-        guard contentType?.lowercased().split(separator: ";", maxSplits: 1).first?.trimmingCharacters(in: .whitespaces) == "application/json",
-              csrfHeader == "1"
-        else {
+        guard csrfHeader == "1" else {
             throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Portal mutation headers are invalid")
+        }
+        if requireJSON {
+            guard contentType?.lowercased().split(separator: ";", maxSplits: 1).first?.trimmingCharacters(in: .whitespaces) == "application/json" else {
+                throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Portal mutation headers are invalid")
+            }
         }
     }
 }

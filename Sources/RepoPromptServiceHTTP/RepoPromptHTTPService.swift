@@ -121,6 +121,88 @@ public struct RepoPromptHTTPService: Sendable {
             let bootstrap = try await portalBootstrap(principal: principal)
             return try portalJSON(bootstrap)
         } }
+        router.get("/portal/api/v1/projects/:id/composer-catalog") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            _ = try await authority.projectSnapshot(projectID: projectID)
+            let catalog = try await requireComposerCatalog().snapshot(
+                context: .init(kind: .project, projectID: projectID, actorID: principal.actorID)
+            )
+            return try portalJSON(catalog)
+        } }
+        router.get("/portal/api/v1/sessions/:id/composer-catalog") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let snapshot = try await authority.authoritySessionSnapshot(sessionID: sessionID)
+            let activeRun = snapshot.activeRun.map { $0.endedAt == nil && $0.state == "running" } ?? false
+            let catalog = try await requireComposerCatalog().snapshot(
+                context: .init(
+                    kind: .session,
+                    projectID: snapshot.session.projectID,
+                    sessionID: sessionID,
+                    actorID: principal.actorID,
+                    activeRun: activeRun
+                )
+            )
+            return try portalJSON(catalog)
+        } }
+        router.post("/portal/api/v1/projects/:id/composer-attachments") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request, requireJSON: false)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            _ = try await authority.projectSnapshot(projectID: projectID)
+            let data = try await bodyData(request, maximumBytes: 10 * 1_024 * 1_024 + 64 * 1_024)
+            let upload = try composerAttachmentUpload(
+                data: data,
+                contentType: request.headers[.contentType],
+                fallbackDisplayName: String(request.uri.queryParameters["displayName"] ?? "image")
+            )
+            guard upload.displayName.utf8.count <= 256 else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Attachment display name exceeds its bound")
+            }
+            let attachment = try await requireComposerAttachments().stage(
+                data: upload.data,
+                displayName: upload.displayName,
+                declaredMediaType: upload.mediaType,
+                actorID: principal.actorID,
+                projectID: projectID
+            )
+            return try portalJSON(attachment, status: .created)
+        } }
+        router.get("/portal/api/v1/projects/:id/composer-attachments/:attachmentId/preview") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let attachmentID = try context.parameters.require("attachmentId", as: UUID.self)
+            let sessionID = request.uri.queryParameters["sessionId"].flatMap { UUID(uuidString: String($0)) }
+            if let sessionID {
+                let session = try await authority.sessionSnapshot(sessionID: sessionID)
+                guard session.projectID == projectID else {
+                    throw ServiceAPIError(code: .notFound, message: "Attachment is unavailable")
+                }
+            } else {
+                _ = try await authority.projectSnapshot(projectID: projectID)
+            }
+            let preview = try await requireComposerAttachments().preview(
+                attachmentID: attachmentID,
+                actorID: principal.actorID,
+                projectID: projectID,
+                visibleSessionID: sessionID
+            )
+            return portalBytes(preview.1, contentType: preview.0.mediaType)
+        } }
+        router.delete("/portal/api/v1/projects/:id/composer-attachments/:attachmentId") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let attachmentID = try context.parameters.require("attachmentId", as: UUID.self)
+            _ = try await authority.projectSnapshot(projectID: projectID)
+            try await requireComposerAttachments().delete(
+                attachmentID: attachmentID,
+                actorID: principal.actorID,
+                projectID: projectID
+            )
+            return portalEmpty()
+        } }
         router.get("/portal/api/v1/sessions/:id/presentation") { request, context in await portalRespond(request) {
             let principal = try await authenticatePortal(request: request, context: context)
             let sessionID = try context.parameters.require("id", as: UUID.self)
@@ -199,6 +281,83 @@ public struct RepoPromptHTTPService: Sendable {
                 RepoPromptPortalSessionProjection.project(snapshot, agentControl: control),
                 status: .accepted
             )
+        } }
+        router.post("/portal/api/v1/agent-sessions") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(PortalStartAgentSessionRequest.self, from: data)
+            guard input.start.visibility == .privateSession, input.start.selectedMessageContext == nil else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Portal Agent sessions must be private root sessions")
+            }
+            guard let provider = input.start.turn.configuration.providerID.runtimeKind else {
+                throw ServiceAPIError(code: .capabilityMissing, message: "Selected provider has no execution adapter")
+            }
+            _ = try await authority.projectSnapshot(projectID: input.start.projectID)
+            let shell = CreateSessionInput(
+                projectID: input.start.projectID,
+                provider: provider,
+                providerSettingsID: input.start.turn.configuration.providerID,
+                model: input.start.turn.configuration.modelID,
+                visibility: .privateSession,
+                startImmediately: false
+            )
+            let digest = CanonicalSigning.bodyDigest(data)
+            let accepted = try await authority.acceptStructuredSession(
+                input: shell,
+                coordinator: requireSubmissionCoordinator(),
+                actor: principal.externalActor,
+                publicSubmissionKey: input.operationID.uuidString.lowercased(),
+                requestDigest: digest,
+                submission: input.start.turn
+            )
+            try await requireSubmissionDispatchQueue().enqueue(
+                accepted,
+                actor: principal.externalActor,
+                requestDigest: digest
+            )
+            let session = try await authority.sessionSnapshot(sessionID: accepted.receipt.sessionID)
+            let control = try? await authority.agentSessionActionSnapshot(
+                sessionID: session.sessionID,
+                actor: principal.externalActor,
+                composerAvailable: composerCatalog != nil
+            )
+            return try portalJSON(
+                PortalAgentSubmissionReceipt(
+                    accepted.receipt,
+                    session: RepoPromptPortalSessionProjection.project(session, agentControl: control)
+                ),
+                status: .accepted
+            )
+        } }
+        router.post("/portal/api/v1/sessions/:id/turns") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(PortalSubmitAgentTurnRequest.self, from: data)
+            let digest = CanonicalSigning.bodyDigest(data)
+            let snapshot = try await authority.authoritySessionSnapshot(sessionID: sessionID)
+            try await authority.authorizeSessionCollaboration(
+                sessionID: sessionID,
+                actor: principal.externalActor,
+                operation: "submitTurn",
+                requestDigest: digest
+            )
+            let accepted = try await requireSubmissionCoordinator().acceptFollowup(
+                session: snapshot.session,
+                activeRun: snapshot.activeRun,
+                actor: principal.externalActor,
+                publicSubmissionKey: input.operationID.uuidString.lowercased(),
+                requestDigest: digest,
+                submission: input.turn
+            )
+            try await requireSubmissionDispatchQueue().enqueue(
+                accepted,
+                actor: principal.externalActor,
+                requestDigest: digest
+            )
+            return try portalJSON(PortalAgentSubmissionReceipt(accepted.receipt), status: .accepted)
         } }
         router.post("/portal/api/v1/sessions/:id/messages") { request, context in await portalRespond(request) {
             let principal = try await authenticatePortal(request: request, context: context)
@@ -1697,6 +1856,19 @@ public struct RepoPromptHTTPService: Sendable {
         return Response(status: status, headers: headers, body: .init(byteBuffer: ByteBuffer(bytes: data)))
     }
 
+    private func portalBytes(_ data: Data, contentType: String) -> Response {
+        var headers = RepoPromptPortalAssets.securityHeaders(contentType: contentType)
+        headers[.cacheControl] = "private, no-store"
+        headers[.contentLength] = String(data.count)
+        return Response(status: .ok, headers: headers, body: .init(byteBuffer: ByteBuffer(bytes: data)))
+    }
+
+    private func portalEmpty() -> Response {
+        var headers = RepoPromptPortalAssets.securityHeaders(contentType: "application/json; charset=utf-8")
+        headers[.cacheControl] = "private, no-store"
+        return Response(status: .noContent, headers: headers)
+    }
+
     private func portalError(_ error: Error) -> Response {
         let apiError = error as? ServiceAPIError ?? ServiceAPIError(code: .dependencyUnavailable, message: "Portal dependency failed", retryable: true)
         let status: HTTPResponse.Status = switch apiError.code {
@@ -1712,13 +1884,14 @@ public struct RepoPromptHTTPService: Sendable {
         return (try? portalJSON(apiError, status: status)) ?? Response(status: .internalServerError)
     }
 
-    private func validatePortalMutation(_ request: Request) throws {
+    private func validatePortalMutation(_ request: Request, requireJSON: Bool = true) throws {
         try RepoPromptPortalRequestProtection.validateMutation(
             origin: request.headers[.init("Origin")!],
             host: request.head.authority,
             fetchSite: request.headers[.init("Sec-Fetch-Site")!],
             contentType: request.headers[.contentType],
-            csrfHeader: request.headers[.init("X-RepoPrompt-Portal-CSRF")!]
+            csrfHeader: request.headers[.init("X-RepoPrompt-Portal-CSRF")!],
+            requireJSON: requireJSON
         )
     }
 

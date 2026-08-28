@@ -117,6 +117,13 @@
       selectionGeneration: 0,
       retryOperation: null,
       blockExpansion: new Map(),
+      composerCatalog: null,
+      composerCatalogKey: null,
+      composerCatalogPromise: null,
+      composerCatalogGeneration: 0,
+      composerStates: new Map(),
+      activeComposerKey: null,
+      attachmentPromise: null,
     },
   };
 
@@ -1602,6 +1609,7 @@
           },
         );
         await loadTranscript({ silent: true });
+        await loadComposerCatalog(true);
         toast(`${humanize(action)} accepted`);
       } catch (error) {
         toast(error.message, true);
@@ -1661,9 +1669,12 @@
         const index = state.bootstrap.sessions.findIndex(
           (item) => item.sessionId === sessionID,
         );
+        const previousRevision = index >= 0 ? state.bootstrap.sessions[index].revision : null;
         if (index >= 0) state.bootstrap.sessions[index] = page.session;
         renderSessions();
         renderAgentDetail();
+        if (previousRevision !== page.session.revision)
+          loadComposerCatalog(true);
         scheduleAgentPoll();
         return page;
       } catch (error) {
@@ -1716,86 +1727,381 @@
     }, delay);
   }
 
+  function composerDestination() {
+    const session = state.agent.newSessionMode ? null : selectedSession();
+    const projectID = session?.projectId || state.agent.selectedProjectID;
+    return {
+      key: session ? `session:${session.sessionId}` : `project:${projectID || "none"}`,
+      projectID,
+      session,
+    };
+  }
+
+  function activeComposerState() {
+    const destination = composerDestination();
+    const editor = document.getElementById("composer-text");
+    if (state.agent.activeComposerKey !== destination.key) {
+      const previous = state.agent.composerStates.get(state.agent.activeComposerKey);
+      if (previous && editor) previous.text = editor.value;
+      state.agent.activeComposerKey = destination.key;
+      if (!state.agent.composerStates.has(destination.key)) {
+        state.agent.composerStates.set(destination.key, {
+          text: "",
+          configuration: null,
+          attachments: [],
+          feedback: "",
+        });
+      }
+      if (editor) editor.value = state.agent.composerStates.get(destination.key).text;
+    }
+    return state.agent.composerStates.get(destination.key);
+  }
+
+  function defaultToolValues(group) {
+    return Object.fromEntries(
+      (group?.toolControls || []).map((control) => {
+        if (control.type === "toggle")
+          return [control.common.id, { type: "boolean", value: Boolean(control.value) }];
+        if (control.type === "singleChoice")
+          return [control.common.id, { type: "choice", value: control.selectedID }];
+        return [control.common.id, { type: "choices", value: control.selectedIDs || [] }];
+      }),
+    );
+  }
+
+  function initialComposerDraft(catalog) {
+    const selected = catalog?.selected;
+    const groups = catalog?.providerGroups || [];
+    const providerID = selected?.providerId || groups[0]?.providerId || "";
+    const group = groups.find((item) => item.providerId === providerID);
+    const modelID = selected?.modelId || group?.models?.find((item) => item.enabled !== false)?.id || "";
+    const model = group?.models?.find((item) => item.id === modelID);
+    return {
+      providerId: providerID,
+      modelId: modelID,
+      effortId: selected?.effortId ?? model?.defaultEffortID ?? null,
+      workflowId: selected?.workflowId ?? null,
+      permissionId: selected?.permissionId ?? group?.permissionControl?.selectedID ?? null,
+      toolValues: { ...defaultToolValues(group), ...(selected?.toolValues || {}) },
+    };
+  }
+
+  async function loadComposerCatalog(force = false) {
+    const destination = composerDestination();
+    if (!destination.projectID) return null;
+    if (!force && state.agent.composerCatalogKey === destination.key && state.agent.composerCatalog)
+      return state.agent.composerCatalog;
+    if (!force && state.agent.composerCatalogPromise && state.agent.composerCatalogKey === destination.key)
+      return state.agent.composerCatalogPromise;
+    const generation = ++state.agent.composerCatalogGeneration;
+    state.agent.composerCatalogKey = destination.key;
+    state.agent.composerCatalog = null;
+    const path = destination.session
+      ? `api/v1/sessions/${encodeURIComponent(destination.session.sessionId)}/composer-catalog`
+      : `api/v1/projects/${encodeURIComponent(destination.projectID)}/composer-catalog`;
+    const promise = api(path)
+      .then((catalog) => {
+        if (generation !== state.agent.composerCatalogGeneration || composerDestination().key !== destination.key)
+          return null;
+        state.agent.composerCatalog = catalog;
+        const composer = activeComposerState();
+        if (!composer.configuration) composer.configuration = initialComposerDraft(catalog);
+        composer.feedback = "";
+        renderAgentComposer();
+        return catalog;
+      })
+      .catch((error) => {
+        if (generation === state.agent.composerCatalogGeneration) {
+          activeComposerState().feedback = error.message;
+          renderAgentComposer();
+        }
+        return null;
+      })
+      .finally(() => {
+        if (state.agent.composerCatalogPromise === promise)
+          state.agent.composerCatalogPromise = null;
+      });
+    state.agent.composerCatalogPromise = promise;
+    renderAgentComposer();
+    return promise;
+  }
+
+  function composerOptionButton(label, selected, disabled, detail, onSelect) {
+    const button = element("button", `composer-option-button${selected ? " selected" : ""}`, label);
+    button.type = "button";
+    button.disabled = disabled;
+    button.setAttribute("role", "menuitemradio");
+    button.setAttribute("aria-checked", String(selected));
+    if (detail) button.title = detail;
+    button.addEventListener("click", () => {
+      onSelect();
+      state.agent.retryOperation = null;
+      button.closest("details").open = false;
+      renderAgentComposer();
+      document.getElementById("composer-text").focus({ preventScroll: true });
+    });
+    return button;
+  }
+
+  function renderComposerMenu(host, rows) {
+    host.replaceChildren(...rows);
+  }
+
+  function renderComposerTools(group, draft) {
+    const menu = document.getElementById("composer-tools-menu");
+    const host = document.getElementById("composer-tools");
+    host.replaceChildren();
+    (group?.toolControls || []).forEach((control) => {
+      const common = control.common;
+      if (control.type === "toggle") {
+        const current = draft.toolValues[common.id]?.value ?? Boolean(control.value);
+        const button = composerOptionButton(
+          common.displayName,
+          current,
+          common.mutable === false,
+          common.lockReasonCode || common.detailText || "",
+          () => { draft.toolValues[common.id] = { type: "boolean", value: !current }; },
+        );
+        button.setAttribute("role", "menuitemcheckbox");
+        host.append(button);
+        return;
+      }
+      const label = element("label", "", common.displayName);
+      const select = document.createElement("select");
+      const current = draft.toolValues[common.id]?.value ??
+        (control.type === "singleChoice" ? control.selectedID : control.selectedIDs || []);
+      if (control.type === "multiChoice") select.multiple = true;
+      (control.choices || []).forEach((choice) => {
+        const option = element("option", "", choice.displayName);
+        option.value = choice.id;
+        option.disabled = choice.enabled === false;
+        option.selected = control.type === "multiChoice" ? current.includes(choice.id) : current === choice.id;
+        select.append(option);
+      });
+      select.disabled = common.mutable === false;
+      select.addEventListener("change", () => {
+        draft.toolValues[common.id] = control.type === "multiChoice"
+          ? { type: "choices", value: Array.from(select.selectedOptions, (option) => option.value) }
+          : { type: "choice", value: select.value };
+        state.agent.retryOperation = null;
+      });
+      label.append(select);
+      host.append(label);
+    });
+    menu.hidden = !host.childElementCount;
+  }
+
+  function renderComposerAttachments(composer) {
+    const host = document.getElementById("composer-attachments");
+    host.replaceChildren();
+    composer.attachments.forEach((attachment) => {
+      const chip = element("span", "composer-attachment-chip");
+      chip.append(element("span", "", attachment.displayName || "Image"));
+      const remove = element("button", "", "×");
+      remove.type = "button";
+      remove.setAttribute("aria-label", `Remove ${attachment.displayName || "image"}`);
+      remove.addEventListener("click", () => removeComposerAttachment(attachment, remove));
+      chip.append(remove);
+      host.append(chip);
+    });
+    host.hidden = !composer.attachments.length;
+  }
+
+  async function stageComposerAttachments(files) {
+    if (state.agent.attachmentPromise || !files.length) return;
+    const destination = composerDestination();
+    const composer = activeComposerState();
+    const accepted = Array.from(files).slice(0, Math.max(0, 4 - composer.attachments.length));
+    if (!accepted.length) return toast("You can attach up to four images.", true);
+    state.agent.attachmentPromise = (async () => {
+      try {
+        for (const file of accepted) {
+          const attachment = await api(
+            `api/v1/projects/${encodeURIComponent(destination.projectID)}/composer-attachments?displayName=${encodeURIComponent(file.name || "image")}`,
+            {
+              method: "POST",
+              headers: { "Content-Type": file.type || "application/octet-stream" },
+              body: file,
+            },
+          );
+          composer.attachments.push(attachment);
+        }
+      } catch (error) {
+        toast(error.message, true);
+      } finally {
+        state.agent.attachmentPromise = null;
+        document.getElementById("composer-attachment-input").value = "";
+        renderAgentComposer();
+      }
+    })();
+    renderAgentComposer();
+    return state.agent.attachmentPromise;
+  }
+
+  async function removeComposerAttachment(attachment, button) {
+    if (state.agent.attachmentPromise) return;
+    const destination = composerDestination();
+    const composer = activeComposerState();
+    const attachmentID = attachment.attachmentId;
+    setDisabledReason(button, true, "Removing attachment…");
+    state.agent.attachmentPromise = api(
+      `api/v1/projects/${encodeURIComponent(destination.projectID)}/composer-attachments/${encodeURIComponent(attachmentID)}`,
+      { method: "DELETE", body: JSON.stringify({}) },
+    );
+    try {
+      await state.agent.attachmentPromise;
+      composer.attachments = composer.attachments.filter((item) => item.attachmentId !== attachmentID);
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      state.agent.attachmentPromise = null;
+      renderAgentComposer();
+    }
+  }
+
   function renderAgentComposer() {
     const form = document.getElementById("composer-form");
-    const options = document.getElementById("new-session-options");
-    const providerSelect = document.getElementById("composer-provider");
-    const modelSelect = document.getElementById("composer-model");
-    const help = document.getElementById("composer-capability-help");
     const text = document.getElementById("composer-text");
     const submit = document.getElementById("composer-submit");
-    options.hidden = !state.agent.newSessionMode;
-    const providers = eligibleSessionProviders();
-    const previousProvider = providerSelect.value;
-    const previousModel = modelSelect.value;
-    providerSelect.replaceChildren();
-    providers.forEach((provider) => {
-      const option = element("option", "", provider.displayName);
-      option.value = provider.providerID;
-      option.selected = provider.providerID === previousProvider;
-      providerSelect.append(option);
+    const attach = document.getElementById("composer-attach");
+    const composer = activeComposerState();
+    const destination = composerDestination();
+    const catalog = state.agent.composerCatalogKey === destination.key ? state.agent.composerCatalog : null;
+    if (!catalog && !state.agent.composerCatalogPromise && destination.projectID)
+      window.setTimeout(() => loadComposerCatalog(), 0);
+    if (state.agent.activeComposerKey === destination.key) composer.text = text.value;
+    if (catalog && !composer.configuration) composer.configuration = initialComposerDraft(catalog);
+    const draft = composer.configuration || initialComposerDraft(catalog);
+    const groups = catalog?.providerGroups || [];
+    const group = groups.find((item) => item.providerId === draft.providerId);
+    const model = group?.models?.find((item) => item.id === draft.modelId);
+
+    const providerRows = [];
+    groups.forEach((provider) => {
+      providerRows.push(element("span", "composer-popover-group", provider.displayName));
+      (provider.models || []).forEach((candidate) => {
+        providerRows.push(composerOptionButton(
+          `${provider.displayName} · ${candidate.displayName}`,
+          provider.providerId === draft.providerId && candidate.id === draft.modelId,
+          catalog?.locks?.model?.locked === true || candidate.enabled === false,
+          catalog?.locks?.model?.reasonText || candidate.description || "",
+          () => {
+            draft.providerId = provider.providerId;
+            draft.modelId = candidate.id;
+            draft.effortId = candidate.defaultEffortID || null;
+            draft.permissionId = provider.permissionControl?.selectedID || null;
+            draft.toolValues = defaultToolValues(provider);
+          },
+        ));
+      });
     });
-    const provider =
-      providers.find((item) => item.providerID === providerSelect.value) ||
-      providers[0];
-    modelSelect.replaceChildren();
-    const providerDefault = element("option", "", "Provider default");
-    providerDefault.value = "";
-    modelSelect.append(providerDefault);
-    (provider?.models || []).forEach((model) => {
-      const option = element("option", "", model.displayName);
-      option.value = model.id;
-      option.selected = previousModel
-        ? model.id === previousModel
-        : model.id === provider.preference?.defaultModel;
-      modelSelect.append(option);
-    });
-    const modelReason = !provider
-      ? "Connect and validate a CLI provider in Settings."
-      : !provider.capabilities.supportsModelSelection
-        ? "This provider uses its own default model."
-        : !(provider.models || []).length
-          ? "No sanitized model catalog is available for this account."
-          : "Model choices come from the live provider catalog.";
-    setDisabledReason(
-      modelSelect,
-      !provider?.capabilities.supportsModelSelection ||
-        !(provider?.models || []).length,
-      modelReason,
+    renderComposerMenu(document.getElementById("composer-provider-model-options"), providerRows);
+    document.getElementById("composer-provider-model-summary").textContent =
+      group && model ? `${group.displayName} · ${model.displayName}` : "Provider · Model";
+
+    const effortIDs = model?.supportedEffortIDs || [];
+    renderComposerMenu(
+      document.getElementById("composer-effort-options"),
+      [null, ...effortIDs].map((effortID) => composerOptionButton(
+        effortID ? humanize(effortID) : "Default",
+        (draft.effortId || null) === effortID,
+        catalog?.locks?.effort?.locked === true,
+        catalog?.locks?.effort?.reasonText || "",
+        () => { draft.effortId = effortID; },
+      )),
     );
-    help.textContent = modelReason;
-    const unavailable =
-      state.agent.newSessionMode && (!selectedProject() || !provider);
-    const session = selectedSession();
-    const control = session?.agentControl;
-    const messageAction = control?.steer?.allowed
-      ? control.steer
-      : control?.submitTurn;
-    const empty = !text.value.trim();
+    document.getElementById("composer-effort-menu").hidden = !effortIDs.length;
+    document.getElementById("composer-effort-summary").textContent =
+      `Effort · ${draft.effortId ? humanize(draft.effortId) : "Default"}`;
+
+    const workflows = (catalog?.workflows || []).filter((item) =>
+      ((item.enabled && item.visible) || item.id === draft.workflowId) &&
+      (!item.providerIDs?.length || item.providerIDs.includes(draft.providerId)),
+    );
+    renderComposerMenu(
+      document.getElementById("composer-workflow-options"),
+      [null, ...workflows].map((workflow) => composerOptionButton(
+        workflow?.displayName || "None",
+        (draft.workflowId || null) === (workflow?.id || null),
+        catalog?.locks?.workflow?.locked === true || workflow?.enabled === false,
+        catalog?.locks?.workflow?.reasonText || workflow?.description || "",
+        () => { draft.workflowId = workflow?.id || null; },
+      )),
+    );
+    const workflow = workflows.find((item) => item.id === draft.workflowId);
+    document.getElementById("composer-workflow-summary").textContent =
+      `Workflow · ${workflow?.displayName || "None"}`;
+    text.placeholder = workflow?.guidance || workflow?.description ||
+      (state.agent.newSessionMode ? "Describe what to build…" : "Send a message…");
+
+    const permissions = group?.permissionControl?.choices || [];
+    renderComposerMenu(
+      document.getElementById("composer-permission-options"),
+      permissions.map((choice) => composerOptionButton(
+        choice.displayName,
+        choice.id === draft.permissionId,
+        group?.permissionControl?.mutable === false || choice.enabled === false,
+        group?.permissionControl?.lockReasonCode || choice.detailText || "",
+        () => { draft.permissionId = choice.id; },
+      )),
+    );
+    document.getElementById("composer-permission-menu").hidden = !permissions.length;
+    document.getElementById("composer-permission-summary").textContent =
+      `Permissions · ${permissions.find((choice) => choice.id === draft.permissionId)?.displayName || "Default"}`;
+    renderComposerTools(group, draft);
+    renderComposerAttachments(composer);
+    document.getElementById("composer-mcp-pill").hidden = catalog?.mcpControlled !== true;
+
+    const control = destination.session?.agentControl;
+    const action = control?.steer?.allowed ? control.steer : control?.submitTurn;
+    const hasContent = Boolean(text.value.trim() || composer.attachments.length);
     const reason = state.agent.mutationPromise
-      ? "A message is already being sent."
-      : !state.online
-        ? "The server connection is unavailable."
-        : unavailable
-          ? "Select a project and connect a CLI provider first."
-          : !state.agent.newSessionMode && !messageAction?.allowed
-            ? messageAction?.reasonText || "Session controls are unavailable."
-          : empty
-            ? "Enter a message to send."
-            : "";
+      ? "Sending…"
+      : state.agent.attachmentPromise
+        ? "Updating attachments…"
+        : !state.online
+          ? "Offline"
+          : !catalog
+            ? composer.feedback || "Loading composer…"
+            : !draft.providerId || !draft.modelId
+              ? "Choose a provider and model"
+              : !state.agent.newSessionMode && !action?.allowed
+                ? action?.reasonText || "Session is read-only"
+                : !hasContent
+                  ? "Type a message"
+                  : catalog?.locks?.send?.locked
+                    ? catalog.locks.send.reasonText || "Sending is locked"
+                    : "";
     setDisabledReason(submit, Boolean(reason), reason);
-    form.setAttribute(
-      "aria-busy",
-      String(Boolean(state.agent.mutationPromise)),
+    const attachmentAvailable = catalog?.capabilities?.attachments === true && model?.capabilities?.nativeImages === true;
+    setDisabledReason(
+      attach,
+      !attachmentAvailable || catalog?.locks?.attachments?.locked || control?.steer?.allowed ||
+        Boolean(state.agent.attachmentPromise) || composer.attachments.length >= 4,
+      catalog?.locks?.attachments?.reasonText || (!attachmentAvailable ? "Selected model does not accept images" : ""),
     );
-    document.getElementById("composer-message").textContent =
-      reason ||
-      (state.agent.newSessionMode
-        ? "Start a private root session."
-        : control?.steer?.allowed
-          ? "Steer the active run."
-          : control?.statusText || "Send a follow-up to this session.");
+    form.setAttribute("aria-busy", String(Boolean(state.agent.mutationPromise || state.agent.attachmentPromise)));
+    const notice = document.getElementById("composer-notice");
+    notice.textContent = composer.feedback || (!["", "Type a message", "Loading composer…", "Sending…", "Updating attachments…"].includes(reason) ? reason : "");
+    notice.hidden = !notice.textContent;
+    document.getElementById("composer-message").textContent = reason || (control?.steer?.allowed ? "Steering" : "Ready");
     renderComposerContextUsage();
+  }
+
+  function selectedTurnConfiguration() {
+    const catalog = state.agent.composerCatalog;
+    const draft = activeComposerState().configuration;
+    if (!catalog || !draft?.providerId || !draft?.modelId) return null;
+    return {
+      schemaVersion: 1,
+      catalogRevision: catalog.revision,
+      providerId: draft.providerId,
+      modelId: draft.modelId,
+      effortId: draft.effortId || null,
+      workflowId: draft.workflowId || null,
+      permissionId: draft.permissionId || null,
+      toolValues: draft.toolValues || {},
+    };
   }
 
   function renderComposerContextUsage() {
@@ -1873,25 +2179,54 @@
   }
 
   async function submitComposer() {
-    if (state.agent.mutationPromise) return state.agent.mutationPromise;
-    const text = document.getElementById("composer-text").value.trim();
-    if (!text) return null;
+    if (state.agent.mutationPromise || state.agent.attachmentPromise)
+      return state.agent.mutationPromise;
+    const composer = activeComposerState();
+    composer.text = document.getElementById("composer-text").value;
+    const text = composer.text.trim();
     const newSession = state.agent.newSessionMode;
-    const payload = newSession
-      ? {
+    const session = selectedSession();
+    const control = session?.agentControl;
+    const configuration = selectedTurnConfiguration();
+    const attachmentIds = composer.attachments.map((item) => item.attachmentId);
+    const steering = !newSession && control?.steer?.allowed === true;
+    if ((steering ? !text : !text && !attachmentIds.length) || !configuration)
+      return null;
+    const content = {
+      schemaVersion: 1,
+      text,
+      attachmentIds,
+      taggedFiles: [],
+      resolvedSuggestionTokens: [],
+    };
+    let path;
+    let payload;
+    if (newSession) {
+      path = "api/v1/agent-sessions";
+      payload = {
+        start: {
           projectId: state.agent.selectedProjectID,
-          providerId: document.getElementById("composer-provider").value,
-          model: document.getElementById("composer-model").value || null,
-          initialPrompt: text,
-        }
-      : {
-          expectedRevision:
-            selectedSession()?.agentControl?.submitTurn
-              ?.expectedSessionRevision ||
-            state.agent.transcriptPage?.session?.revision ||
-            selectedSession()?.revision,
-          text,
-        };
+          visibility: "private",
+          turn: { content, configuration },
+        },
+      };
+    } else if (steering) {
+      path = `api/v1/sessions/${encodeURIComponent(session.sessionId)}/messages`;
+      payload = {
+        expectedRevision: session.revision,
+        text,
+      };
+    } else {
+      path = `api/v1/sessions/${encodeURIComponent(session.sessionId)}/turns`;
+      payload = {
+        turn: {
+          content,
+          configuration,
+          expectedSessionRevision:
+            control?.submitTurn?.expectedSessionRevision || session.revision,
+        },
+      };
+    }
     const operationID = operationIDFor(payload);
     if (!operationID) {
       toast("This browser cannot create secure operation identifiers.", true);
@@ -1901,31 +2236,38 @@
     state.agent.mutationPromise = (async () => {
       renderAgentComposer();
       try {
+        const receipt = await api(path, {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
         if (newSession) {
-          const session = await api("api/v1/sessions", {
-            method: "POST",
-            body: JSON.stringify(body),
-          });
-          state.bootstrap.sessions.push(session);
-          state.agent.selectedSessionID = session.sessionId;
+          const acceptedSession = receipt.session || {
+            sessionId: receipt.sessionId,
+            projectId: state.agent.selectedProjectID,
+            title: text || "Agent Session",
+            revision: receipt.sessionRevision,
+          };
+          const existing = state.bootstrap.sessions.findIndex(
+            (item) => item.sessionId === acceptedSession.sessionId,
+          );
+          if (existing >= 0) state.bootstrap.sessions[existing] = acceptedSession;
+          else state.bootstrap.sessions.push(acceptedSession);
+          state.agent.selectedSessionID = acceptedSession.sessionId;
           state.agent.newSessionMode = false;
           state.agent.transcriptItems = [];
           state.agent.transcriptPage = null;
           state.agent.selectionGeneration += 1;
-        } else {
-          await api(
-            `api/v1/sessions/${encodeURIComponent(state.agent.selectedSessionID)}/messages`,
-            { method: "POST", body: JSON.stringify(body) },
-          );
         }
+        composer.text = "";
+        if (!steering) composer.attachments = [];
         document.getElementById("composer-text").value = "";
         state.agent.retryOperation = null;
         renderHomeProviders();
+        await loadComposerCatalog(true);
         await loadTranscript({ silent: true });
-        toast(newSession ? "Chat started" : "Message accepted");
+        toast(newSession ? "Agent session accepted" : steering ? "Steering accepted" : "Turn accepted");
       } catch (error) {
-        const composerMessage = document.getElementById("composer-message");
-        composerMessage.textContent =
+        composer.feedback =
           error.code === "staleRevision"
             ? "Session changed; review your message and send again."
             : error.message;
@@ -2007,7 +2349,7 @@
         "agent-permissions": "Agent Permissions",
         "agent-workflows": "Agent Workflows",
         "context-builder": "Context Builder",
-        "portal-appearance": "Portal Appearance",
+        "portal-appearance": "Appearance",
         advanced: "Advanced",
         "mcp-server": "MCP Server",
         "mcp-tools": "Tools",
@@ -4729,7 +5071,7 @@
       ],
     );
     settingsPage(
-      "Portal Appearance",
+      "Appearance",
       "Choose browser-native theme and text density without copying macOS preference keys.",
       "appearance",
       [card, boundaries],
@@ -8062,18 +8404,22 @@
           !event.target.value;
         renderSessions();
       });
-    document
-      .getElementById("composer-provider")
-      .addEventListener("change", () => {
-        state.agent.retryOperation = null;
-        renderAgentComposer();
-      });
-    document.getElementById("composer-model").addEventListener("change", () => {
-      state.agent.retryOperation = null;
-    });
     document.getElementById("composer-text").addEventListener("input", () => {
+      activeComposerState().text = document.getElementById("composer-text").value;
       state.agent.retryOperation = null;
       renderAgentComposer();
+    });
+    document.getElementById("composer-attach").addEventListener("click", () => {
+      document.getElementById("composer-attachment-input").click();
+    });
+    document
+      .getElementById("composer-attachment-input")
+      .addEventListener("change", (event) => stageComposerAttachments(event.target.files));
+    document.getElementById("composer-submit").addEventListener("click", (event) => {
+      if (event.currentTarget.dataset.mode === "cancel") {
+        event.preventDefault();
+        submitAgentAction("cancel");
+      }
     });
     document
       .getElementById("composer-form")

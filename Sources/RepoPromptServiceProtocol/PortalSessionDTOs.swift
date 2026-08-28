@@ -256,6 +256,82 @@ public struct PortalSendMessageRequest: Codable, Hashable, Sendable {
     }
 }
 
+/// Browser-authenticated wrapper for the same structured Agent Mode session
+/// start contract used by first-party clients.
+public struct PortalStartAgentSessionRequest: Codable, Sendable {
+    public let operationID: UUID
+    public let start: AgentStartSessionWire
+
+    public init(operationID: UUID, start: AgentStartSessionWire) {
+        self.operationID = operationID
+        self.start = start
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case operationID = "operationId"
+        case start
+    }
+}
+
+/// Browser-authenticated wrapper for a structured Agent Mode follow-up.
+public struct PortalSubmitAgentTurnRequest: Codable, Hashable, Sendable {
+    public let operationID: UUID
+    public let turn: AgentTurnSubmissionWire
+
+    public init(operationID: UUID, turn: AgentTurnSubmissionWire) {
+        self.operationID = operationID
+        self.turn = turn
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case operationID = "operationId"
+        case turn
+    }
+}
+
+/// Portal projection of a durable structured submission receipt. The session
+/// summary is included for new-session acceptance so the browser can switch
+/// destinations without inventing a local session shape.
+public struct PortalAgentSubmissionReceipt: Codable, Hashable, Sendable {
+    public let submissionID: UUID
+    public let operation: String
+    public let acceptedAt: Date
+    public let sessionID: UUID
+    public let sessionRevision: Int64
+    public let requestAnchorID: UUID
+    public let runID: UUID?
+    public let generation: Int64?
+    public let turnEpoch: Int64?
+    public let runPhase: String?
+    public let selectedConfiguration: AgentTurnConfigurationWire
+    public let session: PortalSessionSummary?
+
+    public init(_ receipt: SubmissionReceipt, session: PortalSessionSummary? = nil) {
+        submissionID = receipt.submissionID
+        operation = receipt.operation
+        acceptedAt = receipt.acceptedAt
+        sessionID = receipt.sessionID
+        sessionRevision = receipt.sessionRevision
+        requestAnchorID = receipt.requestAnchorID
+        runID = receipt.runID
+        generation = receipt.generation
+        turnEpoch = receipt.turnEpoch
+        runPhase = receipt.runPhase
+        selectedConfiguration = receipt.selectedConfiguration
+        self.session = session
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case submissionID = "submissionId"
+        case operation, acceptedAt
+        case sessionID = "sessionId"
+        case sessionRevision
+        case requestAnchorID = "requestAnchorId"
+        case runID = "runId"
+        case generation, turnEpoch, runPhase, selectedConfiguration, session
+    }
+}
+
 public struct PortalInteractionAnswerRequest: Codable, Hashable, Sendable {
     public let operationID: UUID
     public let expectedRevision: Int64
