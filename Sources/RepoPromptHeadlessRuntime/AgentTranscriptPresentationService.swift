@@ -293,25 +293,6 @@ public actor AgentTranscriptPresentationService {
     }
 
     private static func interactionWire(_ value: InteractionSnapshot, turnID: String, mutable: Bool) -> AgentPresentationInteractionWire {
-        let providerPayload = try? JSONDecoder.serviceDecoder.decode(ProviderInteractionPayload.self, from: value.payload)
-        let askUser = HeadlessAskUser.isAskUserPayload(value.payload)
-        let prompt = askUser
-            ? HeadlessAskUser.presentationPrompt(from: value.payload)
-            : (providerPayload?.prompt
-                ?? String(data: value.payload, encoding: .utf8).map { String($0.prefix(8_192)) }
-                ?? "Provider interaction")
-        return .init(
-            interactionID: value.interactionID,
-            kind: value.kind == .approval ? .approval : .question,
-            state: value.state.rawValue,
-            prompt: prompt,
-            choices: providerPayload?.choices ?? [],
-            resolution: providerPayload?.resolution ?? (askUser && value.state != .pending ? HeadlessAskUser.resolutionLabel(from: value.payload) : nil),
-            turnID: turnID,
-            liveTail: isActionable(value),
-            requiresAttention: isActionable(value),
-            mutable: mutable && value.state == .pending,
-            revision: value.revision
-        )
+        AgentInteractionPresentationAdapter.project(value, turnID: turnID, mutable: mutable)
     }
 }

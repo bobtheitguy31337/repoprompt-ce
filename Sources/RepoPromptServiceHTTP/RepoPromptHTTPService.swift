@@ -117,22 +117,38 @@ public struct RepoPromptHTTPService: Sendable {
             return try await completePortalLogout(request: request)
         } }
         router.get("/portal/api/v1/bootstrap") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(request: request, context: context)
-            let bootstrap = try await portalBootstrap()
+            let principal = try await authenticatePortal(request: request, context: context)
+            let bootstrap = try await portalBootstrap(principal: principal)
             return try portalJSON(bootstrap)
         } }
-        router.get("/portal/api/v1/sessions/:id/transcript") { request, context in await portalRespond(request) {
-            _ = try await authenticatePortal(request: request, context: context)
+        router.get("/portal/api/v1/sessions/:id/presentation") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
             let sessionID = try context.parameters.require("id", as: UUID.self)
-            let limit = request.uri.queryParameters.get("limit", as: Int.self) ?? 200
-            let beforeSequence = request.uri.queryParameters.get("beforeSequence", as: Int64.self)
-            let afterSequence = request.uri.queryParameters.get("afterSequence", as: Int64.self)
+            let limit = request.uri.queryParameters.get("limit", as: Int.self) ?? 25
+            guard (1 ... 25).contains(limit) else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Presentation limit is outside the portal bound")
+            }
+            let pageToken = request.uri.queryParameters["pageToken"].map(String.init)
             let session = try await authority.sessionSnapshot(sessionID: sessionID)
-            return try portalJSON(RepoPromptPortalSessionProjection.transcriptPage(
-                session: session,
+            let metadata = try await authority.collaborationMetadata(sessionID: sessionID)
+            let page = try await requireTranscriptPresentation().page(
+                sessionID: sessionID,
+                actorID: principal.actorID,
+                legacyTranscript: session.transcript,
+                interactions: session.interactions,
+                pageToken: pageToken,
                 limit: limit,
-                beforeSequence: beforeSequence,
-                afterSequence: afterSequence
+                mutableInteractions: metadata.controllerUserID == principal.actorID
+            )
+            let control = try await authority.agentSessionActionSnapshot(
+                sessionID: sessionID,
+                actor: principal.externalActor,
+                composerAvailable: composerCatalog != nil
+            )
+            return try portalJSON(RepoPromptPortalSessionProjection.presentationPage(
+                session: session,
+                control: control,
+                page: page
             ))
         } }
         router.post("/portal/api/v1/sessions") { request, context in await portalRespond(request) {
@@ -174,7 +190,15 @@ public struct RepoPromptHTTPService: Sendable {
                 idempotencyKey: portalIdempotencyKey(principal: principal, operationID: input.operationID),
                 requestDigest: CanonicalSigning.bodyDigest(data)
             )
-            return try portalJSON(RepoPromptPortalSessionProjection.project(snapshot), status: .accepted)
+            let control = try? await authority.agentSessionActionSnapshot(
+                sessionID: snapshot.sessionID,
+                actor: principal.externalActor,
+                composerAvailable: composerCatalog != nil
+            )
+            return try portalJSON(
+                RepoPromptPortalSessionProjection.project(snapshot, agentControl: control),
+                status: .accepted
+            )
         } }
         router.post("/portal/api/v1/sessions/:id/messages") { request, context in await portalRespond(request) {
             let principal = try await authenticatePortal(request: request, context: context)
@@ -182,12 +206,141 @@ public struct RepoPromptHTTPService: Sendable {
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(PortalSendMessageRequest.self, from: data)
-            let command = try RepoPromptPortalSessionProjection.validatedSendCommand(input)
+            let followup = try RepoPromptPortalSessionProjection.validatedSendCommand(input)
+            guard case let .sendFollowup(text, _) = followup else {
+                throw ServiceAPIError(code: .internalFailure, message: "Portal message validation produced an invalid command")
+            }
+            let control = try await authority.agentSessionActionSnapshot(
+                sessionID: sessionID,
+                actor: principal.externalActor,
+                composerAvailable: composerCatalog != nil
+            )
+            let command: SessionCommand
+            if control.steer.allowed, let epoch = control.steer.targetTurnEpoch {
+                command = .steerSession(text: text, targetTurnEpoch: epoch)
+            } else if control.submitTurn.allowed {
+                command = followup
+            } else {
+                let denial = control.steer.reasonCode == "steering_not_ready"
+                    ? control.steer
+                    : control.submitTurn
+                throw ServiceAPIError(
+                    code: denial.reasonCode == "run_active" ? .runAlreadyActive : .invalidRequest,
+                    message: denial.reasonText ?? "This session cannot accept a message right now",
+                    retryable: denial.reasonCode == "steering_not_ready"
+                )
+            }
             let receipt = try await authority.execute(
                 command: command,
                 sessionID: sessionID,
                 externalActor: principal.externalActor,
                 idempotencyKey: portalIdempotencyKey(principal: principal, operationID: input.operationID),
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            return try portalJSON(receipt, status: .accepted)
+        } }
+        router.post("/portal/api/v1/sessions/:id/interactions/:interactionId/answer") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let interactionID = try context.parameters.require("interactionId", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(
+                PortalInteractionAnswerRequest.self,
+                from: data
+            )
+            guard let interaction = try await authority.interactionSnapshots(sessionID: sessionID)
+                .first(where: { $0.interactionID == interactionID })
+            else {
+                throw ServiceAPIError(code: .notFound, message: "Interaction not found")
+            }
+            guard interaction.revision == input.expectedRevision else {
+                throw ServiceAPIError(
+                    code: .staleRevision,
+                    message: "Interaction revision changed",
+                    currentRevision: interaction.revision
+                )
+            }
+            let payload = try AgentInteractionPresentationAdapter.compile(
+                response: input.response,
+                for: interaction
+            )
+            let resolved = try await authority.answerInteraction(
+                sessionID: sessionID,
+                interactionID: interactionID,
+                expectedRevision: input.expectedRevision,
+                payload: payload,
+                actor: principal.externalActor,
+                idempotencyKey: portalIdempotencyKey(
+                    principal: principal,
+                    operationID: input.operationID
+                ),
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            return try portalJSON(resolved)
+        } }
+        router.post("/portal/api/v1/sessions/:id/actions/:action") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let action = try context.parameters.require("action")
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(
+                PortalSessionActionRequest.self,
+                from: data
+            )
+            let control = try await authority.agentSessionActionSnapshot(
+                sessionID: sessionID,
+                actor: principal.externalActor,
+                composerAvailable: composerCatalog != nil
+            )
+            let command: SessionCommand
+            switch action {
+            case "resume":
+                guard control.resume.allowed else {
+                    throw ServiceAPIError(
+                        code: .resumeUnsupported,
+                        message: control.resume.reasonText ?? "This session cannot be resumed"
+                    )
+                }
+                command = .resumeSession(
+                    expectedRunID: control.resume.expectedRunID,
+                    providerResumeMode: .auto
+                )
+            case "cancel":
+                guard control.cancel.allowed,
+                      let generation = control.cancel.expectedGeneration
+                else {
+                    throw ServiceAPIError(
+                        code: .invalidRequest,
+                        message: control.cancel.reasonText ?? "This session cannot be cancelled"
+                    )
+                }
+                command = .cancelSession(
+                    expectedRunID: control.cancel.expectedRunID,
+                    expectedGeneration: generation
+                )
+            case "retry":
+                guard control.retry.allowed,
+                      let sourceRunID = control.retry.sourceRunID
+                else {
+                    throw ServiceAPIError(
+                        code: .invalidRequest,
+                        message: control.retry.reasonText ?? "This session cannot be retried"
+                    )
+                }
+                command = .retrySession(sourceRunID: sourceRunID, fromTranscriptEntryID: nil)
+            default:
+                throw ServiceAPIError(code: .notFound, message: "Session action not found")
+            }
+            let receipt = try await authority.execute(
+                command: command,
+                sessionID: sessionID,
+                externalActor: principal.externalActor,
+                idempotencyKey: portalIdempotencyKey(
+                    principal: principal,
+                    operationID: input.operationID
+                ),
                 requestDigest: CanonicalSigning.bodyDigest(data)
             )
             return try portalJSON(receipt, status: .accepted)
@@ -1569,9 +1722,17 @@ public struct RepoPromptHTTPService: Sendable {
         )
     }
 
-    private func portalBootstrap() async throws -> PortalBootstrapResponse {
+    private func portalBootstrap(principal: PortalAuthenticatedPrincipal) async throws -> PortalBootstrapResponse {
         let projects = await authority.projectSnapshots().map(RepoPromptPortalSessionProjection.project)
-        let sessions = try await authority.sessionSnapshots().map(RepoPromptPortalSessionProjection.project)
+        let snapshots = try await authority.sessionSnapshots()
+        let controls = try await authority.agentSessionActionSnapshots(
+            sessionIDs: snapshots.map(\.sessionID),
+            actor: principal.externalActor,
+            composerAvailable: composerCatalog != nil
+        )
+        let sessions = snapshots.map {
+            RepoPromptPortalSessionProjection.project($0, agentControl: controls[$0.sessionID])
+        }
         let workflowRepository = try await authority.workflowRepositorySnapshot()
         let workflows = try await authority.workflowSnapshots().map {
             PortalWorkflowSummary(

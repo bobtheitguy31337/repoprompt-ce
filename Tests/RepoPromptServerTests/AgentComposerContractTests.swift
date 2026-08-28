@@ -33,6 +33,186 @@ private func tinyPNG() -> Data {
     Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl9sAAAAASUVORK5CYII=")!
 }
 
+final class AgentSessionPresentationPolicyTests: XCTestCase {
+    func testUnknownHistoricalSettlementDoesNotMakeIdleSessionReadOnly() {
+        let control = AgentSessionPresentationPolicy.evaluate(.init(
+            isRootSession: true,
+            sessionRevision: 9,
+            lifecycleState: .idle,
+            isController: true,
+            composerAvailable: true,
+            providerAvailable: true,
+            supportsResume: true,
+            supportsSteering: true,
+            activeRunID: nil,
+            activeGeneration: nil,
+            activeTurnEpoch: nil,
+            steeringReady: false,
+            runPresentation: .init(
+                sessionID: UUID(),
+                runID: UUID(),
+                generation: 1,
+                turnEpoch: 1,
+                phase: nil,
+                phaseRevision: 2,
+                runStartedAt: Date(),
+                terminalSettlementCode: "future_terminal_state",
+                terminalSettledAt: Date()
+            )
+        ))
+
+        XCTAssertEqual(control.displayState, .idle)
+        XCTAssertTrue(control.submitTurn.allowed)
+        XCTAssertEqual(control.submitTurn.expectedSessionRevision, 9)
+        XCTAssertFalse(control.retry.allowed)
+    }
+
+    func testActiveReadyRunSteersAndCancelsButDoesNotSubmitFollowup() {
+        let runID = UUID()
+        let control = AgentSessionPresentationPolicy.evaluate(.init(
+            isRootSession: true,
+            sessionRevision: 4,
+            lifecycleState: .running,
+            isController: true,
+            composerAvailable: true,
+            providerAvailable: true,
+            supportsResume: true,
+            supportsSteering: true,
+            activeRunID: runID,
+            activeGeneration: 3,
+            activeTurnEpoch: 7,
+            steeringReady: true,
+            runPresentation: .init(
+                sessionID: UUID(),
+                runID: runID,
+                generation: 3,
+                turnEpoch: 7,
+                phase: .working,
+                phaseRevision: 2,
+                runStartedAt: Date()
+            )
+        ))
+
+        XCTAssertFalse(control.submitTurn.allowed)
+        XCTAssertTrue(control.steer.allowed)
+        XCTAssertEqual(control.steer.targetTurnEpoch, 7)
+        XCTAssertTrue(control.cancel.allowed)
+        XCTAssertEqual(control.cancel.expectedRunID, runID)
+        XCTAssertEqual(control.cancel.expectedGeneration, 3)
+    }
+
+    func testWaitingInteractionBlocksTextButKeepsCancelAvailable() {
+        let runID = UUID()
+        let control = AgentSessionPresentationPolicy.evaluate(.init(
+            isRootSession: true,
+            sessionRevision: 4,
+            lifecycleState: .waiting,
+            isController: true,
+            composerAvailable: true,
+            providerAvailable: true,
+            supportsResume: true,
+            supportsSteering: true,
+            activeRunID: runID,
+            activeGeneration: 1,
+            activeTurnEpoch: 2,
+            steeringReady: true,
+            runPresentation: .init(
+                sessionID: UUID(),
+                runID: runID,
+                generation: 1,
+                turnEpoch: 2,
+                phase: .waiting,
+                phaseRevision: 3,
+                runStartedAt: Date()
+            )
+        ))
+
+        XCTAssertEqual(control.submitTurn.reasonCode, "waiting_for_interaction")
+        XCTAssertEqual(control.steer.reasonCode, "waiting_for_interaction")
+        XCTAssertTrue(control.cancel.allowed)
+    }
+}
+
+final class AgentInteractionPresentationAdapterTests: XCTestCase {
+    func testProviderChoiceIsTypedAndCompiledWithoutExposingRoutingPayload() throws {
+        let payload = try JSONEncoder.serviceEncoder.encode(ProviderInteractionPayload(
+            providerRequestID: "provider-private-token",
+            prompt: "Allow the edit?",
+            choices: ["accept", "decline"]
+        ))
+        let interaction = InteractionSnapshot(
+            interactionID: UUID(),
+            kind: .approval,
+            state: .pending,
+            payload: payload,
+            revision: 2,
+            expiresAt: nil
+        )
+
+        let wire = AgentInteractionPresentationAdapter.project(
+            interaction,
+            turnID: "turn",
+            mutable: true
+        )
+        guard case let .singleChoice(choices, allowsCustom) = wire.input else {
+            return XCTFail("Expected typed single-choice interaction")
+        }
+        XCTAssertEqual(choices.map(\.id), ["accept", "decline"])
+        XCTAssertFalse(allowsCustom)
+        let encodedWire = try String(decoding: JSONEncoder.serviceEncoder.encode(wire), as: UTF8.self)
+        XCTAssertFalse(encodedWire.contains("provider-private-token"))
+
+        let answer = try AgentInteractionPresentationAdapter.compile(
+            response: .choice(choiceID: "accept", customText: nil),
+            for: interaction
+        )
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: answer) as? [String: Any])
+        XCTAssertEqual(object["decision"] as? String, "accept")
+        XCTAssertEqual(object["accepted"] as? Bool, true)
+    }
+
+    func testQuestionnaireRejectsMissingAndUnknownAnswers() throws {
+        let payload = Data(#"{"title":"Confirm","questions":[{"id":"scope","question":"Choose scope","options":[{"id":"focused","label":"Focused"}],"allows_custom":false,"required":true}]}"#.utf8)
+        let interaction = InteractionSnapshot(
+            interactionID: UUID(),
+            kind: .question,
+            state: .pending,
+            payload: payload,
+            revision: 1,
+            expiresAt: nil
+        )
+
+        XCTAssertThrowsError(try AgentInteractionPresentationAdapter.compile(
+            response: .questionnaire([]),
+            for: interaction
+        ))
+        XCTAssertThrowsError(try AgentInteractionPresentationAdapter.compile(
+            response: .questionnaire([
+                .init(questionID: "unknown", selectedChoiceIDs: ["focused"]),
+            ]),
+            for: interaction
+        ))
+        XCTAssertNoThrow(try AgentInteractionPresentationAdapter.compile(
+            response: .questionnaire([
+                .init(questionID: "scope", selectedChoiceIDs: ["focused"]),
+            ]),
+            for: interaction
+        ))
+        XCTAssertNoThrow(try AgentInteractionPresentationAdapter.compile(
+            response: .questionnaire([
+                .init(questionID: "scope", skipped: true),
+            ]),
+            for: interaction
+        ))
+        XCTAssertThrowsError(try AgentInteractionPresentationAdapter.compile(
+            response: .questionnaire([
+                .init(questionID: "scope", selectedChoiceIDs: ["focused"], skipped: true),
+            ]),
+            for: interaction
+        ))
+    }
+}
+
 final class AgentComposerCatalogTests: XCTestCase {
     func testDesktopFallbackPopulatesCodexComposerWithoutDiscoveredCatalog() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)

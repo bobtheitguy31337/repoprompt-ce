@@ -405,7 +405,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertEqual(redirect.headers[.cacheControl], "private, no-store")
     }
 
-    func testPortalSessionProjectionBoundsAndSanitizesTranscript() throws {
+    func testPortalSessionProjectionBoundsAndSanitizesSemanticPresentation() throws {
         let actor = ExternalActor(userID: "portal-user", username: "alice", displayName: "Alice")
         let sessionID = UUID()
         let transcript = [
@@ -446,24 +446,64 @@ final class ProviderSettingsPortalTests: XCTestCase {
             cursor: ServiceCursor(storeID: UUID(), globalSequence: 2)
         )
 
-        let page = try RepoPromptPortalSessionProjection.transcriptPage(
+        let presentation = AgentTranscriptPresentationPageWire(
+            presentationRevision: 3,
+            presentationCursor: "cursor",
+            turns: [
+                AgentPresentationTurnWire(
+                    turnID: "turn-1",
+                    blocks: [
+                        .request(
+                            id: "request-1",
+                            row: .userRequest(
+                                id: "human-1",
+                                text: transcript[0].content,
+                                attachmentIDs: [],
+                                taggedFiles: []
+                            )
+                        ),
+                        .standaloneAssistant(
+                            id: "assistant-block-1",
+                            row: .assistant(id: "assistant-1", text: transcript[1].content)
+                        ),
+                    ]
+                ),
+            ]
+        )
+        let unavailable = AgentSessionActionWire(
+            allowed: false,
+            reasonCode: "run_inactive",
+            reasonText: "No active run"
+        )
+        let control = AgentSessionActionSnapshotWire(
+            displayState: .idle,
+            statusText: "Ready for a new turn",
+            submitTurn: .init(allowed: true, expectedSessionRevision: session.revision),
+            steer: unavailable,
+            resume: unavailable,
+            cancel: unavailable,
+            retry: unavailable
+        )
+        let page = try RepoPromptPortalSessionProjection.presentationPage(
             session: session,
-            limit: 2,
-            beforeSequence: nil,
-            afterSequence: nil
+            control: control,
+            page: presentation
         )
         XCTAssertEqual(page.session.title, "Build the provider portal faithfully")
-        XCTAssertEqual(page.items.map(\.sessionSequence), [1, 2])
-        XCTAssertTrue(page.items[1].truncated)
-        XCTAssertEqual(page.items[1].content.utf8.count, RepoPromptPortalSessionProjection.maximumEntryBytes)
+        guard case let .standaloneAssistant(_, row) = page.presentation.turns[0].blocks[1],
+              case let .assistant(_, content) = row
+        else {
+            return XCTFail("assistant presentation row was not preserved")
+        }
+        XCTAssertEqual(content.utf8.count, RepoPromptPortalSessionProjection.maximumEntryBytes)
         let encoded = try String(decoding: JSONEncoder.serviceEncoder.encode(page), as: UTF8.self)
         XCTAssertFalse(encoded.contains("portal-user"))
         XCTAssertFalse(encoded.contains("private-human-presentation"))
         XCTAssertFalse(encoded.contains("private-assistant-presentation"))
         XCTAssertTrue(encoded.contains("\"sessionId\""))
-        XCTAssertTrue(encoded.contains("\"entryId\""))
+        XCTAssertTrue(encoded.contains("\"turnId\""))
         XCTAssertFalse(encoded.contains("\"sessionID\""))
-        XCTAssertFalse(encoded.contains("\"entryID\""))
+        XCTAssertFalse(encoded.contains("\"turnID\""))
         XCTAssertFalse(encoded.contains("presentationPayload"))
         XCTAssertFalse(encoded.contains("actor"))
     }

@@ -188,7 +188,37 @@
                 <div id="session-metadata" class="session-metadata"></div>
               </div>
             </div>
-            <span id="catalog-freshness" class="freshness-label">Loading…</span>
+            <div class="agent-run-toolbar">
+              <span id="agent-run-status" class="agent-run-status"></span>
+              <button
+                id="agent-resume-button"
+                class="secondary-button"
+                type="button"
+                data-action="agent-resume"
+                hidden
+              >
+                Resume
+              </button>
+              <button
+                id="agent-retry-button"
+                class="secondary-button"
+                type="button"
+                data-action="agent-retry"
+                hidden
+              >
+                Retry
+              </button>
+              <button
+                id="agent-cancel-button"
+                class="secondary-button danger-button"
+                type="button"
+                data-action="agent-cancel"
+                hidden
+              >
+                Cancel
+              </button>
+              <span id="catalog-freshness" class="freshness-label">Loading…</span>
+            </div>
           </header>
 
           <div id="main-content" class="transcript-scroll" tabindex="-1">

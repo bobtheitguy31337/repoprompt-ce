@@ -1,5 +1,75 @@
 import Foundation
 
+public enum AgentSessionDisplayStateWire: String, Codable, Hashable, Sendable {
+    case idle, preparing, thinking, working, waiting, cancelling, completed, failed, cancelled, archived
+}
+
+public struct AgentSessionActionWire: Codable, Hashable, Sendable {
+    public let allowed: Bool
+    public let reasonCode: String?
+    public let reasonText: String?
+    public let expectedSessionRevision: Int64?
+    public let expectedRunID: UUID?
+    public let expectedGeneration: Int64?
+    public let targetTurnEpoch: Int64?
+    public let sourceRunID: UUID?
+
+    public init(
+        allowed: Bool,
+        reasonCode: String? = nil,
+        reasonText: String? = nil,
+        expectedSessionRevision: Int64? = nil,
+        expectedRunID: UUID? = nil,
+        expectedGeneration: Int64? = nil,
+        targetTurnEpoch: Int64? = nil,
+        sourceRunID: UUID? = nil
+    ) {
+        self.allowed = allowed
+        self.reasonCode = reasonCode
+        self.reasonText = reasonText
+        self.expectedSessionRevision = expectedSessionRevision
+        self.expectedRunID = expectedRunID
+        self.expectedGeneration = expectedGeneration
+        self.targetTurnEpoch = targetTurnEpoch
+        self.sourceRunID = sourceRunID
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case allowed, reasonCode, reasonText, expectedSessionRevision
+        case expectedRunID = "expectedRunId"
+        case expectedGeneration, targetTurnEpoch
+        case sourceRunID = "sourceRunId"
+    }
+}
+
+public struct AgentSessionActionSnapshotWire: Codable, Hashable, Sendable {
+    public let displayState: AgentSessionDisplayStateWire
+    public let statusText: String
+    public let submitTurn: AgentSessionActionWire
+    public let steer: AgentSessionActionWire
+    public let resume: AgentSessionActionWire
+    public let cancel: AgentSessionActionWire
+    public let retry: AgentSessionActionWire
+
+    public init(
+        displayState: AgentSessionDisplayStateWire,
+        statusText: String,
+        submitTurn: AgentSessionActionWire,
+        steer: AgentSessionActionWire,
+        resume: AgentSessionActionWire,
+        cancel: AgentSessionActionWire,
+        retry: AgentSessionActionWire
+    ) {
+        self.displayState = displayState
+        self.statusText = statusText
+        self.submitTurn = submitTurn
+        self.steer = steer
+        self.resume = resume
+        self.cancel = cancel
+        self.retry = retry
+    }
+}
+
 public enum AgentPresentationToolStatus: String, Codable, Hashable, Sendable {
     case pending, running, success, warning, failed, cancelled, unknown
 }
@@ -169,6 +239,156 @@ public enum AgentPresentationBlockWire: Codable, Hashable, Sendable {
     }
 }
 
+public struct AgentPresentationChoiceWire: Codable, Hashable, Sendable {
+    public let id: String
+    public let displayName: String
+    public let detailText: String?
+
+    public init(id: String, displayName: String, detailText: String? = nil) {
+        self.id = id
+        self.displayName = displayName
+        self.detailText = detailText
+    }
+}
+
+public struct AgentPresentationQuestionWire: Codable, Hashable, Sendable {
+    public let id: String
+    public let prompt: String
+    public let choices: [AgentPresentationChoiceWire]
+    public let allowsMultiple: Bool
+    public let allowsCustom: Bool
+    public let required: Bool
+
+    public init(
+        id: String,
+        prompt: String,
+        choices: [AgentPresentationChoiceWire] = [],
+        allowsMultiple: Bool = false,
+        allowsCustom: Bool = true,
+        required: Bool = true
+    ) {
+        self.id = id
+        self.prompt = prompt
+        self.choices = choices
+        self.allowsMultiple = allowsMultiple
+        self.allowsCustom = allowsCustom
+        self.required = required
+    }
+}
+
+public enum AgentPresentationInteractionInputWire: Codable, Hashable, Sendable {
+    case singleChoice(choices: [AgentPresentationChoiceWire], allowsCustom: Bool)
+    case freeText(placeholder: String?, multiline: Bool)
+    case questionnaire(questions: [AgentPresentationQuestionWire])
+
+    private enum CodingKeys: String, CodingKey { case type, choices, allowsCustom, placeholder, multiline, questions }
+    private enum Kind: String, Codable { case singleChoice, freeText, questionnaire }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        switch try values.decode(Kind.self, forKey: .type) {
+        case .singleChoice:
+            self = try .singleChoice(
+                choices: values.decode([AgentPresentationChoiceWire].self, forKey: .choices),
+                allowsCustom: values.decodeIfPresent(Bool.self, forKey: .allowsCustom) ?? false
+            )
+        case .freeText:
+            self = try .freeText(
+                placeholder: values.decodeIfPresent(String.self, forKey: .placeholder),
+                multiline: values.decodeIfPresent(Bool.self, forKey: .multiline) ?? false
+            )
+        case .questionnaire:
+            self = try .questionnaire(
+                questions: values.decode([AgentPresentationQuestionWire].self, forKey: .questions)
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .singleChoice(choices, allowsCustom):
+            try values.encode(Kind.singleChoice, forKey: .type)
+            try values.encode(choices, forKey: .choices)
+            try values.encode(allowsCustom, forKey: .allowsCustom)
+        case let .freeText(placeholder, multiline):
+            try values.encode(Kind.freeText, forKey: .type)
+            try values.encodeIfPresent(placeholder, forKey: .placeholder)
+            try values.encode(multiline, forKey: .multiline)
+        case let .questionnaire(questions):
+            try values.encode(Kind.questionnaire, forKey: .type)
+            try values.encode(questions, forKey: .questions)
+        }
+    }
+}
+
+public struct AgentPresentationQuestionAnswerWire: Codable, Hashable, Sendable {
+    public let questionID: String
+    public let selectedChoiceIDs: [String]
+    public let customText: String?
+    public let skipped: Bool
+
+    public init(
+        questionID: String,
+        selectedChoiceIDs: [String] = [],
+        customText: String? = nil,
+        skipped: Bool = false
+    ) {
+        self.questionID = questionID
+        self.selectedChoiceIDs = selectedChoiceIDs
+        self.customText = customText
+        self.skipped = skipped
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case questionID = "questionId"
+        case selectedChoiceIDs = "selectedChoiceIds"
+        case customText, skipped
+    }
+}
+
+public enum AgentPresentationInteractionResponseWire: Codable, Hashable, Sendable {
+    case choice(choiceID: String, customText: String?)
+    case text(String)
+    case questionnaire([AgentPresentationQuestionAnswerWire])
+
+    private enum CodingKeys: String, CodingKey { case type, choiceID, customText, text, answers }
+    private enum Kind: String, Codable { case choice, text, questionnaire }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        switch try values.decode(Kind.self, forKey: .type) {
+        case .choice:
+            self = try .choice(
+                choiceID: values.decode(String.self, forKey: .choiceID),
+                customText: values.decodeIfPresent(String.self, forKey: .customText)
+            )
+        case .text:
+            self = try .text(values.decode(String.self, forKey: .text))
+        case .questionnaire:
+            self = try .questionnaire(
+                values.decode([AgentPresentationQuestionAnswerWire].self, forKey: .answers)
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .choice(choiceID, customText):
+            try values.encode(Kind.choice, forKey: .type)
+            try values.encode(choiceID, forKey: .choiceID)
+            try values.encodeIfPresent(customText, forKey: .customText)
+        case let .text(text):
+            try values.encode(Kind.text, forKey: .type)
+            try values.encode(text, forKey: .text)
+        case let .questionnaire(answers):
+            try values.encode(Kind.questionnaire, forKey: .type)
+            try values.encode(answers, forKey: .answers)
+        }
+    }
+}
+
 public struct AgentPresentationInteractionWire: Codable, Hashable, Sendable {
     public enum Kind: String, Codable, Hashable, Sendable { case question, approval, editReview, conflict }
     public let interactionID: UUID
@@ -176,6 +396,7 @@ public struct AgentPresentationInteractionWire: Codable, Hashable, Sendable {
     public let state: String
     public let prompt: String
     public let choices: [String]
+    public let input: AgentPresentationInteractionInputWire?
     public let resolution: String?
     public let turnID: String
     public let activityID: String?
@@ -184,12 +405,13 @@ public struct AgentPresentationInteractionWire: Codable, Hashable, Sendable {
     public let mutable: Bool
     public let revision: Int64
 
-    public init(interactionID: UUID, kind: Kind, state: String, prompt: String, choices: [String] = [], resolution: String? = nil, turnID: String, activityID: String? = nil, liveTail: Bool = false, requiresAttention: Bool = true, mutable: Bool, revision: Int64) {
+    public init(interactionID: UUID, kind: Kind, state: String, prompt: String, choices: [String] = [], input: AgentPresentationInteractionInputWire? = nil, resolution: String? = nil, turnID: String, activityID: String? = nil, liveTail: Bool = false, requiresAttention: Bool = true, mutable: Bool, revision: Int64) {
         self.interactionID = interactionID
         self.kind = kind
         self.state = state
         self.prompt = prompt
         self.choices = choices
+        self.input = input
         self.resolution = resolution
         self.turnID = turnID
         self.activityID = activityID
@@ -199,7 +421,7 @@ public struct AgentPresentationInteractionWire: Codable, Hashable, Sendable {
         self.revision = revision
     }
 
-    private enum CodingKeys: String, CodingKey { case interactionID = "interactionId", kind, state, prompt, choices, resolution, turnID = "turnId", activityID = "activityId", liveTail, requiresAttention, mutable, revision }
+    private enum CodingKeys: String, CodingKey { case interactionID = "interactionId", kind, state, prompt, choices, input, resolution, turnID = "turnId", activityID = "activityId", liveTail, requiresAttention, mutable, revision }
 }
 
 public struct AgentPresentationTurnWire: Codable, Hashable, Sendable {

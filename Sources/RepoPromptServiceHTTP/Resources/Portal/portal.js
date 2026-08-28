@@ -116,6 +116,7 @@
       pollTimer: null,
       selectionGeneration: 0,
       retryOperation: null,
+      blockExpansion: new Map(),
     },
   };
 
@@ -967,6 +968,7 @@
     }
     sessions.forEach((session) => {
       const depth = depthByID.get(session.sessionId) || 0;
+      const displayState = session.agentControl?.displayState || session.state;
       const button = element("button", `session-row depth-${depth}`);
       button.type = "button";
       button.dataset.sessionId = session.sessionId;
@@ -976,7 +978,7 @@
         session.sessionId === state.agent.selectedSessionID;
       button.classList.toggle("active", active);
       if (active) button.setAttribute("aria-current", "true");
-      const plate = element("span", `session-status-plate ${session.state}`);
+      const plate = element("span", `session-status-plate ${displayState}`);
       plate.setAttribute("aria-hidden", "true");
       plate.append(element("i"));
       const copy = element("span", "session-row-copy");
@@ -991,7 +993,7 @@
       button.append(
         plate,
         copy,
-        element("span", "session-row-state", humanize(session.state)),
+        element("span", "session-row-state", humanize(displayState)),
       );
       button.addEventListener("click", () => selectSession(session.sessionId));
       list.append(button);
@@ -1004,6 +1006,7 @@
     clearAgentPoll();
     state.agent.selectedProjectID = projectID;
     state.agent.selectedSessionID = null;
+    state.agent.blockExpansion.clear();
     state.agent.transcriptItems = [];
     state.agent.transcriptPage = null;
     state.agent.newSessionMode = false;
@@ -1030,6 +1033,7 @@
     clearAgentPoll();
     state.agent.selectedSessionID = sessionID;
     state.agent.newSessionMode = false;
+    state.agent.blockExpansion.clear();
     state.agent.transcriptItems = [];
     state.agent.transcriptPage = null;
     state.agent.selectionGeneration += 1;
@@ -1044,6 +1048,7 @@
     clearAgentPoll();
     state.agent.newSessionMode = true;
     state.agent.selectedSessionID = null;
+    state.agent.blockExpansion.clear();
     state.agent.transcriptItems = [];
     state.agent.transcriptPage = null;
     state.agent.selectionGeneration += 1;
@@ -1053,10 +1058,24 @@
 
   function renderAgentDetail() {
     const session = selectedSession();
+    const control = session?.agentControl;
     const title = document.getElementById("active-session-title");
     const metadata = document.getElementById("session-metadata");
     const stateDot = document.getElementById("session-state-dot");
+    const runStatus = document.getElementById("agent-run-status");
     stateDot.className = "session-state-dot";
+    runStatus.textContent = state.agent.newSessionMode
+      ? "Ready for a new session"
+      : control?.statusText || "";
+    ["resume", "retry", "cancel"].forEach((operation) => {
+      const button = document.getElementById(`agent-${operation}-button`);
+      button.hidden = !control?.[operation]?.allowed;
+      setDisabledReason(
+        button,
+        !control?.[operation]?.allowed,
+        control?.[operation]?.reasonText || "Action unavailable",
+      );
+    });
     if (state.agent.newSessionMode) {
       title.textContent = "New chat";
       metadata.replaceChildren(
@@ -1074,11 +1093,11 @@
         element("span", "metadata-pill", session.model || "Provider default"),
         element(
           "span",
-          `metadata-pill state-${session.state}`,
-          humanize(session.state),
+          `metadata-pill state-${control?.displayState || session.state}`,
+          control?.statusText || humanize(session.state),
         ),
       );
-      stateDot.classList.add(session.state);
+      stateDot.classList.add(control?.displayState || session.state);
     } else {
       title.textContent = "What are we building?";
       metadata.replaceChildren();
@@ -1092,9 +1111,10 @@
     const list = document.getElementById("transcript-list");
     const status = document.getElementById("transcript-status");
     const earlier = document.getElementById("load-earlier-button");
+    const presentation = state.agent.transcriptPage?.presentation;
     list.replaceChildren();
     status.textContent = "";
-    earlier.hidden = !state.agent.transcriptPage?.hasMoreBefore;
+    earlier.hidden = !presentation?.nextPageToken;
     if (state.agent.newSessionMode || !state.agent.selectedSessionID) {
       const empty = element("div", "agent-welcome");
       const brand = document.createElement("img");
@@ -1119,36 +1139,30 @@
           "div",
           "transcript-empty",
           state.agent.transcriptPromise
-            ? "Loading transcript…"
-            : "This session has no transcript yet.",
+            ? "Loading activity…"
+            : "This session has no activity yet.",
         ),
       );
     }
-    state.agent.transcriptItems.forEach((item) => {
-      const row = element("article", `transcript-entry kind-${item.kind}`);
-      row.dataset.entryId = item.entryId;
-      const header = element("header", "transcript-entry-header");
-      const role =
-        item.kind === "human"
-          ? "You"
-          : item.kind === "assistant"
-            ? "RepoPrompt"
-            : humanize(item.kind);
-      header.append(
-        element("strong", "", role),
-        element("time", "", formatDate(item.timestamp)),
+    const attachedInteractionIDs = new Set();
+    state.agent.transcriptItems.forEach((turn) => {
+      const article = element(
+        "article",
+        `agent-turn${turn.legacyStandalone ? " legacy" : ""}`,
       );
-      const content = element("div", "transcript-entry-content", item.content);
-      row.append(header, content);
-      if (item.truncated)
-        row.append(
-          element(
-            "small",
-            "transcript-truncated",
-            "Entry truncated by the portal safety bound.",
-          ),
-        );
-      list.append(row);
+      article.dataset.turnId = turn.turnId;
+      (turn.blocks || []).forEach((block) =>
+        article.append(renderPresentationBlock(block)),
+      );
+      (turn.interactions || []).forEach((interaction) => {
+        attachedInteractionIDs.add(interaction.interactionId);
+        article.append(renderInteraction(interaction));
+      });
+      list.append(article);
+    });
+    (presentation?.pendingInteractions || []).forEach((interaction) => {
+      if (!attachedInteractionIDs.has(interaction.interactionId))
+        list.append(renderInteraction(interaction));
     });
     list.setAttribute(
       "aria-busy",
@@ -1156,23 +1170,461 @@
     );
   }
 
+  function renderPresentationBlock(block) {
+    const type = block?.type || "standaloneNote";
+    if (type === "activityCluster") {
+      const details = element(
+        "details",
+        "presentation-block activity-cluster",
+      );
+      details.dataset.blockId = block.id;
+      if (!state.agent.blockExpansion.has(block.id))
+        state.agent.blockExpansion.set(
+          block.id,
+          Boolean(block.summary?.defaultExpanded || block.summary?.running),
+        );
+      details.open = state.agent.blockExpansion.get(block.id);
+      details.addEventListener("toggle", () => {
+        state.agent.blockExpansion.set(block.id, details.open);
+      });
+      const summary = element("summary", "activity-cluster-summary");
+      summary.append(
+        element("strong", "", block.summary?.title || "Activity"),
+        element(
+          "span",
+          "activity-count",
+          `${block.summary?.activityCount || 0} activities · ${block.summary?.toolCount || 0} tools`,
+        ),
+      );
+      if (block.summary?.narration)
+        summary.append(
+          element("span", "activity-narration", block.summary.narration),
+        );
+      details.append(summary);
+      const rows = element("div", "activity-cluster-rows");
+      (block.rows || []).forEach((row) =>
+        rows.append(renderPresentationRow(row)),
+      );
+      details.append(rows);
+      return details;
+    }
+    if (type === "groupedHistory") {
+      const group = element("section", "presentation-block grouped-history");
+      group.append(element("h3", "", block.title || "Earlier activity"));
+      (block.rows || []).forEach((row) =>
+        group.append(renderPresentationRow(row)),
+      );
+      return group;
+    }
+    if (type === "collapsedHistoryRange")
+      return element(
+        "div",
+        "presentation-block collapsed-history",
+        `${block.title || "Earlier activity"} · ${block.count || 0}`,
+      );
+    if (type === "middleSummary")
+      return element(
+        "aside",
+        "presentation-block middle-summary",
+        block.text || "",
+      );
+    const classes = {
+      request: "request-block",
+      standaloneAssistant: "assistant-block",
+      standaloneTool: "tool-block",
+      standaloneNote: "note-block",
+      conclusion: "conclusion-block",
+    };
+    const host = element(
+      "section",
+      `presentation-block ${classes[type] || "note-block"}`,
+    );
+    if (block.row) host.append(renderPresentationRow(block.row));
+    return host;
+  }
+
+  function renderPresentationRow(row) {
+    if (row?.type === "tool") return renderPresentationTool(row.tool, row.id);
+    const host = element(
+      "div",
+      `presentation-row row-${row?.type || "note"}`,
+    );
+    host.dataset.rowId = row?.id || "";
+    const labels = {
+      userRequest: "You",
+      assistant: "RepoPrompt",
+      thinking: "Thinking",
+      progress: "Progress",
+      note: "Note",
+      error: "Error",
+    };
+    host.append(
+      element(
+        "strong",
+        "presentation-row-label",
+        labels[row?.type] || humanize(row?.type || "note"),
+      ),
+      element("div", "presentation-row-content", row?.text || ""),
+    );
+    if (row?.type === "userRequest") {
+      const chips = element("div", "request-chips");
+      (row.taggedFiles || []).forEach((file) =>
+        chips.append(
+          element(
+            "span",
+            "request-chip",
+            file.displayName || file.logicalPath,
+          ),
+        ),
+      );
+      if ((row.attachmentIds || []).length)
+        chips.append(
+          element(
+            "span",
+            "request-chip",
+            `${row.attachmentIds.length} attachments`,
+          ),
+        );
+      if (chips.childElementCount) host.append(chips);
+    }
+    if (row?.code) host.append(element("code", "error-code", row.code));
+    return host;
+  }
+
+  function renderPresentationTool(tool = {}, rowID = "") {
+    const card = element(
+      "article",
+      `typed-tool tool-status-${tool.status || "unknown"}`,
+    );
+    card.dataset.rowId = rowID;
+    card.dataset.executionId = tool.executionId || "";
+    if (["pending", "running"].includes(tool.status))
+      card.setAttribute("role", "status");
+    const header = element("header", "typed-tool-header");
+    header.append(
+      element("strong", "", tool.name || "Tool"),
+      element(
+        "span",
+        "tool-status",
+        humanize(tool.status || "unknown"),
+      ),
+    );
+    card.append(header);
+    if (tool.summary) card.append(element("p", "tool-summary", tool.summary));
+    if ((tool.keyPaths || []).length) {
+      const paths = element("div", "tool-key-paths");
+      tool.keyPaths.forEach((path) =>
+        paths.append(element("code", "", path)),
+      );
+      card.append(paths);
+    }
+    if (tool.displayArguments || tool.displayResult) {
+      const details = element("details", "tool-details");
+      details.append(element("summary", "", "Arguments and result"));
+      if (tool.displayArguments)
+        details.append(
+          element("pre", "tool-payload", tool.displayArguments),
+        );
+      if (tool.displayResult)
+        details.append(element("pre", "tool-payload", tool.displayResult));
+      card.append(details);
+    }
+    const process = [
+      tool.processId != null ? `PID ${tool.processId}` : "",
+      tool.exitCode != null ? `exit ${tool.exitCode}` : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    if (process) card.append(element("small", "tool-process", process));
+    return card;
+  }
+
+  function renderInteraction(interaction) {
+    const card = element(
+      "section",
+      `agent-interaction state-${interaction.state || "unknown"}`,
+    );
+    card.dataset.interactionId = interaction.interactionId;
+    if (interaction.requiresAttention) card.setAttribute("role", "group");
+    card.append(
+      element(
+        "strong",
+        "interaction-title",
+        interaction.kind === "approval" ? "Approval required" : "Question",
+      ),
+      element(
+        "p",
+        "interaction-prompt",
+        interaction.prompt || "The agent needs your response.",
+      ),
+    );
+    if (interaction.resolution)
+      card.append(
+        element(
+          "p",
+          "interaction-resolution",
+          `Resolution: ${interaction.resolution}`,
+        ),
+      );
+    else if (
+      interaction.state === "pending" &&
+      interaction.mutable &&
+      interaction.input
+    ) {
+      const form = element("form", "interaction-form");
+      form.dataset.interactionId = interaction.interactionId;
+      renderInteractionInput(form, interaction.input);
+      const submit = element("button", "primary-button", "Submit response");
+      submit.type = "submit";
+      form.append(submit);
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        submitInteraction(form, interaction);
+      });
+      card.append(form);
+    } else if (interaction.state === "pending") {
+      card.append(element("p", "interaction-pending", "Awaiting response"));
+    }
+    return card;
+  }
+
+  function renderInteractionInput(form, input) {
+    if (input.type === "singleChoice") {
+      (input.choices || []).forEach((choice) => {
+        const label = element("label", "interaction-option");
+        const control = document.createElement("input");
+        control.type = "radio";
+        control.name = "choice";
+        control.value = choice.id;
+        control.required = true;
+        label.append(control, document.createTextNode(choice.displayName));
+        if (choice.detailText)
+          label.append(element("small", "", choice.detailText));
+        form.append(label);
+      });
+      if (input.allowsCustom) {
+        const custom = document.createElement("input");
+        custom.type = "text";
+        custom.name = "customText";
+        custom.placeholder = "Optional detail";
+        form.append(custom);
+      }
+      return;
+    }
+    if (input.type === "freeText") {
+      const control = input.multiline
+        ? document.createElement("textarea")
+        : document.createElement("input");
+      if (!input.multiline) control.type = "text";
+      control.name = "text";
+      control.required = true;
+      control.maxLength = 64000;
+      control.placeholder = input.placeholder || "Enter your response";
+      form.append(control);
+      return;
+    }
+    if (input.type === "questionnaire") {
+      (input.questions || []).forEach((question, index) => {
+        const fieldset = element("fieldset", "interaction-question");
+        fieldset.dataset.questionId = question.id;
+        fieldset.dataset.required = String(Boolean(question.required));
+        fieldset.append(element("legend", "", question.prompt));
+        (question.choices || []).forEach((choice) => {
+          const label = element("label", "interaction-option");
+          const control = document.createElement("input");
+          control.type = question.allowsMultiple ? "checkbox" : "radio";
+          control.name = `question-${index}`;
+          control.value = choice.id;
+          label.append(control, document.createTextNode(choice.displayName));
+          if (choice.detailText)
+            label.append(element("small", "", choice.detailText));
+          fieldset.append(label);
+        });
+        if (question.allowsCustom) {
+          const custom = document.createElement("input");
+          custom.type = "text";
+          custom.name = "customText";
+          custom.maxLength = 64000;
+          custom.placeholder = "Optional custom response";
+          if (!question.allowsMultiple)
+            custom.addEventListener("input", () => {
+              if (custom.value.trim())
+                fieldset
+                  .querySelectorAll('input[type="radio"]')
+                  .forEach((control) => {
+                    control.checked = false;
+                  });
+            });
+          fieldset.append(custom);
+        }
+        if (!question.allowsMultiple)
+          fieldset.querySelectorAll('input[type="radio"]').forEach((control) => {
+            control.addEventListener("change", () => {
+              if (control.checked) {
+                const custom = fieldset.querySelector('input[name="customText"]');
+                if (custom) custom.value = "";
+              }
+            });
+          });
+        const skipLabel = element("label", "interaction-option interaction-skip");
+        const skip = document.createElement("input");
+        skip.type = "checkbox";
+        skip.name = "skipped";
+        skipLabel.append(skip, document.createTextNode("Skip this question"));
+        skip.addEventListener("change", () => {
+          fieldset
+            .querySelectorAll('input:not([name="skipped"])')
+            .forEach((control) => {
+              control.disabled = skip.checked;
+              if (skip.checked) {
+                if (["checkbox", "radio"].includes(control.type))
+                  control.checked = false;
+                else control.value = "";
+              }
+            });
+        });
+        fieldset.append(skipLabel);
+        form.append(fieldset);
+      });
+    }
+  }
+
+  function interactionResponse(form, input) {
+    if (input.type === "singleChoice") {
+      const choiceID = form.querySelector('input[name="choice"]:checked')?.value;
+      if (!choiceID) throw new Error("Choose a response.");
+      return {
+        type: "choice",
+        choiceID,
+        customText: form.elements.customText?.value.trim() || null,
+      };
+    }
+    if (input.type === "freeText") {
+      const value = form.elements.text?.value.trim();
+      if (!value) throw new Error("Enter a response.");
+      return { type: "text", text: value };
+    }
+    const answers = [...form.querySelectorAll("fieldset[data-question-id]")].map(
+      (fieldset) => {
+        const skipped = Boolean(
+          fieldset.querySelector('input[name="skipped"]')?.checked,
+        );
+        const selectedChoiceIDs = [
+          ...fieldset.querySelectorAll('input:not([name="skipped"]):checked'),
+        ]
+          .map((control) => control.value);
+        const customText =
+          fieldset.querySelector('input[name="customText"]')?.value.trim() ||
+          null;
+        if (
+          fieldset.dataset.required === "true" &&
+          !skipped &&
+          !selectedChoiceIDs.length &&
+          !customText
+        )
+          throw new Error("Answer every required question.");
+        return {
+          questionID: fieldset.dataset.questionId,
+          selectedChoiceIDs,
+          customText,
+          skipped,
+        };
+      },
+    );
+    return { type: "questionnaire", answers };
+  }
+
+  async function submitInteraction(form, interaction) {
+    if (state.agent.mutationPromise) return state.agent.mutationPromise;
+    let response;
+    try {
+      response = interactionResponse(form, interaction.input);
+    } catch (error) {
+      toast(error.message, true);
+      return null;
+    }
+    const operationID = window.crypto?.randomUUID?.();
+    if (!operationID) {
+      toast("This browser cannot create secure operation identifiers.", true);
+      return null;
+    }
+    const submit = form.querySelector('button[type="submit"]');
+    state.agent.mutationPromise = (async () => {
+      submit.disabled = true;
+      form.setAttribute("aria-busy", "true");
+      renderAgentComposer();
+      try {
+        await api(
+          `api/v1/sessions/${encodeURIComponent(state.agent.selectedSessionID)}/interactions/${encodeURIComponent(interaction.interactionId)}/answer`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              operationId: operationID,
+              expectedRevision: interaction.revision,
+              response,
+            }),
+          },
+        );
+        await loadTranscript({ silent: true });
+        toast("Response delivered");
+      } catch (error) {
+        toast(error.message, true);
+        if (error.code === "staleRevision")
+          await loadTranscript({ silent: true });
+      } finally {
+        state.agent.mutationPromise = null;
+        renderAgentComposer();
+      }
+    })();
+    return state.agent.mutationPromise;
+  }
+
+  async function submitAgentAction(action) {
+    if (
+      state.agent.mutationPromise ||
+      !state.agent.selectedSessionID ||
+      !["resume", "retry", "cancel"].includes(action)
+    )
+      return null;
+    const operationID = window.crypto?.randomUUID?.();
+    if (!operationID) {
+      toast("This browser cannot create secure operation identifiers.", true);
+      return null;
+    }
+    state.agent.mutationPromise = (async () => {
+      renderAgentComposer();
+      try {
+        await api(
+          `api/v1/sessions/${encodeURIComponent(state.agent.selectedSessionID)}/actions/${action}`,
+          {
+            method: "POST",
+            body: JSON.stringify({ operationId: operationID }),
+          },
+        );
+        await loadTranscript({ silent: true });
+        toast(`${humanize(action)} accepted`);
+      } catch (error) {
+        toast(error.message, true);
+        await loadTranscript({ silent: true });
+      } finally {
+        state.agent.mutationPromise = null;
+        renderAgentComposer();
+      }
+    })();
+    return state.agent.mutationPromise;
+  }
+
   function mergeTranscriptItems(items, prepend = false) {
     const merged = new Map(
       (prepend
         ? items.concat(state.agent.transcriptItems)
         : state.agent.transcriptItems.concat(items)
-      ).map((item) => [item.entryId, item]),
+      ).map((item) => [item.turnId, item]),
     );
-    state.agent.transcriptItems = [...merged.values()].sort(
-      (left, right) => left.sessionSequence - right.sessionSequence,
-    );
+    state.agent.transcriptItems = [...merged.values()];
   }
 
-  async function loadTranscript({
-    before = null,
-    after = null,
-    silent = false,
-  } = {}) {
+  async function loadTranscript({ pageToken = null, silent = false } = {}) {
     const sessionID = state.agent.selectedSessionID;
     if (!sessionID || state.agent.newSessionMode) return null;
     if (
@@ -1181,22 +1633,31 @@
     )
       return state.agent.transcriptPromise;
     const generation = state.agent.selectionGeneration;
-    const query = new URLSearchParams({ limit: "200" });
-    if (before !== null) query.set("beforeSequence", String(before));
-    if (after !== null) query.set("afterSequence", String(after));
+    const query = new URLSearchParams({ limit: "25" });
+    if (pageToken) query.set("pageToken", pageToken);
     const requestPromise = (async () => {
       if (!silent) renderTranscript();
       try {
         const page = await api(
-          `api/v1/sessions/${encodeURIComponent(sessionID)}/transcript?${query}`,
+          `api/v1/sessions/${encodeURIComponent(sessionID)}/presentation?${query}`,
         );
         if (
           generation !== state.agent.selectionGeneration ||
           sessionID !== state.agent.selectedSessionID
         )
           return null;
+        if (
+          silent &&
+          !pageToken &&
+          state.agent.transcriptPage?.presentation?.nextPageToken
+        )
+          page.presentation.nextPageToken =
+            state.agent.transcriptPage.presentation.nextPageToken;
         state.agent.transcriptPage = page;
-        mergeTranscriptItems(page.items || [], before !== null);
+        mergeTranscriptItems(
+          page.presentation?.turns || [],
+          Boolean(pageToken),
+        );
         const index = state.bootstrap.sessions.findIndex(
           (item) => item.sessionId === sessionID,
         );
@@ -1251,8 +1712,7 @@
     const delay = window.__REPOPROMPT_PORTAL_TEST_HOOK__ ? 60_000 : 2_500;
     state.agent.pollTimer = window.setTimeout(async () => {
       state.agent.pollTimer = null;
-      const latest = state.agent.transcriptItems.at(-1)?.sessionSequence || 0;
-      await loadTranscript({ after: latest, silent: true });
+      await loadTranscript({ silent: true });
     }, delay);
   }
 
@@ -1306,6 +1766,11 @@
     help.textContent = modelReason;
     const unavailable =
       state.agent.newSessionMode && (!selectedProject() || !provider);
+    const session = selectedSession();
+    const control = session?.agentControl;
+    const messageAction = control?.steer?.allowed
+      ? control.steer
+      : control?.submitTurn;
     const empty = !text.value.trim();
     const reason = state.agent.mutationPromise
       ? "A message is already being sent."
@@ -1313,6 +1778,8 @@
         ? "The server connection is unavailable."
         : unavailable
           ? "Select a project and connect a CLI provider first."
+          : !state.agent.newSessionMode && !messageAction?.allowed
+            ? messageAction?.reasonText || "Session controls are unavailable."
           : empty
             ? "Enter a message to send."
             : "";
@@ -1325,7 +1792,9 @@
       reason ||
       (state.agent.newSessionMode
         ? "Start a private root session."
-        : "Send a follow-up to this session.");
+        : control?.steer?.allowed
+          ? "Steer the active run."
+          : control?.statusText || "Send a follow-up to this session.");
     renderComposerContextUsage();
   }
 
@@ -1417,6 +1886,8 @@
         }
       : {
           expectedRevision:
+            selectedSession()?.agentControl?.submitTurn
+              ?.expectedSessionRevision ||
             state.agent.transcriptPage?.session?.revision ||
             selectedSession()?.revision,
           text,
@@ -7457,9 +7928,13 @@
     const action = event.target.closest("[data-action]")?.dataset.action;
     if (action === "refresh") loadAll(true);
     else if (action === "new-chat") beginNewSession();
+    else if (action === "agent-resume") submitAgentAction("resume");
+    else if (action === "agent-retry") submitAgentAction("retry");
+    else if (action === "agent-cancel") submitAgentAction("cancel");
     else if (action === "load-earlier") {
-      const earliest = state.agent.transcriptItems[0]?.sessionSequence;
-      if (earliest) loadTranscript({ before: earliest });
+      const pageToken =
+        state.agent.transcriptPage?.presentation?.nextPageToken;
+      if (pageToken) loadTranscript({ pageToken });
     } else if (action === "clear-session-search") {
       state.agent.searchText = "";
       document.getElementById("session-search").value = "";

@@ -1945,6 +1945,54 @@ public actor RepoPromptHeadlessAuthority {
         return preflight ? await providerAdapter.preflight() : await providerAdapter.capabilities()
     }
 
+    /// Desktop-neutral action projection derived from the same durable session,
+    /// run binding, provider capability, and controller authorities used by the
+    /// mutation paths themselves.
+    public func agentSessionActionSnapshot(
+        sessionID: UUID,
+        actor: ExternalActor,
+        composerAvailable: Bool
+    ) async throws -> AgentSessionActionSnapshotWire {
+        let detail = try await authoritySessionSnapshot(sessionID: sessionID)
+        let metadata = try await collaborationMetadata(sessionID: sessionID)
+        let capability = await providerCapabilities().first { $0.kind == detail.session.provider }
+        let persistedPresentation = try await store.runPresentation(sessionID: sessionID)?.wireSnapshot
+        let currentRun = detail.activeRun.flatMap { run in
+            run.endedAt == nil && run.state == "running" ? run : nil
+        }
+        return AgentSessionPresentationPolicy.evaluate(.init(
+            isRootSession: detail.session.parentSessionID == nil,
+            sessionRevision: detail.session.revision,
+            lifecycleState: detail.session.state,
+            isController: metadata.controllerUserID == actor.userID,
+            composerAvailable: composerAvailable,
+            providerAvailable: capability?.enabled == true,
+            supportsResume: capability?.supportsResume == true,
+            supportsSteering: capability?.supportsSteering == true,
+            activeRunID: currentRun?.runID,
+            activeGeneration: currentRun?.generation,
+            activeTurnEpoch: currentRun?.turnEpoch,
+            steeringReady: currentRun.map { providerControlReadyRuns.contains($0.runID) } ?? false,
+            runPresentation: persistedPresentation ?? detail.session.runPresentation
+        ))
+    }
+
+    public func agentSessionActionSnapshots(
+        sessionIDs: [UUID],
+        actor: ExternalActor,
+        composerAvailable: Bool
+    ) async throws -> [UUID: AgentSessionActionSnapshotWire] {
+        var result: [UUID: AgentSessionActionSnapshotWire] = [:]
+        for sessionID in sessionIDs {
+            result[sessionID] = try await agentSessionActionSnapshot(
+                sessionID: sessionID,
+                actor: actor,
+                composerAvailable: composerAvailable
+            )
+        }
+        return result
+    }
+
     public func selectionSnapshot(sessionID: UUID) async throws -> SelectionSnapshot {
         guard let selection = selections[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
         return await selection.snapshot()

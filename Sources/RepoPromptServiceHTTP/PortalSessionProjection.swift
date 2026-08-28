@@ -28,7 +28,10 @@ enum RepoPromptPortalSessionProjection {
         )
     }
 
-    static func project(_ session: SessionSnapshot) -> PortalSessionSummary {
+    static func project(
+        _ session: SessionSnapshot,
+        agentControl: AgentSessionActionSnapshotWire? = nil
+    ) -> PortalSessionSummary {
         PortalSessionSummary(
             sessionID: session.sessionID,
             projectID: session.projectID,
@@ -40,7 +43,10 @@ enum RepoPromptPortalSessionProjection {
             state: session.state,
             revision: session.revision,
             runGeneration: session.runGeneration,
+            turnEpoch: session.turnEpoch,
             lastActivityAt: session.transcript.last?.timestamp,
+            runPresentation: session.runPresentation,
+            agentControl: agentControl,
             contextUsage: session.contextUsage
         )
     }
@@ -69,76 +75,182 @@ enum RepoPromptPortalSessionProjection {
         })
     }
 
-    static func transcriptPage(
+    static func presentationPage(
         session: SessionSnapshot,
-        limit: Int,
-        beforeSequence: Int64?,
-        afterSequence: Int64?
-    ) throws -> PortalTranscriptPage {
-        guard (1 ... 500).contains(limit) else {
-            throw ServiceAPIError(code: .invalidRequest, message: "Transcript limit is outside the portal bound")
-        }
-        guard beforeSequence == nil || afterSequence == nil else {
-            throw ServiceAPIError(code: .invalidRequest, message: "Use either beforeSequence or afterSequence, not both")
-        }
-        if let beforeSequence, beforeSequence <= 0 {
-            throw ServiceAPIError(code: .invalidRequest, message: "beforeSequence must be positive")
-        }
-        if let afterSequence, afterSequence < 0 {
-            throw ServiceAPIError(code: .invalidRequest, message: "afterSequence cannot be negative")
-        }
-
-        let ordered = session.transcript.sorted { $0.sessionSequence < $1.sessionSequence }
-        let eligibleIndices: [Int]
-        if let beforeSequence {
-            eligibleIndices = ordered.indices.filter { ordered[$0].sessionSequence < beforeSequence }
-        } else if let afterSequence {
-            eligibleIndices = ordered.indices.filter { ordered[$0].sessionSequence > afterSequence }
-        } else {
-            eligibleIndices = Array(ordered.indices)
-        }
-
-        let selectedIndices: [Int]
-        if beforeSequence != nil || (beforeSequence == nil && afterSequence == nil) {
-            selectedIndices = Array(eligibleIndices.suffix(limit))
-        } else {
-            selectedIndices = Array(eligibleIndices.prefix(limit))
-        }
-
-        var remainingBytes = maximumPageBytes
-        var items: [PortalTranscriptEntry] = []
-        var includedIndices: [Int] = []
-        for index in selectedIndices {
-            guard remainingBytes > 0 else { break }
-            let entry = ordered[index]
-            let sourceBytes = Array(entry.content.utf8)
-            let byteLimit = min(maximumEntryBytes, remainingBytes)
-            let truncated = sourceBytes.count > byteLimit
-            let content = truncated
-                ? String(decoding: sourceBytes.prefix(byteLimit), as: UTF8.self)
-                : entry.content
-            remainingBytes -= min(sourceBytes.count, byteLimit)
-            items.append(PortalTranscriptEntry(
-                entryID: entry.entryID,
-                sessionSequence: entry.sessionSequence,
-                kind: entry.kind,
-                content: content,
-                timestamp: entry.timestamp,
-                truncated: truncated
-            ))
-            includedIndices.append(index)
-        }
-
-        let firstIndex = includedIndices.first
-        let lastIndex = includedIndices.last
-        return PortalTranscriptPage(
-            session: project(session),
-            items: items,
-            hasMoreBefore: firstIndex.map { $0 > ordered.startIndex } ?? false,
-            hasMoreAfter: lastIndex.map { $0 < ordered.index(before: ordered.endIndex) } ?? false,
-            earliestSequence: items.first?.sessionSequence,
-            latestSequence: items.last?.sessionSequence
+        control: AgentSessionActionSnapshotWire,
+        page: AgentTranscriptPresentationPageWire
+    ) throws -> PortalSessionPresentationPage {
+        let presentation = AgentTranscriptPresentationPageWire(
+            schemaVersion: page.schemaVersion,
+            presentationRevision: page.presentationRevision,
+            presentationCursor: bounded(page.presentationCursor, bytes: 1_024),
+            turns: Array(page.turns.prefix(25)).map(sanitize),
+            nextPageToken: page.nextPageToken.map { bounded($0, bytes: 2_048) },
+            pendingInteractions: Array(page.pendingInteractions.prefix(100)).map(sanitize)
         )
+        guard try JSONEncoder.serviceEncoder.encode(presentation).count <= maximumPageBytes else {
+            throw ServiceAPIError(code: .internalFailure, message: "Semantic transcript page exceeds the portal response bound")
+        }
+        return PortalSessionPresentationPage(
+            session: project(session, agentControl: control),
+            presentation: presentation
+        )
+    }
+
+    private static func sanitize(_ turn: AgentPresentationTurnWire) -> AgentPresentationTurnWire {
+        AgentPresentationTurnWire(
+            turnID: bounded(turn.turnID, bytes: 1_024),
+            responseSpanID: turn.responseSpanID.map { bounded($0, bytes: 1_024) },
+            requestAnchorID: turn.requestAnchorID,
+            terminalState: turn.terminalState.map { bounded($0, bytes: 1_024) },
+            blocks: Array(turn.blocks.prefix(256)).map(sanitize),
+            interactions: Array(turn.interactions.prefix(100)).map(sanitize),
+            legacyStandalone: turn.legacyStandalone
+        )
+    }
+
+    private static func sanitize(_ block: AgentPresentationBlockWire) -> AgentPresentationBlockWire {
+        switch block {
+        case let .request(id, row):
+            .request(id: bounded(id, bytes: 1_024), row: sanitize(row))
+        case let .activityCluster(id, rows, summary):
+            .activityCluster(
+                id: bounded(id, bytes: 1_024),
+                rows: Array(rows.prefix(256)).map(sanitize),
+                summary: AgentActivityClusterSummaryWire(
+                    activityCount: summary.activityCount,
+                    toolCount: summary.toolCount,
+                    toolGroups: Array(summary.toolGroups.prefix(100)).map { bounded($0, bytes: 1_024) },
+                    keyPaths: Array(summary.keyPaths.prefix(256)).map { bounded($0, bytes: 4_096) },
+                    running: summary.running,
+                    warning: summary.warning,
+                    failed: summary.failed,
+                    narration: summary.narration.map { bounded($0, bytes: maximumEntryBytes) },
+                    title: bounded(summary.title, bytes: 4_096),
+                    iconSemantic: bounded(summary.iconSemantic, bytes: 256),
+                    defaultExpanded: summary.defaultExpanded
+                )
+            )
+        case let .groupedHistory(id, rows, title):
+            .groupedHistory(id: bounded(id, bytes: 1_024), rows: Array(rows.prefix(256)).map(sanitize), title: bounded(title, bytes: 4_096))
+        case let .collapsedHistoryRange(id, count, title):
+            .collapsedHistoryRange(id: bounded(id, bytes: 1_024), count: count, title: bounded(title, bytes: 4_096))
+        case let .standaloneAssistant(id, row):
+            .standaloneAssistant(id: bounded(id, bytes: 1_024), row: sanitize(row))
+        case let .standaloneTool(id, row):
+            .standaloneTool(id: bounded(id, bytes: 1_024), row: sanitize(row))
+        case let .standaloneNote(id, row):
+            .standaloneNote(id: bounded(id, bytes: 1_024), row: sanitize(row))
+        case let .middleSummary(id, text):
+            .middleSummary(id: bounded(id, bytes: 1_024), text: bounded(text, bytes: maximumEntryBytes))
+        case let .conclusion(id, row):
+            .conclusion(id: bounded(id, bytes: 1_024), row: sanitize(row))
+        }
+    }
+
+    private static func sanitize(_ row: AgentPresentationRowWire) -> AgentPresentationRowWire {
+        switch row {
+        case let .userRequest(id, text, attachmentIDs, taggedFiles):
+            .userRequest(
+                id: bounded(id, bytes: 1_024),
+                text: bounded(text, bytes: maximumEntryBytes),
+                attachmentIDs: Array(attachmentIDs.prefix(100)),
+                taggedFiles: Array(taggedFiles.prefix(100)).map {
+                    ComposerTaggedFileReferenceWire(
+                        rootID: $0.rootID,
+                        logicalPath: bounded($0.logicalPath, bytes: 4_096),
+                        worktreeBindingID: $0.worktreeBindingID,
+                        displayName: bounded($0.displayName, bytes: 1_024)
+                    )
+                }
+            )
+        case let .assistant(id, text):
+            .assistant(id: bounded(id, bytes: 1_024), text: bounded(text, bytes: maximumEntryBytes))
+        case let .thinking(id, text):
+            .thinking(id: bounded(id, bytes: 1_024), text: bounded(text, bytes: maximumEntryBytes))
+        case let .progress(id, text):
+            .progress(id: bounded(id, bytes: 1_024), text: bounded(text, bytes: maximumEntryBytes))
+        case let .tool(id, tool):
+            .tool(
+                id: bounded(id, bytes: 1_024),
+                tool: AgentPresentationToolWire(
+                    executionID: bounded(tool.executionID, bytes: 1_024),
+                    name: bounded(tool.name, bytes: 1_024),
+                    status: tool.status,
+                    summary: tool.summary.map { bounded($0, bytes: 4_096) },
+                    displayArguments: tool.displayArguments.map { bounded($0, bytes: 64 * 1_024) },
+                    displayResult: tool.displayResult.map { bounded($0, bytes: maximumEntryBytes) },
+                    keyPaths: Array(tool.keyPaths.prefix(256)).map { bounded($0, bytes: 4_096) },
+                    processID: tool.processID,
+                    exitCode: tool.exitCode
+                )
+            )
+        case let .note(id, text):
+            .note(id: bounded(id, bytes: 1_024), text: bounded(text, bytes: maximumEntryBytes))
+        case let .error(id, text, code):
+            .error(id: bounded(id, bytes: 1_024), text: bounded(text, bytes: maximumEntryBytes), code: code.map { bounded($0, bytes: 1_024) })
+        }
+    }
+
+    private static func sanitize(_ interaction: AgentPresentationInteractionWire) -> AgentPresentationInteractionWire {
+        AgentPresentationInteractionWire(
+            interactionID: interaction.interactionID,
+            kind: interaction.kind,
+            state: bounded(interaction.state, bytes: 256),
+            prompt: bounded(interaction.prompt, bytes: 16 * 1_024),
+            choices: Array(interaction.choices.prefix(100)).map { bounded($0, bytes: 4_096) },
+            input: interaction.input.map(sanitize),
+            resolution: interaction.resolution.map { bounded($0, bytes: 16 * 1_024) },
+            turnID: bounded(interaction.turnID, bytes: 1_024),
+            activityID: interaction.activityID.map { bounded($0, bytes: 1_024) },
+            liveTail: interaction.liveTail,
+            requiresAttention: interaction.requiresAttention,
+            mutable: interaction.mutable,
+            revision: interaction.revision
+        )
+    }
+
+    private static func sanitize(
+        _ input: AgentPresentationInteractionInputWire
+    ) -> AgentPresentationInteractionInputWire {
+        switch input {
+        case let .singleChoice(choices, allowsCustom):
+            .singleChoice(
+                choices: Array(choices.prefix(100)).map(sanitize),
+                allowsCustom: allowsCustom
+            )
+        case let .freeText(placeholder, multiline):
+            .freeText(
+                placeholder: placeholder.map { bounded($0, bytes: 4_096) },
+                multiline: multiline
+            )
+        case let .questionnaire(questions):
+            .questionnaire(
+                questions: Array(questions.prefix(100)).map { question in
+                    AgentPresentationQuestionWire(
+                        id: bounded(question.id, bytes: 512),
+                        prompt: bounded(question.prompt, bytes: 16 * 1_024),
+                        choices: Array(question.choices.prefix(100)).map(sanitize),
+                        allowsMultiple: question.allowsMultiple,
+                        allowsCustom: question.allowsCustom,
+                        required: question.required
+                    )
+                }
+            )
+        }
+    }
+
+    private static func sanitize(_ choice: AgentPresentationChoiceWire) -> AgentPresentationChoiceWire {
+        AgentPresentationChoiceWire(
+            id: bounded(choice.id, bytes: 512),
+            displayName: bounded(choice.displayName, bytes: 2_048),
+            detailText: choice.detailText.map { bounded($0, bytes: 4_096) }
+        )
+    }
+
+    private static func bounded(_ value: String, bytes: Int) -> String {
+        guard value.utf8.count > bytes else { return value }
+        return String(decoding: value.utf8.prefix(bytes), as: UTF8.self)
     }
 
     static func validatedCreateInput(

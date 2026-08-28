@@ -32,7 +32,10 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
     public let state: SessionLifecycleState
     public let revision: Int64
     public let runGeneration: Int64
+    public let turnEpoch: Int64
     public let lastActivityAt: Date?
+    public let runPresentation: RunPresentationWireSnapshot?
+    public let agentControl: AgentSessionActionSnapshotWire?
     public let contextUsage: ContextUsageWireSnapshot?
 
     public init(
@@ -46,7 +49,10 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         state: SessionLifecycleState,
         revision: Int64,
         runGeneration: Int64,
+        turnEpoch: Int64,
         lastActivityAt: Date?,
+        runPresentation: RunPresentationWireSnapshot? = nil,
+        agentControl: AgentSessionActionSnapshotWire? = nil,
         contextUsage: ContextUsageWireSnapshot? = nil
     ) {
         self.sessionID = sessionID
@@ -59,7 +65,10 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         self.state = state
         self.revision = revision
         self.runGeneration = runGeneration
+        self.turnEpoch = turnEpoch
         self.lastActivityAt = lastActivityAt
+        self.runPresentation = runPresentation
+        self.agentControl = agentControl
         self.contextUsage = contextUsage
     }
 
@@ -69,7 +78,8 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         case parentSessionID = "parentSessionId"
         case title, provider
         case providerSettingsID = "providerSettingsId"
-        case model, state, revision, runGeneration, lastActivityAt, contextUsage
+        case model, state, revision, runGeneration, turnEpoch, lastActivityAt
+        case runPresentation, agentControl, contextUsage
     }
 }
 
@@ -181,53 +191,19 @@ public struct PortalBootstrapResponse: Codable, Sendable {
     }
 }
 
-/// Sanitized transcript row. Rich desktop presentation payloads and actor
-/// records deliberately remain server-side.
-public struct PortalTranscriptEntry: Codable, Hashable, Sendable {
-    public let entryID: UUID
-    public let sessionSequence: Int64
-    public let kind: TranscriptEntry.Kind
-    public let content: String
-    public let timestamp: Date
-    public let truncated: Bool
-
-    public init(entryID: UUID, sessionSequence: Int64, kind: TranscriptEntry.Kind, content: String, timestamp: Date, truncated: Bool) {
-        self.entryID = entryID
-        self.sessionSequence = sessionSequence
-        self.kind = kind
-        self.content = content
-        self.timestamp = timestamp
-        self.truncated = truncated
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case entryID = "entryId"
-        case sessionSequence, kind, content, timestamp, truncated
-    }
-}
-
-public struct PortalTranscriptPage: Codable, Sendable {
+/// Browser envelope around the same semantic transcript presentation used by
+/// first-party Agent Mode clients. The server remains authoritative for block
+/// grouping, tool presentation, interactions, and terminal state.
+public struct PortalSessionPresentationPage: Codable, Sendable {
     public let session: PortalSessionSummary
-    public let items: [PortalTranscriptEntry]
-    public let hasMoreBefore: Bool
-    public let hasMoreAfter: Bool
-    public let earliestSequence: Int64?
-    public let latestSequence: Int64?
+    public let presentation: AgentTranscriptPresentationPageWire
 
     public init(
         session: PortalSessionSummary,
-        items: [PortalTranscriptEntry],
-        hasMoreBefore: Bool,
-        hasMoreAfter: Bool,
-        earliestSequence: Int64?,
-        latestSequence: Int64?
+        presentation: AgentTranscriptPresentationPageWire
     ) {
         self.session = session
-        self.items = items
-        self.hasMoreBefore = hasMoreBefore
-        self.hasMoreAfter = hasMoreAfter
-        self.earliestSequence = earliestSequence
-        self.latestSequence = latestSequence
+        self.presentation = presentation
     }
 }
 
@@ -277,5 +253,38 @@ public struct PortalSendMessageRequest: Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case operationID = "operationId"
         case expectedRevision, text
+    }
+}
+
+public struct PortalInteractionAnswerRequest: Codable, Hashable, Sendable {
+    public let operationID: UUID
+    public let expectedRevision: Int64
+    public let response: AgentPresentationInteractionResponseWire
+
+    public init(
+        operationID: UUID,
+        expectedRevision: Int64,
+        response: AgentPresentationInteractionResponseWire
+    ) {
+        self.operationID = operationID
+        self.expectedRevision = expectedRevision
+        self.response = response
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case operationID = "operationId"
+        case expectedRevision, response
+    }
+}
+
+public struct PortalSessionActionRequest: Codable, Hashable, Sendable {
+    public let operationID: UUID
+
+    public init(operationID: UUID) {
+        self.operationID = operationID
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case operationID = "operationId"
     }
 }

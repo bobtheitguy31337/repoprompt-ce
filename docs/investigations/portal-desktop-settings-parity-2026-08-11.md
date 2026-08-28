@@ -368,28 +368,11 @@ The authenticated live catalog selects a complete editable provider form after d
 
 `SettingsCatalogAuthorityTests.testTypedSettingsDirectConfigurationWorkflowAndPresetHTTPContractsAreAuthenticatedAndRejectPathAuthorityFields` covers the authenticated-route matrix for Agent Models, sub-agent settings, Context Builder settings/copy, retained session-selection read, model presets, Advanced, direct-provider-configuration GET/PATCH, selection presets, and workflows. It also asserts that the portal-only Context Builder POST route returns `404 Not Found` and covers strict workflow path-field rejection. `ServerSettingsFoundationTests.testRuntimeRouteResolutionContextDefaultsPresetsAndDiscovery` proves `.mcp` resolution consumes `mcpClarifyingQuestions` while explicit invocation overrides retain precedence. Provider catalog/connection authorization remains in the existing provider HTTP coverage and is not claimed by this matrix test.
 
-## DOM
-
-`Tests/PortalDOMTests/portal.test.mjs` retains the P0 contracts and adds focused coverage for:
-
-- server-owned Agent Models profile/recommendations and absence of the old JavaScript recommender;
-- exact Agent Models project mutation keys/profile shape;
-- exact sub-agent mutation keys and Full Access warning;
-- exact Advanced mutation keys plus the authoritative 0–60 history bound;
-- exact Context Builder settings keys/bounds, global/project inheritance controls, Rewrite/Augment/Preserve, a single MCP clarification toggle, hidden portal-field preservation, and absence of Saved Prompt Collection, Add Saved Prompt, saved-prompt payload fields, and Manual Portal Run;
-- persistent accessible `Saving…`, `Saved`, and actionable failure feedback that survives route re-rendering without replacing catalog freshness;
-- behavioral model-preset add/reorder/delete ordering controls plus exact preset payload keys;
-- exact workflow display labels with stable `rp-*` IDs, display-name clone defaults, and no visible built-in `rp-*` names;
-- exact workflow visibility and named selection-preset apply fences/keys;
-- fail-closed hidden-workflow durable-association explanation;
-- deployment-truth-gated direct-provider forms, exact configuration keys, and the authoritative 1–65,536 output-token bound;
-- input-free unsupported boundaries;
-- browser-local strict versioned appearance cookie;
-- canonical 27-tool catalog/search;
-- mounted-account and Codex P0 behavior;
-- no `localStorage`, no `sessionStorage`, no inline script/style, and sensitive-input disposal.
-
-The coordinated focused test batch, commit, push, deployment, live smoke, and cleanup remain deliberately unexecuted for orchestrator verification, as required by the Item 5 implementation/audit handoff.
+The former browser DOM-shape suite was removed. It primarily froze markup and
+CSS implementation details rather than proving server behavior, and it imposed
+a second brittle UI contract alongside the desktop-derived runtime contracts.
+HTTP/runtime tests remain responsible for authorization, bounds, data safety,
+and mutation behavior; live browser smoke covers the assembled portal.
 
 # Primary source index
 
@@ -406,4 +389,3 @@ The coordinated focused test batch, commit, push, deployment, live smoke, and cl
 - `Sources/RepoPromptServiceProtocol/*SettingsDTOs.swift`
 - `Sources/RepoPromptServicePersistence/SchemaV6.swift`
 - `Tests/RepoPromptServerTests/SettingsCatalogAuthorityTests.swift`
-- `Tests/PortalDOMTests/portal.test.mjs`
