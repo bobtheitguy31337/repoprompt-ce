@@ -1,0 +1,63 @@
+name: degentlemen-repoprompt-sandbox
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  repoprompt:
+    image: degentlemen-repoprompt:sandbox
+    restart: unless-stopped
+    user: "65532:65532"
+    init: true
+    stop_grace_period: 60s
+    environment:
+      REPOPROMPT_BIND_HOST: 0.0.0.0
+      REPOPROMPT_BIND_PORT: "9443"
+      REPOPROMPT_PORTAL_HOST: 0.0.0.0
+      REPOPROMPT_PORTAL_PORT: "9081"
+      REPOPROMPT_PUBLIC_ORIGIN: ${REPOPROMPT_PUBLIC_ORIGIN:-http://127.0.0.1:9081}
+      REPOPROMPT_ENABLED_PROVIDERS: ${REPOPROMPT_ENABLED_PROVIDERS:-codex,claudeCompatible,openCodeACP,cursorACP}
+      REPOPROMPT_ENABLED_DIRECT_PROVIDERS: ${REPOPROMPT_ENABLED_DIRECT_PROVIDERS:-}
+      REPOPROMPT_MAX_ACTIVE_SESSIONS: ${REPOPROMPT_MAX_ACTIVE_SESSIONS:-2}
+    ports:
+      - "${REPOPROMPT_LISTEN_ADDRESS:-127.0.0.1}:${REPOPROMPT_API_PORT:-9443}:9443"
+      - "${REPOPROMPT_LISTEN_ADDRESS:-127.0.0.1}:${REPOPROMPT_PORTAL_PORT:-9081}:9081"
+    volumes:
+      - state:/var/lib/repoprompt/state
+      - artifacts:/var/lib/repoprompt/artifacts
+      - projects:/srv/repoprompt/projects
+      - worktrees:/srv/repoprompt/worktrees
+      - cache:/var/cache/repoprompt
+    tmpfs:
+      - /home/repoprompt:size=512m,mode=0700,uid=65532,gid=65532
+      - /tmp:size=256m,mode=1777,uid=65532,gid=65532
+      - /run/repoprompt:size=16m,mode=0700,uid=65532,gid=65532
+    healthcheck:
+      test: ["CMD", "/usr/bin/curl", "-fsS", "--max-time", "3", "http://127.0.0.1:9080/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    cpus: "1.00"
+    mem_limit: 2048m
+    pids_limit: 512
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    logging: *logging
+
+volumes:
+  state:
+    name: degentlemen-repoprompt-sandbox-state
+  artifacts:
+    name: degentlemen-repoprompt-sandbox-artifacts
+  projects:
+    name: degentlemen-repoprompt-sandbox-projects
+  worktrees:
+    name: degentlemen-repoprompt-sandbox-worktrees
+  cache:
+    name: degentlemen-repoprompt-sandbox-cache
