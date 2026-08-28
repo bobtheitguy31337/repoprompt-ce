@@ -160,7 +160,8 @@ enum RepoPromptPortalSessionProjection {
     static func presentationPage(
         session: SessionSnapshot,
         control: AgentSessionActionSnapshotWire,
-        page: AgentTranscriptPresentationPageWire
+        page: AgentTranscriptPresentationPageWire,
+        sidebarSessions: [PortalSessionSummary] = []
     ) throws -> PortalSessionPresentationPage {
         let presentation = AgentTranscriptPresentationPageWire(
             schemaVersion: page.schemaVersion,
@@ -175,7 +176,8 @@ enum RepoPromptPortalSessionProjection {
         }
         return PortalSessionPresentationPage(
             session: project(session, agentControl: control),
-            presentation: presentation
+            presentation: presentation,
+            sidebarSessions: sidebarSessions
         )
     }
 

@@ -295,10 +295,15 @@ public struct RepoPromptHTTPService: Sendable {
                 actor: principal.externalActor,
                 composerAvailable: composerCatalog != nil
             )
+            let sidebarSessions = try await portalSidebarSessions(
+                principal: principal,
+                projectID: session.projectID
+            )
             return try portalJSON(RepoPromptPortalSessionProjection.presentationPage(
                 session: session,
                 control: control,
-                page: page
+                page: page,
+                sidebarSessions: sidebarSessions
             ))
         } }
         router.post("/portal/api/v1/sessions") { request, context in await portalRespond(request) {
@@ -1968,18 +1973,27 @@ public struct RepoPromptHTTPService: Sendable {
         )
     }
 
-    private func portalBootstrap(principal: PortalAuthenticatedPrincipal) async throws -> PortalBootstrapResponse {
-        let projects = await authority.projectSnapshots().map(RepoPromptPortalSessionProjection.project)
-        let snapshots = try await authority.sessionSnapshots()
+    private func portalSidebarSessions(
+        principal: PortalAuthenticatedPrincipal,
+        projectID: UUID? = nil
+    ) async throws -> [PortalSessionSummary] {
+        let snapshots = try await authority.sessionSnapshots().filter {
+            projectID == nil || $0.projectID == projectID
+        }
         let controls = try await authority.agentSessionActionSnapshots(
             sessionIDs: snapshots.map(\.sessionID),
             actor: principal.externalActor,
             composerAvailable: composerCatalog != nil
         )
-        let sessions = RepoPromptPortalSessionProjection.sidebarSessions(
+        return RepoPromptPortalSessionProjection.sidebarSessions(
             snapshots,
             controls: controls
         )
+    }
+
+    private func portalBootstrap(principal: PortalAuthenticatedPrincipal) async throws -> PortalBootstrapResponse {
+        let projects = await authority.projectSnapshots().map(RepoPromptPortalSessionProjection.project)
+        let sessions = try await portalSidebarSessions(principal: principal)
         let workflowRepository = try await authority.workflowRepositorySnapshot()
         let workflows = try await authority.workflowSnapshots().map {
             PortalWorkflowSummary(

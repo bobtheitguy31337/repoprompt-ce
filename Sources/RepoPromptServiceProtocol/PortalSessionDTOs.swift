@@ -301,13 +301,34 @@ public struct PortalBootstrapResponse: Codable, Sendable {
 public struct PortalSessionPresentationPage: Codable, Sendable {
     public let session: PortalSessionSummary
     public let presentation: AgentTranscriptPresentationPageWire
+    public let sidebarSessions: [PortalSessionSummary]
 
     public init(
         session: PortalSessionSummary,
-        presentation: AgentTranscriptPresentationPageWire
+        presentation: AgentTranscriptPresentationPageWire,
+        sidebarSessions: [PortalSessionSummary] = []
     ) {
         self.session = session
         self.presentation = presentation
+        self.sidebarSessions = sidebarSessions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        session = try container.decode(PortalSessionSummary.self, forKey: .session)
+        presentation = try container.decode(AgentTranscriptPresentationPageWire.self, forKey: .presentation)
+        sidebarSessions = try container.decodeIfPresent([PortalSessionSummary].self, forKey: .sidebarSessions) ?? []
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(session, forKey: .session)
+        try container.encode(presentation, forKey: .presentation)
+        try container.encode(sidebarSessions, forKey: .sidebarSessions)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case session, presentation, sidebarSessions
     }
 }
 

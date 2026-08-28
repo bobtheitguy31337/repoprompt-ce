@@ -1673,7 +1673,14 @@
           (item) => item.sessionId === sessionID,
         );
         const previousRevision = index >= 0 ? state.bootstrap.sessions[index].revision : null;
-        if (index >= 0) state.bootstrap.sessions[index] = page.session;
+        if (Array.isArray(page.sidebarSessions)) {
+          const projectID = page.session.projectId;
+          state.bootstrap.sessions = state.bootstrap.sessions
+            .filter((item) => item.projectId !== projectID)
+            .concat(page.sidebarSessions);
+        } else if (index >= 0) {
+          state.bootstrap.sessions[index] = page.session;
+        }
         renderSessions();
         renderAgentDetail();
         if (previousRevision !== page.session.revision)

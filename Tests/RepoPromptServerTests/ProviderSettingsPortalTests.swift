@@ -506,9 +506,11 @@ final class ProviderSettingsPortalTests: XCTestCase {
         let page = try RepoPromptPortalSessionProjection.presentationPage(
             session: session,
             control: control,
-            page: presentation
+            page: presentation,
+            sidebarSessions: [RepoPromptPortalSessionProjection.project(session, agentControl: control)]
         )
         XCTAssertEqual(page.session.title, "Build the provider portal faithfully")
+        XCTAssertEqual(page.sidebarSessions.map(\.sessionID), [sessionID])
         guard case let .standaloneAssistant(_, row) = page.presentation.turns[0].blocks[1],
               case let .assistant(_, content) = row
         else {
@@ -525,6 +527,14 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertFalse(encoded.contains("\"turnID\""))
         XCTAssertFalse(encoded.contains("presentationPayload"))
         XCTAssertFalse(encoded.contains("actor"))
+
+        var legacyObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder.serviceEncoder.encode(page)) as? [String: Any]
+        )
+        legacyObject.removeValue(forKey: "sidebarSessions")
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+        let legacyPage = try JSONDecoder.serviceDecoder.decode(PortalSessionPresentationPage.self, from: legacyData)
+        XCTAssertTrue(legacyPage.sidebarSessions.isEmpty)
     }
 
     func testPortalSidebarUsesDesktopThreadOrderingAndDepth() throws {
