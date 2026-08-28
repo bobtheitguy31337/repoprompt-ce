@@ -1,4 +1,7 @@
 # syntax=docker/dockerfile:1.7
+ARG ADMIN_NODE_VERSION=22.22.3
+FROM node:${ADMIN_NODE_VERSION}-bookworm-slim AS admin-runtime
+
 FROM swift:6.2.4-noble AS build
 WORKDIR /src
 COPY Package.swift Package.resolved ./
@@ -29,37 +32,11 @@ RUN --mount=type=cache,target=/root/.cache/org.swift.swiftpm \
     install -d -m 0755 /out/usr/local/bin/RepoPromptCE_RepoPromptServiceHTTP.resources && \
     install -m 0644 "$bin_path/RepoPromptCE_RepoPromptServiceHTTP.resources/"* /out/usr/local/bin/RepoPromptCE_RepoPromptServiceHTTP.resources/
 
-FROM ubuntu:noble AS providers
-ARG TARGETARCH
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl nodejs npm tar && rm -rf /var/lib/apt/lists/*
-RUN set -eux; \
-    case "$TARGETARCH" in \
-      amd64) CODEX_URL='https://github.com/openai/codex/releases/download/rust-v0.147.0/codex-package-x86_64-unknown-linux-musl.tar.gz'; CODEX_SHA='bd758d53d56e41dc65e045f4589df79a038ed197a011adcb52a258e6ad64cfda'; \
-             OPENCODE_URL='https://github.com/anomalyco/opencode/releases/download/v1.15.11/opencode-linux-x64.tar.gz'; OPENCODE_SHA='49317253722c698394980e1921ff28e919d79bb29d5c3f4cf314a4adaf7037cd'; \
-             CURSOR_URL='https://downloads.cursor.com/lab/2026.08.04-aaa8809/linux/x64/agent-cli-package.tar.gz'; CURSOR_SHA='e282068dcb5cdd668b8ce2e3456c58be13bb64a834e1ad49f8534b5cd7aa2fe5' ;; \
-      arm64) CODEX_URL='https://github.com/openai/codex/releases/download/rust-v0.147.0/codex-package-aarch64-unknown-linux-musl.tar.gz'; CODEX_SHA='89cbf79bd5ae6f9c58da47e8079f311c84219350c9c43c070d42f3e9b2a81401'; \
-             OPENCODE_URL='https://github.com/anomalyco/opencode/releases/download/v1.15.11/opencode-linux-arm64.tar.gz'; OPENCODE_SHA='93e4399f308c49387c25ec2b570602bf0f9dd5f57989427946c0c28dbf259ff4'; \
-             CURSOR_URL='https://downloads.cursor.com/lab/2026.08.04-aaa8809/linux/arm64/agent-cli-package.tar.gz'; CURSOR_SHA='d5196289292a660b59807ac508c9ac36ec1e1a1a7e4697af3ef6824fdea984ee' ;; \
-      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
-    esac; \
-    install -d /opt/repoprompt/providers /opt/repoprompt/provider-bundles/codex /opt/repoprompt/provider-bundles/cursor; \
-    curl -fsSL "$CODEX_URL" -o /tmp/codex.tgz; echo "$CODEX_SHA  /tmp/codex.tgz" | sha256sum -c -; tar -xzf /tmp/codex.tgz -C /opt/repoprompt/provider-bundles/codex; \
-    ln -s ../provider-bundles/codex/bin/codex /opt/repoprompt/providers/codex; \
-    curl -fsSL "$OPENCODE_URL" -o /tmp/opencode.tgz; echo "$OPENCODE_SHA  /tmp/opencode.tgz" | sha256sum -c -; tar -xzf /tmp/opencode.tgz -C /opt/repoprompt/providers; chmod 0755 /opt/repoprompt/providers/opencode; \
-    curl -fsSL "$CURSOR_URL" -o /tmp/cursor.tgz; echo "$CURSOR_SHA  /tmp/cursor.tgz" | sha256sum -c -; tar --strip-components=1 -xzf /tmp/cursor.tgz -C /opt/repoprompt/provider-bundles/cursor; \
-    ln -s ../provider-bundles/cursor/cursor-agent /opt/repoprompt/providers/cursor-agent; \
-    DISABLE_AUTOUPDATER=1 npm install --global --prefix /opt/repoprompt/provider-bundles/claude '@anthropic-ai/claude-code@2.1.226'; \
-    ln -s ../provider-bundles/claude/bin/claude /opt/repoprompt/providers/claude; \
-    /opt/repoprompt/providers/codex --version | grep -F '0.147.0'; \
-    /opt/repoprompt/providers/claude --version | grep -F '2.1.226'; \
-    /opt/repoprompt/providers/opencode --version | grep -F '1.15.11'; \
-    /opt/repoprompt/providers/cursor-agent --version | grep -F '2026.08.04-aaa8809'; \
-    rm -f /tmp/codex.tgz /tmp/opencode.tgz /tmp/cursor.tgz
-
 FROM swift:6.2.4-noble-slim
 ARG REPOPROMPT_COMMIT=unknown
 ARG REPOPROMPT_VERSION=0.1.0
 ARG SOURCE_DATE_EPOCH=1970-01-01T00:00:00Z
+ARG ADMIN_NODE_VERSION
 LABEL org.opencontainers.image.title="RepoPromptServer" \
       org.opencontainers.image.description="Durable internal RepoPrompt Agent and Workspace authority" \
       org.opencontainers.image.source="https://github.com/RepoPrompt/repoprompt-ce" \
@@ -71,24 +48,28 @@ LABEL org.opencontainers.image.title="RepoPromptServer" \
       io.repoprompt.runtime-uid="65532" \
       io.repoprompt.port.internal-api="9443/tcp;mtls" \
       io.repoprompt.port.portal="9081/tcp;http-password" \
-      io.repoprompt.port.health="9080/tcp;loopback-only" \
-      io.repoprompt.provider.codex="0.147.0;app-server-v2" \
-      io.repoprompt.provider.claude-compatible="2.1.226;stream-json-v1" \
-      io.repoprompt.provider.opencode="1.15.11;acp-v1" \
-      io.repoprompt.provider.cursor="2026.08.04-aaa8809;acp-v1-beta"
+      io.repoprompt.port.health="9080/tcp;loopback-only"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git tini util-linux && rm -rf /var/lib/apt/lists/* && \
-    groupadd --gid 65532 repoprompt && useradd --uid 65532 --gid 65532 --home-dir /var/lib/repoprompt --create-home --shell /usr/sbin/nologin repoprompt && \
+    groupadd --gid 65532 repoprompt && useradd --uid 65532 --gid 65532 --home-dir /home/repoprompt --create-home --shell /usr/sbin/nologin repoprompt && \
     install -d -o 65532 -g 65532 /var/lib/repoprompt/state /var/lib/repoprompt/artifacts /srv/repoprompt/projects /srv/repoprompt/worktrees /var/cache/repoprompt
 COPY --from=build /out/usr/local/bin/ /usr/local/bin/
-COPY --from=providers /opt/repoprompt /opt/repoprompt
-ENV PATH="/opt/repoprompt/providers:${PATH}" \
-    REPOPROMPT_STATE_DB="/var/lib/repoprompt/state/repoprompt.sqlite" \
+COPY --from=admin-runtime /usr/local/bin/node /usr/local/bin/node
+COPY Sandbox/Server/provider-cli-manager.sh /usr/local/libexec/repoprompt/provider-cli-manager
+RUN chmod 0555 /usr/local/libexec/repoprompt/provider-cli-manager && \
+    test "$(/usr/local/bin/node --version)" = "v${ADMIN_NODE_VERSION}"
+ENV REPOPROMPT_STATE_DB="/var/lib/repoprompt/state/repoprompt.sqlite" \
     REPOPROMPT_ARTIFACT_DIR="/var/lib/repoprompt/artifacts" \
     REPOPROMPT_PROJECT_DIR="/srv/repoprompt/projects" \
     REPOPROMPT_WORKTREE_DIR="/srv/repoprompt/worktrees" \
-    REPOPROMPT_CACHE_DIR="/var/cache/repoprompt"
+    REPOPROMPT_CACHE_DIR="/var/cache/repoprompt" \
+    REPOPROMPT_PROVIDER_HOME_DIR="/tmp/repoprompt-provider-homes" \
+    REPOPROMPT_PROVIDER_CLI_SELECTION_FILE="/var/lib/repoprompt/state/provider-cli-selection" \
+    REPOPROMPT_PROVIDER_CLI_MANAGER="/usr/local/libexec/repoprompt/provider-cli-manager" \
+    HOME="/home/repoprompt" \
+    PATH="/home/repoprompt/.local/bin:/home/repoprompt/.opencode/bin:${PATH}"
 USER 65532:65532
 EXPOSE 9443 9081 9080
 VOLUME ["/var/lib/repoprompt/state", "/var/lib/repoprompt/artifacts", "/srv/repoprompt/projects", "/srv/repoprompt/worktrees", "/var/cache/repoprompt"]
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=6 CMD ["curl", "-fsS", "--max-time", "3", "http://127.0.0.1:9080/health/ready"]
-ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/usr/local/bin/RepoPromptServer"]
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
+CMD ["/usr/local/bin/RepoPromptServer"]

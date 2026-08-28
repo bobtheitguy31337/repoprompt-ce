@@ -62,15 +62,14 @@ final class CodexDeviceAuthRuntimeTests: XCTestCase {
         }
     }
 
-    func testCapabilityRemainsVisibleButUnavailableWhenPinnedVersionDoesNotMatch() async throws {
+    func testCapabilityAcceptsAProviderManagedCodexUpdate() async throws {
         let fixture = try Fixture(version: "0.146.0")
         defer { fixture.cleanup() }
         let driver = try fixture.makeDriver()
 
         let descriptor = await driver.authFlowDescriptor(providerID: .codex, forceRefresh: true)
         XCTAssertEqual(descriptor?.kind, .deviceCodeBeta)
-        XCTAssertEqual(descriptor?.startable, false)
-        XCTAssertTrue(descriptor?.detail.contains("temporarily unavailable") == true)
+        XCTAssertEqual(descriptor?.startable, true)
     }
 
     func testModelCatalogUsesPaginatedDesktopAppServerDiscoveryAndExplicitFastTierMetadata() async throws {
@@ -118,7 +117,7 @@ private final class Fixture: @unchecked Sendable {
     let managedHome: CodexManagedAuthHome
     private let version: String
 
-    init(version: String = CodexCLIContract.pinnedVersion) throws {
+    init(version: String = "0.149.0") throws {
         self.version = version
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         executable = root.appendingPathComponent("codex")

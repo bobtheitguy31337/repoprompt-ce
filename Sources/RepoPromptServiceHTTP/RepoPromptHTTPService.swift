@@ -514,6 +514,21 @@ public struct RepoPromptHTTPService: Sendable {
             let snapshot = try await requireProviderSettings().setEnabled(providerID: providerSettingsID(context), enabled: false, request: input, attribution: principal.providerAttribution)
             return try portalJSON(snapshot)
         } }
+        router.post("/portal/api/v1/provider-settings/:id/install") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            return try await portalJSON(requireProviderSettings().installCLI(providerID: providerSettingsID(context), attribution: principal.providerAttribution), status: .created)
+        } }
+        router.post("/portal/api/v1/provider-settings/:id/update-cli") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            return try await portalJSON(requireProviderSettings().updateCLI(providerID: providerSettingsID(context), attribution: principal.providerAttribution))
+        } }
+        router.post("/portal/api/v1/provider-settings/:id/uninstall") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            return try await portalJSON(requireProviderSettings().uninstallCLI(providerID: providerSettingsID(context), attribution: principal.providerAttribution))
+        } }
         router.post("/portal/api/v1/provider-settings/:id/auth-flows") { request, context in await portalRespond(request) {
             let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
@@ -608,6 +623,24 @@ public struct RepoPromptHTTPService: Sendable {
             let auth = try await authenticate(request, context: context, body: data, roles: [.app, .operatorRole], operation: "providerDisable")
             let input = try JSONDecoder.serviceDecoder.decode(SetProviderEnabledRequest.self, from: data)
             return try await HTTPResponses.json(requireProviderSettings().setEnabled(providerID: providerSettingsID(context), enabled: false, request: input, attribution: providerAttribution(auth)))
+        } }
+        router.post("/internal/v1/provider-settings/:id/install") { request, context in await respond(request) {
+            let data = try await bodyData(request)
+            _ = try requireIdempotency(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.operatorRole], operation: "providerCLIInstall")
+            return try await HTTPResponses.json(requireProviderSettings().installCLI(providerID: providerSettingsID(context), attribution: providerAttribution(auth)), status: .created)
+        } }
+        router.post("/internal/v1/provider-settings/:id/update-cli") { request, context in await respond(request) {
+            let data = try await bodyData(request)
+            _ = try requireIdempotency(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.operatorRole], operation: "providerCLIUpdate")
+            return try await HTTPResponses.json(requireProviderSettings().updateCLI(providerID: providerSettingsID(context), attribution: providerAttribution(auth)))
+        } }
+        router.post("/internal/v1/provider-settings/:id/uninstall") { request, context in await respond(request) {
+            let data = try await bodyData(request)
+            _ = try requireIdempotency(request)
+            let auth = try await authenticate(request, context: context, body: data, roles: [.operatorRole], operation: "providerCLIUninstall")
+            return try await HTTPResponses.json(requireProviderSettings().uninstallCLI(providerID: providerSettingsID(context), attribution: providerAttribution(auth)))
         } }
         router.post("/internal/v1/provider-settings/:id/connect") { request, context in await respond(request) {
             let data = try await bodyData(request)

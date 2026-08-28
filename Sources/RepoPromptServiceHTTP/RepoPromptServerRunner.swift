@@ -46,6 +46,7 @@ public struct RepoPromptServerConfiguration: Sendable {
     public let restoreActivationTokenPath: String?
     public let projectSourcePolicy: ProjectSourcePolicy
     public let projectSourceGitCredentials: ProjectSourceGitCredentials
+    public let providerCLIManagerExecutable: String?
 
     public static func environment(_ environment: [String: String] = ProcessInfo.processInfo.environment) throws -> Self {
         func required(_ name: String) throws -> String {
@@ -146,11 +147,11 @@ public struct RepoPromptServerConfiguration: Sendable {
         }) else { throw ConfigurationError.invalid("Internal signing keys require a valid key ID and at least 256 bits") }
         guard Set(signingKeys.map(\.keyID)).count == signingKeys.count else { throw ConfigurationError.invalid("Internal signing key IDs must be unique across roles and rotations") }
         let providers: [ProviderKind: String] = [
-            .codex: environment["REPOPROMPT_CODEX_EXECUTABLE"] ?? "/opt/repoprompt/providers/codex",
-            .claudeCompatible: environment["REPOPROMPT_CLAUDE_EXECUTABLE"] ?? "/opt/repoprompt/providers/claude",
-            .openCodeACP: environment["REPOPROMPT_OPENCODE_EXECUTABLE"] ?? "/opt/repoprompt/providers/opencode",
-            .cursorACP: environment["REPOPROMPT_CURSOR_EXECUTABLE"] ?? "/opt/repoprompt/providers/cursor-agent",
-            .grokBuildACP: environment["REPOPROMPT_GROK_EXECUTABLE"] ?? "/opt/repoprompt/providers/grok"
+            .codex: environment["REPOPROMPT_CODEX_EXECUTABLE"] ?? "/home/repoprompt/.local/bin/codex",
+            .claudeCompatible: environment["REPOPROMPT_CLAUDE_EXECUTABLE"] ?? "/home/repoprompt/.local/bin/claude",
+            .openCodeACP: environment["REPOPROMPT_OPENCODE_EXECUTABLE"] ?? "/home/repoprompt/.opencode/bin/opencode",
+            .cursorACP: environment["REPOPROMPT_CURSOR_EXECUTABLE"] ?? "/home/repoprompt/.local/bin/cursor-agent",
+            .grokBuildACP: environment["REPOPROMPT_GROK_EXECUTABLE"] ?? "/home/repoprompt/.local/bin/grok"
         ]
         let enabledProviderNames = if let configured = environment["REPOPROMPT_ENABLED_PROVIDERS"] {
             configured
@@ -177,7 +178,7 @@ public struct RepoPromptServerConfiguration: Sendable {
             }
             enabledDirectProviders.insert(providerID)
         }
-        let versions: [ProviderKind: String] = [.codex: CodexCLIContract.pinnedVersion, .claudeCompatible: "2.1.226", .openCodeACP: "1.15.11", .cursorACP: "2026.08.04-aaa8809", .grokBuildACP: "1.0.4"]
+        let versions: [ProviderKind: String] = [:]
         let protocols: [ProviderKind: String] = [.codex: "app-server-v2", .claudeCompatible: "stream-json-v1", .openCodeACP: "acp-v1", .cursorACP: "acp-v1-beta", .grokBuildACP: "acp-v1"]
         if environment["REPOPROMPT_CODEX_CREDENTIAL_HOME"].map({ !$0.isEmpty }) == true
             || environment["REPOPROMPT_CODEX_AUTH_STATUS_FILE"].map({ !$0.isEmpty }) == true
@@ -313,7 +314,8 @@ public struct RepoPromptServerConfiguration: Sendable {
             maximumActiveSessions: Int(environment["REPOPROMPT_MAX_ACTIVE_SESSIONS"] ?? "64") ?? 64,
             restoreActivationTokenPath: environment["REPOPROMPT_RESTORE_ACTIVATION_TOKEN_FILE"],
             projectSourcePolicy: projectSourcePolicy,
-            projectSourceGitCredentials: projectSourceGitCredentials
+            projectSourceGitCredentials: projectSourceGitCredentials,
+            providerCLIManagerExecutable: environment["REPOPROMPT_PROVIDER_CLI_MANAGER"]
         )
     }
 }
@@ -539,7 +541,6 @@ public enum RepoPromptServerRunner {
         )
         let codexAuthentication = CodexDeviceAuthDriver(
             executable: configuration.providerExecutables[.codex] ?? "",
-            expectedVersion: configuration.providerVersions[.codex] ?? CodexCLIContract.pinnedVersion,
             managedHome: managedCodexHome,
             processPort: processPort,
             processStore: store,
@@ -592,6 +593,11 @@ public enum RepoPromptServerRunner {
             cli: ProviderAuthenticationAdapter(configurations: providerConfigurations, backendSettings: portalDesktopSettings),
             direct: DirectProviderCredentialTester(registry: directProviderRegistry, transport: directTransport)
         )
+        let cliInstallationManager: any ProviderCLIInstallationManaging = if let executable = configuration.providerCLIManagerExecutable {
+            ProviderCLIInstallationManager(executable: executable)
+        } else {
+            UnavailableProviderCLIInstallationManager()
+        }
         let providerSettings = ProviderSettingsService(
             store: store,
             adapter: providers,
@@ -604,7 +610,8 @@ public enum RepoPromptServerRunner {
             vault: providerVault,
             credentialTester: credentialTester,
             directProviderRegistry: directProviderRegistry,
-            directProviderAllowlist: configuration.enabledDirectProviders
+            directProviderAllowlist: configuration.enabledDirectProviders,
+            cliInstallationManager: cliInstallationManager
         )
         try await providers.recoverProcessFamilies()
         let activeProviderRunIDs = Set(try await store.activeProcessFamilies().map(\.runID))

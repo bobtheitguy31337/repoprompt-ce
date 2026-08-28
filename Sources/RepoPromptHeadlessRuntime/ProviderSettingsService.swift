@@ -26,6 +26,31 @@ public struct UnavailableProviderAuthFlowCoordinator: ProviderAuthFlowCoordinati
     }
 }
 
+public protocol ProviderCLIInstallationManaging: Sendable {
+    func restoreSelected() async throws
+    func install(providerID: ProviderSettingsID) async throws
+    func update(providerID: ProviderSettingsID) async throws
+    func uninstall(providerID: ProviderSettingsID) async throws
+}
+
+public struct UnavailableProviderCLIInstallationManager: ProviderCLIInstallationManaging {
+    public init() {}
+
+    public func restoreSelected() async throws {}
+
+    public func install(providerID _: ProviderSettingsID) async throws {
+        throw ServiceAPIError(code: .capabilityMissing, message: "Provider CLI installation is unavailable")
+    }
+
+    public func update(providerID _: ProviderSettingsID) async throws {
+        throw ServiceAPIError(code: .capabilityMissing, message: "Provider CLI updates are unavailable")
+    }
+
+    public func uninstall(providerID _: ProviderSettingsID) async throws {
+        throw ServiceAPIError(code: .capabilityMissing, message: "Provider CLI removal is unavailable")
+    }
+}
+
 /// Provider/settings authority for the Linux portal. It owns only non-secret
 /// preferences and browser-safe projections; native process/session authority
 /// remains in `ProviderCLIAdapter`.
@@ -66,6 +91,7 @@ public actor ProviderSettingsService {
     private let credentialTester: any ProviderCredentialTesting
     private let directProviderRegistry: DirectProviderRegistry?
     private let directProviderAllowlist: Set<ProviderSettingsID>
+    private let cliInstallationManager: any ProviderCLIInstallationManaging
     private let runner: any WorkspaceCommandRunning
     private var preferences: [ProviderSettingsID: ProviderSettingsPreference] = [:]
     private var cliHealth: [ProviderSettingsID: ProviderCLIHealth] = [:]
@@ -95,6 +121,7 @@ public actor ProviderSettingsService {
         credentialTester: any ProviderCredentialTesting = UnavailableProviderCredentialTester(),
         directProviderRegistry: DirectProviderRegistry? = nil,
         directProviderAllowlist: Set<ProviderSettingsID> = [],
+        cliInstallationManager: any ProviderCLIInstallationManaging = UnavailableProviderCLIInstallationManager(),
         runner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner()
     ) {
         self.store = store
@@ -109,10 +136,12 @@ public actor ProviderSettingsService {
         self.credentialTester = credentialTester
         self.directProviderRegistry = directProviderRegistry
         self.directProviderAllowlist = Set(directProviderAllowlist.filter(\.isDirectAPI))
+        self.cliInstallationManager = cliInstallationManager
         self.runner = runner
     }
 
     public func bootstrap() async throws {
+        try await cliInstallationManager.restoreSelected()
         modelCatalogs = try loadModelCatalogs()
         if let directProviderRegistry {
             for providerID in ProviderSettingsID.directAPIProviders {
@@ -186,21 +215,9 @@ public actor ProviderSettingsService {
             }
             if providerID.ownsRuntimeAdmission,
                let runtimeKind = providerID.runtimeKind,
-               let configuration = configurations[runtimeKind],
-               let expectedVersion = configuration.expectedVersion,
-               FileManager.default.isExecutableFile(atPath: configuration.executable)
+               let configuration = configurations[runtimeKind]
             {
-                // Server-packaged providers are resolved and version-verified
-                // when the immutable image is built, matching Desktop's bundled
-                // runtime authority. Make that authority available immediately;
-                // live protocol preflights remain an asynchronous diagnostic.
-                cliHealth[providerID] = ProviderCLIHealth(
-                    installed: true,
-                    healthy: true,
-                    version: expectedVersion,
-                    expectedVersion: expectedVersion
-                )
-                runtimePreflight[providerID] = true
+                await refreshCLIHealth(providerID: providerID, kind: runtimeKind, configuration: configuration)
             }
             if preferences[providerID] == nil {
                 let selection = try bootstrapSelection(
@@ -288,6 +305,13 @@ public actor ProviderSettingsService {
         if request.enabled, !providerID.isDirectAPI, let kind = providerID.runtimeKind, !initiallyEnabled.contains(kind) {
             throw ServiceAPIError(code: .capabilityMissing, message: "Deployment configuration does not allow this provider")
         }
+        if request.enabled,
+           !providerID.isDirectAPI,
+           providerID.runtimeKind != nil,
+           cliHealth[providerID.runtimeSettingsOwner]?.installed != true
+        {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Install this provider CLI before enabling it")
+        }
         try validateSelection(request, providerID: providerID, definition: definition)
         let next = try ProviderSettingsPreference(
             providerID: providerID,
@@ -356,6 +380,117 @@ public actor ProviderSettingsService {
             attribution: attribution,
             auditOperation: enabled ? "enable" : "disable"
         )
+    }
+
+    public func installCLI(
+        providerID: ProviderSettingsID,
+        attribution: ProviderMutationAttribution
+    ) async throws -> ProviderSettingsSnapshot {
+        let owner = try installableRuntimeOwner(providerID)
+        try await cliInstallationManager.install(providerID: owner)
+        try await refreshAfterCLIInstallation(owner)
+        try await store.appendProviderConnectionAudit(
+            providerID: owner,
+            connectionID: connections[owner]?.record.connectionID,
+            operation: "installCLI",
+            attribution: attribution,
+            authenticationMethod: connections[owner]?.record.authenticationMethod,
+            result: "installed"
+        )
+        return try snapshot(for: owner)
+    }
+
+    public func updateCLI(
+        providerID: ProviderSettingsID,
+        attribution: ProviderMutationAttribution
+    ) async throws -> ProviderSettingsSnapshot {
+        let owner = try installableRuntimeOwner(providerID)
+        guard cliHealth[owner]?.installed == true else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Install this provider CLI before updating it")
+        }
+        try await cliInstallationManager.update(providerID: owner)
+        try await refreshAfterCLIInstallation(owner)
+        try await store.appendProviderConnectionAudit(
+            providerID: owner,
+            connectionID: connections[owner]?.record.connectionID,
+            operation: "updateCLI",
+            attribution: attribution,
+            authenticationMethod: connections[owner]?.record.authenticationMethod,
+            result: "updated"
+        )
+        return try snapshot(for: owner)
+    }
+
+    public func uninstallCLI(
+        providerID: ProviderSettingsID,
+        attribution: ProviderMutationAttribution
+    ) async throws -> ProviderSettingsSnapshot {
+        let owner = try installableRuntimeOwner(providerID)
+        let kind = owner.runtimeKind
+        guard !preferences.values.contains(where: { $0.providerID.runtimeKind == kind && $0.enabled }) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Disable this provider and its compatible backends before uninstalling the CLI")
+        }
+        guard !connections.keys.contains(where: { $0.runtimeSettingsOwner == owner }) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Disconnect this provider before uninstalling the CLI")
+        }
+        try await cliInstallationManager.uninstall(providerID: owner)
+        cliHealth[owner] = ProviderCLIHealth(installed: false, healthy: false, detail: "Provider CLI is not installed")
+        runtimePreflight[owner] = false
+        statusRefreshedAt[owner] = nil
+        for id in ProviderSettingsID.allCases where id.runtimeSettingsOwner == owner {
+            supportedAuthenticationMethods[id] = []
+        }
+        try await applyRuntimePreference(owner)
+        try await store.appendProviderConnectionAudit(
+            providerID: owner,
+            connectionID: nil,
+            operation: "uninstallCLI",
+            attribution: attribution,
+            authenticationMethod: nil,
+            result: "uninstalled"
+        )
+        return try snapshot(for: owner)
+    }
+
+    private func installableRuntimeOwner(_ providerID: ProviderSettingsID) throws -> ProviderSettingsID {
+        let owner = providerID.runtimeSettingsOwner
+        guard owner == providerID,
+              owner.ownsRuntimeAdmission,
+              !owner.isDirectAPI,
+              let kind = owner.runtimeKind,
+              initiallyEnabled.contains(kind),
+              configurations[kind] != nil
+        else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "This provider CLI is not available for installation")
+        }
+        return owner
+    }
+
+    private func refreshAfterCLIInstallation(_ providerID: ProviderSettingsID) async throws {
+        guard let kind = providerID.runtimeKind,
+              let configuration = configurations[kind]
+        else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Installed provider has no runtime configuration")
+        }
+        await refreshCLIHealth(providerID: providerID, kind: kind, configuration: configuration)
+        guard cliHealth[providerID]?.installed == true,
+              cliHealth[providerID]?.healthy == true
+        else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider installer completed without a runnable CLI")
+        }
+        runtimePreflight[providerID] = false
+        statusRefreshedAt[providerID] = nil
+        for id in ProviderSettingsID.allCases where id.runtimeSettingsOwner == providerID {
+            var methods = await credentialTester.supportedAuthenticationMethods(for: id)
+            if let externalMethod = Self.externalAuthenticationMethod(for: id), externallyProvisioned(id) {
+                methods.insert(externalMethod)
+            }
+            supportedAuthenticationMethods[id] = methods
+        }
+        if providerID == .codex {
+            await refreshManagedAuthenticationCapabilities(providerID: providerID, forceRefresh: true)
+        }
+        try await applyRuntimePreference(providerID)
     }
 
     public func startAuthFlow(providerID: ProviderSettingsID, request: StartProviderAuthFlowRequest, attribution: ProviderMutationAttribution) async throws -> ProviderAuthTransactionStatus {

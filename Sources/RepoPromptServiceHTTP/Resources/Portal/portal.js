@@ -1919,6 +1919,8 @@
       return details;
     }
 
+    body.append(providerCLIInstallationCard(provider));
+
     if (connected) {
       body.append(connectedProviderSummary(provider));
       body.append(providerRuntimeControls(provider));
@@ -1985,24 +1987,117 @@
     return details;
   }
 
+  function providerCLIInstallationCard(provider) {
+    const installed = provider.cli?.installed === true;
+    const version = provider.cli?.version || "Version unavailable";
+    const card = desktopCard(
+      "CLI installation",
+      installed
+        ? `${version}. Installed for the RepoPrompt server user and reinstalled automatically after app deployment.`
+        : "Install the current release directly from the provider. The CLI is not part of the RepoPrompt app image.",
+    );
+    const actions = element("div", "form-actions");
+    actions.append(
+      element(
+        "span",
+        "form-note",
+        installed
+          ? "Provider releases update independently of RepoPrompt."
+          : "Uses the provider's official installer.",
+      ),
+    );
+    if (!installed) {
+      const install = element("button", "primary-button", "Install");
+      install.type = "button";
+      if (!provider.deploymentAllowed)
+        setDisabledReason(
+          install,
+          true,
+          "This provider is not available for this server deployment.",
+        );
+      else
+        install.addEventListener("click", () =>
+          mutateProviderCLI(provider, "install", install, "Installing…"),
+        );
+      actions.append(install);
+    } else {
+      const update = element("button", "secondary-button", "Update");
+      update.type = "button";
+      update.addEventListener("click", () =>
+        mutateProviderCLI(provider, "update-cli", update, "Updating…"),
+      );
+      const uninstall = element("button", "secondary-button", "Uninstall");
+      uninstall.type = "button";
+      const uninstallReason = provider.preference.enabled
+        ? "Disable this provider before uninstalling its CLI."
+        : provider.connection
+          ? "Disconnect this provider before uninstalling its CLI."
+          : "";
+      if (uninstallReason)
+        setDisabledReason(uninstall, true, uninstallReason);
+      else
+        uninstall.addEventListener("click", () =>
+          mutateProviderCLI(
+            provider,
+            "uninstall",
+            uninstall,
+            "Uninstalling…",
+          ),
+        );
+      actions.append(update, uninstall);
+    }
+    card.append(actions);
+    return card;
+  }
+
+  async function mutateProviderCLI(provider, action, button, pendingLabel) {
+    const originalLabel = button.textContent;
+    button.textContent = pendingLabel;
+    setDisabledReason(
+      button,
+      true,
+      `${pendingLabel.replace("…", "")} provider CLI.`,
+    );
+    try {
+      const updated = await api(
+        `api/v1/provider-settings/${encodeURIComponent(provider.providerID)}/${action}`,
+        { method: "POST" },
+      );
+      replaceProvider(updated);
+      renderRoute();
+      const verb =
+        action === "install"
+          ? "installed"
+          : action === "uninstall"
+            ? "uninstalled"
+            : "updated";
+      toast(`${provider.displayName} CLI ${verb}`);
+      announce(`${provider.displayName} CLI ${verb}`);
+    } catch (error) {
+      button.textContent = originalLabel;
+      setDisabledReason(button, false, "");
+      toast(error.message, true);
+    }
+  }
+
   function externalCLIConnectPanel(provider) {
     const method = externalCLIAuthenticationMethods[provider.providerID];
     const methods = provider.capabilities.authenticationMethods || [];
     const guidance = {
       claudeCompatible: [
-        "Connect the dedicated Claude Code CLI account mounted for this server.",
+        "Connect the Claude Code CLI account installed for this server user.",
         "If the account is not signed in, an operator can run claude login inside the isolated server account. Compatible backends below use their own API keys and do not require this login.",
       ],
       openCodeACP: [
-        "Connect the dedicated OpenCode CLI account mounted for this server.",
+        "Connect the OpenCode CLI account installed for this server user.",
         "If authentication is missing, an operator can run opencode auth login inside the isolated server account.",
       ],
       cursorACP: [
-        "Connect the dedicated Cursor CLI account mounted for this server.",
+        "Connect the Cursor CLI account installed for this server user.",
         "If authentication is missing, an operator can complete Cursor login inside the isolated server account.",
       ],
       grokBuildACP: [
-        "Connect the dedicated Grok Build CLI account mounted for this server.",
+        "Connect the Grok Build CLI account installed for this server user.",
         "If authentication is missing, an operator can complete Grok Build login inside the isolated server account.",
       ],
     }[provider.providerID];
@@ -2013,7 +2108,7 @@
     const message = element(
       "div",
       "inline-message info",
-      "The portal records use of the mounted CLI account; it never receives or copies the provider's login files.",
+      "The portal records use of the server user's CLI account; it never receives or copies the provider's login files.",
     );
     message.setAttribute("role", "status");
     const actions = element("div", "form-actions");
@@ -2072,9 +2167,9 @@
 
   function providerActionUnavailableReason(provider) {
     if (!provider.deploymentAllowed)
-      return "This packaged provider is not enabled for this server deployment.";
+      return "This provider is not available for this server deployment.";
     if (provider.cli?.installed === false)
-      return "The provider command is not installed on this server.";
+      return "Install the provider CLI to continue.";
     if (provider.providerID === "claudeCustom")
       return "Custom endpoint credentials remain an operator-managed boundary because this Claude-compatible backend does not advertise a safe endpoint validator.";
     if (

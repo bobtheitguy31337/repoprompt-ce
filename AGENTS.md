@@ -18,6 +18,10 @@ First-run boot does not need TLS files or a client certificate. Open `/portal/` 
 ## Sandbox fast path
 
 - Work in an isolated worktree based on `sandbox` and implement a coherent feature slice before integration.
+- RepoPrompt deploys independently from its own `sandbox` branch through `/opt/degentlemen-chat-git/chat-ops/deploy/sandbox/deploy-repoprompt.sh`.
+- `Sandbox/Server/build.sh` is one ordinary `docker build`. Docker BuildKit owns SwiftPM and layer caching. Do not add host cache trees, cache-copy scripts, recipe hashes, cache invalidation heuristics, or automatic pruning.
+- Deployment files never contain a Git commit SHA, candidate manifest, per-revision image tag, or per-revision volume name. The image revision label is generated automatically for diagnostics only.
+- Provider CLIs are not bundled into the image. RepoPrompt installs selected CLIs with their official installers into the disposable service-user home and reinstalls them after container replacement.
 - Run one focused daemon-coordinated batch after the slice is complete and before integration. Record the exact commands/results. Do not automatically run full root/provider suites, `pr-ready`, release lanes, test ledgers, or live app smoke.
 - A clean cherry-pick or merge into `sandbox` does not require another test run. Rerun only tests whose covered code changed during conflict resolution or an intentional integration edit.
 - Ordinary sandbox work does not require Context Builder, Oracle, a design review, or a review agent. Reserve them for genuine ambiguity, high-risk security/data migration design, or an explicit owner request.

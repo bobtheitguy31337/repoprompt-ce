@@ -11,7 +11,6 @@ import RepoPromptServiceProtocol
 
 /// Server projection of the desktop Codex runtime authority contract.
 public enum CodexCLIContract {
-    public static let pinnedVersion = "0.147.0"
     public static let deviceFlowType = "chatgptDeviceCode"
 }
 
@@ -161,7 +160,6 @@ private actor CodexManagedAuthRPCProcess {
 
     static func launch(
         executable: String,
-        expectedVersion: String,
         home: CodexManagedAuthHome,
         processPort: PortableProcessSupervisionPort,
         processStore: SQLiteServiceStore?,
@@ -186,11 +184,8 @@ private actor CodexManagedAuthRPCProcess {
                 params: ["clientInfo": ["name": "repoprompt-server", "title": "RepoPrompt Server", "version": "1"]],
                 timeout: timeout
             )
-            let expectedUserAgent = "repoprompt-server/\(expectedVersion)"
-            guard let userAgent = initialized.result["userAgent"] as? String,
-                  userAgent == expectedUserAgent || userAgent.hasPrefix("\(expectedUserAgent) ")
-            else {
-                throw ServiceAPIError(code: .capabilityMissing, message: "Pinned Codex CLI version is unavailable")
+            guard let userAgent = initialized.result["userAgent"] as? String, !userAgent.isEmpty else {
+                throw ServiceAPIError(code: .capabilityMissing, message: "Codex CLI did not complete the app-server handshake")
             }
             try await process.notify(method: "initialized")
             return process
@@ -291,7 +286,6 @@ public actor CodexDeviceAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuth
     }
 
     private let executable: String
-    private let expectedVersion: String
     private let managedHome: CodexManagedAuthHome
     private let processPort: PortableProcessSupervisionPort
     private let processStore: SQLiteServiceStore?
@@ -307,7 +301,6 @@ public actor CodexDeviceAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuth
 
     public init(
         executable: String,
-        expectedVersion: String = CodexCLIContract.pinnedVersion,
         managedHome: CodexManagedAuthHome,
         processPort: PortableProcessSupervisionPort,
         processStore: SQLiteServiceStore? = nil,
@@ -317,7 +310,6 @@ public actor CodexDeviceAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuth
         flowLifetime: Duration = .seconds(900)
     ) {
         self.executable = executable
-        self.expectedVersion = expectedVersion
         self.managedHome = managedHome
         self.processPort = processPort
         self.processStore = processStore
@@ -522,7 +514,6 @@ public actor CodexDeviceAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuth
     private func launchRPC() async throws -> CodexManagedAuthRPCProcess {
         try await CodexManagedAuthRPCProcess.launch(
             executable: executable,
-            expectedVersion: expectedVersion,
             home: managedHome,
             processPort: processPort,
             processStore: processStore,
@@ -642,9 +633,8 @@ public actor CodexDeviceAuthDriver: ProviderAuthFlowDriving, ProviderManagedAuth
         }
         let startable: Bool
         do {
-            guard expectedVersion == CodexCLIContract.pinnedVersion,
-                  FileManager.default.isExecutableFile(atPath: executable)
-            else { throw ServiceAPIError(code: .capabilityMissing, message: "Pinned Codex CLI is unavailable") }
+            guard FileManager.default.isExecutableFile(atPath: executable)
+            else { throw ServiceAPIError(code: .capabilityMissing, message: "Codex CLI is unavailable") }
             let process = try await launchRPC()
             await process.stop()
             startable = true
