@@ -596,14 +596,17 @@ final class ProviderSettingsPortalTests: XCTestCase {
             [parentID, newerChildID, grandchildID, olderChildID, unrelatedRootID]
         )
         XCTAssertEqual(projected.map(\.sidebarDepth), [0, 1, 2, 1, 0])
+        XCTAssertEqual(projected.map(\.effectiveContextWindowTokens), Array(repeating: 200_000, count: 5))
 
         var legacyObject = try XCTUnwrap(
             JSONSerialization.jsonObject(with: JSONEncoder.serviceEncoder.encode(projected[0])) as? [String: Any]
         )
         legacyObject.removeValue(forKey: "sidebarDepth")
+        legacyObject.removeValue(forKey: "effectiveContextWindowTokens")
         let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
         let legacySummary = try JSONDecoder.serviceDecoder.decode(PortalSessionSummary.self, from: legacyData)
         XCTAssertEqual(legacySummary.sidebarDepth, 0)
+        XCTAssertEqual(legacySummary.effectiveContextWindowTokens, 0)
 
         let cycleA = UUID()
         let cycleB = UUID()

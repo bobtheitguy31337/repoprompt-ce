@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentRuntimeCore
 
 /// Structured tags for model discovery. Helps callers programmatically
 /// choose the right model for their task without parsing descriptions.
@@ -583,16 +584,6 @@ enum AgentModel: String, CaseIterable, Codable {
     /// Known context window size in tokens, when verified.
     /// Returns `nil` for models where the context window is unknown or unverified.
     var contextWindowTokens: Int? {
-        switch self {
-        case .claudeFable5, .claudeSonnet5, .claudeOpus5, .claudeOpus48, .claudeOpus1m, .glm52_1m:
-            1_000_000
-        case .claudeSonnet, .claudeOpus, .claudeHaiku,
-             .claudeSonnet46, .claudeSonnet45,
-             .claudeOpus47, .claudeOpus46, .claudeOpus45,
-             .claudeHaiku45:
-            200_000
-        default:
-            nil
-        }
+        AgentContextWindowAuthority.knownModelTokens(for: rawValue)
     }
 }

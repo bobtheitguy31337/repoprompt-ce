@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentRuntimeCore
 import SwiftUI
 
 @MainActor
@@ -40,29 +41,24 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         /// `resolvedModel(forRaw:agentKind:)`; without one, only an exact raw match
         /// can be trusted because the specifier grammar is agent-specific.
         var effectiveContextWindowTokens: Int {
-            if let contextWindowTokens { return contextWindowTokens }
             let model: AgentModel? = if let selectedAgent {
                 AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: selectedAgent)
             } else {
                 selectedModelRaw.flatMap(AgentModel.init(rawValue:))
             }
-            if let selectedAgent,
-               let compatibleContextWindow = ClaudeCompatibleModelCatalogAdapter.contextWindowTokens(
+            let compatibleContextWindow = selectedAgent.flatMap {
+                ClaudeCompatibleModelCatalogAdapter.contextWindowTokens(
                    forRequestedModelRaw: selectedModelRaw,
-                   agentKind: selectedAgent
-               )
-            {
-                return compatibleContextWindow
+                    agentKind: $0
+                )
             }
-            if let modelContextWindow = model?.contextWindowTokens {
-                return modelContextWindow
-            }
-            switch selectedAgent {
-            case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible: return 200_000
-            case .openCode, .cursor: return 200_000
-            case .grokBuild: return 500_000 // grok 4.5/4.6 advertise totalContextTokens 500000
-            case .codexExec, .none: return 200_000
-            }
+            return AgentContextWindowAuthority.effectiveTokens(
+                reportedTokens: contextWindowTokens,
+                compatibleBackendTokens: compatibleContextWindow,
+                resolvedModelTokens: model?.contextWindowTokens,
+                providerID: selectedAgent?.portableProviderSettingsID,
+                modelRaw: selectedModelRaw
+            )
         }
     }
 

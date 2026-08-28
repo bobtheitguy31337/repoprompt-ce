@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentRuntimeCore
 import RepoPromptDomainRuntime
 import RepoPromptServiceProtocol
 
@@ -48,6 +49,12 @@ enum RepoPromptPortalSessionProjection {
             turnEpoch: session.turnEpoch,
             lastActivityAt: session.transcript.last?.timestamp,
             sidebarDepth: sidebarDepth,
+            effectiveContextWindowTokens: AgentContextWindowAuthority.effectiveTokens(
+                reportedTokens: session.contextUsage?.modelContextWindow,
+                providerID: session.providerSettingsID,
+                runtimeKind: session.provider,
+                modelRaw: session.model
+            ),
             runPresentation: session.runPresentation,
             agentControl: agentControl,
             contextUsage: session.contextUsage

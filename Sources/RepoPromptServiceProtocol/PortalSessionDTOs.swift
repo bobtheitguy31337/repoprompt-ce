@@ -111,6 +111,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
     public let turnEpoch: Int64
     public let lastActivityAt: Date?
     public let sidebarDepth: Int
+    public let effectiveContextWindowTokens: Int
     public let runPresentation: RunPresentationWireSnapshot?
     public let agentControl: AgentSessionActionSnapshotWire?
     public let contextUsage: ContextUsageWireSnapshot?
@@ -129,6 +130,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         turnEpoch: Int64,
         lastActivityAt: Date?,
         sidebarDepth: Int = 0,
+        effectiveContextWindowTokens: Int = 0,
         runPresentation: RunPresentationWireSnapshot? = nil,
         agentControl: AgentSessionActionSnapshotWire? = nil,
         contextUsage: ContextUsageWireSnapshot? = nil
@@ -146,6 +148,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         self.turnEpoch = turnEpoch
         self.lastActivityAt = lastActivityAt
         self.sidebarDepth = sidebarDepth
+        self.effectiveContextWindowTokens = effectiveContextWindowTokens
         self.runPresentation = runPresentation
         self.agentControl = agentControl
         self.contextUsage = contextUsage
@@ -166,6 +169,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         turnEpoch = try container.decode(Int64.self, forKey: .turnEpoch)
         lastActivityAt = try container.decodeIfPresent(Date.self, forKey: .lastActivityAt)
         sidebarDepth = try container.decodeIfPresent(Int.self, forKey: .sidebarDepth) ?? 0
+        effectiveContextWindowTokens = try container.decodeIfPresent(Int.self, forKey: .effectiveContextWindowTokens) ?? 0
         runPresentation = try container.decodeIfPresent(RunPresentationWireSnapshot.self, forKey: .runPresentation)
         agentControl = try container.decodeIfPresent(AgentSessionActionSnapshotWire.self, forKey: .agentControl)
         contextUsage = try container.decodeIfPresent(ContextUsageWireSnapshot.self, forKey: .contextUsage)
@@ -177,7 +181,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         case parentSessionID = "parentSessionId"
         case title, provider
         case providerSettingsID = "providerSettingsId"
-        case model, state, revision, runGeneration, turnEpoch, lastActivityAt, sidebarDepth
+        case model, state, revision, runGeneration, turnEpoch, lastActivityAt, sidebarDepth, effectiveContextWindowTokens
         case runPresentation, agentControl, contextUsage
     }
 }

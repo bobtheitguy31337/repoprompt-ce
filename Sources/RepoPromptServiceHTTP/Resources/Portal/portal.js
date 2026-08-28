@@ -2120,7 +2120,7 @@
     const last = Number(usage.lastTotalTokens) || 0;
     const total = Number(usage.totalTotalTokens) || 0;
     const used = last > 0 ? last : total;
-    const windowTokens = effectiveContextWindowTokens(session, usage);
+    const windowTokens = Number(session?.effectiveContextWindowTokens) || 0;
     const show =
       Boolean(session) &&
       !state.agent.newSessionMode &&
@@ -2147,13 +2147,6 @@
       percent > 90 ? "critical" : percent > 75 ? "warn" : "";
     ring.setAttribute("aria-valuenow", String(rounded));
     ring.title = contextUsageTooltip(used, windowTokens, percent);
-  }
-
-  function effectiveContextWindowTokens(session, usage) {
-    const reported = Number(usage?.modelContextWindow) || 0;
-    if (reported > 0) return reported;
-    if (!session) return 0;
-    return session.provider === "grokBuildACP" ? 500000 : 200000;
   }
 
   function contextUsageTooltip(used, windowTokens, percent) {

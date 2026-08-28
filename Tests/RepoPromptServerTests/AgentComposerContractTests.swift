@@ -33,6 +33,60 @@ private func tinyPNG() -> Data {
     Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl9sAAAAASUVORK5CYII=")!
 }
 
+final class AgentContextWindowAuthorityTests: XCTestCase {
+    func testRuntimeReportOverridesAllFallbackMetadata() {
+        XCTAssertEqual(
+            AgentContextWindowAuthority.effectiveTokens(
+                reportedTokens: 272_000,
+                compatibleBackendTokens: 1_000_000,
+                resolvedModelTokens: 200_000,
+                providerID: .grokBuildACP,
+                runtimeKind: .grokBuildACP,
+                modelRaw: "claude-opus-5:max"
+            ),
+            272_000
+        )
+    }
+
+    func testKnownDesktopModelMetadataPrecedesProviderFallback() {
+        XCTAssertEqual(
+            AgentContextWindowAuthority.effectiveTokens(
+                reportedTokens: nil,
+                providerID: .claudeCompatible,
+                modelRaw: "claude-opus-4-8:xhigh"
+            ),
+            1_000_000
+        )
+        XCTAssertEqual(
+            AgentContextWindowAuthority.effectiveTokens(
+                reportedTokens: nil,
+                providerID: .claudeCompatible,
+                modelRaw: "sonnet"
+            ),
+            200_000
+        )
+    }
+
+    func testOnlyGrokUsesTheLargerProviderFallback() {
+        XCTAssertEqual(
+            AgentContextWindowAuthority.effectiveTokens(
+                reportedTokens: nil,
+                providerID: .grokBuildACP,
+                modelRaw: "provider-dynamic-model"
+            ),
+            500_000
+        )
+        XCTAssertEqual(
+            AgentContextWindowAuthority.effectiveTokens(
+                reportedTokens: nil,
+                providerID: .codex,
+                modelRaw: "provider-dynamic-model"
+            ),
+            200_000
+        )
+    }
+}
+
 final class AgentSessionPresentationPolicyTests: XCTestCase {
     func testUnknownHistoricalSettlementDoesNotMakeIdleSessionReadOnly() {
         let control = AgentSessionPresentationPolicy.evaluate(.init(
