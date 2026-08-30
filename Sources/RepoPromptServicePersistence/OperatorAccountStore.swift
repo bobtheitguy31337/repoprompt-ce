@@ -10,23 +10,11 @@ extension SQLiteServiceStore {
         return count > 0
     }
 
-    public func issueOperatorSetupToken() async throws -> String {
-        _ = try await connection.query("DELETE FROM operator_setup_tokens")
-        let token = OperatorPasswordHasher.randomToken()
-        let hash = OperatorPasswordHasher.sha256Hex(Data(token.utf8))
-        _ = try await connection.query(
-            "INSERT INTO operator_setup_tokens(token_hash,created_at) VALUES(?,CURRENT_TIMESTAMP)",
-            [.text(hash)]
-        )
-        return token
-    }
-
-    public func createOperatorAccount(username: String = defaultOperatorUsername, password: String, setupToken: String?, allowMissingSetupToken: Bool = false) async throws {
+    public func createOperatorAccount(username: String = defaultOperatorUsername, password: String) async throws {
         guard try await hasOperatorAccount() == false else {
             throw ServiceAPIError(code: .invalidRequest, message: "Operator account already exists")
         }
         try OperatorPasswordHasher.validate(password)
-        try await consumeSetupToken(setupToken, allowMissing: allowMissingSetupToken)
         let salt = OperatorPasswordHasher.randomSalt()
         let hash = try OperatorPasswordHasher.hash(password: password, salt: salt)
         _ = try await connection.query(
@@ -84,27 +72,4 @@ extension SQLiteServiceStore {
         _ = try await connection.query("DELETE FROM operator_sessions WHERE token_hash=?", [.text(hash)])
     }
 
-    private func consumeSetupToken(_ token: String?, allowMissing: Bool) async throws {
-        guard let pending = try await connection.query("SELECT token_hash FROM operator_setup_tokens WHERE consumed_at IS NULL").first,
-              let expectedHash = pending.column("token_hash")?.string
-        else {
-            if allowMissing { return }
-            throw ServiceAPIError(code: .invalidRequest, message: "First-run setup is not available")
-        }
-        if allowMissing {
-            _ = try await connection.query(
-                "UPDATE operator_setup_tokens SET consumed_at=CURRENT_TIMESTAMP WHERE token_hash=?",
-                [.text(expectedHash)]
-            )
-            return
-        }
-        let provided = OperatorPasswordHasher.sha256Hex(Data((token ?? "").utf8))
-        guard OperatorPasswordHasher.constantTimeEquals(Data(provided.utf8), Data(expectedHash.utf8)) else {
-            throw ServiceAPIError(code: .internalAuthFailed, message: "First-run setup token is invalid")
-        }
-        _ = try await connection.query(
-            "UPDATE operator_setup_tokens SET consumed_at=CURRENT_TIMESTAMP WHERE token_hash=?",
-            [.text(expectedHash)]
-        )
-    }
 }

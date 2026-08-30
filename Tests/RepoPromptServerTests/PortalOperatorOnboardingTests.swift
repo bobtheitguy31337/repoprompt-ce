@@ -14,7 +14,6 @@ final class PortalOperatorOnboardingTests: XCTestCase {
     func testFirstRunSetupThenLoginIssuesSessionCookie() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
-        let token = try await store.issueOperatorSetupToken()
         let service = try await Self.service(store: store)
         let app = Application(router: service.internalRouter())
         try await app.test(.router) { client in
@@ -39,8 +38,7 @@ final class PortalOperatorOnboardingTests: XCTestCase {
                 headers: Self.portalMutationHeaders(),
                 body: ByteBuffer(data: try JSONEncoder.serviceEncoder.encode(SetupBody(
                     password: "operator-password",
-                    passwordConfirmation: "operator-password",
-                    setupToken: token
+                    passwordConfirmation: "operator-password"
                 )))
             ) { response in
                 XCTAssertEqual(response.status, .created)
@@ -64,10 +62,9 @@ final class PortalOperatorOnboardingTests: XCTestCase {
         }
     }
 
-    func testSetupRejectsMismatchedPasswordAndInvalidToken() async throws {
+    func testSetupRejectsMismatchedPassword() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
-        _ = try await store.issueOperatorSetupToken()
         let service = try await Self.service(store: store)
         let app = Application(router: service.internalRouter())
         try await app.test(.router) { client in
@@ -77,23 +74,10 @@ final class PortalOperatorOnboardingTests: XCTestCase {
                 headers: Self.portalMutationHeaders(),
                 body: ByteBuffer(data: try JSONEncoder.serviceEncoder.encode(SetupBody(
                     password: "operator-password",
-                    passwordConfirmation: "different-password",
-                    setupToken: "nope"
+                    passwordConfirmation: "different-password"
                 )))
             ) { response in
                 XCTAssertEqual(response.status, .badRequest)
-            }
-            try await client.execute(
-                uri: "/portal/api/v1/setup",
-                method: .post,
-                headers: Self.portalMutationHeaders(),
-                body: ByteBuffer(data: try JSONEncoder.serviceEncoder.encode(SetupBody(
-                    password: "operator-password",
-                    passwordConfirmation: "operator-password",
-                    setupToken: "nope"
-                )))
-            ) { response in
-                XCTAssertEqual(response.status, .unauthorized)
             }
         }
     }
@@ -131,7 +115,6 @@ final class PortalOperatorOnboardingTests: XCTestCase {
     func testOperatorCertificateDoesNotSkipPasswordSetup() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
-        let token = try await store.issueOperatorSetupToken()
         let service = RepoPromptHTTPService(
             authority: RepoPromptHeadlessAuthority(store: store),
             store: store,
@@ -159,8 +142,7 @@ final class PortalOperatorOnboardingTests: XCTestCase {
                 headers: Self.portalMutationHeaders(),
                 body: ByteBuffer(data: try JSONEncoder.serviceEncoder.encode(SetupBody(
                     password: "operator-password",
-                    passwordConfirmation: "operator-password",
-                    setupToken: token
+                    passwordConfirmation: "operator-password"
                 )))
             ) { response in
                 XCTAssertEqual(response.status, .created)
@@ -171,7 +153,6 @@ final class PortalOperatorOnboardingTests: XCTestCase {
     func testOperatorProjectLifecycleAndSessionArchiveUseSharedAuthority() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
-        let token = try await store.issueOperatorSetupToken()
         let authority = RepoPromptHeadlessAuthority(store: store)
         try await authority.recover()
         let service = RepoPromptHTTPService(
@@ -195,8 +176,7 @@ final class PortalOperatorOnboardingTests: XCTestCase {
                 headers: Self.portalMutationHeaders(),
                 body: ByteBuffer(data: try JSONEncoder.serviceEncoder.encode(SetupBody(
                     password: "operator-password",
-                    passwordConfirmation: "operator-password",
-                    setupToken: token
+                    passwordConfirmation: "operator-password"
                 )))
             ) { response in
                 XCTAssertEqual(response.status, .created)
@@ -330,7 +310,6 @@ final class PortalOperatorOnboardingTests: XCTestCase {
     private struct SetupBody: Encodable {
         let password: String
         let passwordConfirmation: String
-        let setupToken: String
     }
 
     private struct LoginBody: Encodable {

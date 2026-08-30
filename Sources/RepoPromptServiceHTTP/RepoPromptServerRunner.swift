@@ -336,8 +336,7 @@ private func operatorOnboardingBanner(
     portalHost: String,
     portalPort: Int?,
     usesMutualTLS: Bool,
-    needsSetup: Bool,
-    setupToken: String?
+    needsSetup: Bool
 ) -> String {
     let httpsHost = bindHost == "0.0.0.0" || bindHost == "::" ? "127.0.0.1" : bindHost
     let httpHost = portalHost == "0.0.0.0" || portalHost == "::" ? "127.0.0.1" : portalHost
@@ -352,9 +351,8 @@ private func operatorOnboardingBanner(
     } else {
         lines.append("Open /portal/ and create or enter the operator password.")
     }
-    if needsSetup, let setupToken {
+    if needsSetup {
         lines.append("Create the operator password on first visit.")
-        lines.append("Setup token (required unless you are on this machine): \(setupToken)")
     } else {
         lines.append("Sign in with the operator password.")
     }
@@ -728,15 +726,13 @@ public enum RepoPromptServerRunner {
         )
         await durabilityOperations.start()
         let needsSetup = try await store.hasOperatorAccount() == false
-        let setupToken = needsSetup ? try await store.issueOperatorSetupToken() : nil
         FileHandle.standardError.write(Data(operatorOnboardingBanner(
             bindHost: configuration.bindHost,
             bindPort: configuration.bindPort,
             portalHost: configuration.portalHost,
             portalPort: configuration.portalPort,
             usesMutualTLS: configuration.usesMutualTLS,
-            needsSetup: needsSetup,
-            setupToken: setupToken
+            needsSetup: needsSetup
         ).utf8))
         let mcpAdapter = RepoPromptMCPAdapter(authority: authority)
         let mcpSocketURL = URL(

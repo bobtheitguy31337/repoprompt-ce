@@ -8470,9 +8470,8 @@
       ? "Create the operator password"
       : "Sign in";
     document.getElementById("auth-copy").textContent = setup
-      ? "This is the first launch. Choose a password for the operator account. If you are not on this machine, paste the setup token printed in the server log."
+      ? "This is the first launch. Choose a password for the operator account."
       : "Enter the operator password to open the portal.";
-    document.getElementById("auth-token-field").hidden = !setup;
     document.getElementById("auth-confirm-field").hidden = !setup;
     document.getElementById("auth-password").autocomplete = setup
       ? "new-password"
@@ -8495,7 +8494,6 @@
               body: JSON.stringify({
                 password,
                 passwordConfirmation: confirmation,
-                setupToken: document.getElementById("auth-token").value.trim(),
               }),
             });
           } else {

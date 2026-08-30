@@ -28,7 +28,7 @@ REPOPROMPT_ENABLED_PROVIDERS= \
 ./.build/debug/RepoPromptServer
 ```
 
-The log tells you to open `https://127.0.0.1:9443/portal/`. The first visit is a setup page: choose the operator password. If you are not on the same machine, paste the setup token printed in that log.
+The log tells you to open `https://127.0.0.1:9443/portal/`. The first visit is a setup page: choose the operator password.
 
 After setup, the same page is a password sign-in. The browser will warn about the local certificate; that is expected for a generated cert. Loopback health stays on `http://127.0.0.1:9080/health/ready`.
 

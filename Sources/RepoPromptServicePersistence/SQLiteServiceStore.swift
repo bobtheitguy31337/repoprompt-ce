@@ -1629,9 +1629,6 @@ public actor SQLiteServiceStore {
         _ = try await connection.query(
             "CREATE TABLE IF NOT EXISTS operator_sessions(session_id TEXT PRIMARY KEY,username TEXT NOT NULL,token_hash TEXT NOT NULL,created_at TEXT NOT NULL,expires_at REAL NOT NULL)"
         )
-        _ = try await connection.query(
-            "CREATE TABLE IF NOT EXISTS operator_setup_tokens(token_hash TEXT PRIMARY KEY,created_at TEXT NOT NULL,consumed_at TEXT)"
-        )
         for statement in SchemaV2.statements {
             _ = try await connection.query(statement)
         }

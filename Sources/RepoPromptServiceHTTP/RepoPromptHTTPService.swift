@@ -107,7 +107,7 @@ public struct RepoPromptHTTPService: Sendable {
         } }
         router.post("/portal/api/v1/setup") { request, context in await portalRespond(request) {
             try validatePortalMutation(request)
-            return try await completePortalSetup(request: request, context: context)
+            return try await completePortalSetup(request: request)
         } }
         router.post("/portal/api/v1/login") { request, context in await portalRespond(request) {
             try validatePortalMutation(request)
@@ -1732,7 +1732,6 @@ public struct RepoPromptHTTPService: Sendable {
     private struct PortalSetupRequest: Decodable {
         let password: String
         let passwordConfirmation: String
-        let setupToken: String?
     }
 
     private struct PortalLoginRequest: Decodable {
@@ -1752,7 +1751,7 @@ public struct RepoPromptHTTPService: Sendable {
         )
     }
 
-    private func completePortalSetup(request: Request, context: RepoPromptRequestContext) async throws -> Response {
+    private func completePortalSetup(request: Request) async throws -> Response {
         guard portalPasswordLoginEnabled else {
             throw ServiceAPIError(code: .invalidRequest, message: "Password setup is not enabled for this server")
         }
@@ -1760,11 +1759,7 @@ public struct RepoPromptHTTPService: Sendable {
         guard input.password == input.passwordConfirmation else {
             throw ServiceAPIError(code: .invalidRequest, message: "Password confirmation does not match")
         }
-        try await store.createOperatorAccount(
-            password: input.password,
-            setupToken: input.setupToken,
-            allowMissingSetupToken: isLoopback(context)
-        )
+        try await store.createOperatorAccount(password: input.password)
         let token = try await store.createOperatorSession()
         return portalSessionResponse(token: token, status: .created)
     }
@@ -1803,11 +1798,6 @@ public struct RepoPromptHTTPService: Sendable {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .first { $0.hasPrefix("rpce_operator_session=") }
             .map { String($0.dropFirst("rpce_operator_session=".count)) }
-    }
-
-    private func isLoopback(_ context: RepoPromptRequestContext) -> Bool {
-        guard let ip = context.channel.remoteAddress?.ipAddress else { return false }
-        return ip == "127.0.0.1" || ip == "::1" || ip == "0:0:0:0:0:0:0:1"
     }
 
     private func authenticatePortal(request: Request, context: RepoPromptRequestContext) async throws -> PortalAuthenticatedPrincipal {

@@ -78,7 +78,6 @@ final class PortalStandaloneMTLSTests: XCTestCase {
             try await client.execute(uri: "/portal/api/v1/bootstrap", method: .get) { response in
                 XCTAssertEqual(response.status, .unauthorized)
             }
-            let token = try await store.issueOperatorSetupToken()
             var cookie = ""
             try await client.execute(
                 uri: "/portal/api/v1/setup",
@@ -86,8 +85,7 @@ final class PortalStandaloneMTLSTests: XCTestCase {
                 headers: Self.portalMutationHeaders(),
                 body: ByteBuffer(data: try JSONEncoder.serviceEncoder.encode(SetupBody(
                     password: "operator-password",
-                    passwordConfirmation: "operator-password",
-                    setupToken: token
+                    passwordConfirmation: "operator-password"
                 )))
             ) { response in
                 XCTAssertEqual(response.status, .created)
@@ -212,7 +210,6 @@ final class PortalStandaloneMTLSTests: XCTestCase {
     private struct SetupBody: Encodable {
         let password: String
         let passwordConfirmation: String
-        let setupToken: String
     }
 
     private static func portalMutationHeaders() -> HTTPFields {
