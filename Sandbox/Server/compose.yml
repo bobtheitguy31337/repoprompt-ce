@@ -18,7 +18,6 @@ services:
       REPOPROMPT_BIND_PORT: "9443"
       REPOPROMPT_PORTAL_HOST: 0.0.0.0
       REPOPROMPT_PORTAL_PORT: "9081"
-      REPOPROMPT_PUBLIC_ORIGIN: ${REPOPROMPT_PUBLIC_ORIGIN:-http://127.0.0.1:9081}
       REPOPROMPT_ENABLED_PROVIDERS: ${REPOPROMPT_ENABLED_PROVIDERS:-codex,claudeCompatible,openCodeACP,cursorACP}
       REPOPROMPT_ENABLED_DIRECT_PROVIDERS: ${REPOPROMPT_ENABLED_DIRECT_PROVIDERS:-}
       REPOPROMPT_MAX_ACTIVE_SESSIONS: ${REPOPROMPT_MAX_ACTIVE_SESSIONS:-2}
@@ -49,6 +48,10 @@ services:
     security_opt:
       - no-new-privileges:true
     logging: *logging
+    networks:
+      public-ingress:
+        aliases:
+          - repoprompt
 
 volumes:
   state:
@@ -61,3 +64,8 @@ volumes:
     name: degentlemen-repoprompt-sandbox-worktrees
   cache:
     name: degentlemen-repoprompt-sandbox-cache
+
+networks:
+  public-ingress:
+    name: degentlemen-sandbox-ingress
+    external: true
