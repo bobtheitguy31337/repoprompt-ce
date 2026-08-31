@@ -3,8 +3,9 @@
 [![CI](https://github.com/repoprompt/repoprompt-ce/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/repoprompt/repoprompt-ce/actions/workflows/ci.yml?query=branch%3Amain)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![Platform: macOS 26+](https://img.shields.io/badge/platform-macOS%2026%2B-black)
+![Server: Linux](https://img.shields.io/badge/server-Linux-blue)
 
-**A free, open-source native macOS app and agent orchestrator for context engineering.**
+**A free, open-source macOS app and self-hosted Linux agent server for context engineering.**
 
 RepoPrompt CE helps coding agents understand your codebase before they act. It
 assembles focused, reviewable context from files, CodeMaps, repository
@@ -35,6 +36,62 @@ tap. The cask consumes the promoted public updater ZIP from
 [`repoprompt/repoprompt-ce-updates`](https://github.com/repoprompt/repoprompt-ce-updates);
 it does not build from source. Source-build paths remain below for contributors
 and local development.
+
+### Install RepoPrompt Server on Linux
+
+RepoPrompt Server provides Agent Mode, projects, sessions, and the operator
+portal without requiring the macOS app or a chat server. The supported image is
+built directly from this repository.
+
+Requirements:
+
+- A Linux host with Git, Docker Engine, and the Docker Compose plugin
+
+Clone the repository and start the server:
+
+```bash
+git clone https://github.com/repoprompt/repoprompt-ce.git
+cd repoprompt-ce
+docker compose --file compose.server.yml up --detach --build --wait
+```
+
+Open [http://127.0.0.1:9081/portal/](http://127.0.0.1:9081/portal/).
+For a remote host, keep the port bound to loopback and open an SSH tunnel:
+
+```bash
+ssh -L 9081:127.0.0.1:9081 user@your-server
+```
+
+On the first visit:
+
+1. Create the operator password.
+2. Install and sign in to a CLI provider from the setup screen.
+3. Create a project folder.
+4. Start an agent session.
+
+The server installs provider CLIs on demand using their official installers.
+The named volumes preserve server state, artifacts, projects, worktrees, and
+cache when the container is replaced. Do not publish the health listener on
+port `9080`. If the portal will be exposed beyond localhost, put it behind an
+HTTPS reverse proxy.
+
+Useful commands:
+
+```bash
+docker compose --file compose.server.yml logs --follow
+docker compose --file compose.server.yml stop
+docker compose --file compose.server.yml start
+```
+
+To update the server after pulling a newer revision:
+
+```bash
+git pull
+docker compose --file compose.server.yml up --detach --build --wait
+```
+
+See [`docs/server/getting-started.md`](docs/server/getting-started.md) for the
+native Swift build, optional mutual TLS, and integration configuration.
 
 ### Build and launch locally
 

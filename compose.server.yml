@@ -1,0 +1,41 @@
+name: repoprompt-server
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    image: repoprompt-server:local
+    restart: unless-stopped
+    init: true
+    user: "65532:65532"
+    stop_grace_period: 60s
+    environment:
+      REPOPROMPT_PORTAL_HOST: 0.0.0.0
+      REPOPROMPT_PORTAL_PORT: "9081"
+    ports:
+      - "${REPOPROMPT_LISTEN_ADDRESS:-127.0.0.1}:${REPOPROMPT_PORTAL_PORT:-9081}:9081"
+    volumes:
+      - state:/var/lib/repoprompt/state
+      - artifacts:/var/lib/repoprompt/artifacts
+      - projects:/srv/repoprompt/projects
+      - worktrees:/srv/repoprompt/worktrees
+      - cache:/var/cache/repoprompt
+    tmpfs:
+      - /home/repoprompt:exec,mode=0700,uid=65532,gid=65532
+      - /tmp:size=256m,mode=1777,uid=65532,gid=65532
+      - /run/repoprompt:size=16m,mode=0700,uid=65532,gid=65532
+    cpus: "1.00"
+    mem_limit: 2g
+    pids_limit: 512
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  state:
+  artifacts:
+  projects:
+  worktrees:
+  cache:
