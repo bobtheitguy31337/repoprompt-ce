@@ -493,11 +493,16 @@
         tone: "attention",
       };
     }
-    if (
-      provider.authentication?.authenticated &&
-      provider.connection?.testState === "valid"
-    ) {
+    if (isSessionReadyProvider(provider)) {
       return { label: "Connected", tone: "connected" };
+    }
+    if (isConnectedProvider(provider)) {
+      return {
+        label:
+          provider.preflight?.detail ||
+          "Provider setup is still completing.",
+        tone: "attention",
+      };
     }
     return { label: "Not configured", tone: "" };
   }
@@ -813,13 +818,7 @@
   }
 
   function eligibleSessionProviders() {
-    return orderedProviders().filter(
-      (provider) =>
-        provider.category === "cliProvider" &&
-        provider.deploymentAllowed &&
-        provider.effectiveEnabled &&
-        isConnectedProvider(provider),
-    );
+    return orderedProviders().filter(isSessionReadyProvider);
   }
 
   function onboardingStage() {
@@ -1092,9 +1091,9 @@
     stateDot.className = "session-state-dot";
     runStatus.textContent =
       setupStage === "provider"
-        ? "Step 1 of 3"
+        ? "Step 1 of 2"
         : setupStage === "project"
-          ? "Step 2 of 3"
+          ? "Step 2 of 2"
           : state.agent.newSessionMode
             ? "Ready for a new session"
             : control?.statusText || "";
@@ -1123,7 +1122,7 @@
     if (setupStage === "provider") {
       title.textContent = "Set up a provider";
       metadata.replaceChildren(
-        element("span", "metadata-pill", "Install · Connect · Validate"),
+        element("span", "metadata-pill", "Install · Sign in"),
       );
       stateDot.classList.add("idle");
     } else if (setupStage === "project") {
@@ -1168,15 +1167,9 @@
     [
       ["provider", "1", "Provider"],
       ["project", "2", "Project"],
-      ["session", "3", "Session"],
     ].forEach(([key, number, label]) => {
       const item = element("li");
-      const completed =
-        key === "provider"
-          ? stage !== "provider"
-          : key === "project"
-            ? stage === "session"
-            : false;
+      const completed = key === "provider" && stage === "project";
       item.classList.toggle("active", key === stage);
       item.classList.toggle("completed", completed);
       item.append(
@@ -1197,7 +1190,7 @@
       element(
         "p",
         "",
-        "Install one provider with its official installer, then sign in and validate the connection. You only need one to begin.",
+        "Install one provider with its official installer, then sign in. RepoPrompt continues automatically when the provider is ready.",
       ),
     );
     surface.append(setupProgress("provider"), header);
@@ -2718,6 +2711,15 @@
       provider?.authentication?.authenticated &&
         provider?.connection?.state === "connected" &&
         provider?.connection?.testState === "valid",
+    );
+  }
+
+  function isSessionReadyProvider(provider) {
+    return Boolean(
+      provider?.category === "cliProvider" &&
+        provider?.deploymentAllowed &&
+        provider?.preflight?.ready === true &&
+        isConnectedProvider(provider),
     );
   }
 
