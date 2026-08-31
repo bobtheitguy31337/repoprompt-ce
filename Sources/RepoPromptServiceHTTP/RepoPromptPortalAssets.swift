@@ -27,7 +27,7 @@ public enum RepoPromptPortalAssets {
         let parts = asset.rawValue.split(separator: ".", maxSplits: 1).map(String.init)
         guard parts.count == 2,
               let url = Bundle.module.url(forResource: parts[0], withExtension: parts[1], subdirectory: "Portal")
-                ?? Bundle.module.url(forResource: parts[0], withExtension: parts[1])
+              ?? Bundle.module.url(forResource: parts[0], withExtension: parts[1])
         else {
             throw ServiceAPIError(code: .notFound, message: "Portal asset is not bundled")
         }
@@ -37,7 +37,10 @@ public enum RepoPromptPortalAssets {
     static func response(for asset: Asset) throws -> Response {
         let body = try data(for: asset)
         var headers = securityHeaders(contentType: asset.contentType)
-        headers[.cacheControl] = asset == .index ? "private, no-store" : "private, max-age=3600"
+        // Portal assets are deliberately unversioned. Revalidate them on every
+        // page load so HTML and JavaScript from different deployments can
+        // never be combined by the browser cache.
+        headers[.cacheControl] = "private, no-store"
         if asset == .index {
             headers[.init("Content-Security-Policy")!] = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
         }

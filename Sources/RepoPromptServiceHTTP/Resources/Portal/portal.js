@@ -96,6 +96,7 @@
       selectionGeneration: 0,
       retryOperation: null,
       blockExpansion: new Map(),
+      toolExpansion: new Map(),
       composerCatalog: null,
       composerCatalogKey: null,
       composerCatalogPromise: null,
@@ -164,6 +165,13 @@
       '<path d="M14.7 9V7l-1.8-.6-.4-1 .9-1.7L12 2.3l-1.7.9-1-.4L8.7 1h-2l-.6 1.8-1 .4-1.7-.9L2 3.7l.9 1.7-.4 1L.7 7v2l1.8.6.4 1-.9 1.7 1.4 1.4 1.7-.9 1 .4.6 1.8h2l.6-1.8 1-.4 1.7.9 1.4-1.4-.9-1.7.4-1z"/><circle cx="7.7" cy="8" r="2.2"/>',
     message: '<path d="M2 3.5h12v8H7l-3.5 2v-2H2z"/>',
     folder: '<path d="M1.5 4h5l1.4 1.5h6.6v7.5h-13z"/>',
+    document: '<path d="M3 1.5h6l4 4V14.5H3zM9 1.5v4h4M5.5 9h5M5.5 11.5h4"/>',
+    pencil: '<path d="m3 11 8.5-8.5 2 2L5 13l-3 .8zM10 4l2 2"/>',
+    globe: '<circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c2 1.7 3 3.7 3 6s-1 4.3-3 6c-2-1.7-3-3.7-3-6s1-4.3 3-6z"/>',
+    branch: '<circle cx="4" cy="3" r="1.5"/><circle cx="12" cy="5" r="1.5"/><circle cx="4" cy="13" r="1.5"/><path d="M4 4.5v7M5.5 10c4.3 0 3-5 5-5"/>',
+    selection: '<circle cx="8" cy="8" r="6"/><path d="m5 8 2 2 4-4"/>',
+    quote: '<path d="M3 4h4v4H5c0 2-1 3-2 3M9 4h4v4h-2c0 2-1 3-2 3"/>',
+    tools: '<path d="M9.5 3.5a3 3 0 0 0 3.8 3.8L8 12.6a2 2 0 1 1-2.8-2.8l5.3-5.3a3 3 0 0 0-1-1z"/>',
     workflow:
       '<circle cx="4" cy="3" r="1.5"/><circle cx="12" cy="8" r="1.5"/><circle cx="4" cy="13" r="1.5"/><path d="M5.5 3h2A2.5 2.5 0 0 1 10 5.5V8M5.5 13h2A2.5 2.5 0 0 0 10 10.5V8"/>',
     bolt: '<path d="M9 1.5 3.5 8H8l-1 6.5L12.5 7H8z"/>',
@@ -1035,6 +1043,7 @@
     state.agent.selectedProjectID = projectID;
     state.agent.selectedSessionID = null;
     state.agent.blockExpansion.clear();
+    state.agent.toolExpansion.clear();
     state.agent.transcriptItems = [];
     state.agent.transcriptPage = null;
     state.agent.newSessionMode = false;
@@ -1062,6 +1071,7 @@
     state.agent.selectedSessionID = sessionID;
     state.agent.newSessionMode = false;
     state.agent.blockExpansion.clear();
+    state.agent.toolExpansion.clear();
     state.agent.transcriptItems = [];
     state.agent.transcriptPage = null;
     state.agent.selectionGeneration += 1;
@@ -1078,6 +1088,7 @@
     state.agent.newSessionMode = true;
     state.agent.selectedSessionID = null;
     state.agent.blockExpansion.clear();
+    state.agent.toolExpansion.clear();
     state.agent.transcriptItems = [];
     state.agent.transcriptPage = null;
     state.agent.selectionGeneration += 1;
@@ -1375,6 +1386,20 @@
     );
   }
 
+  function scrollTranscriptToBottom() {
+    const viewport = document.getElementById("main-content");
+    window.requestAnimationFrame(() => {
+      viewport.scrollTop = viewport.scrollHeight;
+    });
+  }
+
+  function preserveTranscriptViewport(previousHeight, previousTop) {
+    const viewport = document.getElementById("main-content");
+    window.requestAnimationFrame(() => {
+      viewport.scrollTop = previousTop + (viewport.scrollHeight - previousHeight);
+    });
+  }
+
   function renderPresentationBlock(block) {
     const type = block?.type || "standaloneNote";
     if (type === "activityCluster") {
@@ -1393,14 +1418,25 @@
         state.agent.blockExpansion.set(block.id, details.open);
       });
       const summary = element("summary", "activity-cluster-summary");
-      summary.append(
-        element("strong", "", block.summary?.title || "Activity"),
-        element(
-          "span",
-          "activity-count",
-          `${block.summary?.activityCount || 0} activities · ${block.summary?.toolCount || 0} tools`,
-        ),
+      const summaryPrimary = element("div", "activity-cluster-primary");
+      summaryPrimary.append(
+        iconNode("tools", "activity-cluster-icon"),
+        element("strong", "", activityClusterTitle(block.summary)),
       );
+      if (block.summary?.toolCount)
+        summaryPrimary.append(
+          element("span", "activity-count", String(block.summary.toolCount)),
+        );
+      const groups = (block.summary?.toolGroups || [])
+        .map(toolDisplayName)
+        .filter((value, index, values) => values.indexOf(value) === index)
+        .slice(0, 4);
+      if (groups.length)
+        summaryPrimary.append(
+          element("span", "activity-tool-groups", groups.join(", ")),
+        );
+      summaryPrimary.append(toolStatusDot(activityClusterStatus(block.summary)));
+      summary.append(summaryPrimary);
       if (block.summary?.narration)
         summary.append(
           element("span", "activity-narration", block.summary.narration),
@@ -1608,51 +1644,324 @@
     host.append(document.createTextNode(text.slice(cursor)));
   }
 
+  function parseToolPayload(raw) {
+    if (typeof raw !== "string" || !raw.trim()) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  function toolObject(raw) {
+    const parsed = parseToolPayload(raw);
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object")
+      return null;
+    for (const key of ["Ok", "ok", "Err", "err"])
+      if (parsed[key] && typeof parsed[key] === "object" && !Array.isArray(parsed[key]))
+        return parsed[key];
+    return parsed;
+  }
+
+  function toolValue(object, keys) {
+    if (!object) return null;
+    for (const key of keys) {
+      const value = object[key];
+      if (typeof value === "string" && value.trim()) return value.trim();
+      if (typeof value === "number") return value;
+    }
+    return null;
+  }
+
+  function toolArray(object, keys) {
+    if (!object) return [];
+    for (const key of keys)
+      if (Array.isArray(object[key])) return object[key];
+    return [];
+  }
+
+  function compactToolText(value, maximum = 160) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (text.length <= maximum) return text;
+    return `${text.slice(0, maximum - 1).trimEnd()}…`;
+  }
+
+  function compactToolPath(value) {
+    const path = String(value || "").trim();
+    if (!path) return "";
+    const parts = path.split(/[\\/]/).filter(Boolean);
+    return parts.length <= 2 ? parts.join("/") : `…/${parts.slice(-2).join("/")}`;
+  }
+
+  function toolBaseName(value) {
+    const parts = String(value || "").split(/[\\/]/).filter(Boolean);
+    return parts.at(-1) || "";
+  }
+
+  function normalizedToolName(rawName) {
+    let name = String(rawName || "")
+      .trim()
+      .replace(/^mcp__RepoPrompt__/i, "")
+      .replace(/^functions\./i, "");
+    name = name.split(".").at(-1)?.toLowerCase().replace(/[ -]+/g, "_") || "";
+    if (["local_shell", "shell", "unified_exec", "exec_command", "run_shell_command"].includes(name))
+      return "bash";
+    if (["filechange", "file_change"].includes(name)) return "apply_patch";
+    if (name === "requestuserinput") return "request_user_input";
+    if (["web_search", "websearch", "search_web", "google_web_search"].includes(name))
+      return "search";
+    if (["webfetch", "web_fetch", "read_web", "open_url", "read_url", "fetch_url"].includes(name))
+      return "web_read";
+    return name;
+  }
+
+  const toolTitles = {
+    request_user_input: "Question",
+    ask_user: "Question",
+    ask_user_question: "Question",
+    bash: "Bash",
+    search: "Web Search",
+    web_read: "Read Web Page",
+    read: "Read",
+    read_file: "Read File",
+    apply_edits: "Edit",
+    apply_patch: "Patch",
+    edit: "Edit File",
+    file_actions: "File Action",
+    file_search: "Search",
+    get_file_tree: "File Tree",
+    get_code_structure: "Code Structure",
+    manage_selection: "Selection",
+    workspace_context: "Context",
+    ask_oracle: "Oracle",
+    oracle_send: "Oracle",
+    oracle_chat_log: "Oracle Log",
+    chat_send: "Chat",
+    context_builder: "Context Builder",
+    git: "Git",
+    manage_worktree: "Worktrees",
+    prompt: "Prompt",
+    chats: "Chats",
+    list_models: "Models",
+    bind_context: "Bind Context",
+    manage_workspaces: "Workspaces",
+    agent_explore: "Agent Explore",
+    agent_run: "Agent Run",
+    agent_manage: "Agent Manage",
+    app_settings: "App Settings",
+  };
+
+  function toolDisplayName(rawName) {
+    const name = normalizedToolName(rawName);
+    return toolTitles[name] || humanizeToolValue(name || "tool");
+  }
+
+  function humanizeToolValue(value) {
+    return String(value || "")
+      .replace(/[_-]+/g, " ")
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .replace(/^./, (character) => character.toUpperCase());
+  }
+
+  function toolFamily(name) {
+    if (["get_file_tree", "read_file", "read", "file_search", "search", "web_read", "get_code_structure"].includes(name))
+      return "navigation";
+    if (["apply_edits", "apply_patch", "edit", "file_actions"].includes(name))
+      return "edit";
+    if (name === "bash") return "execution";
+    if (["ask_oracle", "oracle_send", "oracle_utils", "oracle_chat_log", "chat_send", "ask_user", "ask_user_question", "request_user_input", "chats"].includes(name))
+      return "communication";
+    if (["agent_explore", "agent_run", "agent_manage"].includes(name))
+      return "communication";
+    if (["manage_selection", "workspace_context", "prompt", "git", "manage_worktree", "bind_context", "manage_workspaces", "list_models", "context_builder", "app_settings"].includes(name))
+      return "config";
+    return "other";
+  }
+
+  function toolIconName(name) {
+    if (["read", "read_file"].includes(name)) return "document";
+    if (name === "bash") return "terminal";
+    if (["search", "web_read"].includes(name)) return "globe";
+    if (["apply_edits", "apply_patch", "edit"].includes(name)) return "pencil";
+    if (name === "file_actions") return "document";
+    if (name === "file_search") return "search";
+    if (name === "get_file_tree") return "folder";
+    if (name === "get_code_structure") return "listStar";
+    if (name === "manage_selection") return "selection";
+    if (["workspace_context", "context_builder", "bind_context"].includes(name)) return "context";
+    if (["ask_oracle", "oracle_send"].includes(name)) return "brain";
+    if (["chat_send", "chats", "oracle_chat_log", "request_user_input"].includes(name)) return "message";
+    if (["git", "manage_worktree"].includes(name)) return "branch";
+    if (name === "prompt") return "quote";
+    if (["agent_explore", "agent_run", "agent_manage"].includes(name)) return "agent";
+    if (name === "list_models") return "model";
+    if (["manage_workspaces", "app_settings"].includes(name)) return "settings";
+    return "tools";
+  }
+
+  function toolRenderStatus(status) {
+    if (["pending", "running"].includes(status)) return "running";
+    if (status === "success") return "success";
+    if (status === "warning") return "warning";
+    if (["failed", "cancelled"].includes(status)) return "failure";
+    return "neutral";
+  }
+
+  function toolStatusDot(status) {
+    const rendered = toolRenderStatus(status);
+    const dot = element("span", `tool-status-dot status-${rendered}`);
+    dot.setAttribute("aria-label", humanize(status || "unknown"));
+    return dot;
+  }
+
+  function activityClusterStatus(summary = {}) {
+    if (summary.failed) return "failed";
+    if (summary.warning) return "warning";
+    if (summary.running) return "running";
+    return "unknown";
+  }
+
+  function activityClusterTitle(summary = {}) {
+    if (summary.running) return "Working";
+    const names = summary.toolGroups || [];
+    const normalized = names.map(normalizedToolName);
+    const navigated = normalized.some((name) => ["get_file_tree", "read_file", "read", "file_search", "search", "web_read", "get_code_structure"].includes(name));
+    const edited = normalized.some((name) => ["apply_edits", "apply_patch", "edit", "file_actions"].includes(name));
+    const executed = normalized.includes("bash");
+    if (navigated && edited) return "Explored and edited";
+    if (edited) return "Made changes";
+    if (executed) return "Ran commands";
+    if (navigated) return "Explored codebase";
+    return summary.title && !/^\d+ tools?$/.test(summary.title)
+      ? toolDisplayName(summary.title)
+      : "Tool activity";
+  }
+
+  function toolSubtitle(name, args, result, tool) {
+    const path = toolValue(args, ["path", "file_path", "filePath"])
+      || toolValue(result, ["display_path", "displayPath", "path"]);
+    const op = toolValue(args, ["op", "operation", "action", "mode"])
+      || toolValue(result, ["op", "operation", "action", "mode"]);
+    if (["read", "read_file", "apply_edits", "edit"].includes(name) && path)
+      return compactToolPath(path);
+    if (name === "apply_patch") {
+      if (path) return compactToolPath(path);
+      const paths = toolArray(args, ["paths"]);
+      if (paths.length)
+        return `${compactToolPath(paths[0])}${paths.length > 1 ? ` (+${paths.length - 1} more)` : ""}`;
+      const count = toolValue(args, ["change_count", "changeCount"]);
+      if (count) return `${count} file${Number(count) === 1 ? "" : "s"}`;
+    }
+    if (name === "bash") {
+      const command = toolValue(args, ["cmd", "command"])
+        || toolValue(result, ["command"]);
+      if (command) return compactToolText(command, 180);
+      if (tool.processId != null) return `pid ${tool.processId}`;
+    }
+    if (name === "file_search") {
+      const pattern = toolValue(args, ["pattern", "query"]);
+      const matches = toolValue(result, ["total_matches", "totalMatches", "matches"]);
+      const files = toolValue(result, ["total_files", "totalFiles"]);
+      return [pattern ? `"${compactToolText(pattern, 70)}"` : "", matches != null && files != null ? `${matches} matches in ${files} files` : ""].filter(Boolean).join(" • ");
+    }
+    if (name === "search") {
+      const query = toolValue(args, ["query", "q", "search_query", "searchQuery", "text"]);
+      return query ? `"${compactToolText(query, 90)}"` : "";
+    }
+    if (name === "web_read") {
+      const url = toolValue(args, ["url", "uri", "href"]);
+      if (url) {
+        try {
+          const parsed = new URL(url);
+          return compactToolText(`${parsed.host}${parsed.pathname === "/" ? "" : parsed.pathname}`, 90);
+        } catch {
+          return compactToolText(url, 90);
+        }
+      }
+    }
+    if (name === "get_file_tree")
+      return [toolValue(args, ["type"]), path ? compactToolPath(path) : ""].filter(Boolean).join(" • ");
+    if (name === "get_code_structure") {
+      const paths = toolArray(args, ["paths"]);
+      return paths.length ? `${paths.length} path${paths.length === 1 ? "" : "s"}` : "selection";
+    }
+    if (name === "file_actions") {
+      const target = path ? compactToolPath(path) : "";
+      const next = toolValue(args, ["new_path", "newPath"]);
+      return [op ? humanizeToolValue(op) : "", target && next ? `${target} → ${compactToolPath(next)}` : target].filter(Boolean).join(": ");
+    }
+    if (name === "workspace_context") {
+      const include = toolArray(args, ["include"]);
+      return include.map(humanizeToolValue).join(", ");
+    }
+    if (name === "prompt" && op) {
+      const target = toolValue(args, ["path", "copy_preset", "copyPreset"]);
+      return [humanizeToolValue(op), target ? compactToolPath(target) : ""].filter(Boolean).join(" • ");
+    }
+    if (op) return humanizeToolValue(op);
+    if ((tool.keyPaths || []).length)
+      return `${compactToolPath(tool.keyPaths[0])}${tool.keyPaths.length > 1 ? ` (+${tool.keyPaths.length - 1} more)` : ""}`;
+    const summary = compactToolText(tool.summary, 160);
+    return summary && normalizedToolName(summary) !== name ? summary : "";
+  }
+
+  function formattedToolPayload(raw) {
+    const parsed = parseToolPayload(raw);
+    return parsed == null ? String(raw || "") : JSON.stringify(parsed, null, 2);
+  }
+
   function renderPresentationTool(tool = {}, rowID = "") {
-    const card = element(
-      "article",
-      `typed-tool tool-status-${tool.status || "unknown"}`,
-    );
+    const name = normalizedToolName(tool.name);
+    const args = toolObject(tool.displayArguments);
+    const result = toolObject(tool.displayResult);
+    const hasPayload = Boolean(tool.displayArguments || tool.displayResult);
+    const card = element(hasPayload ? "details" : "article", `typed-tool tool-status-${toolRenderStatus(tool.status)} tool-family-${toolFamily(name)}`);
     card.dataset.rowId = rowID;
     card.dataset.executionId = tool.executionId || "";
     if (["pending", "running"].includes(tool.status))
       card.setAttribute("role", "status");
-    const header = element("header", "typed-tool-header");
-    header.append(
-      element("strong", "", tool.name || "Tool"),
-      element(
-        "span",
-        "tool-status",
-        humanize(tool.status || "unknown"),
-      ),
+    if (hasPayload) {
+      card.open = state.agent.toolExpansion.get(rowID) === true;
+      card.addEventListener("toggle", () => {
+        state.agent.toolExpansion.set(rowID, card.open);
+      });
+    }
+    const header = element(hasPayload ? "summary" : "header", "typed-tool-header");
+    const leading = element("span", "typed-tool-leading");
+    leading.append(
+      iconNode(toolIconName(name), "typed-tool-icon"),
+      element("strong", "typed-tool-title", toolDisplayName(name)),
+      toolStatusDot(tool.status),
     );
-    card.append(header);
-    if (tool.summary) card.append(element("p", "tool-summary", tool.summary));
-    if ((tool.keyPaths || []).length) {
-      const paths = element("div", "tool-key-paths");
-      tool.keyPaths.forEach((path) =>
-        paths.append(element("code", "", path)),
-      );
-      card.append(paths);
-    }
-    if (tool.displayArguments || tool.displayResult) {
-      const details = element("details", "tool-details");
-      details.append(element("summary", "", "Arguments and result"));
-      if (tool.displayArguments)
-        details.append(
-          element("pre", "tool-payload", tool.displayArguments),
-        );
-      if (tool.displayResult)
-        details.append(element("pre", "tool-payload", tool.displayResult));
-      card.append(details);
-    }
+    const subtitle = toolSubtitle(name, args, result, tool);
+    if (subtitle) leading.append(element("span", "tool-summary", subtitle));
+    header.append(leading);
     const process = [
-      tool.processId != null ? `PID ${tool.processId}` : "",
+      tool.processId != null ? `pid ${tool.processId}` : "",
       tool.exitCode != null ? `exit ${tool.exitCode}` : "",
-    ]
-      .filter(Boolean)
-      .join(" · ");
-    if (process) card.append(element("small", "tool-process", process));
+    ].filter(Boolean).join(" · ");
+    if (process) header.append(element("span", "tool-process", process));
+    card.append(header);
+    if (hasPayload) {
+      const body = element("div", "tool-details");
+      if (tool.displayArguments) {
+        const section = element("section", "tool-payload-section");
+        section.append(
+          element("strong", "tool-payload-label", "Arguments"),
+          element("pre", "tool-payload", formattedToolPayload(tool.displayArguments)),
+        );
+        body.append(section);
+      }
+      if (tool.displayResult) {
+        const section = element("section", `tool-payload-section${name === "bash" ? " bash-output" : ""}`);
+        section.append(
+          element("strong", "tool-payload-label", name === "bash" ? "Output" : "Result"),
+          element("pre", "tool-payload", formattedToolPayload(tool.displayResult)),
+        );
+        body.append(section);
+      }
+      card.append(body);
+    }
     return card;
   }
 
@@ -1914,6 +2223,11 @@
     )
       return state.agent.transcriptPromise;
     const generation = state.agent.selectionGeneration;
+    const transcriptViewport = document.getElementById("main-content");
+    const previousScrollHeight = transcriptViewport.scrollHeight;
+    const previousScrollTop = transcriptViewport.scrollTop;
+    const previousPresentationCursor =
+      state.agent.transcriptPage?.presentation?.presentationCursor || null;
     const query = new URLSearchParams({ limit: "25" });
     if (pageToken) query.set("pageToken", pageToken);
     const requestPromise = (async () => {
@@ -1953,6 +2267,13 @@
         }
         renderSessions();
         renderAgentDetail();
+        if (pageToken)
+          preserveTranscriptViewport(previousScrollHeight, previousScrollTop);
+        else if (
+          previousPresentationCursor !==
+          (page.presentation?.presentationCursor || null)
+        )
+          scrollTranscriptToBottom();
         if (previousRevision !== page.session.revision)
           loadComposerCatalog(true);
         scheduleAgentPoll();
