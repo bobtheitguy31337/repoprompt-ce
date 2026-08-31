@@ -23,8 +23,8 @@ COPY Sources/RepoPromptLinuxSupport Sources/RepoPromptLinuxSupport
 COPY Sources/RepoPromptServiceHTTP Sources/RepoPromptServiceHTTP
 COPY Sources/RepoPromptMCPAdapter Sources/RepoPromptMCPAdapter
 COPY Sources/RepoPromptServerExecutable Sources/RepoPromptServerExecutable
-RUN --mount=type=cache,target=/root/.cache/org.swift.swiftpm \
-    --mount=type=cache,target=/src/.build \
+RUN --mount=type=cache,id=/root/.cache/org.swift.swiftpm,target=/root/.cache/org.swift.swiftpm,sharing=locked \
+    --mount=type=cache,id=/src/.build,target=/src/.build,sharing=locked \
     swift build --disable-automatic-resolution -c release --product RepoPromptServer && \
     bin_path="$(swift build -c release --show-bin-path)" && \
     install -D -m 0755 "$bin_path/RepoPromptServer" /out/usr/local/bin/RepoPromptServer && \
