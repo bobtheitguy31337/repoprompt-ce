@@ -918,17 +918,17 @@ public struct RepoPromptHTTPService: Sendable {
         } }
         router.post("/portal/api/v1/provider-settings/:id/install") { request, context in await portalRespond(request) {
             let principal = try await authenticatePortal(request: request, context: context)
-            try validatePortalMutation(request)
+            try validatePortalMutation(request, requireJSON: false)
             return try await portalJSON(requireProviderSettings().installCLI(providerID: providerSettingsID(context), attribution: principal.providerAttribution), status: .created)
         } }
         router.post("/portal/api/v1/provider-settings/:id/update-cli") { request, context in await portalRespond(request) {
             let principal = try await authenticatePortal(request: request, context: context)
-            try validatePortalMutation(request)
+            try validatePortalMutation(request, requireJSON: false)
             return try await portalJSON(requireProviderSettings().updateCLI(providerID: providerSettingsID(context), attribution: principal.providerAttribution))
         } }
         router.post("/portal/api/v1/provider-settings/:id/uninstall") { request, context in await portalRespond(request) {
             let principal = try await authenticatePortal(request: request, context: context)
-            try validatePortalMutation(request)
+            try validatePortalMutation(request, requireJSON: false)
             return try await portalJSON(requireProviderSettings().uninstallCLI(providerID: providerSettingsID(context), attribution: principal.providerAttribution))
         } }
         router.post("/portal/api/v1/provider-settings/:id/auth-flows") { request, context in await portalRespond(request) {

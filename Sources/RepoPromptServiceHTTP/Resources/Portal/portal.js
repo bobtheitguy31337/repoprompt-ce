@@ -2951,22 +2951,8 @@
       "claudeCustom",
     ].includes(provider.providerID);
     const connected = isConnectedProvider(provider);
-    const availability = desktopCard(
-      "Agent Mode",
-      "Choose whether new sessions may use this provider.",
-    );
-    availability.append(
-      desktopRow(
-        "Provider",
-        provider.effectiveEnabled
-          ? "Available to the composer."
-          : "Enable this provider after connecting it.",
-        providerEnabledToggle(provider),
-      ),
-    );
 
     if (compatibleBackend) {
-      body.append(availability);
       body.append(compatibleBackendPrerequisite(provider));
       const directMethods = (
         provider.capabilities.authenticationMethods || []
@@ -3003,7 +2989,7 @@
       return details;
     }
 
-    body.append(availability, providerCLIInstallationCard(provider));
+    body.append(providerCLIInstallationCard(provider));
 
     if (connected) {
       body.append(connectedProviderSummary(provider));
@@ -3112,11 +3098,9 @@
       );
       const uninstall = element("button", "secondary-button", "Uninstall");
       uninstall.type = "button";
-      const uninstallReason = provider.preference.enabled
-        ? "Disable this provider before uninstalling its CLI."
-        : provider.connection
-          ? "Disconnect this provider before uninstalling its CLI."
-          : "";
+      const uninstallReason = provider.connection
+        ? "Disconnect this provider before uninstalling its CLI."
+        : "";
       if (uninstallReason)
         setDisabledReason(uninstall, true, uninstallReason);
       else
@@ -3515,25 +3499,6 @@
         ? "Define an Anthropic-compatible endpoint. Credential entry is unavailable because this backend does not advertise a safe configured-host validator."
         : "These runtime settings mirror the desktop backend behavior. Provider credentials are managed in the key section above.",
     );
-    if (custom) {
-      card.append(
-        toggleSetting(
-          "claudeCustomEnabled",
-          "Available for new sessions",
-          "Same persist flag launch resolution reads. Default off.",
-          false,
-        ),
-      );
-    } else {
-      card.append(
-        desktopRow(
-          "Available for new sessions",
-          "Enable this backend in the server provider catalog.",
-          providerEnabledToggle(provider),
-        ),
-      );
-    }
-
     const form = element("form", "compatible-backend-form");
     const primaryFields = element("div", "settings-form");
     const advancedFields = element("div", "settings-form");
@@ -3659,50 +3624,12 @@
       form.querySelectorAll("[data-setting-key]").forEach((input) => {
         changes[input.dataset.settingKey] = input.value.trim();
       });
+      if (custom) changes.claudeCustomEnabled = "true";
       await saveSettingsChanges(changes, save);
       await loadAll(true);
     });
     card.append(form);
     return card;
-  }
-
-  function providerEnabledToggle(provider) {
-    const toggle = element("label", "toggle desktop-toggle");
-    const input = document.createElement("input");
-    input.type = "checkbox";
-    input.checked = provider.preference.enabled;
-    input.setAttribute("aria-label", `Enable ${provider.displayName}`);
-    if (!provider.deploymentAllowed)
-      setDisabledReason(
-        input,
-        true,
-        "This provider is not enabled for the server deployment.",
-      );
-    input.addEventListener("change", async () => {
-      setDisabledReason(input, true, "Saving provider state…");
-      try {
-        const updated = await api(
-          `api/v1/provider-settings/${encodeURIComponent(provider.providerID)}/${input.checked ? "enable" : "disable"}`,
-          {
-            method: "POST",
-            body: JSON.stringify({
-              expectedRevision: provider.preference.revision,
-            }),
-          },
-        );
-        replaceProvider(updated);
-        renderRoute();
-        announce(
-          `${provider.displayName} ${input.checked ? "enabled" : "disabled"}`,
-        );
-      } catch (error) {
-        input.checked = !input.checked;
-        setDisabledReason(input, false, "");
-        toast(error.message, true);
-      }
-    });
-    toggle.append(input, element("span"));
-    return toggle;
   }
 
   function typedSelect(label, options, currentValue) {
@@ -6169,13 +6096,6 @@
       state.typedSettings.directConfigurations[provider.providerID];
     const card = desktopCard(provider.displayName, provider.summary);
     card.dataset.providerId = provider.providerID;
-    card.append(
-      desktopRow(
-        "Enabled",
-        "Connect and validate this provider before using it in Agent Mode.",
-        providerEnabledToggle(provider),
-      ),
-    );
     if (configuration) {
       const form = element("form", "typed-settings-form direct-provider-form");
       const persistBaseURL = acceptsPersistedBaseURL(provider.providerID);
@@ -7503,29 +7423,6 @@
     const form = element("form", "settings-form");
     form.dataset.providerSettings = provider.providerID;
 
-    const enabledLabel = element("label", "", "Provider");
-    const enabledRow = element("div", "toggle-row");
-    const toggle = element("label", "toggle");
-    const enabled = document.createElement("input");
-    enabled.type = "checkbox";
-    enabled.name = "enabled";
-    enabled.checked = provider.preference.enabled;
-    enabled.setAttribute("aria-label", `Enable ${provider.displayName}`);
-    const deploymentReason =
-      provider.providerID === "xAI"
-        ? "This provider has no portable server runtime yet."
-        : "Deployment configuration does not allow this provider runtime.";
-    setDisabledReason(enabled, !provider.deploymentAllowed, deploymentReason);
-    toggle.append(enabled, element("span"));
-    const enabledText = element(
-      "span",
-      "",
-      enabled.checked ? "Enabled" : "Disabled",
-    );
-    enabledRow.append(toggle, enabledText);
-    form.append(enabledLabel, enabledRow);
-    if (!provider.deploymentAllowed) appendFieldHelp(form, deploymentReason);
-
     const model = addSelect(
       form,
       "Default model",
@@ -7640,7 +7537,7 @@
     const note = element(
       "span",
       "form-note",
-      "Disabling blocks new runs; it does not terminate work already in flight.",
+      "Defaults apply to new sessions.",
     );
     const save = element("button", "primary-button", "Save Settings");
     save.type = "submit";
@@ -7650,12 +7547,10 @@
     form.append(message, actions);
 
     function markDirty() {
-      enabledText.textContent = enabled.checked ? "Enabled" : "Disabled";
       setDisabledReason(save, false, "");
       message.textContent = "Unsaved changes";
       message.className = "inline-message info form-message";
     }
-    enabled.addEventListener("change", markDirty);
     model.addEventListener("change", () => {
       refreshDependentOptions(false);
       markDirty();
@@ -7679,7 +7574,7 @@
             method: "PATCH",
             body: JSON.stringify({
               expectedRevision: provider.preference.revision,
-              enabled: enabled.checked,
+              enabled: provider.deploymentAllowed,
               defaultModel: model.value || null,
               reasoningEffort: effort.value || null,
               speedMode: speed.value || null,

@@ -400,17 +400,7 @@ final class ProviderManagementBackendTests: XCTestCase {
         let initialCodex = try XCTUnwrap(initialCatalog.providers.first { $0.providerID == .codex })
         XCTAssertEqual(Set(initialCodex.capabilities.authenticationMethods), [.deviceCodeBeta, .apiKey])
         XCTAssertTrue(initialCodex.capabilities.authFlows.contains { $0.kind == .deviceCodeBeta })
-        _ = try await service.update(
-            providerID: .codex,
-            request: .init(
-                expectedRevision: initialCodex.preference.revision,
-                enabled: true,
-                defaultModel: nil,
-                reasoningEffort: nil,
-                speedMode: nil,
-                serviceTier: nil
-            )
-        )
+        XCTAssertTrue(initialCodex.preference.enabled)
         let attribution = ProviderMutationAttribution(actorID: "admin-1", actorLabel: "alice", channel: "test")
         let secret = "sk-test-write-only-value"
 

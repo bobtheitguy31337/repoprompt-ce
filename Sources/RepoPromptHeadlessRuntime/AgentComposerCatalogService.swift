@@ -323,7 +323,7 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
             states.append(.init(
                 providerID: matrix.providerID,
                 displayName: settings.displayName,
-                enabled: settings.preference.enabled && settings.deploymentAllowed,
+                enabled: settings.deploymentAllowed,
                 configured: settings.preflight.ready || settings.authentication.state != .notConfigured,
                 preflightReady: catalogReady,
                 adapterAvailable: adapters[matrix.providerID] != nil,

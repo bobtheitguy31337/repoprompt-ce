@@ -229,7 +229,7 @@ public actor ProviderSettingsService {
                 )
                 let initial = ProviderSettingsPreference(
                     providerID: providerID,
-                    enabled: false,
+                    enabled: deploymentAllows(providerID),
                     defaultModel: selection.defaultModel,
                     reasoningEffort: selection.reasoningEffort,
                     speedMode: selection.speedMode,
@@ -296,26 +296,10 @@ public actor ProviderSettingsService {
             throw ServiceAPIError(code: .staleRevision, message: "Provider settings revision is stale", currentRevision: current.revision)
         }
         let definition = Self.definition(providerID)
-        if request.enabled, providerID.runtimeKind == nil {
-            throw ServiceAPIError(code: .capabilityMissing, message: "This provider has no portable server runtime")
-        }
-        if request.enabled, providerID.isDirectAPI, !directProviderAllowlist.contains(providerID) {
-            throw ServiceAPIError(code: .capabilityMissing, message: "Deployment configuration does not allow this direct provider")
-        }
-        if request.enabled, !providerID.isDirectAPI, let kind = providerID.runtimeKind, !initiallyEnabled.contains(kind) {
-            throw ServiceAPIError(code: .capabilityMissing, message: "Deployment configuration does not allow this provider")
-        }
-        if request.enabled,
-           !providerID.isDirectAPI,
-           providerID.runtimeKind != nil,
-           cliHealth[providerID.runtimeSettingsOwner]?.installed != true
-        {
-            throw ServiceAPIError(code: .capabilityMissing, message: "Install this provider CLI before enabling it")
-        }
         try validateSelection(request, providerID: providerID, definition: definition)
         let next = try ProviderSettingsPreference(
             providerID: providerID,
-            enabled: request.enabled,
+            enabled: deploymentAllows(providerID),
             defaultModel: normalized(request.defaultModel),
             reasoningEffort: normalized(request.reasoningEffort),
             speedMode: normalized(request.speedMode),
@@ -1044,7 +1028,7 @@ public actor ProviderSettingsService {
         let ownerID = providerID.runtimeSettingsOwner
         guard let preference = preferences[ownerID] else { return }
         let defaults = ProviderRuntimeDefaults(
-            enabled: preference.enabled,
+            enabled: deploymentAllows(providerID),
             model: preference.defaultModel,
             reasoningEffort: preference.reasoningEffort,
             speedMode: preference.speedMode,
@@ -1056,9 +1040,7 @@ public actor ProviderSettingsService {
             return
         }
         guard let kind = providerID.runtimeKind, configurations[kind] != nil else { return }
-        let effectiveAdmission = initiallyEnabled.contains(kind) && preferences.values.contains {
-            !$0.providerID.isDirectAPI && $0.providerID.runtimeKind == kind && $0.enabled
-        }
+        let effectiveAdmission = initiallyEnabled.contains(kind)
         try await adapter.applyRuntimeDefaults(
             kind: kind,
             defaults: ProviderRuntimeDefaults(
@@ -1185,21 +1167,24 @@ public actor ProviderSettingsService {
         return directConfigurations[providerID]?.resolvedCatalog(discovered: discovered) ?? discovered
     }
 
+    private func deploymentAllows(_ providerID: ProviderSettingsID) -> Bool {
+        providerID.isDirectAPI
+            ? directProviderAllowlist.contains(providerID)
+            : (providerID.runtimeKind.map(initiallyEnabled.contains) ?? false)
+    }
+
     private func snapshot(for providerID: ProviderSettingsID) throws -> ProviderSettingsSnapshot {
         guard let preference = preferences[providerID] else {
             throw ServiceAPIError(code: .notFound, message: "Provider settings are not initialized")
         }
         let definition = Self.definition(providerID)
         let runtimeSettingsID = providerID.runtimeSettingsOwner
-        let deploymentAllowed = providerID.isDirectAPI
-            ? directProviderAllowlist.contains(providerID)
-            : (providerID.runtimeKind.map(initiallyEnabled.contains) ?? false)
+        let deploymentAllowed = deploymentAllows(providerID)
         let preflightVerified = runtimePreflight[runtimeSettingsID] ?? false
         let models = resolvedModels(for: providerID)
         let connection = connections[providerID]?.record
         let preflight = preflightStatus(
             providerID: providerID,
-            preference: preference,
             deploymentAllowed: deploymentAllowed,
             runtimeVerified: preflightVerified,
             connection: connection,
@@ -1212,8 +1197,16 @@ public actor ProviderSettingsService {
             summary: definition.summary,
             deploymentAllowed: deploymentAllowed,
             runtimePreflightVerified: preflightVerified,
-            effectiveEnabled: preference.enabled && preflight.ready,
-            preference: preference,
+            effectiveEnabled: preflight.ready,
+            preference: ProviderSettingsPreference(
+                providerID: preference.providerID,
+                enabled: deploymentAllowed,
+                defaultModel: preference.defaultModel,
+                reasoningEffort: preference.reasoningEffort,
+                speedMode: preference.speedMode,
+                serviceTier: preference.serviceTier,
+                revision: preference.revision
+            ),
             cli: providerID.isDirectAPI || providerID.runtimeKind == nil
                 ? nil
                 : cliHealth[runtimeSettingsID] ?? ProviderCLIHealth(installed: false, healthy: false, detail: "CLI health has not been checked"),
@@ -1261,8 +1254,7 @@ public actor ProviderSettingsService {
         return ProviderAuthenticationStatus(state: .notConfigured, authenticated: false, detail: "Provision credentials on the server")
     }
 
-    private func preflightStatus(providerID: ProviderSettingsID, preference: ProviderSettingsPreference, deploymentAllowed: Bool, runtimeVerified: Bool, connection: ProviderConnectionRecord?, cli: ProviderCLIHealth?) -> ProviderPreflightStatus {
-        guard preference.enabled else { return .init(ready: false, reason: .disabled, detail: "Provider is administratively disabled") }
+    private func preflightStatus(providerID: ProviderSettingsID, deploymentAllowed: Bool, runtimeVerified: Bool, connection: ProviderConnectionRecord?, cli: ProviderCLIHealth?) -> ProviderPreflightStatus {
         guard deploymentAllowed else { return .init(ready: false, reason: .deploymentDisabled, detail: "Deployment configuration does not allow this provider runtime") }
         if !providerID.isDirectAPI, providerID.runtimeKind != nil, cli?.installed != true {
             return .init(ready: false, reason: .missingExecutable, detail: "Provider executable is missing")
@@ -1334,7 +1326,7 @@ public actor ProviderSettingsService {
         )
         let request = UpdateProviderSettingsRequest(
             expectedRevision: preference.revision,
-            enabled: preference.enabled,
+            enabled: deploymentAllows(preference.providerID),
             defaultModel: selection.defaultModel,
             reasoningEffort: selection.reasoningEffort,
             speedMode: selection.speedMode,
@@ -1344,7 +1336,7 @@ public actor ProviderSettingsService {
         guard selection != current else { return nil }
         return ProviderSettingsPreference(
             providerID: preference.providerID,
-            enabled: preference.enabled,
+            enabled: deploymentAllows(preference.providerID),
             defaultModel: selection.defaultModel,
             reasoningEffort: selection.reasoningEffort,
             speedMode: selection.speedMode,

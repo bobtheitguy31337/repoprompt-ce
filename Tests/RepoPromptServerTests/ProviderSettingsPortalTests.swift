@@ -236,19 +236,16 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertFalse(codex.deploymentAllowed)
         XCTAssertFalse(codex.runtimePreflightVerified)
         XCTAssertFalse(codex.effectiveEnabled)
-        do {
-            _ = try await service.update(providerID: .codex, request: .init(
-                expectedRevision: codex.preference.revision,
-                enabled: true,
-                defaultModel: codex.preference.defaultModel,
-                reasoningEffort: nil,
-                speedMode: nil,
-                serviceTier: nil
-            ))
-            XCTFail("deployment ceiling must reject enablement")
-        } catch let error as ServiceAPIError {
-            XCTAssertEqual(error.code, .capabilityMissing)
-        }
+        let updated = try await service.update(providerID: .codex, request: .init(
+            expectedRevision: codex.preference.revision,
+            enabled: true,
+            defaultModel: codex.preference.defaultModel,
+            reasoningEffort: nil,
+            speedMode: nil,
+            serviceTier: nil
+        ))
+        XCTAssertFalse(updated.preference.enabled)
+        XCTAssertFalse(updated.effectiveEnabled)
         try await store.close()
     }
 
