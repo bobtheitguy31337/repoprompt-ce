@@ -156,13 +156,9 @@
     }
   }
 
-  // Hand-authored web-safe semantic line glyphs substitute for non-portable
-  // SF Symbols without copying Apple artwork.
+  // Web-safe semantic line glyphs substitute for non-portable SF Symbols.
   const icons = {
     search: '<circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3.5 3.5"/>',
-    refresh: '<path d="M13 5V2l-2 2a5.5 5.5 0 1 0 1.2 7.8"/>',
-    settings:
-      '<path d="M14.7 9V7l-1.8-.6-.4-1 .9-1.7L12 2.3l-1.7.9-1-.4L8.7 1h-2l-.6 1.8-1 .4-1.7-.9L2 3.7l.9 1.7-.4 1L.7 7v2l1.8.6.4 1-.9 1.7 1.4 1.4 1.7-.9 1 .4.6 1.8h2l.6-1.8 1-.4 1.7.9 1.4-1.4-.9-1.7.4-1z"/><circle cx="7.7" cy="8" r="2.2"/>',
     message: '<path d="M2 3.5h12v8H7l-3.5 2v-2H2z"/>',
     folder: '<path d="M1.5 4h5l1.4 1.5h6.6v7.5h-13z"/>',
     document: '<path d="M3 1.5h6l4 4V14.5H3zM9 1.5v4h4M5.5 9h5M5.5 11.5h4"/>',
@@ -542,11 +538,7 @@
   }
 
   function setLoading(loading) {
-    const refresh = document.getElementById("refresh-button");
     state.loading = loading;
-    refresh.classList.toggle("loading", loading);
-    refresh.setAttribute("aria-busy", String(loading));
-    setDisabledReason(refresh, loading, "Refresh is already in progress.");
     document
       .getElementById("session-list")
       .setAttribute("aria-busy", String(loading));
@@ -556,11 +548,13 @@
   }
 
   function renderInitialLoading() {
-    const projects = document.getElementById("project-list");
+    const projectSelector = document.getElementById("project-selector");
     const sessions = document.getElementById("session-list");
-    projects.replaceChildren(
-      element("div", "sidebar-loading", "Loading projects…"),
-    );
+    const loadingProject = document.createElement("option");
+    loadingProject.textContent = "Loading projects…";
+    projectSelector.replaceChildren(loadingProject);
+    projectSelector.disabled = true;
+    document.getElementById("current-project-name").textContent = "Loading…";
     sessions.replaceChildren(
       element("div", "sidebar-loading", "Loading sessions…"),
     );
@@ -876,75 +870,34 @@
   }
 
   function renderProjects() {
-    const list = document.getElementById("project-list");
-    list.replaceChildren();
-    const projects = state.bootstrap?.projects || [];
+    const selector = document.getElementById("project-selector");
+    selector.replaceChildren();
+    const projects = [...(state.bootstrap?.projects || [])].sort((left, right) =>
+      left.name.localeCompare(right.name, undefined, {
+        numeric: true,
+        sensitivity: "base",
+      }),
+    );
     const providersReady = eligibleSessionProviders().length > 0;
-    if (!projects.length) {
-      list.append(
-        element(
-          "div",
-          "sidebar-empty",
-          providersReady
-            ? "Create a folder for your first project."
-            : "Set up a provider to continue.",
-        ),
-      );
-    }
+    const activeProject = selectedProject();
+    document.getElementById("current-project-name").textContent =
+      activeProject?.name || "No project";
+
+    const create = document.createElement("option");
+    create.value = "__create_project__";
+    create.textContent = "Create New Project";
+    create.disabled = !providersReady;
+    selector.append(create);
+
     projects.forEach((project) => {
-      const button = element("button", "project-row");
-      button.type = "button";
-      button.dataset.projectId = project.projectId;
-      button.dataset.action = "select-project";
-      button.classList.toggle(
-        "active",
-        project.projectId === state.agent.selectedProjectID,
-      );
-      button.setAttribute(
-        "aria-pressed",
-        String(project.projectId === state.agent.selectedProjectID),
-      );
-      const glyph = iconNode("folder", "project-row-icon");
-      const copy = element("span", "project-row-copy");
-      copy.append(
-        element("strong", "", project.name),
-        element(
-          "small",
-          "",
-          project.rootNames?.length
-            ? project.rootNames.join(" · ")
-            : humanize(project.state),
-        ),
-      );
-      button.append(glyph, copy);
-      button.addEventListener("click", () => selectProject(project.projectId));
-      list.append(button);
+      const option = document.createElement("option");
+      option.value = project.projectId;
+      option.textContent = project.name;
+      selector.append(option);
     });
-    if (providersReady) {
-      const create = element("button", "project-row project-create-row");
-      create.type = "button";
-      create.dataset.action = "create-project";
-      create.append(
-        iconNode("folder", "project-row-icon"),
-        (() => {
-          const copy = element("span", "project-row-copy");
-          copy.append(
-            element("strong", "", projects.length ? "New Project" : "Create Project"),
-            element("small", "", "Create a server folder"),
-          );
-          return copy;
-        })(),
-      );
-      create.addEventListener("click", () => {
-        state.agent.projectCreationOpen = true;
-        renderHomeProviders();
-        window.setTimeout(
-          () => document.getElementById("project-name")?.focus({ preventScroll: true }),
-          0,
-        );
-      });
-      list.append(create);
-    }
+    if (activeProject) selector.value = activeProject.projectId;
+    selector.disabled = !providersReady && !projects.length;
+
     const newChat = document.getElementById("new-chat-button");
     const reason = !providersReady
       ? "Set up a CLI provider before starting a chat."
@@ -952,7 +905,6 @@
         ? "Create a project folder before starting a chat."
         : "";
     setDisabledReason(newChat, Boolean(reason), reason);
-    installIcons(list);
   }
 
   function renderSessions() {
@@ -1061,6 +1013,16 @@
       .then(renderRoute)
       .catch((error) => toast(error.message, true));
     if (state.agent.selectedSessionID) loadTranscript();
+  }
+
+  function beginProjectCreation() {
+    state.agent.projectCreationOpen = true;
+    renderHomeProviders();
+    window.setTimeout(
+      () =>
+        document.getElementById("project-name")?.focus({ preventScroll: true }),
+      0,
+    );
   }
 
   function selectSession(sessionID) {
@@ -9002,6 +8964,13 @@
         document.getElementById("clear-session-search").hidden =
           !event.target.value;
         renderSessions();
+      });
+    document
+      .getElementById("project-selector")
+      .addEventListener("change", (event) => {
+        const projectID = event.target.value;
+        if (projectID === "__create_project__") beginProjectCreation();
+        else if (projectID) selectProject(projectID);
       });
     const composerText = document.getElementById("composer-text");
     composerText.addEventListener("input", () => {

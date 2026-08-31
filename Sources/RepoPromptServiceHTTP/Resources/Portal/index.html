@@ -85,14 +85,14 @@
       <main id="home-shell" class="agent-shell" tabindex="-1">
         <aside
           class="agent-sidebar native-material"
-          aria-label="Projects and sessions"
+          aria-label="Project sessions"
         >
-          <section class="project-switcher" aria-labelledby="projects-heading">
+          <header
+            class="project-session-header"
+            aria-labelledby="current-project-name"
+          >
             <div class="sidebar-heading-row">
-              <div>
-                <span class="eyebrow">Workspace</span>
-                <h1 id="projects-heading">Projects</h1>
-              </div>
+              <h1 id="current-project-name">No project</h1>
               <button
                 id="new-chat-button"
                 class="small-icon-button"
@@ -102,12 +102,7 @@
                 aria-label="Start a new chat"
               ></button>
             </div>
-            <div
-              id="project-list"
-              class="project-list"
-              aria-live="polite"
-            ></div>
-          </section>
+          </header>
 
           <div class="session-toolbar">
             <label class="search-control session-search-control">
@@ -144,24 +139,35 @@
             ></div>
           </section>
 
-          <nav class="sidebar-actions" aria-label="Portal actions">
-            <button
-              class="icon-button"
-              id="refresh-button"
-              type="button"
-              data-action="refresh"
-              data-icon="refresh"
-              aria-label="Refresh server state"
-            ></button>
+          <footer class="sidebar-footer">
+            <label class="project-picker">
+              <span class="sr-only">Project</span>
+              <select
+                id="project-selector"
+                aria-label="Choose a project"
+              ></select>
+            </label>
             <a
-              class="icon-button"
+              class="settings-link"
               id="settings-button"
-              data-icon="settings"
               data-route-link
               href="#settings/overview"
-              aria-label="Open Settings"
-            ></a>
-          </nav>
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+              <span>Settings</span>
+            </a>
+          </footer>
         </aside>
 
         <section class="agent-detail" aria-label="Agent session">
