@@ -1966,9 +1966,12 @@ public actor RepoPromptHeadlessAuthority {
         let metadata = try await collaborationMetadata(sessionID: sessionID)
         let capability = await providerCapabilities().first { $0.kind == detail.session.provider }
         let persistedPresentation = try await store.runPresentation(sessionID: sessionID)?.wireSnapshot
-        let currentRun = detail.activeRun.flatMap { run in
-            run.endedAt == nil && run.state == "running" ? run : nil
-        }
+        // The live binding is the lifecycle authority. The persisted run row is
+        // diagnostic history and can lead or lag the binding while a run is
+        // being admitted or settled; deriving controls from its string state
+        // lets the UI claim completion while mutation authority still sees an
+        // active run.
+        let activeBinding = detail.activeBinding
         return AgentSessionPresentationPolicy.evaluate(.init(
             isRootSession: detail.session.parentSessionID == nil,
             sessionRevision: detail.session.revision,
@@ -1978,10 +1981,10 @@ public actor RepoPromptHeadlessAuthority {
             providerAvailable: capability?.enabled == true,
             supportsResume: capability?.supportsResume == true,
             supportsSteering: capability?.supportsSteering == true,
-            activeRunID: currentRun?.runID,
-            activeGeneration: currentRun?.generation,
-            activeTurnEpoch: currentRun?.turnEpoch,
-            steeringReady: currentRun.map { providerControlReadyRuns.contains($0.runID) } ?? false,
+            activeRunID: activeBinding?.runID,
+            activeGeneration: activeBinding?.generation,
+            activeTurnEpoch: activeBinding?.turnEpoch,
+            steeringReady: activeBinding.map { providerControlReadyRuns.contains($0.runID) } ?? false,
             runPresentation: persistedPresentation ?? detail.session.runPresentation
         ))
     }

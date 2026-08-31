@@ -103,6 +103,10 @@
       composerStates: new Map(),
       activeComposerKey: null,
       attachmentPromise: null,
+      eventSource: null,
+      eventRefreshRevision: 0,
+      appliedEventRefreshRevision: 0,
+      eventRefreshPromise: null,
     },
   };
 
@@ -760,6 +764,7 @@
         document.getElementById("service-caption").textContent =
           "Connected · authenticated portal";
         setConnectionPresentation("online", "");
+        connectAgentEvents();
         updateShell();
         renderHomeProviders();
         renderRoute();
@@ -1086,17 +1091,6 @@
     const control = session?.agentControl;
     const title = document.getElementById("active-session-title");
     const metadata = document.getElementById("session-metadata");
-    const stateDot = document.getElementById("session-state-dot");
-    const runStatus = document.getElementById("agent-run-status");
-    stateDot.className = "session-state-dot";
-    runStatus.textContent =
-      setupStage === "provider"
-        ? "Step 1 of 2"
-        : setupStage === "project"
-          ? "Step 2 of 2"
-          : state.agent.newSessionMode
-            ? "Ready for a new session"
-            : control?.statusText || "";
     ["resume", "retry", "cancel"].forEach((operation) => {
       const button = document.getElementById(`agent-${operation}-button`);
       button.hidden = Boolean(setupStage) || !control?.[operation]?.allowed;
@@ -1106,31 +1100,16 @@
         control?.[operation]?.reasonText || "Action unavailable",
       );
     });
-    const archive = document.getElementById("agent-archive-button");
-    const canArchive = Boolean(
-      !setupStage &&
-        session &&
-        !state.agent.newSessionMode &&
-        control?.archive?.allowed,
-    );
-    archive.hidden = !canArchive;
-    setDisabledReason(
-      archive,
-      !canArchive,
-      control?.archive?.reasonText || "This session cannot be archived.",
-    );
     if (setupStage === "provider") {
       title.textContent = "Set up a provider";
       metadata.replaceChildren(
         element("span", "metadata-pill", "Install · Sign in"),
       );
-      stateDot.classList.add("idle");
     } else if (setupStage === "project") {
       title.textContent = "Create a project";
       metadata.replaceChildren(
         element("span", "metadata-pill", "A project is a folder"),
       );
-      stateDot.classList.add("idle");
     } else if (state.agent.newSessionMode) {
       title.textContent = "New chat";
       metadata.replaceChildren(
@@ -1140,23 +1119,15 @@
           selectedProject()?.name || "No project",
         ),
       );
-      stateDot.classList.add("idle");
     } else if (session) {
       title.textContent = session.title || "Agent Session";
       metadata.replaceChildren(
         element("span", "metadata-pill", humanize(session.provider)),
         element("span", "metadata-pill", session.model || "Provider default"),
-        element(
-          "span",
-          `metadata-pill state-${control?.displayState || session.state}`,
-          control?.statusText || humanize(session.state),
-        ),
       );
-      stateDot.classList.add(control?.displayState || session.state);
     } else {
       title.textContent = "What are we building?";
       metadata.replaceChildren();
-      stateDot.classList.add("idle");
     }
     renderTranscript();
     renderAgentComposer();
@@ -1466,12 +1437,11 @@
         "presentation-block collapsed-history",
         `${block.title || "Earlier activity"} · ${block.count || 0}`,
       );
-    if (type === "middleSummary")
-      return element(
-        "aside",
-        "presentation-block middle-summary",
-        block.text || "",
-      );
+    if (type === "middleSummary") {
+      const summary = element("aside", "presentation-block middle-summary");
+      summary.append(renderMarkdown(block.text || ""));
+      return summary;
+    }
     const classes = {
       request: "request-block",
       standaloneAssistant: "assistant-block",
@@ -1508,7 +1478,7 @@
         "presentation-row-label",
         labels[row?.type] || humanize(row?.type || "note"),
       ),
-      element("div", "presentation-row-content", row?.text || ""),
+      renderMarkdown(row?.text || ""),
     );
     if (row?.type === "userRequest") {
       const chips = element("div", "request-chips");
@@ -1533,6 +1503,119 @@
     }
     if (row?.code) host.append(element("code", "error-code", row.code));
     return host;
+  }
+
+  // Render the transcript's common Markdown without accepting raw HTML. This
+  // keeps provider output readable while preserving the portal's XSS boundary:
+  // every text fragment is still installed with textContent/createTextNode.
+  function renderMarkdown(source) {
+    const root = element("div", "presentation-row-content markdown-content");
+    const lines = String(source || "").replace(/\r\n?/g, "\n").split("\n");
+    let index = 0;
+    while (index < lines.length) {
+      const line = lines[index];
+      if (!line.trim()) {
+        index += 1;
+        continue;
+      }
+      const fence = line.match(/^\s*```\s*([\w.+-]*)\s*$/);
+      if (fence) {
+        const body = [];
+        index += 1;
+        while (index < lines.length && !/^\s*```\s*$/.test(lines[index]))
+          body.push(lines[index++]);
+        if (index < lines.length) index += 1;
+        const pre = element("pre", "markdown-code-block");
+        const code = element("code", "", body.join("\n"));
+        if (fence[1]) code.dataset.language = fence[1];
+        pre.append(code);
+        root.append(pre);
+        continue;
+      }
+      const heading = line.match(/^(#{1,4})\s+(.+)$/);
+      if (heading) {
+        const node = document.createElement(`h${heading[1].length + 2}`);
+        appendInlineMarkdown(node, heading[2]);
+        root.append(node);
+        index += 1;
+        continue;
+      }
+      const quote = line.match(/^\s*>\s?(.*)$/);
+      if (quote) {
+        const node = document.createElement("blockquote");
+        const parts = [];
+        while (index < lines.length) {
+          const match = lines[index].match(/^\s*>\s?(.*)$/);
+          if (!match) break;
+          parts.push(match[1]);
+          index += 1;
+        }
+        appendInlineMarkdown(node, parts.join("\n"));
+        root.append(node);
+        continue;
+      }
+      const listItem = line.match(/^\s*(?:([-+*])|(\d+)\.)\s+(.+)$/);
+      if (listItem) {
+        const ordered = Boolean(listItem[2]);
+        const list = document.createElement(ordered ? "ol" : "ul");
+        while (index < lines.length) {
+          const match = lines[index].match(/^\s*(?:([-+*])|(\d+)\.)\s+(.+)$/);
+          if (!match || Boolean(match[2]) !== ordered) break;
+          const item = document.createElement("li");
+          appendInlineMarkdown(item, match[3]);
+          list.append(item);
+          index += 1;
+        }
+        root.append(list);
+        continue;
+      }
+      const paragraph = [];
+      while (
+        index < lines.length &&
+        lines[index].trim() &&
+        !/^\s*```/.test(lines[index]) &&
+        !/^(#{1,4})\s+/.test(lines[index]) &&
+        !/^\s*>/.test(lines[index]) &&
+        !/^\s*(?:[-+*]|\d+\.)\s+/.test(lines[index])
+      )
+        paragraph.push(lines[index++]);
+      const node = document.createElement("p");
+      paragraph.forEach((part, partIndex) => {
+        if (partIndex) node.append(document.createElement("br"));
+        appendInlineMarkdown(node, part);
+      });
+      root.append(node);
+    }
+    return root;
+  }
+
+  function appendInlineMarkdown(host, source) {
+    const pattern = /(`[^`\n]+`|\[[^\]\n]+\]\([^\s)]+\)|\*\*[^*\n]+\*\*|__[^_\n]+__|\*[^*\n]+\*|_[^_\n]+_)/g;
+    const text = String(source || "");
+    let cursor = 0;
+    for (const match of text.matchAll(pattern)) {
+      host.append(document.createTextNode(text.slice(cursor, match.index)));
+      const token = match[0];
+      if (token.startsWith("`")) {
+        host.append(element("code", "", token.slice(1, -1)));
+      } else if (token.startsWith("[")) {
+        const parsed = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+        const href = parsed?.[2] || "";
+        if (parsed && /^(https?:|mailto:)/i.test(href)) {
+          const link = element("a", "", parsed[1]);
+          link.href = href;
+          link.rel = "noopener noreferrer";
+          if (/^https?:/i.test(href)) link.target = "_blank";
+          host.append(link);
+        } else host.append(document.createTextNode(token));
+      } else if (token.startsWith("**") || token.startsWith("__")) {
+        host.append(element("strong", "", token.slice(2, -2)));
+      } else {
+        host.append(element("em", "", token.slice(1, -1)));
+      }
+      cursor = match.index + token.length;
+    }
+    host.append(document.createTextNode(text.slice(cursor)));
   }
 
   function renderPresentationTool(tool = {}, rowID = "") {
@@ -1865,18 +1948,6 @@
     return state.agent.mutationPromise;
   }
 
-  async function requestArchiveSession(button) {
-    const session = selectedSession();
-    if (!session) return;
-    const accepted = await confirmAction({
-      title: `Archive ${session.title || "this session"}?`,
-      message: "The session will remain in the project history but cannot receive new messages.",
-      label: "Archive",
-      returnFocus: button,
-    });
-    if (accepted) await submitAgentAction("archive");
-  }
-
   function mergeTranscriptItems(items, prepend = false) {
     const merged = new Map(
       (prepend
@@ -1982,11 +2053,56 @@
       document.hidden
     )
       return;
-    const delay = window.__REPOPROMPT_PORTAL_TEST_HOOK__ ? 60_000 : 2_500;
+    const delay = window.__REPOPROMPT_PORTAL_TEST_HOOK__ ? 60_000 : 15_000;
     state.agent.pollTimer = window.setTimeout(async () => {
       state.agent.pollTimer = null;
       await loadTranscript({ silent: true });
     }, delay);
+  }
+
+  function requestAgentEventRefresh(event) {
+    const selectedSessionID = state.agent.selectedSessionID;
+    if (
+      state.route !== "home" ||
+      !selectedSessionID ||
+      state.agent.newSessionMode ||
+      (event?.sessionId && event.sessionId !== selectedSessionID)
+    )
+      return;
+    state.agent.eventRefreshRevision += 1;
+    if (state.agent.eventRefreshPromise) return;
+    state.agent.eventRefreshPromise = (async () => {
+      while (
+        state.agent.appliedEventRefreshRevision <
+        state.agent.eventRefreshRevision
+      ) {
+        state.agent.appliedEventRefreshRevision =
+          state.agent.eventRefreshRevision;
+        await loadTranscript({ silent: true });
+      }
+    })().finally(() => {
+      state.agent.eventRefreshPromise = null;
+      if (
+        state.agent.appliedEventRefreshRevision <
+        state.agent.eventRefreshRevision
+      )
+        requestAgentEventRefresh();
+    });
+  }
+
+  function connectAgentEvents() {
+    if (state.agent.eventSource || typeof EventSource === "undefined") return;
+    const source = new EventSource("api/v1/events/stream");
+    state.agent.eventSource = source;
+    source.addEventListener("open", () => clearAgentPoll());
+    source.addEventListener("refresh", (message) => {
+      let event = null;
+      try {
+        event = JSON.parse(message.data);
+      } catch (_) {}
+      requestAgentEventRefresh(event);
+    });
+    source.addEventListener("error", () => scheduleAgentPoll());
   }
 
   function composerDestination() {
@@ -8490,8 +8606,6 @@
     else if (action === "agent-resume") submitAgentAction("resume");
     else if (action === "agent-retry") submitAgentAction("retry");
     else if (action === "agent-cancel") submitAgentAction("cancel");
-    else if (action === "agent-archive")
-      requestArchiveSession(event.target.closest("[data-action]"));
     else if (action === "load-earlier") {
       const pageToken =
         state.agent.transcriptPage?.presentation?.nextPageToken;
@@ -8623,10 +8737,23 @@
           !event.target.value;
         renderSessions();
       });
-    document.getElementById("composer-text").addEventListener("input", () => {
-      activeComposerState().text = document.getElementById("composer-text").value;
+    const composerText = document.getElementById("composer-text");
+    composerText.addEventListener("input", () => {
+      activeComposerState().text = composerText.value;
       state.agent.retryOperation = null;
       renderAgentComposer();
+    });
+    composerText.addEventListener("keydown", (event) => {
+      if (
+        event.key !== "Enter" ||
+        event.shiftKey ||
+        event.isComposing ||
+        event.keyCode === 229
+      )
+        return;
+      event.preventDefault();
+      if (!document.getElementById("composer-submit").disabled)
+        submitComposer();
     });
     document.getElementById("composer-attach").addEventListener("click", () => {
       document.getElementById("composer-attachment-input").click();
@@ -8671,6 +8798,8 @@
       disposeSensitiveInputs();
       clearPollTimer();
       clearAgentPoll();
+      state.agent.eventSource?.close();
+      state.agent.eventSource = null;
     });
     renderRoute();
     ensureOperatorSession().then((ready) => {

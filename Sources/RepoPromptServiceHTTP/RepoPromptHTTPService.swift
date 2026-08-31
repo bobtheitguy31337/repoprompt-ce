@@ -105,6 +105,34 @@ public struct RepoPromptHTTPService: Sendable {
         router.get("/portal/api/v1/auth/status") { request, context in await portalRespond(request) {
             try portalJSON(await portalAuthStatus(request: request, context: context))
         } }
+        router.get("/portal/api/v1/events/stream") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(request: request, context: context)
+            let cursor: ServiceCursor
+            if let requested = try parseCursor(request) {
+                cursor = requested
+            } else {
+                let next = try await store.nextCursor()
+                cursor = ServiceCursor(storeID: next.storeID, globalSequence: max(0, next.globalSequence - 1))
+            }
+            let stream = try await authority.subscribe(after: cursor)
+            var headers = HTTPFields()
+            headers[.contentType] = "text/event-stream"
+            headers[.cacheControl] = "no-store"
+            return Response(status: .ok, headers: headers, body: ResponseBody { writer in
+                try await writer.write(ByteBuffer(string: ": repoprompt-portal-stream-v1\n\n"))
+                for try await frame in heartbeatFrames(stream) {
+                    switch frame {
+                    case let .event(event):
+                        let refresh = PortalRefreshEvent(projectID: event.projectID, sessionID: event.sessionID)
+                        let json = try String(decoding: JSONEncoder.serviceEncoder.encode(refresh), as: UTF8.self)
+                        try await writer.write(ByteBuffer(string: "id: \(event.storeID.uuidString):\(event.globalSequence)\nevent: refresh\ndata: \(json)\n\n"))
+                    case .heartbeat:
+                        try await writer.write(ByteBuffer(string: ": heartbeat\n\n"))
+                    }
+                }
+                try await writer.finish(nil)
+            })
+        } }
         router.post("/portal/api/v1/setup") { request, context in await portalRespond(request) {
             try validatePortalMutation(request)
             return try await completePortalSetup(request: request)
@@ -209,7 +237,7 @@ public struct RepoPromptHTTPService: Sendable {
             let principal = try await authenticatePortal(request: request, context: context)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let snapshot = try await authority.authoritySessionSnapshot(sessionID: sessionID)
-            let activeRun = snapshot.activeRun.map { $0.endedAt == nil && $0.state == "running" } ?? false
+            let activeRun = snapshot.activeBinding != nil
             let catalog = try await requireComposerCatalog().snapshot(
                 context: .init(
                     kind: .session,
@@ -424,6 +452,38 @@ public struct RepoPromptHTTPService: Sendable {
                 operation: "submitTurn",
                 requestDigest: digest
             )
+            // The server, not a browser snapshot, decides whether this message
+            // starts a turn or steers the currently bound run. This closes the
+            // race where a run begins between rendering and form submission.
+            if snapshot.activeBinding != nil {
+                let control = try await authority.agentSessionActionSnapshot(
+                    sessionID: sessionID,
+                    actor: principal.externalActor,
+                    composerAvailable: composerCatalog != nil
+                )
+                guard control.steer.allowed, let epoch = control.steer.targetTurnEpoch else {
+                    throw ServiceAPIError(
+                        code: .runAlreadyActive,
+                        message: control.steer.reasonText ?? "The current run is not ready for another message yet.",
+                        retryable: control.steer.reasonCode == "steering_not_ready"
+                    )
+                }
+                guard input.turn.content.attachmentIDs.isEmpty else {
+                    throw ServiceAPIError(code: .invalidRequest, message: "Attachments cannot be added while steering a running agent.")
+                }
+                let text = input.turn.content.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else {
+                    throw ServiceAPIError(code: .invalidRequest, message: "Enter a message before sending")
+                }
+                let receipt = try await authority.execute(
+                    command: .steerSession(text: text, targetTurnEpoch: epoch),
+                    sessionID: sessionID,
+                    externalActor: principal.externalActor,
+                    idempotencyKey: portalIdempotencyKey(principal: principal, operationID: input.operationID),
+                    requestDigest: digest
+                )
+                return try portalJSON(receipt, status: .accepted)
+            }
             let accepted = try await requireSubmissionCoordinator().acceptFollowup(
                 session: snapshot.session,
                 activeRun: snapshot.activeRun,
@@ -1120,7 +1180,7 @@ public struct RepoPromptHTTPService: Sendable {
             let auth = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getComposerCatalog", sessionID: resolvedSessionID)
             let actor = try requireActor(auth)
             let snapshot = try await authority.authoritySessionSnapshot(sessionID: resolvedSessionID)
-            let active = snapshot.activeRun.map { $0.endedAt == nil && $0.state == "running" } ?? false
+            let active = snapshot.activeBinding != nil
             return try await HTTPResponses.privateJSON(requireComposerCatalog().snapshot(context: .init(kind: .session, projectID: snapshot.session.projectID, sessionID: resolvedSessionID, actorID: actor.userID, activeRun: active)))
         } }
         router.get("/internal/v1/catalog/composer-suggestions") { request, context in await respond(request) {
@@ -1140,7 +1200,7 @@ public struct RepoPromptHTTPService: Sendable {
             let auth = try await authenticate(request, context: context, body: Data(), roles: [.app], operation: "getComposerSuggestions", sessionID: resolvedSessionID)
             let actor = try requireActor(auth)
             let snapshot = try await authority.authoritySessionSnapshot(sessionID: resolvedSessionID)
-            let active = snapshot.activeRun.map { $0.endedAt == nil && $0.state == "running" } ?? false
+            let active = snapshot.activeBinding != nil
             return try await HTTPResponses.privateJSON(requireComposerCatalog().suggestions(context: .init(kind: .session, projectID: snapshot.session.projectID, sessionID: resolvedSessionID, actorID: actor.userID, activeRun: active), query: query, kinds: kinds, limit: 50))
         } }
         router.get("/internal/v1/diagnostics") { request, context in await respond(request) { _ = try await authenticate(request, context: context, body: Data(), roles: [.operatorRole], operation: "diagnostics")
@@ -1733,6 +1793,16 @@ public struct RepoPromptHTTPService: Sendable {
         let authenticated: Bool
         let username: String?
         let passwordLoginEnabled: Bool
+    }
+
+    private struct PortalRefreshEvent: Encodable {
+        let projectID: UUID
+        let sessionID: UUID?
+
+        private enum CodingKeys: String, CodingKey {
+            case projectID = "projectId"
+            case sessionID = "sessionId"
+        }
     }
 
     private struct PortalSetupRequest: Decodable {
