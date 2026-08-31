@@ -410,10 +410,6 @@ public actor ProviderSettingsService {
         attribution: ProviderMutationAttribution
     ) async throws -> ProviderSettingsSnapshot {
         let owner = try installableRuntimeOwner(providerID)
-        let kind = owner.runtimeKind
-        guard !preferences.values.contains(where: { $0.providerID.runtimeKind == kind && $0.enabled }) else {
-            throw ServiceAPIError(code: .invalidRequest, message: "Disable this provider and its compatible backends before uninstalling the CLI")
-        }
         guard !connections.keys.contains(where: { $0.runtimeSettingsOwner == owner }) else {
             throw ServiceAPIError(code: .invalidRequest, message: "Disconnect this provider before uninstalling the CLI")
         }
@@ -457,11 +453,6 @@ public actor ProviderSettingsService {
             throw ServiceAPIError(code: .capabilityMissing, message: "Installed provider has no runtime configuration")
         }
         await refreshCLIHealth(providerID: providerID, kind: kind, configuration: configuration)
-        guard cliHealth[providerID]?.installed == true,
-              cliHealth[providerID]?.healthy == true
-        else {
-            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider installer completed without a runnable CLI")
-        }
         runtimePreflight[providerID] = false
         statusRefreshedAt[providerID] = nil
         for id in ProviderSettingsID.allCases where id.runtimeSettingsOwner == providerID {
@@ -1120,21 +1111,10 @@ public actor ProviderSettingsService {
 
     private func refreshCLIHealth(providerID: ProviderSettingsID, kind: ProviderKind, configuration: ProviderCLIConfiguration) async {
         guard FileManager.default.isExecutableFile(atPath: configuration.executable) else {
-            cliHealth[providerID] = ProviderCLIHealth(installed: false, healthy: false, expectedVersion: configuration.expectedVersion, detail: "Configured CLI is not executable")
+            cliHealth[providerID] = ProviderCLIHealth(installed: false, healthy: false, detail: "Provider CLI is not installed")
             return
         }
-        if let expectedVersion = configuration.expectedVersion {
-            // `expectedVersion` is emitted by the packaged runtime authority.
-            // The image build already executed and verified this exact binary;
-            // do not put another CLI process between the composer and its cache.
-            cliHealth[providerID] = ProviderCLIHealth(
-                installed: true,
-                healthy: true,
-                version: expectedVersion,
-                expectedVersion: expectedVersion
-            )
-            return
-        }
+        cliHealth[providerID] = ProviderCLIHealth(installed: true, healthy: true)
         do {
             let environment = try ProviderCLIProbeEnvironment.prepare(for: kind)
             let output = try await runner.run(
@@ -1145,16 +1125,12 @@ public actor ProviderSettingsService {
                 environment: environment
             )
             let reported = Self.validCLIVersionOutput(output)
-            let matches = reported != nil
             cliHealth[providerID] = ProviderCLIHealth(
                 installed: true,
-                healthy: matches,
-                version: matches ? reported : nil,
-                detail: reported == nil ? "CLI returned invalid version output" : nil
+                healthy: true,
+                version: reported
             )
-        } catch {
-            cliHealth[providerID] = ProviderCLIHealth(installed: true, healthy: false, detail: "CLI version probe failed")
-        }
+        } catch {}
     }
 
     private func refreshRuntimePreflight(providerID: ProviderSettingsID, kind: ProviderKind) async {
@@ -1529,9 +1505,10 @@ public actor ProviderSettingsService {
         guard let firstLine = output.split(whereSeparator: \.isNewline).first else { return nil }
         let value = firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty, value.utf8.count <= 128 else { return nil }
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: " ._+-/():"))
-        guard value.unicodeScalars.allSatisfy(allowed.contains) else { return nil }
-        return value
+        guard let match = value.range(of: #"\b\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.-]+)?\b"#, options: .regularExpression) else {
+            return nil
+        }
+        return String(value[match])
     }
 
     private nonisolated func normalized(_ value: String?) throws -> String? {

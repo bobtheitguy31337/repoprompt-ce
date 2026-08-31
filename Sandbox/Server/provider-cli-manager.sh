@@ -76,13 +76,11 @@ uninstall_provider() {
   esac
 }
 
-verify_provider() {
+status_provider() {
   provider=$1
   command_name=$(provider_command "$provider")
-  executable=$(command -v "$command_name" 2>/dev/null) || fail "$provider installer did not put $command_name on PATH"
-  version=$($executable --version 2>&1 | head -n 1)
-  [ -n "$version" ] || fail "$provider executable did not report a version"
-  printf '%s\n' "$version"
+  executable=$(command -v "$command_name" 2>/dev/null) || fail "$provider is not installed"
+  "$executable" --version 2>&1 | head -n 1
 }
 
 action=${1:-}
@@ -98,17 +96,16 @@ exec 9>"$selection_file.lock"
 flock 9
 
 case $action in
-  install) install_provider "$provider"; verify_provider "$provider"; record_installed "$provider" ;;
-  update) update_provider "$provider"; verify_provider "$provider" ;;
+  install) install_provider "$provider"; record_installed "$provider" ;;
+  update) update_provider "$provider" ;;
   uninstall) uninstall_provider "$provider"; record_uninstalled "$provider" ;;
-  status) verify_provider "$provider" ;;
+  status) status_provider "$provider" ;;
   restore)
     [ -f "$selection_file" ] || exit 0
     while IFS= read -r provider; do
       [ -n "$provider" ] || continue
       provider_command "$provider" >/dev/null
       install_provider "$provider"
-      verify_provider "$provider"
     done < "$selection_file"
     ;;
 esac

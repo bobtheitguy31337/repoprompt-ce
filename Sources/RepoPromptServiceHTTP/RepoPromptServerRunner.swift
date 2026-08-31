@@ -32,7 +32,6 @@ public struct RepoPromptServerConfiguration: Sendable {
     public let providerExecutables: [ProviderKind: String]
     public let enabledProviders: Set<ProviderKind>
     public let enabledDirectProviders: Set<ProviderSettingsID>
-    public let providerVersions: [ProviderKind: String]
     public let providerProtocols: [ProviderKind: String]
     public let providerCredentialSources: [ProviderKind: String]
     public let providerAuthenticationStatusFiles: [ProviderSettingsID: String]
@@ -178,7 +177,6 @@ public struct RepoPromptServerConfiguration: Sendable {
             }
             enabledDirectProviders.insert(providerID)
         }
-        let versions: [ProviderKind: String] = [:]
         let protocols: [ProviderKind: String] = [.codex: "app-server-v2", .claudeCompatible: "stream-json-v1", .openCodeACP: "acp-v1", .cursorACP: "acp-v1-beta", .grokBuildACP: "acp-v1"]
         if environment["REPOPROMPT_CODEX_CREDENTIAL_HOME"].map({ !$0.isEmpty }) == true
             || environment["REPOPROMPT_CODEX_AUTH_STATUS_FILE"].map({ !$0.isEmpty }) == true
@@ -301,7 +299,6 @@ public struct RepoPromptServerConfiguration: Sendable {
             providerExecutables: providers,
             enabledProviders: enabledProviders,
             enabledDirectProviders: enabledDirectProviders,
-            providerVersions: versions,
             providerProtocols: protocols,
             providerCredentialSources: credentialSources,
             providerAuthenticationStatusFiles: authenticationStatusFiles,
@@ -518,7 +515,6 @@ public enum RepoPromptServerRunner {
             ProviderCLIConfiguration(
                 kind: kind,
                 executable: executable,
-                expectedVersion: configuration.providerVersions[kind],
                 protocolVersion: configuration.providerProtocols[kind],
                 credentialSourceDirectory: configuration.providerCredentialSources[kind]
             )

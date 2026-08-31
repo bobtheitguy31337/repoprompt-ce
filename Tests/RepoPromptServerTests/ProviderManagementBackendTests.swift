@@ -176,7 +176,7 @@ final class ProviderManagementBackendTests: XCTestCase {
             runner: StaticVersionRunner()
         )
         try await providerSettings.bootstrap()
-        var catalog = try await providerSettings.catalog()
+        var catalog = try await providerSettings.catalog(refreshCLI: true, refreshRuntime: true)
         var codexSettings = try XCTUnwrap(catalog.providers.first { $0.providerID == .codex })
         XCTAssertTrue(codexSettings.runtimePreflightVerified)
         _ = try await providerSettings.update(
