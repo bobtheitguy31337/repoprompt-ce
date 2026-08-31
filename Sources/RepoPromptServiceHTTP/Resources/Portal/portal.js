@@ -858,7 +858,9 @@
     const sessions = (state.bootstrap?.sessions || []).filter(
       (item) => item.projectId === state.agent.selectedProjectID,
     );
-    if (
+    if (state.agent.newSessionMode) {
+      state.agent.selectedSessionID = null;
+    } else if (
       !sessions.some((item) => item.sessionId === state.agent.selectedSessionID)
     ) {
       state.agent.selectedSessionID = sessions[0]?.sessionId || null;

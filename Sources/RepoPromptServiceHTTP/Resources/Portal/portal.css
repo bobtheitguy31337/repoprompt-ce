@@ -331,7 +331,6 @@ input:disabled {
 }
 
 .titlebar-leading,
-.titlebar-actions,
 .window-title {
   display: flex;
   align-items: center;
@@ -395,11 +394,6 @@ input:disabled {
 
 .status-dot.offline {
   background: var(--danger);
-}
-
-.titlebar-actions {
-  justify-content: flex-end;
-  gap: var(--space-4);
 }
 
 .icon-button,
@@ -2453,23 +2447,12 @@ input:disabled {
   text-align: center;
 }
 
-.sidebar-footnote {
+.sidebar-actions {
   display: flex;
-  gap: 7px;
-  padding: 10px 12px;
+  justify-content: flex-end;
+  gap: var(--space-4);
+  padding: 8px 10px;
   border-top: 0.5px solid var(--separator);
-  color: var(--text-tertiary);
-  font-size: 10px;
-}
-
-.sidebar-footnote [data-icon] {
-  width: 13px;
-  height: 13px;
-  margin-top: 1px;
-}
-
-.sidebar-footnote p {
-  margin: 0;
 }
 
 .agent-detail {
@@ -3564,8 +3547,7 @@ details.typed-tool > .typed-tool-header {
     border-bottom: 0.5px solid var(--separator);
   }
 
-  .project-switcher,
-  .sidebar-footnote {
+  .project-switcher {
     display: none;
   }
 

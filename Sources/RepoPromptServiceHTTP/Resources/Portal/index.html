@@ -67,24 +67,6 @@
           <span class="status-dot" id="service-dot" aria-hidden="true"></span>
           <span id="window-title-text">Server Portal</span>
         </div>
-        <nav class="titlebar-actions" aria-label="Portal actions">
-          <button
-            class="icon-button"
-            id="refresh-button"
-            type="button"
-            data-action="refresh"
-            data-icon="refresh"
-            aria-label="Refresh server state"
-          ></button>
-          <a
-            class="icon-button"
-            id="settings-button"
-            data-icon="settings"
-            data-route-link
-            href="#settings/overview"
-            aria-label="Open Settings"
-          ></a>
-        </nav>
       </header>
 
       <div
@@ -162,13 +144,24 @@
             ></div>
           </section>
 
-          <div class="sidebar-footnote">
-            <span data-icon="info" aria-hidden="true"></span>
-            <p>
-              Server settings, permissions, tools, workflows, and worktrees are
-              managed from Settings.
-            </p>
-          </div>
+          <nav class="sidebar-actions" aria-label="Portal actions">
+            <button
+              class="icon-button"
+              id="refresh-button"
+              type="button"
+              data-action="refresh"
+              data-icon="refresh"
+              aria-label="Refresh server state"
+            ></button>
+            <a
+              class="icon-button"
+              id="settings-button"
+              data-icon="settings"
+              data-route-link
+              href="#settings/overview"
+              aria-label="Open Settings"
+            ></a>
+          </nav>
         </aside>
 
         <section class="agent-detail" aria-label="Agent session">
