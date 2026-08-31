@@ -85,6 +85,7 @@
       selectedProjectID: null,
       selectedSessionID: null,
       newSessionMode: false,
+      projectCreationOpen: false,
       searchText: "",
       transcriptItems: [],
       transcriptPage: null,
@@ -816,8 +817,20 @@
       (provider) =>
         provider.category === "cliProvider" &&
         provider.deploymentAllowed &&
-        provider.effectiveEnabled,
+        provider.effectiveEnabled &&
+        isConnectedProvider(provider),
     );
+  }
+
+  function onboardingStage() {
+    if (!state.providers.length && state.loading) return null;
+    if (!eligibleSessionProviders().length) return "provider";
+    if (
+      !(state.bootstrap?.projects || []).length ||
+      state.agent.projectCreationOpen
+    )
+      return "project";
+    return null;
   }
 
   function reconcileAgentSelection() {
@@ -852,9 +865,16 @@
     const list = document.getElementById("project-list");
     list.replaceChildren();
     const projects = state.bootstrap?.projects || [];
+    const providersReady = eligibleSessionProviders().length > 0;
     if (!projects.length) {
       list.append(
-        element("div", "sidebar-empty", "No projects are available."),
+        element(
+          "div",
+          "sidebar-empty",
+          providersReady
+            ? "Create a folder for your first project."
+            : "Set up a provider to continue.",
+        ),
       );
     }
     projects.forEach((project) => {
@@ -886,11 +906,36 @@
       button.addEventListener("click", () => selectProject(project.projectId));
       list.append(button);
     });
+    if (providersReady) {
+      const create = element("button", "project-row project-create-row");
+      create.type = "button";
+      create.dataset.action = "create-project";
+      create.append(
+        iconNode("folder", "project-row-icon"),
+        (() => {
+          const copy = element("span", "project-row-copy");
+          copy.append(
+            element("strong", "", projects.length ? "New Project" : "Create Project"),
+            element("small", "", "Create a server folder"),
+          );
+          return copy;
+        })(),
+      );
+      create.addEventListener("click", () => {
+        state.agent.projectCreationOpen = true;
+        renderHomeProviders();
+        window.setTimeout(
+          () => document.getElementById("project-name")?.focus({ preventScroll: true }),
+          0,
+        );
+      });
+      list.append(create);
+    }
     const newChat = document.getElementById("new-chat-button");
-    const reason = !projects.length
-      ? "Create a project through an authorized RepoPrompt client first."
-      : !eligibleSessionProviders().length
-        ? "Connect and validate a CLI provider before starting a chat."
+    const reason = !providersReady
+      ? "Set up a CLI provider before starting a chat."
+      : !projects.length
+        ? "Create a project folder before starting a chat."
         : "";
     setDisabledReason(newChat, Boolean(reason), reason);
     installIcons(list);
@@ -976,8 +1021,13 @@
   }
 
   function selectProject(projectID) {
-    if (state.agent.selectedProjectID === projectID) return;
+    if (
+      state.agent.selectedProjectID === projectID &&
+      !state.agent.projectCreationOpen
+    )
+      return;
     clearAgentPoll();
+    state.agent.projectCreationOpen = false;
     state.agent.selectedProjectID = projectID;
     state.agent.selectedSessionID = null;
     state.agent.blockExpansion.clear();
@@ -1019,6 +1069,7 @@
   }
 
   function beginNewSession() {
+    if (onboardingStage()) return;
     clearAgentPoll();
     state.agent.newSessionMode = true;
     state.agent.selectedSessionID = null;
@@ -1031,6 +1082,7 @@
   }
 
   function renderAgentDetail() {
+    const setupStage = onboardingStage();
     const session = selectedSession();
     const control = session?.agentControl;
     const title = document.getElementById("active-session-title");
@@ -1038,12 +1090,17 @@
     const stateDot = document.getElementById("session-state-dot");
     const runStatus = document.getElementById("agent-run-status");
     stateDot.className = "session-state-dot";
-    runStatus.textContent = state.agent.newSessionMode
-      ? "Ready for a new session"
-      : control?.statusText || "";
+    runStatus.textContent =
+      setupStage === "provider"
+        ? "Step 1 of 3"
+        : setupStage === "project"
+          ? "Step 2 of 3"
+          : state.agent.newSessionMode
+            ? "Ready for a new session"
+            : control?.statusText || "";
     ["resume", "retry", "cancel"].forEach((operation) => {
       const button = document.getElementById(`agent-${operation}-button`);
-      button.hidden = !control?.[operation]?.allowed;
+      button.hidden = Boolean(setupStage) || !control?.[operation]?.allowed;
       setDisabledReason(
         button,
         !control?.[operation]?.allowed,
@@ -1052,7 +1109,10 @@
     });
     const archive = document.getElementById("agent-archive-button");
     const canArchive = Boolean(
-      session && !state.agent.newSessionMode && control?.archive?.allowed,
+      !setupStage &&
+        session &&
+        !state.agent.newSessionMode &&
+        control?.archive?.allowed,
     );
     archive.hidden = !canArchive;
     setDisabledReason(
@@ -1060,7 +1120,19 @@
       !canArchive,
       control?.archive?.reasonText || "This session cannot be archived.",
     );
-    if (state.agent.newSessionMode) {
+    if (setupStage === "provider") {
+      title.textContent = "Set up a provider";
+      metadata.replaceChildren(
+        element("span", "metadata-pill", "Install · Connect · Validate"),
+      );
+      stateDot.classList.add("idle");
+    } else if (setupStage === "project") {
+      title.textContent = "Create a project";
+      metadata.replaceChildren(
+        element("span", "metadata-pill", "A project is a folder"),
+      );
+      stateDot.classList.add("idle");
+    } else if (state.agent.newSessionMode) {
       title.textContent = "New chat";
       metadata.replaceChildren(
         element(
@@ -1091,6 +1163,188 @@
     renderAgentComposer();
   }
 
+  function setupProgress(stage) {
+    const progress = element("ol", "setup-progress");
+    [
+      ["provider", "1", "Provider"],
+      ["project", "2", "Project"],
+      ["session", "3", "Session"],
+    ].forEach(([key, number, label]) => {
+      const item = element("li");
+      const completed =
+        key === "provider"
+          ? stage !== "provider"
+          : key === "project"
+            ? stage === "session"
+            : false;
+      item.classList.toggle("active", key === stage);
+      item.classList.toggle("completed", completed);
+      item.append(
+        element("span", "setup-step-number", completed ? "✓" : number),
+        element("span", "setup-step-label", label),
+      );
+      progress.append(item);
+    });
+    return progress;
+  }
+
+  function renderProviderOnboarding(list) {
+    const surface = element("section", "onboarding-surface");
+    const header = element("div", "onboarding-heading");
+    header.append(
+      iconNode("terminal", "onboarding-icon"),
+      element("h2", "", "Choose an agent provider"),
+      element(
+        "p",
+        "",
+        "Install one provider with its official installer, then sign in and validate the connection. You only need one to begin.",
+      ),
+    );
+    surface.append(setupProgress("provider"), header);
+    const providers = Object.fromEntries(
+      orderedProviders().map((provider) => [provider.providerID, provider]),
+    );
+    const choices = [
+      providers.codex,
+      providers.claudeCompatible,
+      providers.openCodeACP,
+      providers.cursorACP,
+      providers.grokBuildACP,
+    ].filter((provider) => provider?.deploymentAllowed);
+    const stack = element("div", "onboarding-provider-list desktop-provider-list");
+    choices.forEach((provider, index) => {
+      const card = cliProviderCard(provider);
+      card.open = index === 0 || isConnectedProvider(provider);
+      stack.append(card);
+    });
+    if (!choices.length) {
+      stack.append(
+        element(
+          "div",
+          "empty-state-panel",
+          "This server does not currently advertise an installable CLI provider.",
+        ),
+      );
+    }
+    surface.append(stack);
+    list.append(surface);
+    installIcons(surface);
+  }
+
+  function renderProjectOnboarding(list) {
+    const surface = element("section", "onboarding-surface project-onboarding");
+    const header = element("div", "onboarding-heading");
+    header.append(
+      iconNode("folder", "onboarding-icon"),
+      element("h2", "", "Create a project folder"),
+      element(
+        "p",
+        "",
+        "A project is an ordinary writable folder on this RepoPrompt server. It does not need to be a Git repository.",
+      ),
+    );
+    const provider = eligibleSessionProviders()[0];
+    const ready = element("div", "setup-ready-row");
+    ready.append(
+      iconNode("check"),
+      element(
+        "span",
+        "",
+        `${provider?.displayName || "Provider"} is connected and ready.`,
+      ),
+    );
+    const card = element("section", "project-create-card");
+    const form = element("form", "project-create-form");
+    const label = document.createElement("label");
+    label.htmlFor = "project-name";
+    label.textContent = "Project name";
+    const input = document.createElement("input");
+    input.id = "project-name";
+    input.name = "projectName";
+    input.type = "text";
+    input.maxLength = 128;
+    input.autocomplete = "off";
+    input.placeholder = "My Project";
+    input.required = true;
+    const help = element(
+      "p",
+      "field-help",
+      "RepoPrompt creates a folder with this name in the server projects directory.",
+    );
+    const message = element("div", "inline-message info", "Your files stay in this folder across app deployments.");
+    message.setAttribute("role", "status");
+    const actions = element("div", "form-actions");
+    if ((state.bootstrap?.projects || []).length) {
+      const cancel = element("button", "secondary-button", "Cancel");
+      cancel.type = "button";
+      cancel.addEventListener("click", () => {
+        state.agent.projectCreationOpen = false;
+        renderHomeProviders();
+      });
+      actions.append(cancel);
+    }
+    const submit = element("button", "primary-button", "Create Project");
+    submit.type = "submit";
+    actions.append(submit);
+    label.append(input);
+    form.append(label, help, message, actions);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      createManagedProject(input.value, submit, message);
+    });
+    card.append(form);
+    surface.append(setupProgress("project"), header, ready, card);
+    list.append(surface);
+    installIcons(surface);
+  }
+
+  async function createManagedProject(rawName, button, message) {
+    const name = rawName.trim();
+    if (!name) {
+      message.className = "inline-message error";
+      message.textContent = "Enter a name for the project folder.";
+      return;
+    }
+    const operationID = window.crypto?.randomUUID?.();
+    if (!operationID) {
+      message.className = "inline-message error";
+      message.textContent = "This browser cannot create secure operation identifiers.";
+      return;
+    }
+    button.textContent = "Creating…";
+    setDisabledReason(button, true, "Creating the project folder…");
+    message.className = "inline-message info";
+    message.textContent = "Creating the folder and preparing Agent Mode…";
+    try {
+      const result = await api("api/v1/projects", {
+        method: "POST",
+        body: JSON.stringify({
+          operationId: operationID,
+          name,
+          logicalName: name,
+          source: { type: "managedDirectory", name },
+        }),
+      });
+      state.agent.selectedProjectID = result.projectId;
+      state.agent.selectedSessionID = null;
+      state.agent.newSessionMode = true;
+      state.agent.projectCreationOpen = false;
+      await loadAll(false);
+      toast(`${name} is ready`);
+      announce(`Project ${name} created. Agent composer ready.`);
+      window.setTimeout(
+        () => document.getElementById("composer-text").focus({ preventScroll: true }),
+        0,
+      );
+    } catch (error) {
+      button.textContent = "Create Project";
+      setDisabledReason(button, false, "");
+      message.className = "inline-message error";
+      message.textContent = error.message;
+      toast(error.message, true);
+    }
+  }
+
   function renderTranscript() {
     const list = document.getElementById("transcript-list");
     const status = document.getElementById("transcript-status");
@@ -1099,6 +1353,19 @@
     list.replaceChildren();
     status.textContent = "";
     earlier.hidden = !presentation?.nextPageToken;
+    const setupStage = onboardingStage();
+    if (setupStage === "provider") {
+      earlier.hidden = true;
+      renderProviderOnboarding(list);
+      list.setAttribute("aria-busy", "false");
+      return;
+    }
+    if (setupStage === "project") {
+      earlier.hidden = true;
+      renderProjectOnboarding(list);
+      list.setAttribute("aria-busy", "false");
+      return;
+    }
     if (state.agent.newSessionMode || !state.agent.selectedSessionID) {
       const empty = element("div", "agent-welcome");
       const brand = document.createElement("img");
@@ -1963,6 +2230,11 @@
 
   function renderAgentComposer() {
     const form = document.getElementById("composer-form");
+    if (onboardingStage()) {
+      form.hidden = true;
+      return;
+    }
+    form.hidden = false;
     const text = document.getElementById("composer-text");
     const submit = document.getElementById("composer-submit");
     const attach = document.getElementById("composer-attach");
@@ -2679,8 +2951,22 @@
       "claudeCustom",
     ].includes(provider.providerID);
     const connected = isConnectedProvider(provider);
+    const availability = desktopCard(
+      "Agent Mode",
+      "Choose whether new sessions may use this provider.",
+    );
+    availability.append(
+      desktopRow(
+        "Provider",
+        provider.effectiveEnabled
+          ? "Available to the composer."
+          : "Enable this provider after connecting it.",
+        providerEnabledToggle(provider),
+      ),
+    );
 
     if (compatibleBackend) {
+      body.append(availability);
       body.append(compatibleBackendPrerequisite(provider));
       const directMethods = (
         provider.capabilities.authenticationMethods || []
@@ -2717,7 +3003,7 @@
       return details;
     }
 
-    body.append(providerCLIInstallationCard(provider));
+    body.append(availability, providerCLIInstallationCard(provider));
 
     if (connected) {
       body.append(connectedProviderSummary(provider));
@@ -6280,10 +6566,61 @@
     const projects = state.bootstrap?.projects || [];
     const cards = [];
     const capabilities = state.bootstrap?.projectSources;
+    const createFolder = desktopCard(
+      "New Project Folder",
+      "Create an ordinary writable folder on this RepoPrompt server. Git is optional.",
+    );
+    const folderForm = element("form", "typed-settings-form");
+    const folderName = document.createElement("input");
+    folderName.type = "text";
+    folderName.maxLength = 128;
+    folderName.placeholder = "Project name";
+    folderName.required = true;
+    folderName.setAttribute("aria-label", "Project folder name");
+    const createFolderButton = element("button", "primary-button", "Create Project");
+    createFolderButton.type = "submit";
+    folderForm.append(
+      desktopRow(
+        "Project Name",
+        "Also used as the folder name in the server projects directory.",
+        folderName,
+      ),
+      createFolderButton,
+    );
+    folderForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const operationID = window.crypto?.randomUUID?.();
+      const name = folderName.value.trim();
+      if (!operationID || !name) {
+        toast(
+          !operationID
+            ? "This browser cannot create secure operation identifiers."
+            : "Enter a project name.",
+          true,
+        );
+        return;
+      }
+      mutateProjects(
+        createFolderButton,
+        () =>
+          api("api/v1/projects", {
+            method: "POST",
+            body: JSON.stringify({
+              operationId: operationID,
+              name,
+              logicalName: name,
+              source: { type: "managedDirectory", name },
+            }),
+          }),
+        "Project created",
+      );
+    });
+    createFolder.append(folderForm);
+    cards.push(createFolder);
     if (capabilities?.gitCloneEnabled) {
       const create = desktopCard(
-        "New Project",
-        "Clone a Git repository into a new RepoPrompt project.",
+        "Clone Git Repository",
+        "Optional: clone a Git repository and use the checkout as a new project folder.",
       );
       const form = element("form", "typed-settings-form");
       const name = document.createElement("input");
@@ -6330,8 +6667,11 @@
                 operationId: operationID,
                 name: name.value.trim(),
                 logicalName: logicalName.value.trim(),
-                remote: remote.value.trim(),
-                ref: ref.value.trim(),
+                source: {
+                  type: "gitClone",
+                  remote: remote.value.trim(),
+                  ref: ref.value.trim(),
+                },
               }),
             }),
           "Project created",

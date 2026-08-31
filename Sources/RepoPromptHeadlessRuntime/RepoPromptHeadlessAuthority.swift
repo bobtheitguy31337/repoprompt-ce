@@ -315,6 +315,8 @@ public actor RepoPromptHeadlessAuthority {
         await progress(.validating, revision: 1, code: "project_source_validating")
         do {
             switch input.source {
+            case .managedDirectory:
+                await progress(.validating, revision: 2, code: "project_source_creating")
             case .configuredRoot:
                 await progress(.validating, revision: 2, code: "project_source_connecting")
             case .gitClone:
@@ -354,7 +356,7 @@ public actor RepoPromptHeadlessAuthority {
                 project: ProjectWireSnapshot(snapshot)
             )
         } catch {
-            await projectSourceService.abandonProvisionedClone(projectID: projectID)
+            await projectSourceService.abandonProvisionedProject(input: input, projectID: projectID)
             let code = (error as? ServiceAPIError)?.code ?? .dependencyUnavailable
             await progress(.failed, revision: 4, code: "project_source_failed", error: code)
             throw error
@@ -1010,7 +1012,10 @@ public actor RepoPromptHeadlessAuthority {
         let permissions = await rootLaunchPermissions(sessionID: sessionID, input: input, actor: actor)
         let collaboration = CollaborationMetadataSnapshot(sessionID: sessionID, visibility: input.visibility, collaborativeSteeringEnabled: false, controllerUserID: actor.userID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
         var worktrees: [WorktreeBindingSnapshot] = []
-        if let worktreeService, !project.roots.isEmpty {
+        if let worktreeService,
+           !project.roots.isEmpty,
+           projectSupportsWorktreeIsolation(project)
+        {
             do {
                 for root in project.roots where root.writable {
                     let sessionPrefix = sessionID.uuidString.lowercased().prefix(12)
@@ -1123,7 +1128,11 @@ public actor RepoPromptHeadlessAuthority {
         )
         let collaboration = CollaborationMetadataSnapshot(sessionID: sessionID, visibility: input.visibility, collaborativeSteeringEnabled: false, controllerUserID: externalActor.userID, policyRevision: 1, controllerRevision: 1, membershipRevision: 1)
         var initialWorktrees: [WorktreeBindingSnapshot] = []
-        if input.parentSessionID == nil, let worktreeService, !project.roots.isEmpty {
+        if input.parentSessionID == nil,
+           let worktreeService,
+           !project.roots.isEmpty,
+           projectSupportsWorktreeIsolation(project)
+        {
             do {
                 for root in project.roots where root.writable {
                     let sessionPrefix = sessionID.uuidString.lowercased().prefix(12)
@@ -3338,10 +3347,21 @@ public actor RepoPromptHeadlessAuthority {
         if quiescing { throw ServiceAPIError(code: .quiescing, message: "Service is quiescing", retryable: true) }
     }
 
+    private func projectSupportsWorktreeIsolation(_ project: ProjectSnapshot) -> Bool {
+        project.roots
+            .filter(\.writable)
+            .allSatisfy { root in
+                FileManager.default.fileExists(
+                    atPath: URL(fileURLWithPath: root.canonicalPath)
+                        .appendingPathComponent(".git").path
+                )
+            }
+    }
+
     private func ensureExecutionWorkspaceLocked(session: SessionSnapshot) async throws {
         guard let worktreeService else { return }
         let project = try await projectSnapshot(projectID: session.projectID)
-        guard !project.roots.isEmpty else { return }
+        guard !project.roots.isEmpty, projectSupportsWorktreeIsolation(project) else { return }
         let allBindings = try await store.worktrees(projectID: project.projectID).filter { $0.sessionID == session.rootSessionID }
         var activeBindings = try await effectiveWorktreeBindings(session: session)
         let missingRoots = project.roots.filter { root in
@@ -4385,7 +4405,7 @@ public actor RepoPromptHeadlessAuthority {
             let workspace = try await projectSourceService.projectWorkspaceDirectory(projectID: project.projectID)
             return try providerExecutionLocation(workingDirectory: workspace, writableRoots: [workspace], executionRoots: [])
         }
-        if let worktreeService {
+        if let worktreeService, projectSupportsWorktreeIsolation(project) {
             let bindings = try await effectiveWorktreeBindings(session: session)
             let workspace = try await worktreeService.materializeExecutionWorkspace(
                 project: project,
@@ -4433,7 +4453,10 @@ public actor RepoPromptHeadlessAuthority {
     private func sessionToolAuthority(session: SessionSnapshot) async throws -> ProjectToolAuthority {
         let snapshot = try await projectSnapshot(projectID: session.projectID)
         let bindings = try await effectiveWorktreeBindings(session: session)
-        if let worktreeService, !snapshot.roots.isEmpty {
+        let usesWorktreeIsolation = worktreeService != nil
+            && !snapshot.roots.isEmpty
+            && projectSupportsWorktreeIsolation(snapshot)
+        if let worktreeService, usesWorktreeIsolation {
             _ = try await worktreeService.materializeExecutionWorkspace(
                 project: snapshot,
                 ownerSessionID: session.rootSessionID,
@@ -4445,7 +4468,7 @@ public actor RepoPromptHeadlessAuthority {
         let persistedIdentities = try await store.projectRootIdentities(projectID: snapshot.projectID)
         let roots = try snapshot.roots.map { root -> CanonicalRoot in
             let path: String
-            if root.writable, worktreeService != nil {
+            if root.writable, usesWorktreeIsolation {
                 guard let binding = byRoot[root.rootID] else {
                     throw ServiceAPIError(code: .worktreeConflict, message: "Writable project root is missing its session worktree")
                 }

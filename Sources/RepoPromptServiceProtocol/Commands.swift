@@ -170,10 +170,12 @@ public struct AddProjectRepositoryInput: Codable, Hashable, Sendable {
 /// configured-root alias, physical path, executable, environment, or secret.
 public struct ProjectSourceOperationInput: Codable, Hashable, Sendable {
     public enum Source: Codable, Hashable, Sendable {
+        case managedDirectory(name: String)
         case configuredRoot(alias: String)
         case gitClone(remote: String, ref: String)
 
         private enum Kind: String, Codable {
+            case managedDirectory
             case configuredRoot
             case gitClone
         }
@@ -182,6 +184,11 @@ public struct ProjectSourceOperationInput: Codable, Hashable, Sendable {
             let values = try decoder.container(keyedBy: ProjectSourceCodingKey.self)
             let type = ProjectSourceCodingKey("type")
             switch try values.decode(Kind.self, forKey: type) {
+            case .managedDirectory:
+                guard Set(values.allKeys.map(\.stringValue)) == Set(["type", "name"]) else {
+                    throw DecodingError.dataCorruptedError(forKey: type, in: values, debugDescription: "Managed directory source contains unsupported fields")
+                }
+                self = try .managedDirectory(name: values.decode(String.self, forKey: ProjectSourceCodingKey("name")))
             case .configuredRoot:
                 guard Set(values.allKeys.map(\.stringValue)) == Set(["type", "alias"]) else {
                     throw DecodingError.dataCorruptedError(forKey: type, in: values, debugDescription: "Configured root source contains unsupported fields")
@@ -201,6 +208,9 @@ public struct ProjectSourceOperationInput: Codable, Hashable, Sendable {
         public func encode(to encoder: Encoder) throws {
             var values = encoder.container(keyedBy: ProjectSourceCodingKey.self)
             switch self {
+            case let .managedDirectory(name):
+                try values.encode(Kind.managedDirectory, forKey: ProjectSourceCodingKey("type"))
+                try values.encode(name, forKey: ProjectSourceCodingKey("name"))
             case let .configuredRoot(alias):
                 try values.encode(Kind.configuredRoot, forKey: ProjectSourceCodingKey("type"))
                 try values.encode(alias, forKey: ProjectSourceCodingKey("alias"))

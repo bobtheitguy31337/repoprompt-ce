@@ -189,8 +189,10 @@ final class PortalOperatorOnboardingTests: XCTestCase {
                 operationID: UUID(),
                 name: "Unavailable Clone",
                 logicalName: "repo",
-                remote: "https://github.com/repoprompt/repoprompt-ce.git",
-                ref: "main"
+                source: .gitClone(
+                    remote: "https://github.com/repoprompt/repoprompt-ce.git",
+                    ref: "main"
+                )
             )
             try await client.execute(
                 uri: "/portal/api/v1/projects",

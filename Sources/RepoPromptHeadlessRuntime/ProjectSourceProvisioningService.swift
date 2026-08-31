@@ -811,6 +811,8 @@ public actor ProjectSourceProvisioningService {
     ) async throws -> CanonicalRoot {
         try validate(input)
         switch input.source {
+        case let .managedDirectory(name):
+            return try createManagedDirectory(name: name, logicalName: input.logicalName, rootID: rootID)
         case let .configuredRoot(alias):
             guard let configured = configuredRoots[alias] else {
                 throw ServiceAPIError(code: .rootUnauthorized, message: "Configured project root alias is not approved")
@@ -833,6 +835,68 @@ public actor ProjectSourceProvisioningService {
             )
         case let .gitClone(remote, ref):
             return try await clone(input: input, projectID: projectID, rootID: rootID, remote: remote, ref: ref)
+        }
+    }
+
+    private func createManagedDirectory(name: String, logicalName: String, rootID: UUID) throws -> CanonicalRoot {
+        try validateImmutableCloneRoot()
+        let directoryName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !directoryName.isEmpty,
+              directoryName != ".",
+              directoryName != "..",
+              !directoryName.hasPrefix("."),
+              directoryName.utf8.count <= 128,
+              !directoryName.contains("/"),
+              !directoryName.contains("\\"),
+              directoryName.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
+        else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Project folder name is invalid")
+        }
+        let path = try DurableFilesystem.standardizedContainedPath(
+            root: cloneRoot,
+            candidate: URL(fileURLWithPath: cloneRoot).appendingPathComponent(directoryName).path
+        )
+        guard try pinnedCloneRoot.directoryIfExists(at: path) == nil else {
+            throw ServiceAPIError(code: .worktreeConflict, message: "A project folder with this name already exists")
+        }
+        let directory = try pinnedCloneRoot.createDirectory(at: path)
+        let canonical = try filesystem.canonicalizeRoot(path)
+        guard canonical.path == path,
+              canonical.identity == directory.identity || canonical.identity.hasPrefix(directory.identity + ":"),
+              try filesystem.contains(root: cloneRoot, candidate: path),
+              !Self.isSymbolicLink(path)
+        else {
+            try? cleanup(path: path)
+            throw ServiceAPIError(code: .rootUnauthorized, message: "Managed project folder is unsafe")
+        }
+        return CanonicalRoot(
+            snapshot: ProjectRootSnapshot(
+                rootID: rootID,
+                logicalName: logicalName,
+                canonicalPath: canonical.path,
+                writable: true
+            ),
+            filesystemIdentity: canonical.identity
+        )
+    }
+
+    public func abandonProvisionedProject(input: ProjectSourceOperationInput, projectID: UUID) async {
+        switch input.source {
+        case let .managedDirectory(name):
+            let directoryName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !directoryName.isEmpty,
+                  let path = try? DurableFilesystem.standardizedContainedPath(
+                      root: cloneRoot,
+                      candidate: URL(fileURLWithPath: cloneRoot).appendingPathComponent(directoryName).path
+                  ),
+                  let directory = try? pinnedCloneRoot.directoryIfExists(at: path),
+                  (try? directory.directoryEntryNames().isEmpty) == true
+            else { return }
+            try? cleanup(path: path)
+        case .gitClone:
+            await abandonProvisionedClone(projectID: projectID)
+        case .configuredRoot:
+            break
         }
     }
 

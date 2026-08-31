@@ -127,13 +127,19 @@ public struct RepoPromptHTTPService: Sendable {
             try validatePortalMutation(request)
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(PortalCreateProjectRequest.self, from: data)
+            let source: ProjectSourceOperationInput.Source = switch input.source {
+            case let .managedDirectory(name):
+                .managedDirectory(name: name)
+            case let .gitClone(remote, ref):
+                .gitClone(remote: remote, ref: ref)
+            }
             let result = try await authority.createProjectFromSource(
                 input: .init(
                     operationID: input.operationID,
                     expectedRevision: 0,
                     name: input.name,
                     logicalName: input.logicalName,
-                    source: .gitClone(remote: input.remote, ref: input.ref)
+                    source: source
                 ),
                 externalActor: principal.externalActor,
                 idempotencyKey: portalIdempotencyKey(principal: principal, operationID: input.operationID),

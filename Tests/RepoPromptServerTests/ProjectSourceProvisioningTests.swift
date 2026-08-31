@@ -11,6 +11,91 @@ import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 final class ProjectSourceProvisioningTests: XCTestCase {
+    func testManagedDirectoryCreatesOrdinaryWritableProjectFolder() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let service = try ProjectSourceProvisioningService(
+            cloneRoot: fixture.cloneRoot.path,
+            policy: .disabled,
+            credentials: ProjectSourceGitCredentials(),
+            resources: store,
+            git: FakeProjectSourceGitRunner()
+        )
+        let root = try await service.provision(
+            input: .init(
+                operationID: UUID(),
+                expectedRevision: 0,
+                name: "My Project",
+                logicalName: "My Project",
+                source: .managedDirectory(name: "My Project")
+            ),
+            projectID: UUID(),
+            rootID: UUID()
+        )
+        XCTAssertEqual(root.snapshot.canonicalPath, fixture.cloneRoot.appendingPathComponent("My Project").path)
+        XCTAssertEqual(root.snapshot.logicalName, "My Project")
+        XCTAssertTrue(root.snapshot.writable)
+        try Data("hello".utf8).write(to: URL(fileURLWithPath: root.snapshot.canonicalPath).appendingPathComponent("README.txt"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: URL(fileURLWithPath: root.snapshot.canonicalPath).appendingPathComponent("README.txt").path))
+
+        do {
+            _ = try await service.provision(
+                input: .init(
+                    operationID: UUID(),
+                    expectedRevision: 0,
+                    name: "Duplicate",
+                    logicalName: "Duplicate",
+                    source: .managedDirectory(name: "My Project")
+                ),
+                projectID: UUID(),
+                rootID: UUID()
+            )
+            XCTFail("Expected duplicate project folder rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .worktreeConflict)
+        }
+
+        let worktrees = try WorktreeRuntimeService(
+            baseDirectory: fixture.directory.appendingPathComponent("worktrees").path,
+            resources: store
+        )
+        let authority = RepoPromptHeadlessAuthority(
+            store: store,
+            worktreeService: worktrees,
+            projectSourceService: service
+        )
+        let actor = ExternalActor(userID: "folder-owner", username: "owner", displayName: "Owner")
+        let created = try await authority.createProjectFromSource(
+            input: .init(
+                operationID: UUID(),
+                expectedRevision: 0,
+                name: "Session Project",
+                logicalName: "Session Project",
+                source: .managedDirectory(name: "Session Project")
+            ),
+            externalActor: actor,
+            idempotencyKey: "managed-directory-project",
+            requestDigest: "managed-directory-project"
+        )
+        let session = try await authority.createSession(
+            input: .init(
+                projectID: created.projectID,
+                provider: .codex,
+                providerSettingsID: .codex,
+                model: nil,
+                visibility: .privateSession,
+                startImmediately: false
+            ),
+            externalActor: actor,
+            idempotencyKey: "managed-directory-session",
+            requestDigest: "managed-directory-session"
+        )
+        let snapshot = try await authority.authoritySessionSnapshot(sessionID: session.sessionID)
+        XCTAssertTrue(snapshot.worktrees.isEmpty)
+    }
+
     func testExactProjectCreationFixtureDecodes() throws {
         let fixtureURL = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

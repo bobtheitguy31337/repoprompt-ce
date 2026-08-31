@@ -24,23 +24,61 @@ public struct PortalProjectSummary: Codable, Hashable, Sendable {
 }
 
 public struct PortalCreateProjectRequest: Codable, Hashable, Sendable {
+    public enum Source: Codable, Hashable, Sendable {
+        case managedDirectory(name: String)
+        case gitClone(remote: String, ref: String)
+
+        private enum CodingKeys: String, CodingKey {
+            case type, name, remote, ref
+        }
+
+        private enum Kind: String, Codable {
+            case managedDirectory
+            case gitClone
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            switch try container.decode(Kind.self, forKey: .type) {
+            case .managedDirectory:
+                self = try .managedDirectory(name: container.decode(String.self, forKey: .name))
+            case .gitClone:
+                self = try .gitClone(
+                    remote: container.decode(String.self, forKey: .remote),
+                    ref: container.decode(String.self, forKey: .ref)
+                )
+            }
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            switch self {
+            case let .managedDirectory(name):
+                try container.encode(Kind.managedDirectory, forKey: .type)
+                try container.encode(name, forKey: .name)
+            case let .gitClone(remote, ref):
+                try container.encode(Kind.gitClone, forKey: .type)
+                try container.encode(remote, forKey: .remote)
+                try container.encode(ref, forKey: .ref)
+            }
+        }
+    }
+
     public let operationID: UUID
     public let name: String
     public let logicalName: String
-    public let remote: String
-    public let ref: String
+    public let source: Source
 
-    public init(operationID: UUID, name: String, logicalName: String, remote: String, ref: String) {
+    public init(operationID: UUID, name: String, logicalName: String, source: Source) {
         self.operationID = operationID
         self.name = name
         self.logicalName = logicalName
-        self.remote = remote
-        self.ref = ref
+        self.source = source
     }
 
     private enum CodingKeys: String, CodingKey {
         case operationID = "operationId"
-        case name, logicalName, remote, ref
+        case name, logicalName, source
     }
 }
 
