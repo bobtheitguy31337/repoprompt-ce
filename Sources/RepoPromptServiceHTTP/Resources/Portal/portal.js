@@ -1088,18 +1088,8 @@
   function renderAgentDetail() {
     const setupStage = onboardingStage();
     const session = selectedSession();
-    const control = session?.agentControl;
     const title = document.getElementById("active-session-title");
     const metadata = document.getElementById("session-metadata");
-    ["resume", "retry", "cancel"].forEach((operation) => {
-      const button = document.getElementById(`agent-${operation}-button`);
-      button.hidden = Boolean(setupStage) || !control?.[operation]?.allowed;
-      setDisabledReason(
-        button,
-        !control?.[operation]?.allowed,
-        control?.[operation]?.reasonText || "Action unavailable",
-      );
-    });
     if (setupStage === "provider") {
       title.textContent = "Set up a provider";
       metadata.replaceChildren(
@@ -1893,53 +1883,10 @@
           },
         );
         await loadTranscript({ silent: true });
-        toast("Response delivered");
       } catch (error) {
         toast(error.message, true);
         if (error.code === "staleRevision")
           await loadTranscript({ silent: true });
-      } finally {
-        state.agent.mutationPromise = null;
-        renderAgentComposer();
-      }
-    })();
-    return state.agent.mutationPromise;
-  }
-
-  async function submitAgentAction(action) {
-    if (
-      state.agent.mutationPromise ||
-      !state.agent.selectedSessionID ||
-      !["resume", "retry", "cancel", "archive"].includes(action)
-    )
-      return null;
-    const operationID = window.crypto?.randomUUID?.();
-    if (!operationID) {
-      toast("This browser cannot create secure operation identifiers.", true);
-      return null;
-    }
-    state.agent.mutationPromise = (async () => {
-      renderAgentComposer();
-      try {
-        await api(
-          `api/v1/sessions/${encodeURIComponent(state.agent.selectedSessionID)}/actions/${action}`,
-          {
-            method: "POST",
-            body: JSON.stringify({
-              operationId: operationID,
-              expectedRevision:
-                action === "archive"
-                  ? selectedSession()?.agentControl?.archive?.expectedSessionRevision
-                  : undefined,
-            }),
-          },
-        );
-        await loadTranscript({ silent: true });
-        await loadComposerCatalog(true);
-        toast(`${humanize(action)} accepted`);
-      } catch (error) {
-        toast(error.message, true);
-        await loadTranscript({ silent: true });
       } finally {
         state.agent.mutationPromise = null;
         renderAgentComposer();
@@ -2641,7 +2588,6 @@
         renderHomeProviders();
         await loadComposerCatalog(true);
         await loadTranscript({ silent: true });
-        toast(newSession ? "Agent session accepted" : steering ? "Steering accepted" : "Turn accepted");
       } catch (error) {
         composer.feedback =
           error.code === "staleRevision"
@@ -8603,9 +8549,6 @@
     const action = event.target.closest("[data-action]")?.dataset.action;
     if (action === "refresh") loadAll(true);
     else if (action === "new-chat") beginNewSession();
-    else if (action === "agent-resume") submitAgentAction("resume");
-    else if (action === "agent-retry") submitAgentAction("retry");
-    else if (action === "agent-cancel") submitAgentAction("cancel");
     else if (action === "load-earlier") {
       const pageToken =
         state.agent.transcriptPage?.presentation?.nextPageToken;
@@ -8761,12 +8704,6 @@
     document
       .getElementById("composer-attachment-input")
       .addEventListener("change", (event) => stageComposerAttachments(event.target.files));
-    document.getElementById("composer-submit").addEventListener("click", (event) => {
-      if (event.currentTarget.dataset.mode === "cancel") {
-        event.preventDefault();
-        submitAgentAction("cancel");
-      }
-    });
     document
       .getElementById("composer-form")
       .addEventListener("submit", (event) => {

@@ -2470,15 +2470,6 @@ input:disabled {
   justify-content: flex-end;
 }
 
-.agent-run-toolbar .secondary-button {
-  min-height: 28px;
-  padding: 4px 9px;
-}
-
-.agent-run-toolbar .danger-button {
-  color: var(--danger);
-}
-
 .session-title-cluster > div {
   min-width: 0;
 }
@@ -3332,8 +3323,6 @@ input:disabled {
   color: #fff;
   background: var(--accent);
 }
-
-.composer-send-button[data-mode="cancel"] { background: var(--danger); }
 
 .composer-icon-button [data-icon],
 .composer-icon-button svg,
