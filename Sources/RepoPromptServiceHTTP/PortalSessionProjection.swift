@@ -195,6 +195,8 @@ enum RepoPromptPortalSessionProjection {
             responseSpanID: turn.responseSpanID.map { bounded($0, bytes: 1_024) },
             requestAnchorID: turn.requestAnchorID,
             terminalState: turn.terminalState.map { bounded($0, bytes: 1_024) },
+            startedAt: turn.startedAt,
+            completedAt: turn.completedAt,
             blocks: Array(turn.blocks.prefix(256)).map(sanitize),
             interactions: Array(turn.interactions.prefix(100)).map(sanitize),
             legacyStandalone: turn.legacyStandalone

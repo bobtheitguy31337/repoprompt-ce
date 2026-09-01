@@ -31,10 +31,12 @@ public struct AgentSemanticPresentationTurn: Hashable, Sendable {
     public let attachmentIDs: [UUID]
     public let taggedFiles: [ComposerTaggedFileReferenceWire]
     public let terminalState: String?
+    public let startedAt: Date?
+    public let completedAt: Date?
     public let activities: [AgentSemanticPresentationActivity]
     public let interactions: [AgentPresentationInteractionWire]
 
-    public init(turnID: String, responseSpanID: String?, requestAnchorID: UUID?, requestText: String, attachmentIDs: [UUID] = [], taggedFiles: [ComposerTaggedFileReferenceWire] = [], terminalState: String? = nil, activities: [AgentSemanticPresentationActivity], interactions: [AgentPresentationInteractionWire] = []) {
+    public init(turnID: String, responseSpanID: String?, requestAnchorID: UUID?, requestText: String, attachmentIDs: [UUID] = [], taggedFiles: [ComposerTaggedFileReferenceWire] = [], terminalState: String? = nil, startedAt: Date? = nil, completedAt: Date? = nil, activities: [AgentSemanticPresentationActivity], interactions: [AgentPresentationInteractionWire] = []) {
         self.turnID = turnID
         self.responseSpanID = responseSpanID
         self.requestAnchorID = requestAnchorID
@@ -42,6 +44,8 @@ public struct AgentSemanticPresentationTurn: Hashable, Sendable {
         self.attachmentIDs = attachmentIDs
         self.taggedFiles = taggedFiles
         self.terminalState = terminalState
+        self.startedAt = startedAt
+        self.completedAt = completedAt
         self.activities = activities
         self.interactions = interactions
     }
@@ -108,7 +112,7 @@ public enum AgentTranscriptPresentationCore {
             }
         }
         flushCluster()
-        return AgentPresentationTurnWire(turnID: input.turnID, responseSpanID: input.responseSpanID, requestAnchorID: input.requestAnchorID, terminalState: input.terminalState, blocks: blocks, interactions: input.interactions)
+        return AgentPresentationTurnWire(turnID: input.turnID, responseSpanID: input.responseSpanID, requestAnchorID: input.requestAnchorID, terminalState: input.terminalState, startedAt: input.startedAt, completedAt: input.completedAt, blocks: blocks, interactions: input.interactions)
     }
 
     public static func projectLegacy(_ entry: TranscriptEntry) -> AgentPresentationTurnWire? {

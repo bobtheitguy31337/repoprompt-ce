@@ -2328,6 +2328,20 @@ input:disabled {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+.session-status-plate.preparing::after,
+.session-status-plate.thinking::after,
+.session-status-plate.working::after,
+.session-status-plate.cancelling::after {
+  position: absolute;
+  inset: 0;
+  border: 1.5px solid transparent;
+  border-top-color: var(--accent);
+  border-right-color: color-mix(in srgb, var(--accent) 42%, transparent);
+  border-radius: 50%;
+  content: "";
+  animation: agent-run-spin 0.9s linear infinite;
+}
+
 .session-status-plate.waiting i,
 .session-status-plate.completed i {
   background: var(--success);
@@ -2501,6 +2515,83 @@ input:disabled {
   display: grid;
   gap: 10px;
   width: 100%;
+}
+
+.turn-runtime-footer {
+  margin: -3px 0 0 12px;
+  color: color-mix(in srgb, var(--text-secondary) 72%, transparent);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-run-status {
+  min-height: 24px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.agent-run-spinner {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
+  border: 1.5px solid color-mix(in srgb, var(--text-secondary) 28%, transparent);
+  border-top-color: var(--text-secondary);
+  border-radius: 50%;
+  animation: agent-run-spin 0.9s linear infinite;
+}
+
+.agent-run-state-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: var(--warning);
+}
+
+.agent-run-status.state-failed .agent-run-state-dot {
+  background: var(--danger);
+}
+
+.agent-run-status.state-cancelled .agent-run-state-dot {
+  background: var(--text-tertiary);
+}
+
+.agent-run-status-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-run-elapsed {
+  flex: 0 0 auto;
+  color: color-mix(in srgb, var(--text-secondary) 72%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-run-action {
+  min-height: 24px;
+  margin-left: 4px;
+  padding: 2px 9px;
+  border: 0.5px solid var(--border);
+  border-radius: 7px;
+  color: var(--text-secondary);
+  background: var(--bg-control);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.agent-run-action:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--bg-control-strong);
+}
+
+@keyframes agent-run-spin {
+  to { transform: rotate(360deg); }
 }
 
 .presentation-block {
@@ -3368,6 +3459,11 @@ details.typed-tool > .typed-tool-header {
   display: grid;
   place-items: center;
   border-radius: 50%;
+}
+
+.composer-send-button.cancel {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 13%, var(--bg-control-strong));
 }
 
 .composer-icon-button {

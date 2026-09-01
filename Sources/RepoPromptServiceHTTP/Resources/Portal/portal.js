@@ -108,6 +108,9 @@
       eventRefreshRevision: 0,
       appliedEventRefreshRevision: 0,
       eventRefreshPromise: null,
+      runClockTimer: null,
+      actionPromise: null,
+      actionName: null,
     },
   };
 
@@ -208,6 +211,7 @@
     check: '<path d="m2.5 8 3.5 3.5 7.5-7.5"/>',
     link: '<path d="M6.5 9.5 9.5 6.5M5 11H3.5a2.5 2.5 0 0 1 0-5H6M10 5h2.5a2.5 2.5 0 0 1 0 5H10"/>',
     send: '<path d="M1.5 8 14.5 2 10 14l-2-5zM8 9l6.5-7"/>',
+    stop: '<rect x="4" y="4" width="8" height="8" rx="1.5"/>',
   };
 
   class PortalError extends Error {
@@ -244,6 +248,13 @@
         `<svg viewBox="0 0 16 16" aria-hidden="true">${content}</svg>`,
       );
     });
+  }
+
+  function setIcon(node, name) {
+    if (node.dataset.icon === name && node.querySelector("svg")) return;
+    node.dataset.icon = name;
+    node.replaceChildren();
+    installIcons(node);
   }
 
   function humanize(value) {
@@ -1084,6 +1095,108 @@
     renderAgentComposer();
   }
 
+  function formatAgentRuntime(startValue, endValue = Date.now()) {
+    const start = new Date(startValue).getTime();
+    const end = endValue instanceof Date ? endValue.getTime() : Number(endValue);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return "";
+    const totalSeconds = Math.max(0, Math.floor((end - start) / 1000));
+    if (totalSeconds < 60) return `${totalSeconds}s`;
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = String(totalSeconds % 60).padStart(2, "0");
+    return `${minutes}m ${seconds}s`;
+  }
+
+  function updateAgentRunClocks() {
+    document.querySelectorAll("[data-run-started-at]").forEach((node) => {
+      const elapsed = formatAgentRuntime(node.dataset.runStartedAt);
+      if (elapsed) node.textContent = `· ${elapsed}`;
+    });
+  }
+
+  function clearAgentRunClock() {
+    if (state.agent.runClockTimer !== null) {
+      window.clearInterval(state.agent.runClockTimer);
+      state.agent.runClockTimer = null;
+    }
+  }
+
+  function syncAgentRunClock() {
+    clearAgentRunClock();
+    updateAgentRunClocks();
+    if (
+      state.route !== "home" ||
+      document.hidden ||
+      !document.querySelector("[data-run-started-at]")
+    )
+      return;
+    state.agent.runClockTimer = window.setInterval(updateAgentRunClocks, 1_000);
+  }
+
+  function renderTurnRuntime(turn) {
+    if (!turn?.startedAt || !turn?.completedAt) return null;
+    const elapsed = formatAgentRuntime(
+      turn.startedAt,
+      new Date(turn.completedAt),
+    );
+    if (!elapsed) return null;
+    return element("div", "turn-runtime-footer", `Worked for ${elapsed}`);
+  }
+
+  function sessionRecoveryAction(control) {
+    if (control?.retry?.allowed) return { name: "retry", label: "Retry" };
+    if (control?.resume?.allowed) return { name: "resume", label: "Resume" };
+    return null;
+  }
+
+  function renderAgentRunStatus() {
+    const session = selectedSession();
+    const control = session?.agentControl;
+    const presentation = session?.runPresentation;
+    const displayState = control?.displayState;
+    const active = ["preparing", "thinking", "working", "cancelling"].includes(
+      displayState,
+    );
+    const waiting = displayState === "waiting";
+    const recovery = sessionRecoveryAction(control);
+    if (!active && !waiting && !recovery) return null;
+
+    const host = element(
+      "div",
+      `agent-run-status state-${displayState || "idle"}`,
+    );
+    host.setAttribute("role", "status");
+    if (active) host.append(element("span", "agent-run-spinner"));
+    else host.append(element("span", "agent-run-state-dot"));
+    host.append(
+      element(
+        "span",
+        "agent-run-status-text",
+        control?.statusText || presentation?.runningStatusText || humanize(displayState),
+      ),
+    );
+    if (active && presentation?.runStartedAt) {
+      const elapsed = element("span", "agent-run-elapsed");
+      elapsed.dataset.runStartedAt = presentation.runStartedAt;
+      host.append(elapsed);
+    }
+    if (control?.cancel?.allowed) {
+      const cancel = element("button", "agent-run-action", "Stop");
+      cancel.type = "button";
+      cancel.disabled = Boolean(state.agent.actionPromise) || !state.online;
+      cancel.addEventListener("click", () => performSessionAction("cancel"));
+      host.append(cancel);
+    } else if (recovery) {
+      const action = element("button", "agent-run-action", recovery.label);
+      action.type = "button";
+      action.disabled = Boolean(state.agent.actionPromise) || !state.online;
+      action.addEventListener("click", () =>
+        performSessionAction(recovery.name),
+      );
+      host.append(action);
+    }
+    return host;
+  }
+
   function setupProgress(stage) {
     const progress = element("ol", "setup-progress");
     [
@@ -1265,6 +1378,7 @@
     const status = document.getElementById("transcript-status");
     const earlier = document.getElementById("load-earlier-button");
     const presentation = state.agent.transcriptPage?.presentation;
+    clearAgentRunClock();
     list.replaceChildren();
     status.textContent = "";
     earlier.hidden = !presentation?.nextPageToken;
@@ -1324,12 +1438,17 @@
         attachedInteractionIDs.add(interaction.interactionId);
         article.append(renderInteraction(interaction));
       });
+      const runtime = renderTurnRuntime(turn);
+      if (runtime) article.append(runtime);
       list.append(article);
     });
     (presentation?.pendingInteractions || []).forEach((interaction) => {
       if (!attachedInteractionIDs.has(interaction.interactionId))
         list.append(renderInteraction(interaction));
     });
+    const runStatus = renderAgentRunStatus();
+    if (runStatus) list.append(runStatus);
+    syncAgentRunClock();
     list.setAttribute(
       "aria-busy",
       String(Boolean(state.agent.transcriptPromise)),
@@ -2654,9 +2773,25 @@
     document.getElementById("composer-mcp-pill").hidden = catalog?.mcpControlled !== true;
 
     const control = destination.session?.agentControl;
+    const hasCancelAction = control?.cancel?.allowed === true;
     const action = control?.steer?.allowed ? control.steer : control?.submitTurn;
     const hasContent = Boolean(text.value.trim() || composer.attachments.length);
-    const reason = state.agent.mutationPromise
+    if (hasCancelAction) {
+      submit.type = "button";
+      submit.dataset.mode = "cancel";
+      submit.classList.add("cancel");
+      submit.setAttribute("aria-label", "Stop agent run");
+      setIcon(submit, "stop");
+    } else {
+      submit.type = "submit";
+      submit.dataset.mode = "send";
+      submit.classList.remove("cancel");
+      submit.setAttribute("aria-label", "Send message");
+      setIcon(submit, "send");
+    }
+    const reason = state.agent.actionPromise
+      ? `${humanize(state.agent.actionName)} in progress…`
+      : state.agent.mutationPromise
       ? "Sending…"
       : state.agent.attachmentPromise
         ? "Updating attachments…"
@@ -2666,13 +2801,15 @@
             ? composer.feedback || "Loading composer…"
             : !draft.providerId || !draft.modelId
               ? "Choose a provider and model"
-              : !state.agent.newSessionMode && !action?.allowed
-                ? action?.reasonText || "Session is read-only"
-                : !hasContent
-                  ? "Type a message"
-                  : catalog?.locks?.send?.locked
-                    ? catalog.locks.send.reasonText || "Sending is locked"
-                    : "";
+              : hasCancelAction
+                  ? ""
+                  : !state.agent.newSessionMode && !action?.allowed
+                    ? action?.reasonText || "Session is read-only"
+                    : !hasContent
+                      ? "Type a message"
+                      : catalog?.locks?.send?.locked
+                        ? catalog.locks.send.reasonText || "Sending is locked"
+                        : "";
     setDisabledReason(submit, Boolean(reason), reason);
     const attachmentAvailable = catalog?.capabilities?.attachments === true && model?.capabilities?.nativeImages === true;
     setDisabledReason(
@@ -2687,6 +2824,56 @@
     notice.hidden = !notice.textContent;
     document.getElementById("composer-message").textContent = reason || (control?.steer?.allowed ? "Steering" : "Ready");
     renderComposerContextUsage();
+  }
+
+  async function performSessionAction(actionName) {
+    if (state.agent.actionPromise) return state.agent.actionPromise;
+    const session = selectedSession();
+    const action = session?.agentControl?.[actionName];
+    if (!session || !action?.allowed) {
+      toast(action?.reasonText || `This session cannot ${actionName}.`, true);
+      return null;
+    }
+    const operationID = operationIDFor({
+      action: actionName,
+      sessionId: session.sessionId,
+      revision: session.revision,
+      runId: action.expectedRunId || action.sourceRunId || null,
+    });
+    if (!operationID) {
+      toast("This browser cannot create secure operation identifiers.", true);
+      return null;
+    }
+    state.agent.actionName = actionName;
+    state.agent.actionPromise = (async () => {
+      await Promise.resolve();
+      renderTranscript();
+      renderAgentComposer();
+      try {
+        await api(
+          `api/v1/sessions/${encodeURIComponent(session.sessionId)}/actions/${actionName}`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              operationId: operationID,
+              expectedRevision: action.expectedSessionRevision || session.revision,
+            }),
+          },
+        );
+        state.agent.retryOperation = null;
+        await loadTranscript({ silent: true });
+      } catch (error) {
+        toast(error.message, true);
+        if (error.code === "staleRevision")
+          await loadTranscript({ silent: true });
+      } finally {
+        state.agent.actionPromise = null;
+        state.agent.actionName = null;
+        renderTranscript();
+        renderAgentComposer();
+      }
+    })();
+    return state.agent.actionPromise;
   }
 
   function selectedTurnConfiguration() {
@@ -8974,6 +9161,11 @@
       if (!document.getElementById("composer-submit").disabled)
         submitComposer();
     });
+    document.getElementById("composer-submit").addEventListener("click", (event) => {
+      if (event.currentTarget.dataset.mode !== "cancel") return;
+      event.preventDefault();
+      performSessionAction("cancel");
+    });
     document.getElementById("composer-attach").addEventListener("click", () => {
       document.getElementById("composer-attachment-input").click();
     });
@@ -8987,8 +9179,13 @@
         submitComposer();
       });
     document.addEventListener("visibilitychange", () => {
-      if (document.hidden) clearAgentPoll();
-      else scheduleAgentPoll();
+      if (document.hidden) {
+        clearAgentPoll();
+        clearAgentRunClock();
+      } else {
+        scheduleAgentPoll();
+        syncAgentRunClock();
+      }
     });
     window.addEventListener("hashchange", renderRoute);
     window.addEventListener("offline", () => {
@@ -9009,6 +9206,7 @@
       disposeSensitiveInputs();
       clearPollTimer();
       clearAgentPoll();
+      clearAgentRunClock();
       state.agent.eventSource?.close();
       state.agent.eventSource = null;
     });

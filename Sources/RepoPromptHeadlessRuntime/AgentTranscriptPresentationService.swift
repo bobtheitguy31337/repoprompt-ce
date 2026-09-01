@@ -108,6 +108,8 @@ public actor AgentTranscriptPresentationService {
                 attachmentIDs: canonical.attachments.map(\.attachmentID),
                 taggedFiles: canonical.taggedFiles,
                 terminalState: record.terminalState,
+                startedAt: record.acceptedAt,
+                completedAt: record.settledAt,
                 activities: presentationActivities,
                 interactions: attachedInteractions
             ))
