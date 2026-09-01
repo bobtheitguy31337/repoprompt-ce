@@ -36,6 +36,7 @@
   --tool-config: #008c8f;
   --tool-other: #7f7f7f;
   --shadow-card: 0 1px 1px rgb(0 0 0 / 3%), 0 6px 22px rgb(0 0 0 / 5%);
+  --agent-header-height: 58px;
   --settings-sidebar-width: 250px;
   --portal-font-size: 14px;
 }
@@ -2134,7 +2135,10 @@ input:disabled {
 }
 
 .project-session-header {
-  padding: 9px 12px;
+  height: var(--agent-header-height);
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
   border-bottom: 0.5px solid var(--separator);
 }
 
@@ -2409,7 +2413,8 @@ input:disabled {
 }
 
 .agent-detail-toolbar {
-  min-height: 58px;
+  height: var(--agent-header-height);
+  min-height: var(--agent-header-height);
   justify-content: space-between;
   gap: 16px;
   padding: 8px 16px;
@@ -2436,7 +2441,7 @@ input:disabled {
 
 .session-title-cluster h2 {
   max-width: min(62vw, 720px);
-  margin: 0 0 3px;
+  margin: 0;
   overflow: hidden;
   font-size: 14px;
   font-weight: 650;
@@ -2447,6 +2452,11 @@ input:disabled {
 .session-metadata {
   gap: 5px;
   min-height: 17px;
+  margin-top: 3px;
+}
+
+.session-metadata:empty {
+  display: none;
 }
 
 .metadata-pill {

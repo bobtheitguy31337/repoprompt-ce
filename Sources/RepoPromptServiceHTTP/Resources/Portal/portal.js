@@ -1075,10 +1075,7 @@
       );
     } else if (session) {
       title.textContent = session.title || "Agent Session";
-      metadata.replaceChildren(
-        element("span", "metadata-pill", humanize(session.provider)),
-        element("span", "metadata-pill", session.model || "Provider default"),
-      );
+      metadata.replaceChildren();
     } else {
       title.textContent = "What are we building?";
       metadata.replaceChildren();
