@@ -1148,6 +1148,12 @@
     return null;
   }
 
+  function activeTurnStartedAt() {
+    return [...state.agent.transcriptItems]
+      .reverse()
+      .find((turn) => turn?.startedAt && !turn?.completedAt)?.startedAt || null;
+  }
+
   function renderAgentRunStatus() {
     const session = selectedSession();
     const control = session?.agentControl;
@@ -1174,18 +1180,13 @@
         control?.statusText || presentation?.runningStatusText || humanize(displayState),
       ),
     );
-    if (active && presentation?.runStartedAt) {
+    const turnStartedAt = active ? activeTurnStartedAt() : null;
+    if (turnStartedAt) {
       const elapsed = element("span", "agent-run-elapsed");
-      elapsed.dataset.runStartedAt = presentation.runStartedAt;
+      elapsed.dataset.runStartedAt = turnStartedAt;
       host.append(elapsed);
     }
-    if (control?.cancel?.allowed) {
-      const cancel = element("button", "agent-run-action", "Stop");
-      cancel.type = "button";
-      cancel.disabled = Boolean(state.agent.actionPromise) || !state.online;
-      cancel.addEventListener("click", () => performSessionAction("cancel"));
-      host.append(cancel);
-    } else if (recovery) {
+    if (recovery) {
       const action = element("button", "agent-run-action", recovery.label);
       action.type = "button";
       action.disabled = Boolean(state.agent.actionPromise) || !state.online;
