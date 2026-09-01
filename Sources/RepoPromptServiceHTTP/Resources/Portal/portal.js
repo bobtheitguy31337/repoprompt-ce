@@ -101,6 +101,9 @@
       composerCatalogKey: null,
       composerCatalogPromise: null,
       composerCatalogGeneration: 0,
+      composerCatalogVersion: 0,
+      composerControlsSignature: null,
+      composerAttachmentsSignature: null,
       composerStates: new Map(),
       activeComposerKey: null,
       attachmentPromise: null,
@@ -252,9 +255,15 @@
 
   function setIcon(node, name) {
     if (node.dataset.icon === name && node.querySelector("svg")) return;
+    const content = icons[name];
     node.dataset.icon = name;
     node.replaceChildren();
-    installIcons(node);
+    if (content) {
+      node.insertAdjacentHTML(
+        "afterbegin",
+        `<svg viewBox="0 0 16 16" aria-hidden="true">${content}</svg>`,
+      );
+    }
   }
 
   function humanize(value) {
@@ -2326,7 +2335,6 @@
         const index = state.bootstrap.sessions.findIndex(
           (item) => item.sessionId === sessionID,
         );
-        const previousRevision = index >= 0 ? state.bootstrap.sessions[index].revision : null;
         if (Array.isArray(page.sidebarSessions)) {
           const projectID = page.session.projectId;
           state.bootstrap.sessions = state.bootstrap.sessions
@@ -2344,8 +2352,6 @@
           (page.presentation?.presentationCursor || null)
         )
           scrollTranscriptToBottom();
-        if (previousRevision !== page.session.revision)
-          loadComposerCatalog(true);
         scheduleAgentPoll();
         return page;
       } catch (error) {
@@ -2505,13 +2511,14 @@
   async function loadComposerCatalog(force = false) {
     const destination = composerDestination();
     if (!destination.projectID) return null;
-    if (!force && state.agent.composerCatalogKey === destination.key && state.agent.composerCatalog)
+    const sameDestination = state.agent.composerCatalogKey === destination.key;
+    if (!force && sameDestination && state.agent.composerCatalog)
       return state.agent.composerCatalog;
-    if (!force && state.agent.composerCatalogPromise && state.agent.composerCatalogKey === destination.key)
+    if (state.agent.composerCatalogPromise && sameDestination)
       return state.agent.composerCatalogPromise;
     const generation = ++state.agent.composerCatalogGeneration;
     state.agent.composerCatalogKey = destination.key;
-    state.agent.composerCatalog = null;
+    if (!sameDestination) state.agent.composerCatalog = null;
     const path = destination.session
       ? `api/v1/sessions/${encodeURIComponent(destination.session.sessionId)}/composer-catalog`
       : `api/v1/projects/${encodeURIComponent(destination.projectID)}/composer-catalog`;
@@ -2520,6 +2527,7 @@
         if (generation !== state.agent.composerCatalogGeneration || composerDestination().key !== destination.key)
           return null;
         state.agent.composerCatalog = catalog;
+        state.agent.composerCatalogVersion += 1;
         const composer = activeComposerState();
         if (!composer.configuration) composer.configuration = initialComposerDraft(catalog);
         composer.feedback = "";
@@ -2696,88 +2704,106 @@
     const groups = catalog?.providerGroups || [];
     const group = groups.find((item) => item.providerId === draft.providerId);
     const model = group?.models?.find((item) => item.id === draft.modelId);
-
-    const providerRows = [];
-    groups.forEach((provider) => {
-      providerRows.push(element("span", "composer-popover-group", provider.displayName));
-      (provider.models || []).forEach((candidate) => {
-        providerRows.push(composerOptionButton(
-          `${provider.displayName} · ${candidate.displayName}`,
-          provider.providerId === draft.providerId && candidate.id === draft.modelId,
-          catalog?.locks?.model?.locked === true || candidate.enabled === false,
-          catalog?.locks?.model?.reasonText || candidate.description || "",
-          () => {
-            draft.providerId = provider.providerId;
-            draft.modelId = candidate.id;
-            draft.effortId = candidate.defaultEffortID || null;
-            draft.permissionId = provider.permissionControl?.selectedID || null;
-            draft.toolValues = defaultToolValues(provider);
-          },
-        ));
-      });
-    });
-    renderComposerMenu(document.getElementById("composer-provider-model-options"), providerRows);
-    document.getElementById("composer-provider-model-summary").textContent =
-      group && model ? `${group.displayName} · ${model.displayName}` : "Provider · Model";
-
     const effortIDs = model?.supportedEffortIDs || [];
-    renderComposerMenu(
-      document.getElementById("composer-effort-options"),
-      [null, ...effortIDs].map((effortID) => composerOptionButton(
-        effortID ? humanize(effortID) : "Default",
-        (draft.effortId || null) === effortID,
-        catalog?.locks?.effort?.locked === true,
-        catalog?.locks?.effort?.reasonText || "",
-        () => { draft.effortId = effortID; },
-      )),
-    );
-    document.getElementById("composer-effort-menu").hidden = !effortIDs.length;
-    document.getElementById("composer-effort-summary").textContent =
-      `Effort · ${draft.effortId ? humanize(draft.effortId) : "Default"}`;
-
     const workflows = (catalog?.workflows || []).filter((item) =>
       ((item.enabled && item.visible) || item.id === draft.workflowId) &&
       (!item.providerIDs?.length || item.providerIDs.includes(draft.providerId)),
     );
-    renderComposerMenu(
-      document.getElementById("composer-workflow-options"),
-      [null, ...workflows].map((workflow) => composerOptionButton(
-        workflow?.displayName || "None",
-        (draft.workflowId || null) === (workflow?.id || null),
-        catalog?.locks?.workflow?.locked === true || workflow?.enabled === false,
-        catalog?.locks?.workflow?.reasonText || workflow?.description || "",
-        () => { draft.workflowId = workflow?.id || null; },
-      )),
-    );
+    const permissions = group?.permissionControl?.choices || [];
+    const controlsSignature = JSON.stringify({
+      destination: destination.key,
+      catalogVersion: catalog ? state.agent.composerCatalogVersion : null,
+      configuration: draft,
+    });
+
+    if (state.agent.composerControlsSignature !== controlsSignature) {
+      const providerRows = [];
+      groups.forEach((provider) => {
+        providerRows.push(element("span", "composer-popover-group", provider.displayName));
+        (provider.models || []).forEach((candidate) => {
+          providerRows.push(composerOptionButton(
+            `${provider.displayName} · ${candidate.displayName}`,
+            provider.providerId === draft.providerId && candidate.id === draft.modelId,
+            catalog?.locks?.model?.locked === true || candidate.enabled === false,
+            catalog?.locks?.model?.reasonText || candidate.description || "",
+            () => {
+              draft.providerId = provider.providerId;
+              draft.modelId = candidate.id;
+              draft.effortId = candidate.defaultEffortID || null;
+              draft.permissionId = provider.permissionControl?.selectedID || null;
+              draft.toolValues = defaultToolValues(provider);
+            },
+          ));
+        });
+      });
+      renderComposerMenu(document.getElementById("composer-provider-model-options"), providerRows);
+      renderComposerMenu(
+        document.getElementById("composer-effort-options"),
+        [null, ...effortIDs].map((effortID) => composerOptionButton(
+          effortID ? humanize(effortID) : "Default",
+          (draft.effortId || null) === effortID,
+          catalog?.locks?.effort?.locked === true,
+          catalog?.locks?.effort?.reasonText || "",
+          () => { draft.effortId = effortID; },
+        )),
+      );
+      renderComposerMenu(
+        document.getElementById("composer-workflow-options"),
+        [null, ...workflows].map((workflow) => composerOptionButton(
+          workflow?.displayName || "None",
+          (draft.workflowId || null) === (workflow?.id || null),
+          catalog?.locks?.workflow?.locked === true || workflow?.enabled === false,
+          catalog?.locks?.workflow?.reasonText || workflow?.description || "",
+          () => { draft.workflowId = workflow?.id || null; },
+        )),
+      );
+      renderComposerMenu(
+        document.getElementById("composer-permission-options"),
+        permissions.map((choice) => composerOptionButton(
+          choice.displayName,
+          choice.id === draft.permissionId,
+          group?.permissionControl?.mutable === false || choice.enabled === false,
+          group?.permissionControl?.lockReasonCode || choice.detailText || "",
+          () => { draft.permissionId = choice.id; },
+        )),
+      );
+      renderComposerTools(group, draft);
+      state.agent.composerControlsSignature = controlsSignature;
+    }
+    document.getElementById("composer-provider-model-summary").textContent =
+      group && model ? `${group.displayName} · ${model.displayName}` : "Provider · Model";
+
+    document.getElementById("composer-effort-menu").hidden = !effortIDs.length;
+    document.getElementById("composer-effort-summary").textContent =
+      `Effort · ${draft.effortId ? humanize(draft.effortId) : "Default"}`;
+
     const workflow = workflows.find((item) => item.id === draft.workflowId);
     document.getElementById("composer-workflow-summary").textContent =
       `Workflow · ${workflow?.displayName || "None"}`;
     text.placeholder = workflow?.guidance || workflow?.description ||
       (state.agent.newSessionMode ? "Describe what to build…" : "Send a message…");
 
-    const permissions = group?.permissionControl?.choices || [];
-    renderComposerMenu(
-      document.getElementById("composer-permission-options"),
-      permissions.map((choice) => composerOptionButton(
-        choice.displayName,
-        choice.id === draft.permissionId,
-        group?.permissionControl?.mutable === false || choice.enabled === false,
-        group?.permissionControl?.lockReasonCode || choice.detailText || "",
-        () => { draft.permissionId = choice.id; },
-      )),
-    );
     document.getElementById("composer-permission-menu").hidden = !permissions.length;
     document.getElementById("composer-permission-summary").textContent =
       `Permissions · ${permissions.find((choice) => choice.id === draft.permissionId)?.displayName || "Default"}`;
-    renderComposerTools(group, draft);
-    renderComposerAttachments(composer);
+    const attachmentsSignature = JSON.stringify({
+      destination: destination.key,
+      attachments: composer.attachments,
+    });
+    if (state.agent.composerAttachmentsSignature !== attachmentsSignature) {
+      renderComposerAttachments(composer);
+      state.agent.composerAttachmentsSignature = attachmentsSignature;
+    }
     document.getElementById("composer-mcp-pill").hidden = catalog?.mcpControlled !== true;
 
     const control = destination.session?.agentControl;
     const hasCancelAction = control?.cancel?.allowed === true;
+    const activeRun = ["preparing", "thinking", "working", "waiting", "cancelling"]
+      .includes(control?.displayState);
+    const showsStop = activeRun || hasCancelAction;
     const action = control?.steer?.allowed ? control.steer : control?.submitTurn;
     const hasContent = Boolean(text.value.trim() || composer.attachments.length);
-    if (hasCancelAction) {
+    if (showsStop) {
       submit.type = "button";
       submit.dataset.mode = "cancel";
       submit.classList.add("cancel");
@@ -2790,20 +2816,26 @@
       submit.setAttribute("aria-label", "Send message");
       setIcon(submit, "send");
     }
-    const reason = state.agent.actionPromise
-      ? `${humanize(state.agent.actionName)} in progress…`
-      : state.agent.mutationPromise
-      ? "Sending…"
-      : state.agent.attachmentPromise
-        ? "Updating attachments…"
+    const reason = showsStop
+      ? state.agent.actionPromise
+        ? `${humanize(state.agent.actionName)} in progress…`
         : !state.online
           ? "Offline"
-          : !catalog
-            ? composer.feedback || "Loading composer…"
-            : !draft.providerId || !draft.modelId
-              ? "Choose a provider and model"
-              : hasCancelAction
-                  ? ""
+          : !hasCancelAction
+            ? control?.cancel?.reasonText || "Cancellation unavailable"
+            : ""
+      : state.agent.actionPromise
+        ? `${humanize(state.agent.actionName)} in progress…`
+        : state.agent.mutationPromise
+          ? "Sending…"
+          : state.agent.attachmentPromise
+            ? "Updating attachments…"
+            : !state.online
+              ? "Offline"
+              : !catalog
+                ? composer.feedback || "Loading composer…"
+                : !draft.providerId || !draft.modelId
+                  ? "Choose a provider and model"
                   : !state.agent.newSessionMode && !action?.allowed
                     ? action?.reasonText || "Session is read-only"
                     : !hasContent
