@@ -36,7 +36,6 @@
   --tool-config: #008c8f;
   --tool-other: #7f7f7f;
   --shadow-card: 0 1px 1px rgb(0 0 0 / 3%), 0 6px 22px rgb(0 0 0 / 5%);
-  --titlebar-height: 48px;
   --settings-sidebar-width: 250px;
   --portal-font-size: 14px;
 }
@@ -297,51 +296,22 @@ input:disabled {
 .app-frame {
   height: 100vh;
   display: grid;
-  grid-template-rows: var(--titlebar-height) auto minmax(0, 1fr);
-}
-
-.titlebar {
-  grid-row: 1;
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .connection-banner {
-  grid-row: 2;
+  grid-row: 1;
 }
 
 .agent-shell,
 .settings-shell {
-  grid-row: 3;
+  grid-row: 2;
 }
 
-.native-material,
-.titlebar {
+.native-material {
   background: var(--bg-sidebar);
   backdrop-filter: blur(26px) saturate(145%);
   -webkit-backdrop-filter: blur(26px) saturate(145%);
-}
-
-.titlebar {
-  display: grid;
-  grid-template-columns: minmax(220px, 1fr) auto minmax(220px, 1fr);
-  align-items: center;
-  gap: var(--space-10);
-  padding: 0 var(--space-12);
-  border-bottom: 0.5px solid var(--separator);
-  user-select: none;
-}
-
-.titlebar-leading,
-.window-title {
-  display: flex;
-  align-items: center;
-}
-
-.titlebar-leading {
-  min-width: 0;
-  gap: var(--space-8);
-  color: inherit;
-  text-decoration: none;
-  border-radius: 8px;
 }
 
 .app-icon {
@@ -351,50 +321,6 @@ input:disabled {
   box-shadow: 0 1px 3px rgb(0 0 0 / 16%);
 }
 
-.workspace-title {
-  min-width: 0;
-  display: grid;
-  line-height: 1.15;
-}
-
-.workspace-title strong {
-  overflow: hidden;
-  font-size: 13px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.workspace-title span {
-  color: var(--text-secondary);
-  font-size: 10px;
-}
-
-.window-title {
-  justify-content: center;
-  gap: var(--space-6);
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.status-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--text-tertiary);
-}
-
-.status-dot.online {
-  background: var(--success);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 12%, transparent);
-}
-
-.status-dot.stale {
-  background: var(--warning);
-}
-
-.status-dot.offline {
-  background: var(--danger);
-}
 
 .icon-button,
 .search-clear {
@@ -2025,14 +1951,6 @@ input:disabled {
 }
 
 @media (max-width: 720px) {
-  .titlebar {
-    grid-template-columns: minmax(0, 1fr) auto;
-  }
-
-  .window-title {
-    display: none;
-  }
-
   .settings-shell {
     position: relative;
     grid-template-columns: 1fr;
@@ -2216,11 +2134,11 @@ input:disabled {
 }
 
 .project-session-header {
-  padding: 10px;
+  padding: 9px 12px;
   border-bottom: 0.5px solid var(--separator);
 }
 
-.sidebar-heading-row,
+.sidebar-brand,
 .sessions-label-row,
 .agent-detail-toolbar,
 .session-title-cluster,
@@ -2230,13 +2148,17 @@ input:disabled {
   align-items: center;
 }
 
-.sidebar-heading-row {
-  justify-content: space-between;
-  gap: 10px;
-  margin: 0 2px;
+.sidebar-brand {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-8);
+  color: inherit;
+  text-decoration: none;
+  border-radius: 8px;
 }
 
-.sidebar-heading-row h1,
+.sidebar-brand h1,
 .sessions-label-row h2 {
   margin: 0;
   overflow: hidden;
@@ -2310,11 +2232,14 @@ input:disabled {
 }
 
 .session-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 9px 10px 6px;
 }
 
 .session-search-control {
-  width: 100%;
+  flex: 1;
   min-height: 30px;
 }
 
@@ -3692,7 +3617,6 @@ details.typed-tool > .typed-tool-header {
 }
 
 @media (forced-colors: active) {
-  .status-dot,
   .glance-status i,
   .connection-badge i,
   .polling-status i {

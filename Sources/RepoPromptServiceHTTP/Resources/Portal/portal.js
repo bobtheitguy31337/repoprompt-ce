@@ -527,11 +527,8 @@
   }
 
   function setConnectionPresentation(kind, message) {
-    const dot = document.getElementById("service-dot");
     const banner = document.getElementById("connection-banner");
     const bannerText = document.getElementById("connection-banner-text");
-    dot.classList.remove("online", "stale", "offline");
-    dot.classList.add(kind);
     banner.hidden = kind === "online";
     bannerText.textContent = message || "";
     state.online = kind !== "offline";
@@ -763,8 +760,6 @@
         await loadTypedSettings();
         state.generatedAt =
           providerCatalog.generatedAt || new Date().toISOString();
-        document.getElementById("service-caption").textContent =
-          "Connected · authenticated portal";
         setConnectionPresentation("online", "");
         connectAgentEvents();
         updateShell();
@@ -779,9 +774,6 @@
         }
       } catch (error) {
         const offline = error.network || navigator.onLine === false;
-        document.getElementById("service-caption").textContent = offline
-          ? "Server connection unavailable"
-          : "Server state may be stale";
         setConnectionPresentation(
           offline ? "offline" : "stale",
           offline ? "The server is offline or unreachable." : error.message,
@@ -802,9 +794,6 @@
   }
 
   function updateShell() {
-    const project = selectedProject() || state.bootstrap?.projects?.[0];
-    document.getElementById("active-workspace-name").textContent =
-      project?.name || "RepoPrompt Server";
     const freshness = state.generatedAt
       ? `Updated ${formatDate(state.generatedAt)}`
       : "Not yet loaded";
@@ -2928,8 +2917,6 @@
     const settings = document.getElementById("settings-shell");
     home.hidden = route.surface !== "home";
     settings.hidden = route.surface !== "settings";
-    document.getElementById("window-title-text").textContent =
-      route.surface === "home" ? "Agent Mode" : "Settings";
     if (route.surface === "home") {
       renderHomeProviders();
       if (state.agent.selectedSessionID && !state.agent.transcriptPage) {
@@ -9012,8 +8999,6 @@
         "offline",
         "This browser is offline. Changes require a restored connection.",
       );
-      document.getElementById("service-caption").textContent =
-        "Browser offline";
       announce("Browser is offline");
     });
     window.addEventListener("online", () => {

@@ -50,25 +50,6 @@
       Skip to content
     </button>
     <div id="app" class="app-frame">
-      <header class="titlebar">
-        <a
-          class="titlebar-leading"
-          href="#home"
-          data-route-link
-          aria-label="RepoPrompt Server home"
-        >
-          <img class="app-icon" src="assets/repoprompt-icon.png" alt="" />
-          <span class="workspace-title">
-            <strong id="active-workspace-name">RepoPrompt Server</strong>
-            <span id="service-caption">Connecting to server…</span>
-          </span>
-        </a>
-        <div class="window-title" aria-label="Current surface">
-          <span class="status-dot" id="service-dot" aria-hidden="true"></span>
-          <span id="window-title-text">Server Portal</span>
-        </div>
-      </header>
-
       <div
         id="connection-banner"
         class="connection-banner"
@@ -91,17 +72,15 @@
             class="project-session-header"
             aria-labelledby="current-project-name"
           >
-            <div class="sidebar-heading-row">
+            <a
+              class="sidebar-brand"
+              href="#home"
+              data-route-link
+              aria-label="RepoPrompt Server home"
+            >
+              <img class="app-icon" src="assets/repoprompt-icon.png" alt="" />
               <h1 id="current-project-name">No project</h1>
-              <button
-                id="new-chat-button"
-                class="small-icon-button"
-                type="button"
-                data-action="new-chat"
-                data-icon="message"
-                aria-label="Start a new chat"
-              ></button>
-            </div>
+            </a>
           </header>
 
           <div class="session-toolbar">
@@ -124,6 +103,14 @@
                 hidden
               ></button>
             </label>
+            <button
+              id="new-chat-button"
+              class="small-icon-button"
+              type="button"
+              data-action="new-chat"
+              data-icon="message"
+              aria-label="Start a new chat"
+            ></button>
           </div>
 
           <section class="sessions-panel" aria-labelledby="sessions-heading">
