@@ -42,6 +42,7 @@
   ]);
   const pollDelay = window.__REPOPROMPT_PORTAL_TEST_HOOK__ ? 60_000 : 1_600;
   const selectedProjectStorageKey = "rpce_portal_selected_project_id";
+  const selectedSessionStorageKey = "rpce_portal_selected_session_id";
 
   const state = {
     providers: [],
@@ -134,6 +135,24 @@
     if (!projectID) return;
     try {
       window.localStorage.setItem(selectedProjectStorageKey, projectID);
+    } catch (_) {}
+  }
+
+  function storedSelectedSessionID() {
+    try {
+      return window.localStorage.getItem(selectedSessionStorageKey);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function rememberSelectedSessionID(sessionID) {
+    try {
+      if (sessionID) {
+        window.localStorage.setItem(selectedSessionStorageKey, sessionID);
+      } else {
+        window.localStorage.removeItem(selectedSessionStorageKey);
+      }
     } catch (_) {}
   }
 
@@ -793,10 +812,14 @@
         if (!state.agent.selectedProjectID) {
           state.agent.selectedProjectID = storedSelectedProjectID();
         }
+        if (!state.agent.selectedSessionID && !state.agent.newSessionMode) {
+          state.agent.selectedSessionID = storedSelectedSessionID();
+        }
         state.providers = providerCatalog.providers;
         state.desktopSettings = desktopSettings;
         reconcileAgentSelection();
         rememberSelectedProjectID(state.agent.selectedProjectID);
+        rememberSelectedSessionID(state.agent.selectedSessionID);
         await loadTypedSettings();
         state.generatedAt =
           providerCatalog.generatedAt || new Date().toISOString();
@@ -869,6 +892,7 @@
   }
 
   function reconcileAgentSelection() {
+    if (!state.bootstrap) return;
     const projects = state.bootstrap?.projects || [];
     if (
       !projects.some((item) => item.projectId === state.agent.selectedProjectID)
@@ -1032,6 +1056,7 @@
     state.agent.transcriptPage = null;
     state.agent.newSessionMode = false;
     reconcileAgentSelection();
+    rememberSelectedSessionID(state.agent.selectedSessionID);
     renderHomeProviders();
     updateShell();
     Promise.all([
@@ -1063,6 +1088,7 @@
       return;
     clearAgentPoll();
     state.agent.selectedSessionID = sessionID;
+    rememberSelectedSessionID(sessionID);
     state.agent.newSessionMode = false;
     state.agent.blockExpansion.clear();
     state.agent.toolExpansion.clear();
@@ -1081,6 +1107,7 @@
     clearAgentPoll();
     state.agent.newSessionMode = true;
     state.agent.selectedSessionID = null;
+    rememberSelectedSessionID(null);
     state.agent.blockExpansion.clear();
     state.agent.toolExpansion.clear();
     state.agent.transcriptItems = [];
@@ -1387,6 +1414,7 @@
       state.agent.selectedProjectID = result.projectId;
       rememberSelectedProjectID(result.projectId);
       state.agent.selectedSessionID = null;
+      rememberSelectedSessionID(null);
       state.agent.newSessionMode = true;
       state.agent.projectCreationOpen = false;
       await loadAll(false);
@@ -3089,6 +3117,7 @@
           if (existing >= 0) state.bootstrap.sessions[existing] = acceptedSession;
           else state.bootstrap.sessions.push(acceptedSession);
           state.agent.selectedSessionID = acceptedSession.sessionId;
+          rememberSelectedSessionID(acceptedSession.sessionId);
           state.agent.newSessionMode = false;
           state.agent.transcriptItems = [];
           state.agent.transcriptPage = null;
