@@ -1977,6 +1977,8 @@ public actor RepoPromptHeadlessAuthority {
             sessionRevision: detail.session.revision,
             lifecycleState: detail.session.state,
             isController: metadata.controllerUserID == actor.userID,
+            collaborativeSteeringAllowed: metadata.visibility == .collaborative
+                && metadata.collaborativeSteeringEnabled,
             composerAvailable: composerAvailable,
             providerAvailable: capability?.enabled == true,
             supportsResume: capability?.supportsResume == true,

@@ -9,6 +9,9 @@ public struct AgentSessionPresentationFacts: Sendable {
     public let sessionRevision: Int64
     public let lifecycleState: SessionLifecycleState
     public let isController: Bool
+    /// The durable collaboration policy permits this actor to submit a
+    /// follow-up or steer an active turn without owning the session.
+    public let collaborativeSteeringAllowed: Bool
     public let composerAvailable: Bool
     public let providerAvailable: Bool
     public let supportsResume: Bool
@@ -24,6 +27,7 @@ public struct AgentSessionPresentationFacts: Sendable {
         sessionRevision: Int64,
         lifecycleState: SessionLifecycleState,
         isController: Bool,
+        collaborativeSteeringAllowed: Bool = false,
         composerAvailable: Bool,
         providerAvailable: Bool,
         supportsResume: Bool,
@@ -38,6 +42,7 @@ public struct AgentSessionPresentationFacts: Sendable {
         self.sessionRevision = sessionRevision
         self.lifecycleState = lifecycleState
         self.isController = isController
+        self.collaborativeSteeringAllowed = collaborativeSteeringAllowed
         self.composerAvailable = composerAvailable
         self.providerAvailable = providerAvailable
         self.supportsResume = supportsResume
@@ -65,21 +70,23 @@ public enum AgentSessionPresentationPolicy {
             .init(allowed: false, reasonCode: code, reasonText: text)
         }
 
-        func commonDenial() -> AgentSessionActionWire? {
+        func commonDenial(allowsCollaborativeSteering: Bool = false) -> AgentSessionActionWire? {
             if !facts.isRootSession {
                 return denied("root_session_only", "Only root Agent sessions can be controlled here.")
             }
             if facts.lifecycleState == .archived {
                 return denied("session_archived", "This session is archived.")
             }
-            if !facts.isController {
+            if !facts.isController,
+               !(allowsCollaborativeSteering && facts.collaborativeSteeringAllowed)
+            {
                 return denied("not_controller", "Only the session controller can perform this action.")
             }
             return nil
         }
 
         let submit: AgentSessionActionWire
-        if let denial = commonDenial() {
+        if let denial = commonDenial(allowsCollaborativeSteering: true) {
             submit = denial
         } else if facts.lifecycleState == .waiting || phase == .waiting {
             submit = denied("waiting_for_interaction", "Answer the pending interaction before submitting another turn.")
@@ -94,7 +101,7 @@ public enum AgentSessionPresentationPolicy {
         }
 
         let steer: AgentSessionActionWire
-        if let denial = commonDenial() {
+        if let denial = commonDenial(allowsCollaborativeSteering: true) {
             steer = denial
         } else if facts.lifecycleState == .waiting || phase == .waiting {
             steer = denied("waiting_for_interaction", "Answer the pending interaction before steering the run.")
