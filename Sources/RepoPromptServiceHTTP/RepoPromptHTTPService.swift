@@ -154,6 +154,123 @@ public struct RepoPromptHTTPService: Sendable {
             let actor = try await authenticateGabblin(request: request)
             return try portalJSON(try await bootstrap(actor: actor))
         } }
+        router.post("/external/v1/projects") { request, _ in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(GabblinCreateProjectRequest.self, from: data)
+            let key = try requireIdempotency(request)
+            guard let operationID = UUID(uuidString: key) else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Gabblin project creation requires a UUID idempotency key")
+            }
+            let result = try await authority.createProjectFromSource(
+                input: .init(
+                    operationID: operationID,
+                    expectedRevision: 0,
+                    name: input.name,
+                    logicalName: input.name,
+                    source: .managedDirectory(name: input.name)
+                ),
+                externalActor: actor,
+                idempotencyKey: key,
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            let project = try await authority.projectSnapshot(projectID: result.projectID)
+            return try portalJSON(
+                GabblinProjectResponse(project: RepoPromptPortalSessionProjection.project(project)),
+                status: .created
+            )
+        } }
+        router.get("/external/v1/projects/:id/composer-catalog") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            _ = try await authority.projectSnapshot(projectID: projectID)
+            return try await portalJSON(requireComposerCatalog().snapshot(
+                context: .init(kind: .project, projectID: projectID, actorID: actor.userID)
+            ))
+        } }
+        router.get("/external/v1/projects/:id/composer-suggestions") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            _ = try await authority.projectSnapshot(projectID: projectID)
+            return try await portalJSON(requireComposerCatalog().suggestions(
+                context: .init(kind: .project, projectID: projectID, actorID: actor.userID),
+                query: try gabblinSuggestionQuery(request),
+                kinds: [.nativeCommand, .skill, .file],
+                limit: 50
+            ))
+        } }
+        router.post("/external/v1/projects/:id/composer-attachments") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            _ = try requireIdempotency(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            _ = try await authority.projectSnapshot(projectID: projectID)
+            let data = try await bodyData(request, maximumBytes: 10 * 1_024 * 1_024 + 64 * 1_024)
+            let upload = try composerAttachmentUpload(
+                data: data,
+                contentType: request.headers[.contentType],
+                fallbackDisplayName: String(request.uri.queryParameters["displayName"] ?? "image")
+            )
+            guard upload.displayName.utf8.count <= 256 else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Attachment display name exceeds its bound")
+            }
+            let attachment = try await requireComposerAttachments().stage(
+                data: upload.data,
+                displayName: upload.displayName,
+                declaredMediaType: upload.mediaType,
+                actorID: actor.userID,
+                projectID: projectID
+            )
+            return try portalJSON(attachment, status: .created)
+        } }
+        router.post("/external/v1/projects/:id/composer-attachments/resolve") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            _ = try requireIdempotency(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            _ = try await authority.projectSnapshot(projectID: projectID)
+            let input = try await JSONDecoder.serviceDecoder.decode(
+                ComposerAttachmentResolveRequest.self,
+                from: bodyData(request)
+            )
+            return try await portalJSON(requireComposerAttachments().resolve(
+                attachmentIDs: input.attachmentIDs,
+                actorID: actor.userID,
+                projectID: projectID
+            ))
+        } }
+        router.get("/external/v1/projects/:id/composer-attachments/:attachmentId/preview") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let attachmentID = try context.parameters.require("attachmentId", as: UUID.self)
+            let sessionID = try optionalGabblinSessionID(request)
+            if let sessionID {
+                let session = try await authority.sessionSnapshot(sessionID: sessionID)
+                guard session.projectID == projectID else {
+                    throw ServiceAPIError(code: .notFound, message: "Attachment is unavailable")
+                }
+            } else {
+                _ = try await authority.projectSnapshot(projectID: projectID)
+            }
+            let preview = try await requireComposerAttachments().preview(
+                attachmentID: attachmentID,
+                actorID: actor.userID,
+                projectID: projectID,
+                visibleSessionID: sessionID
+            )
+            return portalBytes(preview.1, contentType: preview.0.mediaType)
+        } }
+        router.delete("/external/v1/projects/:id/composer-attachments/:attachmentId") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            _ = try requireIdempotency(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let attachmentID = try context.parameters.require("attachmentId", as: UUID.self)
+            _ = try await authority.projectSnapshot(projectID: projectID)
+            try await requireComposerAttachments().delete(
+                attachmentID: attachmentID,
+                actorID: actor.userID,
+                projectID: projectID
+            )
+            return portalEmpty()
+        } }
         router.get("/external/v1/sessions/:id") { request, context in await portalRespond(request) {
             let actor = try await authenticateGabblin(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
@@ -167,6 +284,35 @@ public struct RepoPromptHTTPService: Sendable {
             return try portalJSON(GabblinSessionDetailResponse(
                 session: RepoPromptPortalSessionProjection.project(session, agentControl: control),
                 collaboration: collaboration
+            ))
+        } }
+        router.get("/external/v1/sessions/:id/composer-catalog") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let snapshot = try await authority.authoritySessionSnapshot(sessionID: sessionID)
+            return try await portalJSON(requireComposerCatalog().snapshot(context: .init(
+                kind: .session,
+                projectID: snapshot.session.projectID,
+                sessionID: sessionID,
+                actorID: actor.userID,
+                activeRun: snapshot.activeBinding != nil
+            )))
+        } }
+        router.get("/external/v1/sessions/:id/composer-suggestions") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let snapshot = try await authority.authoritySessionSnapshot(sessionID: sessionID)
+            return try await portalJSON(requireComposerCatalog().suggestions(
+                context: .init(
+                    kind: .session,
+                    projectID: snapshot.session.projectID,
+                    sessionID: sessionID,
+                    actorID: actor.userID,
+                    activeRun: snapshot.activeBinding != nil
+                ),
+                query: try gabblinSuggestionQuery(request),
+                kinds: [.nativeCommand, .skill, .file],
+                limit: 50
             ))
         } }
         router.get("/external/v1/sessions/:id/presentation") { request, context in await portalRespond(request) {
@@ -189,6 +335,371 @@ public struct RepoPromptHTTPService: Sendable {
                 mutableInteractions: metadata.controllerUserID == actor.userID
             )
             return try portalJSON(page)
+        } }
+        router.get("/external/v1/sessions/:id/children") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            _ = try await authority.sessionSnapshot(sessionID: sessionID)
+            let children = try await authority.childSessionSnapshots(parentSessionID: sessionID)
+            let controls = try await authority.agentSessionActionSnapshots(
+                sessionIDs: children.map(\.sessionID),
+                actor: actor,
+                composerAvailable: composerCatalog != nil
+            )
+            let summaries = children.map {
+                RepoPromptPortalSessionProjection.project($0, agentControl: controls[$0.sessionID])
+            }
+            return try await portalJSON(page(
+                summaries,
+                request: request,
+                defaultLimit: 100,
+                maximumLimit: 500,
+                sortKey: { $0.sessionID.uuidString }
+            ))
+        } }
+        router.get("/external/v1/sessions/:id/artifacts") { request, context in await portalRespond(request) {
+            _ = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let artifacts = try await authority.artifactSnapshots(sessionID: sessionID)
+            return try await portalJSON(page(
+                artifacts,
+                request: request,
+                defaultLimit: 100,
+                maximumLimit: 200,
+                sortKey: { $0.artifactID.uuidString }
+            ))
+        } }
+        router.get("/external/v1/sessions/:id/artifacts/:artifactId/content") { request, context in await portalRespond(request) {
+            _ = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let artifactID = try context.parameters.require("artifactId", as: UUID.self)
+            let requestedRange = try parseByteRange(request.headers[.range])
+            let result = try await authority.artifactContent(
+                sessionID: sessionID,
+                artifactID: artifactID,
+                range: requestedRange
+            )
+            var headers = HTTPFields()
+            headers[.contentType] = "application/octet-stream"
+            headers[.cacheControl] = "private, no-store"
+            headers[.contentLength] = String(result.1.count)
+            let partial = result.2.lowerBound != 0 || result.2.upperBound != Int(result.0.size)
+            if partial {
+                headers[.contentRange] = "bytes \(result.2.lowerBound)-\(max(result.2.lowerBound, result.2.upperBound - 1))/\(result.0.size)"
+            }
+            return Response(
+                status: partial ? .partialContent : .ok,
+                headers: headers,
+                body: .init(byteBuffer: ByteBuffer(bytes: result.1))
+            )
+        } }
+        router.get("/external/v1/sessions/:id/selection") { request, context in await portalRespond(request) {
+            _ = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            return try await portalJSON(authority.selectionSnapshot(sessionID: sessionID))
+        } }
+        router.post("/external/v1/agent-sessions") { request, _ in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(PortalStartAgentSessionRequest.self, from: data)
+            let key = try requireGabblinOperationKey(request, operationID: input.operationID)
+            guard input.start.visibility == .privateSession, input.start.selectedMessageContext == nil else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Gabblin Agent sessions must be private root sessions")
+            }
+            guard let provider = input.start.turn.configuration.providerID.runtimeKind else {
+                throw ServiceAPIError(code: .capabilityMissing, message: "Selected provider has no execution adapter")
+            }
+            _ = try await authority.projectSnapshot(projectID: input.start.projectID)
+            let shell = CreateSessionInput(
+                projectID: input.start.projectID,
+                provider: provider,
+                providerSettingsID: input.start.turn.configuration.providerID,
+                model: input.start.turn.configuration.modelID,
+                visibility: .privateSession,
+                startImmediately: false
+            )
+            let digest = CanonicalSigning.bodyDigest(data)
+            let accepted = try await authority.acceptStructuredSession(
+                input: shell,
+                coordinator: requireSubmissionCoordinator(),
+                actor: actor,
+                publicSubmissionKey: key,
+                requestDigest: digest,
+                submission: input.start.turn
+            )
+            try await requireSubmissionDispatchQueue().enqueue(
+                accepted,
+                actor: actor,
+                requestDigest: digest
+            )
+            let session = try await authority.sessionSnapshot(sessionID: accepted.receipt.sessionID)
+            let control = try? await authority.agentSessionActionSnapshot(
+                sessionID: session.sessionID,
+                actor: actor,
+                composerAvailable: composerCatalog != nil
+            )
+            return try portalJSON(
+                PortalAgentSubmissionReceipt(
+                    accepted.receipt,
+                    session: RepoPromptPortalSessionProjection.project(session, agentControl: control)
+                ),
+                status: .accepted
+            )
+        } }
+        router.post("/external/v1/sessions/:id/turns") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(PortalSubmitAgentTurnRequest.self, from: data)
+            let key = try requireGabblinOperationKey(request, operationID: input.operationID)
+            let digest = CanonicalSigning.bodyDigest(data)
+            let snapshot = try await authority.authoritySessionSnapshot(sessionID: sessionID)
+            try await authority.authorizeSessionCollaboration(
+                sessionID: sessionID,
+                actor: actor,
+                operation: "submitTurn",
+                requestDigest: digest
+            )
+            if snapshot.activeBinding != nil {
+                let control = try await authority.agentSessionActionSnapshot(
+                    sessionID: sessionID,
+                    actor: actor,
+                    composerAvailable: composerCatalog != nil
+                )
+                guard control.steer.allowed, let epoch = control.steer.targetTurnEpoch else {
+                    throw ServiceAPIError(
+                        code: .runAlreadyActive,
+                        message: control.steer.reasonText ?? "The current run is not ready for another message yet.",
+                        retryable: control.steer.reasonCode == "steering_not_ready"
+                    )
+                }
+                guard input.turn.content.attachmentIDs.isEmpty else {
+                    throw ServiceAPIError(code: .invalidRequest, message: "Attachments cannot be added while steering a running agent.")
+                }
+                let text = input.turn.content.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else {
+                    throw ServiceAPIError(code: .invalidRequest, message: "Enter a message before sending")
+                }
+                let receipt = try await authority.execute(
+                    command: .steerSession(text: text, targetTurnEpoch: epoch),
+                    sessionID: sessionID,
+                    externalActor: actor,
+                    idempotencyKey: key,
+                    requestDigest: digest
+                )
+                return try portalJSON(receipt, status: .accepted)
+            }
+            let accepted = try await requireSubmissionCoordinator().acceptFollowup(
+                session: snapshot.session,
+                activeRun: snapshot.activeRun,
+                actor: actor,
+                publicSubmissionKey: key,
+                requestDigest: digest,
+                submission: input.turn
+            )
+            try await requireSubmissionDispatchQueue().enqueue(
+                accepted,
+                actor: actor,
+                requestDigest: digest
+            )
+            return try portalJSON(PortalAgentSubmissionReceipt(accepted.receipt), status: .accepted)
+        } }
+        router.post("/external/v1/sessions/:id/agent-commands") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(GabblinAgentCommandRequest.self, from: data)
+            let key = try requireGabblinOperationKey(request, operationID: input.operationID)
+            let receipt = try await authority.execute(
+                command: try input.sessionCommand(),
+                sessionID: sessionID,
+                externalActor: actor,
+                idempotencyKey: key,
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            return try portalJSON(receipt, status: .accepted)
+        } }
+        router.post("/external/v1/sessions/:id/interactions/:interactionId/answer") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let interactionID = try context.parameters.require("interactionId", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(PortalInteractionAnswerRequest.self, from: data)
+            let key = try requireGabblinOperationKey(request, operationID: input.operationID)
+            guard let interaction = try await authority.interactionSnapshots(sessionID: sessionID)
+                .first(where: { $0.interactionID == interactionID })
+            else {
+                throw ServiceAPIError(code: .notFound, message: "Interaction not found")
+            }
+            guard interaction.revision == input.expectedRevision else {
+                throw ServiceAPIError(
+                    code: .staleRevision,
+                    message: "Interaction revision changed",
+                    currentRevision: interaction.revision
+                )
+            }
+            let payload = try AgentInteractionPresentationAdapter.compile(
+                response: input.response,
+                for: interaction
+            )
+            let result = try await authority.answerInteraction(
+                sessionID: sessionID,
+                interactionID: interactionID,
+                expectedRevision: input.expectedRevision,
+                payload: payload,
+                actor: actor,
+                idempotencyKey: key,
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            return try portalJSON(result)
+        } }
+        router.put("/external/v1/sessions/:id/selection") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(SelectionMutationInput.self, from: data)
+            let digest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(
+                sessionID: sessionID,
+                actor: actor,
+                operation: "replaceSelection",
+                requestDigest: digest
+            )
+            return try await portalJSON(authority.replaceSelection(
+                sessionID: sessionID,
+                entries: input.entries,
+                expectedRevision: input.expectedRevision,
+                actor: actor,
+                idempotencyKey: requireIdempotency(request),
+                requestDigest: digest
+            ))
+        } }
+        router.post("/external/v1/sessions/:id/selection/add") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(SelectionMutationInput.self, from: data)
+            let digest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(
+                sessionID: sessionID,
+                actor: actor,
+                operation: "addToSelection",
+                requestDigest: digest
+            )
+            return try await portalJSON(authority.addSelection(
+                sessionID: sessionID,
+                entries: input.entries,
+                expectedRevision: input.expectedRevision,
+                actor: actor,
+                idempotencyKey: requireIdempotency(request),
+                requestDigest: digest
+            ))
+        } }
+        router.post("/external/v1/sessions/:id/selection/remove") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(SelectionRemovalInput.self, from: data)
+            let digest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(
+                sessionID: sessionID,
+                actor: actor,
+                operation: "removeFromSelection",
+                requestDigest: digest
+            )
+            return try await portalJSON(authority.removeSelection(
+                sessionID: sessionID,
+                rootID: input.rootID,
+                logicalPaths: input.logicalPaths,
+                expectedRevision: input.expectedRevision,
+                actor: actor,
+                idempotencyKey: requireIdempotency(request),
+                requestDigest: digest
+            ))
+        } }
+        router.post("/external/v1/sessions/:id/context-builder") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            _ = try requireIdempotency(request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(ContextBuilderInput.self, from: data)
+            if let budget = input.budget, !(1 ... 1_000_000).contains(budget) {
+                throw ServiceAPIError(code: .invalidRequest, message: "Context Builder budget exceeds the v1 bound")
+            }
+            let digest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(
+                sessionID: sessionID,
+                actor: actor,
+                operation: "runContextBuilder",
+                requestDigest: digest
+            )
+            return try await portalJSON(authority.runContextBuilder(
+                sessionID: sessionID,
+                input: input,
+                actor: actor,
+                origin: .internal,
+                requestDigest: digest
+            ))
+        } }
+        router.post("/external/v1/sessions/:id/oracle") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            _ = try requireIdempotency(request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(OracleInput.self, from: data)
+            let digest = CanonicalSigning.bodyDigest(data)
+            try await authority.authorizeSessionCollaboration(
+                sessionID: sessionID,
+                actor: actor,
+                operation: "askOracle",
+                requestDigest: digest
+            )
+            return try await portalJSON(authority.askOracle(
+                sessionID: sessionID,
+                input: input,
+                actor: actor,
+                requestDigest: digest
+            ))
+        } }
+        router.patch("/external/v1/sessions/:id/visibility") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(GabblinVisibilityRequest.self, from: data)
+            let current = try await authority.collaborationMetadata(sessionID: sessionID)
+            let collaboration = try await authority.updateCollaborationMetadata(
+                sessionID: sessionID,
+                input: .init(
+                    expectedPolicyRevision: input.expectedPolicyRevision,
+                    visibility: input.visibility,
+                    collaborativeSteeringEnabled: current.collaborativeSteeringEnabled,
+                    controllerUserID: current.controllerUserID
+                ),
+                actor: actor,
+                idempotencyKey: requireIdempotency(request),
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            return try portalJSON(GabblinCollaborationResponse(collaboration: collaboration))
+        } }
+        router.patch("/external/v1/sessions/:id/collaborative-steering") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(GabblinSteeringRequest.self, from: data)
+            let current = try await authority.collaborationMetadata(sessionID: sessionID)
+            let collaboration = try await authority.updateCollaborationMetadata(
+                sessionID: sessionID,
+                input: .init(
+                    expectedPolicyRevision: input.expectedPolicyRevision,
+                    visibility: current.visibility,
+                    collaborativeSteeringEnabled: input.enabled,
+                    controllerUserID: current.controllerUserID
+                ),
+                actor: actor,
+                idempotencyKey: requireIdempotency(request),
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            return try portalJSON(GabblinCollaborationResponse(collaboration: collaboration))
         } }
         router.get("/portal/api/v1/client-integrations") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(request: request, context: context)
@@ -1880,9 +2391,86 @@ public struct RepoPromptHTTPService: Sendable {
         let displayName: String
     }
 
+    private struct GabblinCreateProjectRequest: Decodable {
+        let name: String
+    }
+
+    private struct GabblinProjectResponse: Encodable {
+        let project: PortalProjectSummary
+    }
+
     private struct GabblinSessionDetailResponse: Encodable {
         let session: PortalSessionSummary
         let collaboration: CollaborationMetadataSnapshot
+    }
+
+    private struct GabblinCollaborationResponse: Encodable {
+        let collaboration: CollaborationMetadataSnapshot
+    }
+
+    private struct GabblinVisibilityRequest: Decodable {
+        let expectedPolicyRevision: Int64
+        let visibility: Visibility
+    }
+
+    private struct GabblinSteeringRequest: Decodable {
+        let expectedPolicyRevision: Int64
+        let enabled: Bool
+    }
+
+    private struct GabblinAgentCommandRequest: Decodable {
+        let operation: String
+        let operationID: UUID
+        let text: String?
+        let targetTurnEpoch: Int64?
+        let expectedRunID: UUID?
+        let expectedGeneration: Int64?
+        let providerResumeMode: ProviderResumeMode?
+        let sourceRunID: UUID?
+        let fromTranscriptEntryID: UUID?
+
+        private enum CodingKeys: String, CodingKey {
+            case operation
+            case operationID = "operationId"
+            case text, targetTurnEpoch
+            case expectedRunID = "expectedRunId"
+            case expectedGeneration, providerResumeMode
+            case sourceRunID = "sourceRunId"
+            case fromTranscriptEntryID = "fromTranscriptEntryId"
+        }
+
+        func sessionCommand() throws -> SessionCommand {
+            switch operation {
+            case "steer":
+                guard let text, let targetTurnEpoch else {
+                    throw ServiceAPIError(code: .invalidRequest, message: "Steer command is incomplete")
+                }
+                return .steerSession(text: text, targetTurnEpoch: targetTurnEpoch)
+            case "cancel":
+                guard let expectedGeneration else {
+                    throw ServiceAPIError(code: .invalidRequest, message: "Cancel command is incomplete")
+                }
+                return .cancelSession(
+                    expectedRunID: expectedRunID,
+                    expectedGeneration: expectedGeneration
+                )
+            case "resume":
+                return .resumeSession(
+                    expectedRunID: expectedRunID,
+                    providerResumeMode: providerResumeMode ?? .auto
+                )
+            case "retry":
+                guard let sourceRunID else {
+                    throw ServiceAPIError(code: .invalidRequest, message: "Retry command is incomplete")
+                }
+                return .retrySession(
+                    sourceRunID: sourceRunID,
+                    fromTranscriptEntryID: fromTranscriptEntryID
+                )
+            default:
+                throw ServiceAPIError(code: .invalidRequest, message: "Unsupported Gabblin session command")
+            }
+        }
     }
 
     private struct PortalAuthStatusResponse: Encodable {
@@ -2077,6 +2665,32 @@ public struct RepoPromptHTTPService: Sendable {
             displayName: envelope.displayName
         )
         return ExternalActor(userID: envelope.subject, username: envelope.username, displayName: envelope.displayName)
+    }
+
+    private func requireGabblinOperationKey(_ request: Request, operationID: UUID) throws -> String {
+        let key = try requireIdempotency(request)
+        guard key.caseInsensitiveCompare(operationID.uuidString) == .orderedSame else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Gabblin operation and idempotency IDs do not match")
+        }
+        return key
+    }
+
+    private func gabblinSuggestionQuery(_ request: Request) throws -> String {
+        let query = String(request.uri.queryParameters["query"] ?? "")
+        guard query.utf8.count <= 512,
+              query.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
+        else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Composer suggestion query is invalid")
+        }
+        return query.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func optionalGabblinSessionID(_ request: Request) throws -> UUID? {
+        guard let raw = request.uri.queryParameters["sessionId"] else { return nil }
+        guard let sessionID = UUID(uuidString: String(raw)) else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Composer attachment session ID is invalid")
+        }
+        return sessionID
     }
 
     private func portalIdempotencyKey(principal: PortalAuthenticatedPrincipal, operationID: UUID) -> String {
