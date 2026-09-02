@@ -41,6 +41,7 @@
     "expired",
   ]);
   const pollDelay = window.__REPOPROMPT_PORTAL_TEST_HOOK__ ? 60_000 : 1_600;
+  const selectedProjectStorageKey = "rpce_portal_selected_project_id";
 
   const state = {
     providers: [],
@@ -120,6 +121,21 @@
   const appearanceCookieName = "rpce_portal_appearance";
   const appearanceThemes = new Set(["system", "light", "dark"]);
   const appearanceDensities = new Set(["normal", "large", "extraLarge"]);
+
+  function storedSelectedProjectID() {
+    try {
+      return window.localStorage.getItem(selectedProjectStorageKey);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function rememberSelectedProjectID(projectID) {
+    if (!projectID) return;
+    try {
+      window.localStorage.setItem(selectedProjectStorageKey, projectID);
+    } catch (_) {}
+  }
 
   function portalAppearance() {
     const encoded = document.cookie
@@ -774,9 +790,13 @@
         state.bootstrap.projects ||= [];
         state.bootstrap.sessions ||= [];
         state.bootstrap.workflows ||= [];
+        if (!state.agent.selectedProjectID) {
+          state.agent.selectedProjectID = storedSelectedProjectID();
+        }
         state.providers = providerCatalog.providers;
         state.desktopSettings = desktopSettings;
         reconcileAgentSelection();
+        rememberSelectedProjectID(state.agent.selectedProjectID);
         await loadTypedSettings();
         state.generatedAt =
           providerCatalog.generatedAt || new Date().toISOString();
@@ -996,6 +1016,7 @@
   }
 
   function selectProject(projectID) {
+    rememberSelectedProjectID(projectID);
     if (
       state.agent.selectedProjectID === projectID &&
       !state.agent.projectCreationOpen
@@ -1364,6 +1385,7 @@
         }),
       });
       state.agent.selectedProjectID = result.projectId;
+      rememberSelectedProjectID(result.projectId);
       state.agent.selectedSessionID = null;
       state.agent.newSessionMode = true;
       state.agent.projectCreationOpen = false;
