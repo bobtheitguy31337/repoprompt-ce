@@ -154,6 +154,21 @@ public struct RepoPromptHTTPService: Sendable {
             let actor = try await authenticateGabblin(request: request)
             return try portalJSON(try await bootstrap(actor: actor))
         } }
+        router.get("/external/v1/sessions/:id") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let session = try await authority.sessionSnapshot(sessionID: sessionID)
+            let collaboration = try await authority.collaborationMetadata(sessionID: sessionID)
+            let control = try await authority.agentSessionActionSnapshot(
+                sessionID: sessionID,
+                actor: actor,
+                composerAvailable: composerCatalog != nil
+            )
+            return try portalJSON(GabblinSessionDetailResponse(
+                session: RepoPromptPortalSessionProjection.project(session, agentControl: control),
+                collaboration: collaboration
+            ))
+        } }
         router.get("/external/v1/sessions/:id/presentation") { request, context in await portalRespond(request) {
             let actor = try await authenticateGabblin(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
@@ -1863,6 +1878,11 @@ public struct RepoPromptHTTPService: Sendable {
         let subject: String
         let username: String
         let displayName: String
+    }
+
+    private struct GabblinSessionDetailResponse: Encodable {
+        let session: PortalSessionSummary
+        let collaboration: CollaborationMetadataSnapshot
     }
 
     private struct PortalAuthStatusResponse: Encodable {
