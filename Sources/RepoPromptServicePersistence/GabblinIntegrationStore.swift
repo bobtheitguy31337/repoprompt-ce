@@ -88,13 +88,14 @@ public extension SQLiteServiceStore {
             else {
                 throw ServiceAPIError(code: .internalAuthFailed, message: "Gabblin API token is invalid")
             }
+            let staleBefore = now.addingTimeInterval(-60).timeIntervalSince1970
             _ = try await connection.query(
-                "UPDATE external_gabblin_credentials SET last_used_at=? WHERE credential_id=?",
-                [.float(now.timeIntervalSince1970), .text(credential.id.uuidString.lowercased())]
+                "UPDATE external_gabblin_credentials SET last_used_at=? WHERE credential_id=? AND last_used_at<?",
+                [.float(now.timeIntervalSince1970), .text(credential.id.uuidString.lowercased()), .float(staleBefore)]
             )
             _ = try await connection.query(
-                "INSERT INTO external_gabblin_members(member_id,integration_id,immutable_subject,display_name,username,first_seen_at,last_seen_at,profile_observed_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(integration_id,immutable_subject) DO UPDATE SET display_name=excluded.display_name,username=excluded.username,last_seen_at=excluded.last_seen_at,profile_observed_at=excluded.profile_observed_at",
-                [.text(UUID().uuidString.lowercased()), .text(integrationID), .text(subject), .text(displayName), .text(username), .float(now.timeIntervalSince1970), .float(now.timeIntervalSince1970), .float(now.timeIntervalSince1970)]
+                "INSERT INTO external_gabblin_members(member_id,integration_id,immutable_subject,display_name,username,first_seen_at,last_seen_at,profile_observed_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(integration_id,immutable_subject) DO UPDATE SET display_name=excluded.display_name,username=excluded.username,last_seen_at=excluded.last_seen_at,profile_observed_at=excluded.profile_observed_at WHERE external_gabblin_members.last_seen_at<? OR external_gabblin_members.display_name<>excluded.display_name OR external_gabblin_members.username<>excluded.username",
+                [.text(UUID().uuidString.lowercased()), .text(integrationID), .text(subject), .text(displayName), .text(username), .float(now.timeIntervalSince1970), .float(now.timeIntervalSince1970), .float(now.timeIntervalSince1970), .float(staleBefore)]
             )
         }
     }

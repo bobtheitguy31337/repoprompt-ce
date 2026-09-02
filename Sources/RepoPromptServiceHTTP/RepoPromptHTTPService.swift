@@ -154,6 +154,27 @@ public struct RepoPromptHTTPService: Sendable {
             let actor = try await authenticateGabblin(request: request)
             return try portalJSON(try await bootstrap(actor: actor))
         } }
+        router.get("/external/v1/sessions/:id/presentation") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let limit = request.uri.queryParameters.get("limit", as: Int.self) ?? 25
+            guard (1 ... 100).contains(limit) else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Presentation limit is outside the external API bound")
+            }
+            let pageToken = request.uri.queryParameters["pageToken"].map(String.init)
+            let session = try await authority.sessionSnapshot(sessionID: sessionID)
+            let metadata = try await authority.collaborationMetadata(sessionID: sessionID)
+            let page = try await requireTranscriptPresentation().page(
+                sessionID: sessionID,
+                actorID: actor.userID,
+                legacyTranscript: session.transcript,
+                interactions: session.interactions,
+                pageToken: pageToken,
+                limit: limit,
+                mutableInteractions: metadata.controllerUserID == actor.userID
+            )
+            return try portalJSON(page)
+        } }
         router.get("/portal/api/v1/client-integrations") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(request: request, context: context)
             let integration = try await store.gabblinIntegration()
