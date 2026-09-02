@@ -286,6 +286,40 @@ public struct RepoPromptHTTPService: Sendable {
                 collaboration: collaboration
             ))
         } }
+        router.get("/external/v1/sessions/:id/events/stream") { request, context in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let session = try await authority.sessionSnapshot(sessionID: sessionID)
+            _ = try await authority.agentSessionActionSnapshot(
+                sessionID: sessionID,
+                actor: actor,
+                composerAvailable: composerCatalog != nil
+            )
+            let next = try await store.nextCursor()
+            let cursor = ServiceCursor(storeID: next.storeID, globalSequence: max(0, next.globalSequence - 1))
+            let stream = try await authority.subscribe(after: cursor)
+            let initialRefresh = PortalRefreshEvent(projectID: session.projectID, sessionID: sessionID)
+            let initialJSON = try String(decoding: JSONEncoder.serviceEncoder.encode(initialRefresh), as: UTF8.self)
+            var headers = HTTPFields()
+            headers[.contentType] = "text/event-stream"
+            headers[.cacheControl] = "private, no-store"
+            return Response(status: .ok, headers: headers, body: ResponseBody { writer in
+                try await writer.write(ByteBuffer(string: ": repoprompt-gabblin-session-stream-v1\n\nevent: refresh\ndata: \(initialJSON)\n\n"))
+                for try await frame in heartbeatFrames(stream) {
+                    switch frame {
+                    case let .event(event) where event.sessionID == sessionID:
+                        let refresh = PortalRefreshEvent(projectID: event.projectID, sessionID: sessionID)
+                        let json = try String(decoding: JSONEncoder.serviceEncoder.encode(refresh), as: UTF8.self)
+                        try await writer.write(ByteBuffer(string: "id: \(event.storeID.uuidString):\(event.globalSequence)\nevent: refresh\ndata: \(json)\n\n"))
+                    case .event:
+                        continue
+                    case .heartbeat:
+                        try await writer.write(ByteBuffer(string: ": heartbeat\n\n"))
+                    }
+                }
+                try await writer.finish(nil)
+            })
+        } }
         router.get("/external/v1/sessions/:id/composer-catalog") { request, context in await portalRespond(request) {
             let actor = try await authenticateGabblin(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
