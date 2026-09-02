@@ -179,19 +179,19 @@ public struct RepoPromptHTTPService: Sendable {
         } }
         router.post("/portal/api/v1/client-integrations/gabblin") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(request: request, context: context)
-            try validatePortalMutation(request)
+            try validatePortalMutation(request, requireJSON: false)
             let issue = try await store.createGabblinIntegration()
             return try portalJSON(PortalGabblinCredentialDisclosureResponse(token: issue.token), status: .created)
         } }
         router.post("/portal/api/v1/client-integrations/gabblin/rotate") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(request: request, context: context)
-            try validatePortalMutation(request)
+            try validatePortalMutation(request, requireJSON: false)
             let issue = try await store.rotateGabblinCredential()
             return try portalJSON(PortalGabblinCredentialDisclosureResponse(token: issue.token))
         } }
         router.delete("/portal/api/v1/client-integrations/gabblin") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(request: request, context: context)
-            try validatePortalMutation(request)
+            try validatePortalMutation(request, requireJSON: false)
             _ = try await store.revokeGabblinIntegration()
             return portalEmpty()
         } }
