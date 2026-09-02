@@ -150,6 +150,10 @@ public struct RepoPromptHTTPService: Sendable {
             let bootstrap = try await portalBootstrap(principal: principal)
             return try portalJSON(bootstrap)
         } }
+        router.get("/external/v1/bootstrap") { request, _ in await portalRespond(request) {
+            let actor = try await authenticateGabblin(request: request)
+            return try portalJSON(try await bootstrap(actor: actor))
+        } }
         router.get("/portal/api/v1/client-integrations") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(request: request, context: context)
             let integration = try await store.gabblinIntegration()
@@ -1833,6 +1837,13 @@ public struct RepoPromptHTTPService: Sendable {
         let externalActor: ExternalActor
     }
 
+    private struct GabblinActorEnvelope: Decodable {
+        let schemaVersion: Int
+        let subject: String
+        let username: String
+        let displayName: String
+    }
+
     private struct PortalAuthStatusResponse: Encodable {
         let needsSetup: Bool
         let authenticated: Bool
@@ -1999,6 +2010,34 @@ public struct RepoPromptHTTPService: Sendable {
         )
     }
 
+    private func authenticateGabblin(request: Request) async throws -> ExternalActor {
+        let authorization = request.headers[.init("Authorization")!] ?? ""
+        guard authorization.hasPrefix("Bearer ") else {
+            throw ServiceAPIError(code: .internalAuthFailed, message: "Gabblin API token is required")
+        }
+        let token = String(authorization.dropFirst("Bearer ".count))
+        guard let encodedActor = request.headers[.init("X-RepoPrompt-Gabblin-Actor")!],
+              encodedActor.utf8.count <= 1_024,
+              let actorData = CanonicalSigning.base64URLDecode(encodedActor),
+              let envelope = try? JSONDecoder.serviceDecoder.decode(GabblinActorEnvelope.self, from: actorData),
+              envelope.schemaVersion == 1,
+              envelope.subject.range(of: "^[A-Za-z0-9_-]{1,128}$", options: .regularExpression) != nil,
+              !envelope.username.isEmpty,
+              envelope.username.utf8.count <= 128,
+              !envelope.displayName.isEmpty,
+              envelope.displayName.utf8.count <= 256
+        else {
+            throw ServiceAPIError(code: .internalAuthFailed, message: "Gabblin actor header is invalid")
+        }
+        try await store.authenticateGabblinCredential(
+            token: token,
+            subject: envelope.subject,
+            username: envelope.username,
+            displayName: envelope.displayName
+        )
+        return ExternalActor(userID: envelope.subject, username: envelope.username, displayName: envelope.displayName)
+    }
+
     private func portalIdempotencyKey(principal: PortalAuthenticatedPrincipal, operationID: UUID) -> String {
         "portal:\(principal.actorID):\(operationID.uuidString.lowercased())"
     }
@@ -2138,8 +2177,18 @@ public struct RepoPromptHTTPService: Sendable {
     }
 
     private func portalBootstrap(principal: PortalAuthenticatedPrincipal) async throws -> PortalBootstrapResponse {
+        try await bootstrap(actor: principal.externalActor)
+    }
+
+    private func bootstrap(actor: ExternalActor) async throws -> PortalBootstrapResponse {
         let projects = await authority.projectSnapshots().map(RepoPromptPortalSessionProjection.project)
-        let sessions = try await portalSidebarSessions(principal: principal)
+        let snapshots = try await authority.sessionSnapshots()
+        let controls = try await authority.agentSessionActionSnapshots(
+            sessionIDs: snapshots.map(\.sessionID),
+            actor: actor,
+            composerAvailable: composerCatalog != nil
+        )
+        let sessions = RepoPromptPortalSessionProjection.sidebarSessions(snapshots, controls: controls)
         let workflowRepository = try await authority.workflowRepositorySnapshot()
         let workflows = try await authority.workflowSnapshots().map {
             PortalWorkflowSummary(

@@ -29,15 +29,7 @@ public struct GabblinCredentialIssue: Sendable {
 }
 
 private enum GabblinCredentialCrypto {
-    static func prepare() -> (id: UUID, token: String, digest: String) {
-        let credentialID = UUID()
-        var generator = SystemRandomNumberGenerator()
-        let secret = Data((0 ..< 32).map { _ in UInt8.random(in: .min ... .max, using: &generator) })
-        let encoded = secret.base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
-        let token = "rp_gabblin_v1.\(credentialID.uuidString.lowercased()).\(encoded)"
+    static func digest(credentialID: UUID, secret: Data) -> String {
         var material = Data("repoprompt.external.gabblin.v1".utf8)
         material.append(0)
         let bytes = credentialID.uuid
@@ -47,12 +39,66 @@ private enum GabblinCredentialCrypto {
         ])
         material.append(0)
         material.append(secret)
-        let digest = SHA256.hash(data: material).map { String(format: "%02x", $0) }.joined()
-        return (credentialID, token, digest)
+        return SHA256.hash(data: material).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func prepare() -> (id: UUID, token: String, digest: String) {
+        let credentialID = UUID()
+        var generator = SystemRandomNumberGenerator()
+        let secret = Data((0 ..< 32).map { _ in UInt8.random(in: .min ... .max, using: &generator) })
+        let encoded = secret.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        let token = "rp_gabblin_v1.\(credentialID.uuidString.lowercased()).\(encoded)"
+        return (credentialID, token, digest(credentialID: credentialID, secret: secret))
+    }
+
+    static func parse(_ token: String) -> (id: UUID, digest: String)? {
+        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3,
+              parts[0] == "rp_gabblin_v1",
+              let credentialID = UUID(uuidString: String(parts[1])),
+              let secret = CanonicalSigning.base64URLDecode(String(parts[2])),
+              secret.count == 32
+        else { return nil }
+        return (credentialID, digest(credentialID: credentialID, secret: secret))
     }
 }
 
 public extension SQLiteServiceStore {
+    func authenticateGabblinCredential(
+        token: String,
+        subject: String,
+        username: String,
+        displayName: String,
+        now: Date = Date()
+    ) async throws {
+        guard let credential = GabblinCredentialCrypto.parse(token) else {
+            throw ServiceAPIError(code: .internalAuthFailed, message: "Gabblin API token is invalid")
+        }
+        try await transaction {
+            guard let row = try await connection.query(
+                "SELECT c.secret_digest,i.integration_id FROM external_gabblin_credentials c JOIN external_gabblin_integration i ON i.integration_id=c.integration_id WHERE c.credential_id=? AND c.revoked_at IS NULL AND i.status='active'",
+                [.text(credential.id.uuidString.lowercased())]
+            ).first,
+                let storedDigest = row.column("secret_digest")?.string,
+                let integrationID = row.column("integration_id")?.string,
+                CanonicalSigning.secureEquals(storedDigest, credential.digest)
+            else {
+                throw ServiceAPIError(code: .internalAuthFailed, message: "Gabblin API token is invalid")
+            }
+            _ = try await connection.query(
+                "UPDATE external_gabblin_credentials SET last_used_at=? WHERE credential_id=?",
+                [.float(now.timeIntervalSince1970), .text(credential.id.uuidString.lowercased())]
+            )
+            _ = try await connection.query(
+                "INSERT INTO external_gabblin_members(member_id,integration_id,immutable_subject,display_name,username,first_seen_at,last_seen_at,profile_observed_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(integration_id,immutable_subject) DO UPDATE SET display_name=excluded.display_name,username=excluded.username,last_seen_at=excluded.last_seen_at,profile_observed_at=excluded.profile_observed_at",
+                [.text(UUID().uuidString.lowercased()), .text(integrationID), .text(subject), .text(displayName), .text(username), .float(now.timeIntervalSince1970), .float(now.timeIntervalSince1970), .float(now.timeIntervalSince1970)]
+            )
+        }
+    }
+
     func gabblinIntegration() async throws -> GabblinIntegrationRecord? {
         guard let row = try await connection.query(
             "SELECT integration_id,workspace_id,status,created_at,updated_at,revoked_at FROM external_gabblin_integration WHERE fixed_id=1"
