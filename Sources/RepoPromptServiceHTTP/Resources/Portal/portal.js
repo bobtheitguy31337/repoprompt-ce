@@ -213,8 +213,8 @@
     close: '<path d="m3 3 10 10M13 3 3 13"/>',
     check: '<path d="m2.5 8 3.5 3.5 7.5-7.5"/>',
     link: '<path d="M6.5 9.5 9.5 6.5M5 11H3.5a2.5 2.5 0 0 1 0-5H6M10 5h2.5a2.5 2.5 0 0 1 0 5H10"/>',
-    send: '<path d="M1.5 8 14.5 2 10 14l-2-5zM8 9l6.5-7"/>',
-    stop: '<rect x="4" y="4" width="8" height="8" rx="1.5"/>',
+    send: '<path d="M8 13.5v-11M3.5 7 8 2.5 12.5 7"/>',
+    stop: '<rect x="4" y="4" width="8" height="8" rx="1" fill="currentColor" stroke="none"/>',
   };
 
   class PortalError extends Error {
