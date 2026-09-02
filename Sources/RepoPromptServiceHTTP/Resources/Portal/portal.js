@@ -20,6 +20,7 @@
     "model-config",
     "manage-workspaces",
     "manage-presets",
+    "client-integrations",
   ]);
   const directAuthenticationMethods = new Set([
     "apiKey",
@@ -48,6 +49,9 @@
     providers: [],
     bootstrap: null,
     desktopSettings: null,
+    clientIntegrations: null,
+    lifecycleDisclosure: null,
+    lifecycleMutation: null,
     settingsMutation: null,
     domainMutations: {},
     settingsFeedback: {
@@ -407,6 +411,7 @@
       /^api\/v1\/projects\/[^/]+\/settings\//.test(path) ||
       /^api\/v1\/provider-settings\//.test(path) ||
       /^api\/v1\/provider-auth-flows\//.test(path) ||
+      /^api\/v1\/client-integrations(?:\/|$)/.test(path) ||
       /^api\/v1\/workflows(?:\/|$)/.test(path) ||
       /^api\/v1\/projects\/[^/]+\/selection-presets(?:\/|$)/.test(path)
     );
@@ -791,11 +796,17 @@
     setLoading(true);
     state.loadPromise = (async () => {
       try {
-        const [bootstrap, providerCatalog, desktopSettings] = await Promise.all(
+        const [
+          bootstrap,
+          providerCatalog,
+          desktopSettings,
+          clientIntegrations,
+        ] = await Promise.all(
           [
             api("api/v1/bootstrap"),
             api(`api/v1/provider-settings${refresh ? "?refresh=true" : ""}`),
             api("api/v1/desktop-settings"),
+            api("api/v1/client-integrations"),
           ],
         );
         if (!providerCatalog || !Array.isArray(providerCatalog.providers)) {
@@ -817,6 +828,7 @@
         }
         state.providers = providerCatalog.providers;
         state.desktopSettings = desktopSettings;
+        state.clientIntegrations = clientIntegrations;
         reconcileAgentSelection();
         rememberSelectedProjectID(state.agent.selectedProjectID);
         rememberSelectedSessionID(state.agent.selectedSessionID);
@@ -3180,7 +3192,10 @@
 
   function renderRoute() {
     const route = normalizedRoute();
-    state.route = route.surface === "home" ? "home" : `settings/${route.page}`;
+    const nextRoute =
+      route.surface === "home" ? "home" : `settings/${route.page}`;
+    if (state.route !== nextRoute) disposeLifecycleDisclosure();
+    state.route = nextRoute;
     const home = document.getElementById("home-shell");
     const settings = document.getElementById("settings-shell");
     home.hidden = route.surface !== "home";
@@ -3223,6 +3238,7 @@
         "model-config": "Model Config",
         "manage-workspaces": "Manage Workspaces",
         "manage-presets": "Manage Presets",
+        "client-integrations": "Client Integrations",
       };
       document.getElementById("settings-detail-title").textContent =
         titles[route.page];
@@ -3245,6 +3261,7 @@
         "model-config": renderModelConfig,
         "manage-workspaces": renderManageWorkspaces,
         "manage-presets": renderTypedManagePresets,
+        "client-integrations": renderClientIntegrations,
       };
       if ((!state.providers.length || !state.desktopSettings) && state.loading)
         renderInitialSettingsLoading();
@@ -3470,6 +3487,155 @@
     if (banner) content.append(banner);
     cards.forEach((card) => content.append(card));
     installIcons(content);
+  }
+
+  function disposeLifecycleDisclosure() {
+    state.lifecycleDisclosure = null;
+    document.querySelectorAll("[data-lifecycle-secret]").forEach((node) => {
+      node.textContent = "Disposed";
+      node.removeAttribute("data-lifecycle-secret");
+    });
+  }
+
+  async function runGabblinMutation(control, operation) {
+    if (state.lifecycleMutation) return state.lifecycleMutation;
+    setDisabledReason(control, true, "An integration operation is in progress.");
+    state.lifecycleMutation = (async () => {
+      try {
+        await operation();
+        state.clientIntegrations = await api("api/v1/client-integrations");
+        renderRoute();
+      } catch (error) {
+        toast(error.message, true);
+      } finally {
+        state.lifecycleMutation = null;
+        if (control.isConnected) setDisabledReason(control, false, "");
+      }
+    })();
+    return state.lifecycleMutation;
+  }
+
+  function gabblinDisclosureCard() {
+    const disclosure = state.lifecycleDisclosure;
+    if (!disclosure) return null;
+    const card = desktopCard(
+      "Gabblin API Token",
+      "Copy this token into Gabblin now. It will not be shown again.",
+    );
+    const secret = element("pre", "lifecycle-secret", disclosure);
+    secret.dataset.lifecycleSecret = "true";
+    secret.setAttribute("aria-label", "Gabblin API token");
+    const actions = element("div", "button-row");
+    const copy = element("button", "secondary-button", "Copy token");
+    copy.type = "button";
+    copy.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(disclosure);
+        toast("Token copied");
+      } catch (_error) {
+        toast("Copy failed. Select the token manually.", true);
+      }
+    });
+    const done = element("button", "secondary-button", "Done");
+    done.type = "button";
+    done.addEventListener("click", () => {
+      disposeLifecycleDisclosure();
+      renderRoute();
+    });
+    actions.append(copy, done);
+    card.append(secret, actions);
+    return card;
+  }
+
+  function gabblinIntegrationCard(gabblin) {
+    const integration = gabblin?.integration;
+    const card = desktopCard("Gabblin", "Connect Gabblin to RepoPrompt.");
+    if (!integration || integration.status !== "active") {
+      const create = element("button", "primary-button", "Generate API token");
+      create.type = "button";
+      create.addEventListener("click", () =>
+        runGabblinMutation(create, async () => {
+          disposeLifecycleDisclosure();
+          const disclosure = await api("api/v1/client-integrations/gabblin", {
+            method: "POST",
+          });
+          state.lifecycleDisclosure = disclosure.token;
+        }),
+      );
+      card.append(create);
+      return card;
+    }
+    const members = gabblin.members || [];
+    card.append(
+      desktopRow(
+        "Gabblin connected",
+        `Connected ${formatDate(integration.createdAt)} · ${members.length} ${members.length === 1 ? "member" : "members"}`,
+        element("span", "status-pill connected", "Connected"),
+      ),
+    );
+    const actions = element("div", "button-row");
+    const rotate = element("button", "secondary-button", "Generate new token");
+    rotate.type = "button";
+    rotate.addEventListener("click", () =>
+      runGabblinMutation(rotate, async () => {
+        disposeLifecycleDisclosure();
+        const disclosure = await api(
+          "api/v1/client-integrations/gabblin/rotate",
+          { method: "POST" },
+        );
+        state.lifecycleDisclosure = disclosure.token;
+      }),
+    );
+    const disconnect = element("button", "danger-button", "Disconnect");
+    disconnect.type = "button";
+    disconnect.addEventListener("click", async () => {
+      const accepted = await confirmAction({
+        title: "Disconnect Gabblin?",
+        message:
+          "Gabblin will lose access to RepoPrompt until you generate and save a new token.",
+        label: "Disconnect",
+        returnFocus: disconnect,
+      });
+      if (!accepted) return;
+      await runGabblinMutation(disconnect, async () => {
+        await api("api/v1/client-integrations/gabblin", { method: "DELETE" });
+        disposeLifecycleDisclosure();
+      });
+    });
+    actions.append(rotate, disconnect);
+    card.append(actions);
+    members.forEach((member) =>
+      card.append(
+        desktopRow(
+          member.displayName,
+          `${member.username} · last seen ${formatDate(member.lastSeenAt)}`,
+          element("span", "read-only-value", "Observed"),
+        ),
+      ),
+    );
+    return card;
+  }
+
+  function renderClientIntegrations() {
+    const inventory = state.clientIntegrations;
+    if (!inventory) {
+      settingsPage(
+        "Client Integrations",
+        "Loading Gabblin integration state…",
+        "link",
+      );
+      return;
+    }
+    const cards = [];
+    const disclosure = gabblinDisclosureCard();
+    if (disclosure) cards.push(disclosure);
+    cards.push(gabblinIntegrationCard(inventory.gabblin));
+    settingsPage(
+      "Client Integrations",
+      "Connect and manage apps that use RepoPrompt.",
+      "link",
+      cards,
+    );
   }
 
   function renderCLIProviders() {

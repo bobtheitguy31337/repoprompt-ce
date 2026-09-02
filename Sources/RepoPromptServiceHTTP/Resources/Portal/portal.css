@@ -1190,6 +1190,22 @@ input:disabled {
   text-align: right;
 }
 
+.lifecycle-secret {
+  box-sizing: border-box;
+  max-height: 14rem;
+  margin: 0.8rem 0;
+  padding: 0.8rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  background: var(--bg-control-strong);
+  border: 0.5px solid var(--border);
+  border-radius: var(--radius-8);
+  font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  user-select: all;
+}
+
 .recommended-value {
   color: var(--accent);
 }

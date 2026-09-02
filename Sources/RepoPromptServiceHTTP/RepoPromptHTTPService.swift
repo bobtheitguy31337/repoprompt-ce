@@ -150,6 +150,51 @@ public struct RepoPromptHTTPService: Sendable {
             let bootstrap = try await portalBootstrap(principal: principal)
             return try portalJSON(bootstrap)
         } }
+        router.get("/portal/api/v1/client-integrations") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(request: request, context: context)
+            let integration = try await store.gabblinIntegration()
+            let members = try await store.gabblinMembers()
+            return try portalJSON(PortalClientIntegrationInventory(
+                gabblin: PortalGabblinInventory(
+                    integration: integration.map {
+                        PortalGabblinIntegrationView(
+                            status: $0.status.rawValue,
+                            createdAt: $0.createdAt,
+                            updatedAt: $0.updatedAt,
+                            revokedAt: $0.revokedAt
+                        )
+                    },
+                    members: members.map {
+                        PortalGabblinMemberView(
+                            memberID: $0.memberID,
+                            username: $0.username,
+                            displayName: $0.displayName,
+                            firstSeenAt: $0.firstSeenAt,
+                            lastSeenAt: $0.lastSeenAt,
+                            profileObservedAt: $0.profileObservedAt
+                        )
+                    }
+                )
+            ))
+        } }
+        router.post("/portal/api/v1/client-integrations/gabblin") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            let issue = try await store.createGabblinIntegration()
+            return try portalJSON(PortalGabblinCredentialDisclosureResponse(token: issue.token), status: .created)
+        } }
+        router.post("/portal/api/v1/client-integrations/gabblin/rotate") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            let issue = try await store.rotateGabblinCredential()
+            return try portalJSON(PortalGabblinCredentialDisclosureResponse(token: issue.token))
+        } }
+        router.delete("/portal/api/v1/client-integrations/gabblin") { request, context in await portalRespond(request) {
+            _ = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            _ = try await store.revokeGabblinIntegration()
+            return portalEmpty()
+        } }
         router.post("/portal/api/v1/projects") { request, context in await portalRespond(request) {
             let principal = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request)
@@ -1803,6 +1848,35 @@ public struct RepoPromptHTTPService: Sendable {
             case projectID = "projectId"
             case sessionID = "sessionId"
         }
+    }
+
+    private struct PortalClientIntegrationInventory: Encodable {
+        let gabblin: PortalGabblinInventory
+    }
+
+    private struct PortalGabblinInventory: Encodable {
+        let integration: PortalGabblinIntegrationView?
+        let members: [PortalGabblinMemberView]
+    }
+
+    private struct PortalGabblinIntegrationView: Encodable {
+        let status: String
+        let createdAt: Date
+        let updatedAt: Date
+        let revokedAt: Date?
+    }
+
+    private struct PortalGabblinMemberView: Encodable {
+        let memberID: UUID
+        let username: String
+        let displayName: String
+        let firstSeenAt: Date
+        let lastSeenAt: Date
+        let profileObservedAt: Date
+    }
+
+    private struct PortalGabblinCredentialDisclosureResponse: Encodable {
+        let token: String
     }
 
     private struct PortalSetupRequest: Decodable {

@@ -1,7 +1,8 @@
 enum SchemaV6 {
     static let version = 6
-    static let digest = "repoprompt-service-schema-v6-typed-mcp-show-model-presets"
+    static let digest = "repoprompt-service-schema-v6-gabblin-client-integration"
     static let compatiblePriorDigests: Set<String> = [
+        "repoprompt-service-schema-v6-typed-mcp-show-model-presets",
         "repoprompt-service-schema-v6-typed-mcp-disabled-tools",
         "repoprompt-service-schema-v6-typed-workspace-approvals",
         "repoprompt-service-schema-v6-typed-direct-agent-permissions",
@@ -17,6 +18,11 @@ enum SchemaV6 {
         "CREATE TABLE IF NOT EXISTS workspace_approval_settings(fixed_id INTEGER PRIMARY KEY CHECK(fixed_id=1),settings_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",
         "CREATE TABLE IF NOT EXISTS mcp_disabled_tools(fixed_id INTEGER PRIMARY KEY CHECK(fixed_id=1),settings_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",
         "CREATE TABLE IF NOT EXISTS mcp_show_model_presets(fixed_id INTEGER PRIMARY KEY CHECK(fixed_id=1),settings_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS external_gabblin_integration(fixed_id INTEGER PRIMARY KEY CHECK(fixed_id=1),integration_id TEXT NOT NULL UNIQUE CHECK(length(integration_id)=36 AND lower(integration_id)=integration_id),workspace_id TEXT NOT NULL UNIQUE CHECK(length(CAST(workspace_id AS BLOB)) BETWEEN 1 AND 256),status TEXT NOT NULL CHECK(status IN ('active','revoked')),created_at REAL NOT NULL,updated_at REAL NOT NULL CHECK(updated_at>=created_at),revoked_at REAL,correlation_id TEXT NOT NULL CHECK(length(correlation_id)=36 AND lower(correlation_id)=correlation_id),CHECK((status='active' AND revoked_at IS NULL) OR (status='revoked' AND revoked_at IS NOT NULL)))",
+        "CREATE TABLE IF NOT EXISTS external_gabblin_credentials(credential_id TEXT PRIMARY KEY CHECK(length(credential_id)=36 AND lower(credential_id)=credential_id),integration_id TEXT NOT NULL REFERENCES external_gabblin_integration(integration_id) ON DELETE RESTRICT,secret_digest TEXT UNIQUE CHECK(secret_digest IS NULL OR (length(secret_digest)=64 AND secret_digest NOT GLOB '*[^0-9a-f]*')),issued_at REAL NOT NULL,last_used_at REAL NOT NULL CHECK(last_used_at>=issued_at),revoked_at REAL,revocation_reason TEXT,CHECK((secret_digest IS NOT NULL AND revoked_at IS NULL AND revocation_reason IS NULL) OR (secret_digest IS NULL AND revoked_at IS NOT NULL AND revocation_reason IS NOT NULL)))",
+        "CREATE UNIQUE INDEX IF NOT EXISTS external_gabblin_credentials_one_active ON external_gabblin_credentials(integration_id) WHERE secret_digest IS NOT NULL AND revoked_at IS NULL",
+        "CREATE TABLE IF NOT EXISTS external_gabblin_members(member_id TEXT PRIMARY KEY CHECK(length(member_id)=36 AND lower(member_id)=member_id),integration_id TEXT NOT NULL REFERENCES external_gabblin_integration(integration_id) ON DELETE RESTRICT,immutable_subject TEXT NOT NULL CHECK(length(CAST(immutable_subject AS BLOB)) BETWEEN 1 AND 128 AND immutable_subject NOT GLOB '*[^A-Za-z0-9_-]*'),display_name TEXT NOT NULL CHECK(length(CAST(display_name AS BLOB)) BETWEEN 1 AND 256),username TEXT NOT NULL CHECK(length(CAST(username AS BLOB)) BETWEEN 1 AND 128),first_seen_at REAL NOT NULL,last_seen_at REAL NOT NULL CHECK(last_seen_at>=first_seen_at),profile_observed_at REAL NOT NULL CHECK(profile_observed_at>=first_seen_at),UNIQUE(integration_id,immutable_subject))",
+        "CREATE INDEX IF NOT EXISTS external_gabblin_members_integration_seen ON external_gabblin_members(integration_id,last_seen_at)",
         "CREATE TABLE IF NOT EXISTS context_builder_settings(scope_id TEXT PRIMARY KEY,project_id TEXT,settings_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",
         "CREATE TABLE IF NOT EXISTS mcp_model_presets(fixed_id INTEGER PRIMARY KEY CHECK(fixed_id=1),presets_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",
         "CREATE TABLE IF NOT EXISTS advanced_server_settings(fixed_id INTEGER PRIMARY KEY CHECK(fixed_id=1),settings_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",
