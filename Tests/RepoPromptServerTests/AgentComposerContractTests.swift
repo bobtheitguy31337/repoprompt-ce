@@ -1606,6 +1606,8 @@ final class AgentTranscriptPresentationTests: XCTestCase {
         let helloAnchor = UUID()
         let testingAnchor = UUID()
         let spaceXAnchor = UUID()
+        let testingActor = ExternalActor(userID: "testing-user", username: "tester", displayName: "Testing User")
+        let spaceXActor = ExternalActor(userID: "space-x-user", username: "researcher", displayName: "SpaceX Researcher")
         let testingIdentity = CanonicalTurnIdentity(requestAnchorID: testingAnchor, runID: UUID(), generation: 2, turnEpoch: 2, turnID: UUID(), responseSpanID: UUID())
         let spaceXIdentity = CanonicalTurnIdentity(requestAnchorID: spaceXAnchor, runID: UUID(), generation: 3, turnEpoch: 3, turnID: UUID(), responseSpanID: UUID())
 
@@ -1619,10 +1621,10 @@ final class AgentTranscriptPresentationTests: XCTestCase {
 
         let legacy = [
             TranscriptEntry(entryID: helloAnchor, sessionSequence: 9, kind: .human, content: "hello?", actor: nil, timestamp: now),
-            TranscriptEntry(entryID: testingIdentity.turnID, sessionSequence: 10, kind: .human, content: "Testing", actor: nil, timestamp: now),
+            TranscriptEntry(entryID: UUID(), sessionSequence: 10, kind: .human, content: "Testing", actor: testingActor, timestamp: now),
             TranscriptEntry(entryID: UUID(), sessionSequence: 11, kind: .assistant, content: "Received", actor: nil, timestamp: now),
             TranscriptEntry(entryID: UUID(), sessionSequence: 17, kind: .assistant, content: "Received—everything's working.", actor: nil, timestamp: now),
-            TranscriptEntry(entryID: spaceXIdentity.turnID, sessionSequence: 18, kind: .human, content: "Tell me what SpaceX's stock did today", actor: nil, timestamp: now),
+            TranscriptEntry(entryID: UUID(), sessionSequence: 18, kind: .human, content: "Tell me what SpaceX's stock did today", actor: spaceXActor, timestamp: now),
             TranscriptEntry(entryID: UUID(), sessionSequence: 19, kind: .assistant, content: "I'll check", actor: nil, timestamp: now),
             TranscriptEntry(entryID: UUID(), sessionSequence: 69, kind: .assistant, content: "SpaceX", actor: nil, timestamp: now),
             TranscriptEntry(entryID: UUID(), sessionSequence: 195, kind: .assistant, content: "SpaceX is privately held.", actor: nil, timestamp: now),
@@ -1630,7 +1632,9 @@ final class AgentTranscriptPresentationTests: XCTestCase {
 
         let newest = try await service.page(sessionID: sessionID, actorID: "actor", legacyTranscript: legacy, limit: 2)
         XCTAssertEqual(newest.turns.compactMap(Self.requestText), ["Testing", "Tell me what SpaceX's stock did today"])
+        XCTAssertEqual(newest.turns.first { Self.requestText($0) == "Testing" }?.requestActor, testingActor)
         let spaceX = try XCTUnwrap(newest.turns.first { Self.requestText($0) == "Tell me what SpaceX's stock did today" })
+        XCTAssertEqual(spaceX.requestActor, spaceXActor)
         XCTAssertEqual(Self.assistantTexts(spaceX), ["SpaceX is privately held."])
 
         let token = try XCTUnwrap(newest.nextPageToken)

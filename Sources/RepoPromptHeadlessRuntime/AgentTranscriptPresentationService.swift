@@ -113,10 +113,7 @@ public actor AgentTranscriptPresentationService {
                 activities: presentationActivities,
                 interactions: attachedInteractions
             ))
-            let requestActor = legacyTranscript.first {
-                ($0.entryID == record.identity.requestAnchorID || $0.entryID == record.identity.turnID)
-                    && $0.kind == .human
-            }?.actor
+            let requestActor = Self.requestActor(for: record, in: legacyTranscript)
             units.append(.init(
                 sequence: record.firstSequence,
                 beforeSequence: record.firstSequence,
@@ -145,6 +142,15 @@ public actor AgentTranscriptPresentationService {
 
     nonisolated static func isActionable(_ interaction: InteractionSnapshot) -> Bool {
         interaction.state == .pending || interaction.state == .deliveryIntent
+    }
+
+    private static func requestActor(for record: SemanticTurnRecord, in transcript: [TranscriptEntry]) -> ExternalActor? {
+        transcript.first {
+            ($0.entryID == record.identity.requestAnchorID || $0.entryID == record.identity.turnID)
+                && $0.kind == .human
+        }?.actor ?? transcript.first {
+            $0.kind == .human && $0.sessionSequence == record.firstSequence
+        }?.actor
     }
 
     private static func legacyCoverage(for records: [SemanticTurnRecord], in transcript: [TranscriptEntry]) -> LegacyCoverage {
