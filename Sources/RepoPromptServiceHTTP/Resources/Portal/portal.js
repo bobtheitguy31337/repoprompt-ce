@@ -1672,117 +1672,124 @@
     return host;
   }
 
-  // Render the transcript's common Markdown without accepting raw HTML. This
-  // keeps provider output readable while preserving the portal's XSS boundary:
-  // every text fragment is still installed with textContent/createTextNode.
-  function renderMarkdown(source) {
-    const root = element("div", "presentation-row-content markdown-content");
-    const lines = String(source || "").replace(/\r\n?/g, "\n").split("\n");
-    let index = 0;
-    while (index < lines.length) {
-      const line = lines[index];
-      if (!line.trim()) {
-        index += 1;
-        continue;
-      }
-      const fence = line.match(/^\s*```\s*([\w.+-]*)\s*$/);
-      if (fence) {
-        const body = [];
-        index += 1;
-        while (index < lines.length && !/^\s*```\s*$/.test(lines[index]))
-          body.push(lines[index++]);
-        if (index < lines.length) index += 1;
-        const pre = element("pre", "markdown-code-block");
-        const code = element("code", "", body.join("\n"));
-        if (fence[1]) code.dataset.language = fence[1];
-        pre.append(code);
-        root.append(pre);
-        continue;
-      }
-      const heading = line.match(/^(#{1,4})\s+(.+)$/);
-      if (heading) {
-        const node = document.createElement(`h${heading[1].length + 2}`);
-        appendInlineMarkdown(node, heading[2]);
-        root.append(node);
-        index += 1;
-        continue;
-      }
-      const quote = line.match(/^\s*>\s?(.*)$/);
-      if (quote) {
-        const node = document.createElement("blockquote");
-        const parts = [];
-        while (index < lines.length) {
-          const match = lines[index].match(/^\s*>\s?(.*)$/);
-          if (!match) break;
-          parts.push(match[1]);
-          index += 1;
-        }
-        appendInlineMarkdown(node, parts.join("\n"));
-        root.append(node);
-        continue;
-      }
-      const listItem = line.match(/^\s*(?:([-+*])|(\d+)\.)\s+(.+)$/);
-      if (listItem) {
-        const ordered = Boolean(listItem[2]);
-        const list = document.createElement(ordered ? "ol" : "ul");
-        while (index < lines.length) {
-          const match = lines[index].match(/^\s*(?:([-+*])|(\d+)\.)\s+(.+)$/);
-          if (!match || Boolean(match[2]) !== ordered) break;
-          const item = document.createElement("li");
-          appendInlineMarkdown(item, match[3]);
-          list.append(item);
-          index += 1;
-        }
-        root.append(list);
-        continue;
-      }
-      const paragraph = [];
-      while (
-        index < lines.length &&
-        lines[index].trim() &&
-        !/^\s*```/.test(lines[index]) &&
-        !/^(#{1,4})\s+/.test(lines[index]) &&
-        !/^\s*>/.test(lines[index]) &&
-        !/^\s*(?:[-+*]|\d+\.)\s+/.test(lines[index])
-      )
-        paragraph.push(lines[index++]);
-      const node = document.createElement("p");
-      paragraph.forEach((part, partIndex) => {
-        if (partIndex) node.append(document.createElement("br"));
-        appendInlineMarkdown(node, part);
-      });
-      root.append(node);
-    }
-    return root;
+  const markdownRenderer = globalThis.marked
+    ? new globalThis.marked.Renderer()
+    : null;
+  if (markdownRenderer) {
+    // Provider-authored raw HTML is always shown as source text. Markdown syntax
+    // is rendered by marked, then the resulting DOM is constrained below.
+    markdownRenderer.html = (html) => escapeHTML(html);
   }
 
-  function appendInlineMarkdown(host, source) {
-    const pattern = /(`[^`\n]+`|\[[^\]\n]+\]\([^\s)]+\)|\*\*[^*\n]+\*\*|__[^_\n]+__|\*[^*\n]+\*|_[^_\n]+_)/g;
-    const text = String(source || "");
-    let cursor = 0;
-    for (const match of text.matchAll(pattern)) {
-      host.append(document.createTextNode(text.slice(cursor, match.index)));
-      const token = match[0];
-      if (token.startsWith("`")) {
-        host.append(element("code", "", token.slice(1, -1)));
-      } else if (token.startsWith("[")) {
-        const parsed = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-        const href = parsed?.[2] || "";
-        if (parsed && /^(https?:|mailto:)/i.test(href)) {
-          const link = element("a", "", parsed[1]);
-          link.href = href;
-          link.rel = "noopener noreferrer";
-          if (/^https?:/i.test(href)) link.target = "_blank";
-          host.append(link);
-        } else host.append(document.createTextNode(token));
-      } else if (token.startsWith("**") || token.startsWith("__")) {
-        host.append(element("strong", "", token.slice(2, -2)));
-      } else {
-        host.append(element("em", "", token.slice(1, -1)));
-      }
-      cursor = match.index + token.length;
+  const markdownElements = new Set([
+    "a",
+    "blockquote",
+    "br",
+    "code",
+    "del",
+    "em",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "hr",
+    "img",
+    "input",
+    "li",
+    "ol",
+    "p",
+    "pre",
+    "strong",
+    "table",
+    "tbody",
+    "td",
+    "th",
+    "thead",
+    "tr",
+    "ul",
+  ]);
+
+  function escapeHTML(source) {
+    return String(source || "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+  }
+
+  function safeMarkdownURL(value, kind) {
+    try {
+      const resolved = new URL(value, window.location.href);
+      if (kind === "link" && ["http:", "https:", "mailto:"].includes(resolved.protocol))
+        return resolved.href;
+      if (
+        kind === "image" &&
+        (resolved.origin === window.location.origin ||
+          (resolved.protocol === "data:" && /^data:image\/(?:png|jpeg|gif|webp);/i.test(value)))
+      )
+        return resolved.href;
+    } catch {
+      return null;
     }
-    host.append(document.createTextNode(text.slice(cursor)));
+    return null;
+  }
+
+  function sanitizeMarkdown(root) {
+    [...root.querySelectorAll("*")].forEach((node) => {
+      const tag = node.tagName.toLowerCase();
+      if (!markdownElements.has(tag)) {
+        node.replaceWith(document.createTextNode(node.textContent || ""));
+        return;
+      }
+      const href = tag === "a" ? safeMarkdownURL(node.getAttribute("href") || "", "link") : null;
+      const src = tag === "img" ? safeMarkdownURL(node.getAttribute("src") || "", "image") : null;
+      const language = tag === "code" ? (node.getAttribute("class") || "").match(/^language-[A-Za-z0-9_+.-]+$/)?.[0] : null;
+      const checked = tag === "input" && node.getAttribute("checked") !== null;
+      [...node.attributes].forEach((attribute) => node.removeAttribute(attribute.name));
+      if (href) {
+        node.setAttribute("href", href);
+        node.setAttribute("rel", "noopener noreferrer");
+        if (/^https?:/i.test(href)) node.setAttribute("target", "_blank");
+      }
+      if (src) {
+        node.setAttribute("src", src);
+        node.setAttribute("alt", "");
+        node.setAttribute("loading", "lazy");
+      }
+      if (language) node.setAttribute("class", language);
+      if (tag === "input") {
+        node.setAttribute("type", "checkbox");
+        node.setAttribute("disabled", "");
+        if (checked) node.setAttribute("checked", "");
+      }
+    });
+    root.querySelectorAll("table").forEach((table) => {
+      const wrapper = element("div", "markdown-table-scroll");
+      table.replaceWith(wrapper);
+      wrapper.append(table);
+    });
+  }
+
+  // Use the same mature GFM parser family as Gabblin. The DOM allowlist keeps
+  // provider output inside the portal's existing no-raw-HTML security boundary.
+  function renderMarkdown(source) {
+    const root = element("div", "presentation-row-content markdown-content");
+    if (!markdownRenderer || !globalThis.marked) {
+      root.textContent = String(source || "");
+      return root;
+    }
+    root.innerHTML = globalThis.marked.parse(String(source || ""), {
+      breaks: true,
+      gfm: true,
+      headerIds: false,
+      mangle: false,
+      renderer: markdownRenderer,
+    });
+    sanitizeMarkdown(root);
+    return root;
   }
 
   function parseToolPayload(raw) {

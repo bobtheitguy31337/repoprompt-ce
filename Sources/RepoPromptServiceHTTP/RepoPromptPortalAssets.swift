@@ -6,6 +6,7 @@ public enum RepoPromptPortalAssets {
     public enum Asset: String, CaseIterable, Sendable {
         case index = "index.html"
         case stylesheet = "portal.css"
+        case markdownRenderer = "marked.min.js"
         case script = "portal.js"
         case appIcon = "repoprompt-icon.png"
 
@@ -17,7 +18,7 @@ public enum RepoPromptPortalAssets {
             switch self {
             case .index: "text/html; charset=utf-8"
             case .stylesheet: "text/css; charset=utf-8"
-            case .script: "text/javascript; charset=utf-8"
+            case .markdownRenderer, .script: "text/javascript; charset=utf-8"
             case .appIcon: "image/png"
             }
         }
