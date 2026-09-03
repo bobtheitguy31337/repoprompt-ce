@@ -591,6 +591,54 @@
     </div>
 
     <div
+      id="rename-session-dialog"
+      class="modal-backdrop"
+      role="presentation"
+      hidden
+    >
+      <section
+        class="rename-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="rename-session-title"
+        tabindex="-1"
+      >
+        <div
+          class="dialog-icon rename-icon"
+          data-icon="pencil"
+          aria-hidden="true"
+        ></div>
+        <h2 id="rename-session-title">Rename Chat</h2>
+        <form id="rename-session-form">
+          <label for="rename-session-input">Name</label>
+          <input
+            id="rename-session-input"
+            type="text"
+            maxlength="200"
+            autocomplete="off"
+            required
+          />
+          <div class="dialog-actions">
+            <button
+              type="button"
+              class="secondary-button"
+              data-action="cancel-session-rename"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              id="rename-session-button"
+              class="primary-button"
+            >
+              Rename
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <div
       id="toast-region"
       class="toast-region"
       aria-live="polite"
@@ -603,6 +651,6 @@
       aria-atomic="true"
     ></div>
     <script src="assets/marked.min.js?fresh=1" defer></script>
-    <script src="assets/portal.js?fresh=3" defer></script>
+    <script src="assets/portal.js?fresh=4" defer></script>
   </body>
 </html>

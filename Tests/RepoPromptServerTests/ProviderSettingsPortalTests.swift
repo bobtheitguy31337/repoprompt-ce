@@ -587,7 +587,21 @@ final class ProviderSettingsPortalTests: XCTestCase {
             session(unrelatedRootID, parentSessionID: nil, rootSessionID: unrelatedRootID, activity: 35),
         ]
 
-        let projected = RepoPromptPortalSessionProjection.sidebarSessions(sessions, controls: [:])
+        let renamedAgent = AgentSnapshot(
+            agentID: parentID,
+            sessionID: parentID,
+            rootSessionID: parentID,
+            parentAgentID: nil,
+            role: "root",
+            label: "Renamed parent",
+            state: .completed,
+            revision: 4
+        )
+        let projected = RepoPromptPortalSessionProjection.sidebarSessions(
+            sessions,
+            controls: [:],
+            agents: [parentID: renamedAgent]
+        )
 
         XCTAssertEqual(
             projected.map(\.sessionID),
@@ -595,16 +609,20 @@ final class ProviderSettingsPortalTests: XCTestCase {
         )
         XCTAssertEqual(projected.map(\.sidebarDepth), [0, 1, 2, 1, 0])
         XCTAssertEqual(projected.map(\.effectiveContextWindowTokens), Array(repeating: 200_000, count: 5))
+        XCTAssertEqual(projected[0].title, "Renamed parent")
+        XCTAssertEqual(projected[0].agentRevision, 4)
 
         var legacyObject = try XCTUnwrap(
             JSONSerialization.jsonObject(with: JSONEncoder.serviceEncoder.encode(projected[0])) as? [String: Any]
         )
         legacyObject.removeValue(forKey: "sidebarDepth")
         legacyObject.removeValue(forKey: "effectiveContextWindowTokens")
+        legacyObject.removeValue(forKey: "agentRevision")
         let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
         let legacySummary = try JSONDecoder.serviceDecoder.decode(PortalSessionSummary.self, from: legacyData)
         XCTAssertEqual(legacySummary.sidebarDepth, 0)
         XCTAssertEqual(legacySummary.effectiveContextWindowTokens, 0)
+        XCTAssertEqual(legacySummary.agentRevision, 0)
 
         let cycleA = UUID()
         let cycleB = UUID()

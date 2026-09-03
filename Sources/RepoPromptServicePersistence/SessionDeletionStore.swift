@@ -9,9 +9,28 @@ extension SQLiteServiceStore {
     public func deleteSession(
         tombstone: SessionSnapshot,
         actor: ExternalActor?,
-        correlationID: UUID
+        correlationID: UUID,
+        idempotency: IdempotencyInput? = nil,
+        expectedRevision: Int64? = nil,
+        idempotencyResponse: Data? = nil
     ) async throws -> EventEnvelope {
         try await transaction {
+            if let idempotency, let existing = try await existingIdempotency(idempotency) {
+                throw ExistingIdempotency(existing)
+            }
+            if let expectedRevision {
+                let observed = try await Int64(connection.query(
+                    "SELECT revision FROM sessions WHERE session_id=?",
+                    [.text(tombstone.sessionID.uuidString)]
+                ).first?.column("revision")?.integer ?? 0)
+                guard observed == expectedRevision, tombstone.revision == expectedRevision + 1 else {
+                    throw ServiceAPIError(
+                        code: .staleRevision,
+                        message: "Session revision is stale",
+                        currentRevision: observed
+                    )
+                }
+            }
             let event = try await persistSessionInTransaction(
                 tombstone,
                 eventType: .sessionRemoved,
@@ -55,6 +74,13 @@ extension SQLiteServiceStore {
             )
             _ = try await connection.query("DELETE FROM session_event_counters WHERE session_id=?", [ID])
             _ = try await connection.query("DELETE FROM sessions WHERE session_id=?", [ID])
+            if let idempotency {
+                try await saveIdempotency(
+                    idempotency,
+                    status: 200,
+                    response: idempotencyResponse ?? encoder.encode([tombstone.sessionID])
+                )
+            }
             return event
         }
     }

@@ -122,6 +122,9 @@
       runClockTimer: null,
       actionPromise: null,
       actionName: null,
+      sessionMutationPromise: null,
+      renameSessionID: null,
+      renameReturnFocus: null,
     },
   };
 
@@ -210,6 +213,7 @@
     folder: '<path d="M1.5 4h5l1.4 1.5h6.6v7.5h-13z"/>',
     document: '<path d="M3 1.5h6l4 4V14.5H3zM9 1.5v4h4M5.5 9h5M5.5 11.5h4"/>',
     pencil: '<path d="m3 11 8.5-8.5 2 2L5 13l-3 .8zM10 4l2 2"/>',
+    trash: '<path d="M3 4h10M6 2h4l1 2M4.5 4l.7 10h5.6l.7-10M6.7 6.5v5M9.3 6.5v5"/>',
     globe: '<circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c2 1.7 3 3.7 3 6s-1 4.3-3 6c-2-1.7-3-3.7-3-6s1-4.3 3-6z"/>',
     branch: '<circle cx="4" cy="3" r="1.5"/><circle cx="12" cy="5" r="1.5"/><circle cx="4" cy="13" r="1.5"/><path d="M4 4.5v7M5.5 10c4.3 0 3-5 5-5"/>',
     selection: '<circle cx="8" cy="8" r="6"/><path d="m5 8 2 2 4-4"/>',
@@ -1021,15 +1025,16 @@
     sessions.forEach((session) => {
       const depth = session.sidebarDepth || 0;
       const displayState = session.agentControl?.displayState || session.state;
-      const button = element("button", `session-row depth-${depth}`);
-      button.type = "button";
-      button.dataset.sessionId = session.sessionId;
-      button.dataset.action = "select-session";
+      const row = element("div", `session-row depth-${depth}`);
+      row.dataset.sessionId = session.sessionId;
+      const select = element("button", "session-row-select");
+      select.type = "button";
+      select.dataset.action = "select-session";
       const active =
         !state.agent.newSessionMode &&
         session.sessionId === state.agent.selectedSessionID;
-      button.classList.toggle("active", active);
-      if (active) button.setAttribute("aria-current", "true");
+      row.classList.toggle("active", active);
+      if (active) select.setAttribute("aria-current", "true");
       const plate = element("span", `session-status-plate ${displayState}`);
       plate.setAttribute("aria-hidden", "true");
       plate.append(element("i"));
@@ -1042,15 +1047,197 @@
           `${humanize(session.provider)}${session.model ? ` · ${session.model}` : ""}`,
         ),
       );
-      button.append(
+      select.append(
         plate,
         copy,
         element("span", "session-row-state", humanize(displayState)),
       );
-      button.addEventListener("click", () => selectSession(session.sessionId));
-      list.append(button);
+      select.addEventListener("click", () => selectSession(session.sessionId));
+
+      const actions = element("span", "session-row-actions");
+      const rename = element("button", "session-row-action");
+      rename.type = "button";
+      rename.setAttribute("aria-label", `Rename ${session.title || "chat"}`);
+      rename.title = "Rename chat";
+      setIcon(rename, "pencil");
+      rename.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openSessionRename(session, rename);
+      });
+      const remove = element("button", "session-row-action delete");
+      remove.type = "button";
+      remove.setAttribute("aria-label", `Delete ${session.title || "chat"}`);
+      remove.title = "Delete chat";
+      setIcon(remove, "trash");
+      remove.addEventListener("click", (event) => {
+        event.stopPropagation();
+        deleteSessionFromSidebar(session, remove);
+      });
+      const mutating = Boolean(state.agent.sessionMutationPromise);
+      rename.disabled = mutating;
+      remove.disabled = mutating;
+      actions.append(rename, remove);
+      row.append(select, actions);
+      list.append(row);
     });
     list.setAttribute("aria-busy", "false");
+  }
+
+  function openSessionRename(session, returnFocus) {
+    if (state.agent.sessionMutationPromise) return;
+    state.agent.renameSessionID = session.sessionId;
+    state.agent.renameReturnFocus = returnFocus;
+    const input = document.getElementById("rename-session-input");
+    input.value = session.title || "Agent Session";
+    const backdrop = document.getElementById("rename-session-dialog");
+    backdrop.hidden = false;
+    window.setTimeout(() => {
+      input.focus({ preventScroll: true });
+      input.select();
+    }, 0);
+  }
+
+  function closeSessionRename({ restoreFocus = true } = {}) {
+    const returnFocus = state.agent.renameReturnFocus;
+    state.agent.renameSessionID = null;
+    state.agent.renameReturnFocus = null;
+    document.getElementById("rename-session-dialog").hidden = true;
+    if (restoreFocus && returnFocus?.isConnected)
+      returnFocus.focus({ preventScroll: true });
+  }
+
+  async function submitSessionRename() {
+    if (state.agent.sessionMutationPromise)
+      return state.agent.sessionMutationPromise;
+    const session = (state.bootstrap?.sessions || []).find(
+      (item) => item.sessionId === state.agent.renameSessionID,
+    );
+    const input = document.getElementById("rename-session-input");
+    const name = input.value.trim().replace(/\s+/g, " ");
+    if (!session || !name) {
+      input.setCustomValidity(
+        name ? "The session is no longer available." : "Enter a name.",
+      );
+      input.reportValidity();
+      return null;
+    }
+    input.setCustomValidity("");
+    const operationID = operationIDFor({
+      action: "rename-session",
+      sessionId: session.sessionId,
+      agentRevision: session.agentRevision,
+      name,
+    });
+    if (!operationID) {
+      toast("This browser cannot create secure operation identifiers.", true);
+      return null;
+    }
+    const submit = document.getElementById("rename-session-button");
+    submit.disabled = true;
+    input.disabled = true;
+    let renamedSuccessfully = false;
+    state.agent.sessionMutationPromise = (async () => {
+      try {
+        const renamed = await api(
+          `api/v1/sessions/${encodeURIComponent(session.sessionId)}`,
+          {
+            method: "PATCH",
+            body: JSON.stringify({
+              operationId: operationID,
+              expectedAgentRevision: session.agentRevision,
+              name,
+            }),
+          },
+        );
+        session.title = renamed.title;
+        session.agentRevision = renamed.agentRevision;
+        state.agent.retryOperation = null;
+        renamedSuccessfully = true;
+        closeSessionRename({ restoreFocus: false });
+        renderAgentDetail();
+        toast("Chat renamed");
+      } catch (error) {
+        toast(error.message, true);
+        if (error.code === "staleRevision") await loadAll(false);
+      } finally {
+        state.agent.sessionMutationPromise = null;
+        submit.disabled = false;
+        input.disabled = false;
+        renderSessions();
+        if (renamedSuccessfully) {
+          document
+            .querySelector(
+              `[data-session-id="${session.sessionId}"] .session-row-select`,
+            )
+            ?.focus({ preventScroll: true });
+        }
+      }
+    })();
+    return state.agent.sessionMutationPromise;
+  }
+
+  function sessionDescendantCount(sessionID) {
+    const children = new Map();
+    (state.bootstrap?.sessions || []).forEach((session) => {
+      if (!session.parentSessionId) return;
+      const current = children.get(session.parentSessionId) || [];
+      current.push(session.sessionId);
+      children.set(session.parentSessionId, current);
+    });
+    const visited = new Set([sessionID]);
+    const pending = [...(children.get(sessionID) || [])];
+    while (pending.length) {
+      const child = pending.pop();
+      if (visited.has(child)) continue;
+      visited.add(child);
+      pending.push(...(children.get(child) || []));
+    }
+    return visited.size - 1;
+  }
+
+  async function deleteSessionFromSidebar(session, returnFocus) {
+    if (state.agent.sessionMutationPromise) return;
+    const descendants = sessionDescendantCount(session.sessionId);
+    const accepted = await confirmAction({
+      title: "Delete Chat?",
+      message: descendants
+        ? `This permanently deletes “${session.title}” and ${descendants} sub-agent chat${descendants === 1 ? "" : "s"}. This cannot be undone.`
+        : `This permanently deletes “${session.title}”. This cannot be undone.`,
+      label: "Delete",
+      returnFocus,
+    });
+    if (!accepted) return;
+    const operationID = operationIDFor({
+      action: "delete-session",
+      sessionId: session.sessionId,
+      revision: session.revision,
+    });
+    if (!operationID) {
+      toast("This browser cannot create secure operation identifiers.", true);
+      return;
+    }
+    state.agent.sessionMutationPromise = (async () => {
+      renderSessions();
+      try {
+        await api(`api/v1/sessions/${encodeURIComponent(session.sessionId)}`, {
+          method: "DELETE",
+          body: JSON.stringify({
+            operationId: operationID,
+            expectedRevision: session.revision,
+          }),
+        });
+        state.agent.retryOperation = null;
+        await loadAll(false);
+        toast("Chat deleted");
+      } catch (error) {
+        toast(error.message, true);
+        if (error.code === "staleRevision") await loadAll(false);
+      } finally {
+        state.agent.sessionMutationPromise = null;
+        renderSessions();
+      }
+    })();
+    return state.agent.sessionMutationPromise;
   }
 
   function selectProject(projectID) {
@@ -9205,8 +9392,11 @@
   }
 
   function trapDialogFocus(event) {
-    const backdrop = document.getElementById("confirm-dialog");
-    if (backdrop.hidden || event.key !== "Tab") return;
+    const backdrop = [
+      document.getElementById("rename-session-dialog"),
+      document.getElementById("confirm-dialog"),
+    ].find((candidate) => !candidate.hidden);
+    if (!backdrop || event.key !== "Tab") return;
     const focusable = [
       ...backdrop.querySelectorAll(
         'button:not(:disabled), [href], [tabindex]:not([tabindex="-1"])',
@@ -9332,6 +9522,7 @@
     } else if (action === "close-settings-drawer") closeSettingsDrawer();
     else if (action === "cancel-confirm") closeConfirm(false);
     else if (action === "accept-confirm") closeConfirm(true);
+    else if (action === "cancel-session-rename") closeSessionRename();
   }
 
   function handleDocumentKeydown(event) {
@@ -9358,6 +9549,11 @@
       }
     }
     if (event.key !== "Escape") return;
+    if (!document.getElementById("rename-session-dialog").hidden) {
+      event.preventDefault();
+      closeSessionRename();
+      return;
+    }
     if (!document.getElementById("confirm-dialog").hidden) {
       event.preventDefault();
       closeConfirm(false);
@@ -9435,6 +9631,16 @@
         document.getElementById("clear-session-search").hidden =
           !event.target.value;
         renderSessions();
+      });
+    const renameSessionInput = document.getElementById("rename-session-input");
+    renameSessionInput.addEventListener("input", () =>
+      renameSessionInput.setCustomValidity(""),
+    );
+    document
+      .getElementById("rename-session-form")
+      .addEventListener("submit", (event) => {
+        event.preventDefault();
+        submitSessionRename();
       });
     document
       .getElementById("project-selector")

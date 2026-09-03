@@ -383,15 +383,23 @@ public struct RepoPromptHTTPService: Sendable {
         router.get("/external/v1/sessions/:id/children") { request, context in await portalRespond(request) {
             let actor = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
-            _ = try await authority.sessionSnapshot(sessionID: sessionID)
+            let parent = try await authority.sessionSnapshot(sessionID: sessionID)
             let children = try await authority.childSessionSnapshots(parentSessionID: sessionID)
             let controls = try await authority.agentSessionActionSnapshots(
                 sessionIDs: children.map(\.sessionID),
                 actor: actor,
                 composerAvailable: composerCatalog != nil
             )
+            let agents = try await authority.agentSnapshots(rootSessionID: parent.rootSessionID)
+            let agentsBySessionID = Dictionary(uniqueKeysWithValues: agents.map { ($0.sessionID, $0) })
             let summaries = children.map {
-                RepoPromptPortalSessionProjection.project($0, agentControl: controls[$0.sessionID])
+                let agent = agentsBySessionID[$0.sessionID]
+                return RepoPromptPortalSessionProjection.project(
+                    $0,
+                    title: agent?.label,
+                    agentRevision: agent?.revision ?? 0,
+                    agentControl: controls[$0.sessionID]
+                )
             }
             return try await portalJSON(page(
                 summaries,
@@ -1004,6 +1012,48 @@ public struct RepoPromptHTTPService: Sendable {
                 RepoPromptPortalSessionProjection.project(snapshot, agentControl: control),
                 status: .accepted
             )
+        } }
+        router.patch("/portal/api/v1/sessions/:id") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(PortalRenameSessionRequest.self, from: data)
+            let agent = try await authority.renameSessionLabel(
+                sessionID: sessionID,
+                name: input.name,
+                actor: principal.externalActor,
+                expectedAgentRevision: input.expectedAgentRevision,
+                idempotencyKey: portalIdempotencyKey(principal: principal, operationID: input.operationID),
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            let session = try await authority.sessionSnapshot(sessionID: sessionID)
+            let control = try await authority.agentSessionActionSnapshot(
+                sessionID: sessionID,
+                actor: principal.externalActor,
+                composerAvailable: composerCatalog != nil
+            )
+            return try portalJSON(RepoPromptPortalSessionProjection.project(
+                session,
+                title: agent.label,
+                agentRevision: agent.revision,
+                agentControl: control
+            ))
+        } }
+        router.delete("/portal/api/v1/sessions/:id") { request, context in await portalRespond(request) {
+            let principal = try await authenticatePortal(request: request, context: context)
+            try validatePortalMutation(request)
+            let sessionID = try context.parameters.require("id", as: UUID.self)
+            let data = try await bodyData(request)
+            let input = try JSONDecoder.serviceDecoder.decode(PortalDeleteSessionRequest.self, from: data)
+            let deletedSessionIDs = try await authority.deleteSessionTree(
+                sessionID: sessionID,
+                expectedRevision: input.expectedRevision,
+                actor: principal.externalActor,
+                idempotencyKey: portalIdempotencyKey(principal: principal, operationID: input.operationID),
+                requestDigest: CanonicalSigning.bodyDigest(data)
+            )
+            return try portalJSON(PortalDeleteSessionResponse(deletedSessionIDs: deletedSessionIDs))
         } }
         router.post("/portal/api/v1/agent-sessions") { request, context in await portalRespond(request) {
             let principal = try await authenticatePortal(request: request, context: context)
@@ -2890,9 +2940,12 @@ public struct RepoPromptHTTPService: Sendable {
             actor: principal.externalActor,
             composerAvailable: composerCatalog != nil
         )
+        let agents = try await authority.agentSnapshots()
+        let agentsBySessionID = Dictionary(uniqueKeysWithValues: agents.map { ($0.sessionID, $0) })
         return RepoPromptPortalSessionProjection.sidebarSessions(
             snapshots,
-            controls: controls
+            controls: controls,
+            agents: agentsBySessionID
         )
     }
 
@@ -2908,7 +2961,13 @@ public struct RepoPromptHTTPService: Sendable {
             actor: actor,
             composerAvailable: composerCatalog != nil
         )
-        let sessions = RepoPromptPortalSessionProjection.sidebarSessions(snapshots, controls: controls)
+        let agents = try await authority.agentSnapshots()
+        let agentsBySessionID = Dictionary(uniqueKeysWithValues: agents.map { ($0.sessionID, $0) })
+        let sessions = RepoPromptPortalSessionProjection.sidebarSessions(
+            snapshots,
+            controls: controls,
+            agents: agentsBySessionID
+        )
         let workflowRepository = try await authority.workflowRepositorySnapshot()
         let workflows = try await authority.workflowSnapshots().map {
             PortalWorkflowSummary(

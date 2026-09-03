@@ -16,6 +16,9 @@ final class ClientIntegrationHTTPTests: XCTestCase {
         XCTAssertTrue(script.contains("Connect an app to RepoPrompt."))
         XCTAssertTrue(script.contains("eventType.startsWith(\"session.\")"))
         XCTAssertTrue(script.contains("eventRefreshNeedsBootstrap"))
+        XCTAssertTrue(script.contains("openSessionRename"))
+        XCTAssertTrue(script.contains("deleteSessionFromSidebar"))
+        XCTAssertTrue(html.contains("rename-session-dialog"))
         XCTAssertFalse(script.localizedCaseInsensitiveContains("gabblin"))
         XCTAssertFalse(html.localizedCaseInsensitiveContains("gabblin"))
     }

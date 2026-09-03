@@ -150,7 +150,7 @@ final class PortalOperatorOnboardingTests: XCTestCase {
         }
     }
 
-    func testOperatorProjectLifecycleAndSessionArchiveUseSharedAuthority() async throws {
+    func testOperatorProjectAndSessionLifecycleUseSharedAuthority() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
         let authority = RepoPromptHeadlessAuthority(store: store)
@@ -233,6 +233,53 @@ final class PortalOperatorOnboardingTests: XCTestCase {
                 requestDigest: CanonicalSigning.bodyDigest(Data("session".utf8))
             )
 
+            var bootstrap: PortalBootstrapResponse?
+            try await client.execute(
+                uri: "/portal/api/v1/bootstrap",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                bootstrap = try JSONDecoder.serviceDecoder.decode(
+                    PortalBootstrapResponse.self,
+                    from: Data(response.body.readableBytesView)
+                )
+            }
+            let initialSession = try XCTUnwrap(
+                bootstrap?.sessions.first(where: { $0.sessionID == session.sessionID })
+            )
+            XCTAssertEqual(initialSession.agentRevision, 1)
+
+            let renameSession = PortalRenameSessionRequest(
+                operationID: UUID(),
+                expectedAgentRevision: initialSession.agentRevision,
+                name: "  Portal   chat  "
+            )
+            let renameSessionData = try JSONEncoder.serviceEncoder.encode(renameSession)
+            var renamedSession: PortalSessionSummary?
+            try await client.execute(
+                uri: "/portal/api/v1/sessions/\(session.sessionID.uuidString)",
+                method: .patch,
+                headers: headers,
+                body: ByteBuffer(data: renameSessionData)
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                renamedSession = try JSONDecoder.serviceDecoder.decode(
+                    PortalSessionSummary.self,
+                    from: Data(response.body.readableBytesView)
+                )
+            }
+            XCTAssertEqual(renamedSession?.title, "Portal chat")
+            XCTAssertEqual(renamedSession?.agentRevision, 2)
+            try await client.execute(
+                uri: "/portal/api/v1/sessions/\(session.sessionID.uuidString)",
+                method: .patch,
+                headers: headers,
+                body: ByteBuffer(data: renameSessionData)
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+
             let rename = PortalRenameProjectRequest(
                 operationID: UUID(),
                 expectedRevision: project.revision,
@@ -267,6 +314,39 @@ final class PortalOperatorOnboardingTests: XCTestCase {
             }
             let archived = try await authority.sessionSnapshot(sessionID: session.sessionID)
             XCTAssertEqual(archived.state, .archived)
+
+            let delete = PortalDeleteSessionRequest(
+                operationID: UUID(),
+                expectedRevision: archived.revision
+            )
+            let deleteData = try JSONEncoder.serviceEncoder.encode(delete)
+            try await client.execute(
+                uri: "/portal/api/v1/sessions/\(session.sessionID.uuidString)",
+                method: .delete,
+                headers: headers,
+                body: ByteBuffer(data: deleteData)
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                let result = try JSONDecoder.serviceDecoder.decode(
+                    PortalDeleteSessionResponse.self,
+                    from: Data(response.body.readableBytesView)
+                )
+                XCTAssertEqual(result.deletedSessionIDs, [session.sessionID])
+            }
+            try await client.execute(
+                uri: "/portal/api/v1/sessions/\(session.sessionID.uuidString)",
+                method: .delete,
+                headers: headers,
+                body: ByteBuffer(data: deleteData)
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+            do {
+                _ = try await authority.sessionSnapshot(sessionID: session.sessionID)
+                XCTFail("Deleted session remained available")
+            } catch let error as ServiceAPIError {
+                XCTAssertEqual(error.code, .notFound)
+            }
 
             let remove = PortalRemoveProjectRequest(
                 operationID: UUID(),

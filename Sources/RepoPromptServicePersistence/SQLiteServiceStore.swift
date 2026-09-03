@@ -394,9 +394,43 @@ public actor SQLiteServiceStore {
         }
     }
 
-    public func persistAgent(_ snapshot: AgentSnapshot, projectID: UUID, actor: ExternalActor?, correlationID: UUID, eventType: EventType) async throws -> EventEnvelope {
+    public func persistAgent(
+        _ snapshot: AgentSnapshot,
+        projectID: UUID,
+        actor: ExternalActor?,
+        correlationID: UUID,
+        eventType: EventType,
+        idempotency: IdempotencyInput? = nil,
+        expectedRevision: Int64? = nil
+    ) async throws -> EventEnvelope {
         try await transaction {
-            try await persistAgentInTransaction(snapshot, projectID: projectID, actor: actor, correlationID: correlationID, eventType: eventType)
+            if let idempotency, let existing = try await existingIdempotency(idempotency) {
+                throw ExistingIdempotency(existing)
+            }
+            if let expectedRevision {
+                let observed = try await Int64(connection.query(
+                    "SELECT revision FROM agents WHERE session_id=?",
+                    [.text(snapshot.sessionID.uuidString)]
+                ).first?.column("revision")?.integer ?? 0)
+                guard observed == expectedRevision, snapshot.revision == expectedRevision + 1 else {
+                    throw ServiceAPIError(
+                        code: .staleRevision,
+                        message: "Agent revision is stale",
+                        currentRevision: observed
+                    )
+                }
+            }
+            let event = try await persistAgentInTransaction(
+                snapshot,
+                projectID: projectID,
+                actor: actor,
+                correlationID: correlationID,
+                eventType: eventType
+            )
+            if let idempotency {
+                try await saveIdempotency(idempotency, status: 200, response: encoder.encode(snapshot))
+            }
+            return event
         }
     }
 
@@ -1934,7 +1968,7 @@ public struct ExistingIdempotency: Error, Sendable { public let response: Data
     }
 }
 
-private extension SQLiteServiceStore {
+extension SQLiteServiceStore {
     func existingIdempotency(_ input: IdempotencyInput) async throws -> (Data, Int)? {
         guard let row = try await connection.query("SELECT request_digest,response_body,status FROM idempotency_records WHERE actor_id=? AND operation=? AND idempotency_key=?", [.text(input.actorID), .text(input.operation), .text(input.key)]).first else { return nil }
         guard row.column("request_digest")?.string == input.requestDigest else { throw ServiceAPIError(code: .idempotencyConflict, message: "Idempotency key was used with a different request") }

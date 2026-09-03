@@ -33,6 +33,8 @@ enum RepoPromptPortalSessionProjection {
 
     static func project(
         _ session: SessionSnapshot,
+        title: String? = nil,
+        agentRevision: Int64 = 0,
         agentControl: AgentSessionActionSnapshotWire? = nil,
         sidebarDepth: Int = 0
     ) -> PortalSessionSummary {
@@ -40,12 +42,13 @@ enum RepoPromptPortalSessionProjection {
             sessionID: session.sessionID,
             projectID: session.projectID,
             parentSessionID: session.parentSessionID,
-            title: title(for: session),
+            title: normalizedTitle(title) ?? self.title(for: session),
             provider: session.provider,
             providerSettingsID: session.providerSettingsID,
             model: session.model,
             state: session.state,
             revision: session.revision,
+            agentRevision: agentRevision,
             runGeneration: session.runGeneration,
             turnEpoch: session.turnEpoch,
             lastActivityAt: session.transcript.last?.timestamp,
@@ -68,7 +71,8 @@ enum RepoPromptPortalSessionProjection {
     /// second session-list state machine.
     static func sidebarSessions(
         _ sessions: [SessionSnapshot],
-        controls: [UUID: AgentSessionActionSnapshotWire]
+        controls: [UUID: AgentSessionActionSnapshotWire],
+        agents: [UUID: AgentSnapshot] = [:]
     ) -> [PortalSessionSummary] {
         let base = sessions.sorted { left, right in
             let leftActivity = left.transcript.last?.timestamp ?? .distantPast
@@ -119,8 +123,11 @@ enum RepoPromptPortalSessionProjection {
         result.reserveCapacity(base.count)
         func emit(_ index: Int, depth: Int) {
             let session = base[index]
+            let agent = agents[session.sessionID]
             result.append(project(
                 session,
+                title: agent?.label,
+                agentRevision: agent?.revision ?? 0,
                 agentControl: controls[session.sessionID],
                 sidebarDepth: min(depth, 6)
             ))
@@ -155,6 +162,13 @@ enum RepoPromptPortalSessionProjection {
         return normalized.count > prefix.count ? "\(prefix)…" : prefix
     }
 
+    private static func normalizedTitle(_ title: String?) -> String? {
+        guard let title = title?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty else {
+            return nil
+        }
+        return title
+    }
+
     static func snapshotTitles(sessions: [SessionSnapshot], agents: [AgentSnapshot]) -> [String: String] {
         let labels = agents.reduce(into: [UUID: String]()) { result, agent in
             guard let label = agent.label?.trimmingCharacters(in: .whitespacesAndNewlines), !label.isEmpty else { return }
@@ -183,7 +197,8 @@ enum RepoPromptPortalSessionProjection {
             throw ServiceAPIError(code: .internalFailure, message: "Semantic transcript page exceeds the portal response bound")
         }
         return PortalSessionPresentationPage(
-            session: project(session, agentControl: control),
+            session: sidebarSessions.first(where: { $0.sessionID == session.sessionID })
+                ?? project(session, agentControl: control),
             presentation: presentation,
             sidebarSessions: sidebarSessions
         )

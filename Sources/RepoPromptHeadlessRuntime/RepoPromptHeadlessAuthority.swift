@@ -1158,6 +1158,13 @@ public actor RepoPromptHeadlessAuthority {
             await discardPreparedWorktrees(initialWorktrees, project: project, ownerSessionID: sessionID)
             throw ServiceAPIError(code: .staleRevision, message: "Project repositories changed during session preparation", currentRevision: currentProject.revision)
         }
+        if input.parentSessionID != nil,
+           projectRepositoryMutationBarriers.contains(input.projectID)
+            || cancellationBarriers.contains(rootSessionID)
+        {
+            await discardPreparedWorktrees(initialWorktrees, project: project, ownerSessionID: sessionID)
+            throw ServiceAPIError(code: .quiescing, message: "The parent session tree is changing")
+        }
         let events: (session: EventEnvelope, agent: EventEnvelope, worktrees: [EventEnvelope])
         do {
             events = try await store.persistNewSession(
@@ -2101,16 +2108,90 @@ public actor RepoPromptHeadlessAuthority {
     }
 
     public func updateAgentLabel(sessionID: UUID, label: String?, actor: ExternalActor, expectedRevision: Int64) async throws -> AgentSnapshot {
+        try await persistAgentLabel(
+            sessionID: sessionID,
+            label: label,
+            actor: actor,
+            expectedRevision: expectedRevision,
+            idempotency: nil
+        )
+    }
+
+    /// Renames a session through the same durable agent label used by every
+    /// thin-client projection. Unlike the MCP status surface, a user-facing
+    /// rename must contain a non-empty, bounded title.
+    public func renameSessionLabel(
+        sessionID: UUID,
+        name: String,
+        actor: ExternalActor,
+        expectedAgentRevision: Int64,
+        idempotencyKey: String,
+        requestDigest: String
+    ) async throws -> AgentSnapshot {
+        let normalized = name
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: \Character.isWhitespace)
+            .joined(separator: " ")
+        guard !normalized.isEmpty,
+              normalized.utf8.count <= 200,
+              normalized.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
+        else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Session name is invalid")
+        }
+        let idempotency = IdempotencyInput(
+            actorID: actor.userID,
+            operation: "renameSession",
+            key: idempotencyKey,
+            requestDigest: requestDigest
+        )
+        if let existing = try await store.idempotencyResult(idempotency) {
+            return try JSONDecoder.serviceDecoder.decode(AgentSnapshot.self, from: existing.response)
+        }
+        return try await persistAgentLabel(
+            sessionID: sessionID,
+            label: normalized,
+            actor: actor,
+            expectedRevision: expectedAgentRevision,
+            idempotency: idempotency
+        )
+    }
+
+    private func persistAgentLabel(
+        sessionID: UUID,
+        label: String?,
+        actor: ExternalActor,
+        expectedRevision: Int64,
+        idempotency: IdempotencyInput?
+    ) async throws -> AgentSnapshot {
         try ensureWritable()
         guard let current = agents[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Agent not found") }
         guard current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Agent revision is stale", currentRevision: current.revision) }
         let normalized = label?.trimmingCharacters(in: .whitespacesAndNewlines)
         let updated = AgentSnapshot(agentID: current.agentID, sessionID: current.sessionID, rootSessionID: current.rootSessionID, parentAgentID: current.parentAgentID, providerNativeIdentity: current.providerNativeIdentity, role: current.role, label: normalized?.isEmpty == true ? nil : normalized, state: current.state, revision: current.revision + 1)
         let session = try await sessionSnapshot(sessionID: sessionID)
-        let event = try await store.persistAgent(updated, projectID: session.projectID, actor: actor, correlationID: ids.next(), eventType: .agentUpdated)
-        agents[sessionID] = updated
-        await eventHub.publish(event)
-        return updated
+        guard !projectRepositoryMutationBarriers.contains(session.projectID),
+              !cancellationBarriers.contains(session.rootSessionID)
+        else {
+            throw ServiceAPIError(code: .quiescing, message: "The session tree is changing")
+        }
+        do {
+            let event = try await store.persistAgent(
+                updated,
+                projectID: session.projectID,
+                actor: actor,
+                correlationID: ids.next(),
+                eventType: .agentUpdated,
+                idempotency: idempotency,
+                expectedRevision: expectedRevision
+            )
+            agents[sessionID] = updated
+            await eventHub.publish(event)
+            return updated
+        } catch let existing as ExistingIdempotency {
+            let replay = try JSONDecoder.serviceDecoder.decode(AgentSnapshot.self, from: existing.response)
+            agents[sessionID] = replay
+            return replay
+        }
     }
 
     public func updateSessionPrompt(
@@ -3320,7 +3401,9 @@ public actor RepoPromptHeadlessAuthority {
         guard snapshot.parentSessionID == controllingParentSessionID else {
             throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Only a directly controlled child session can be deleted")
         }
-        guard ![.preparing, .running, .waiting].contains(snapshot.state), providerTasks[sessionID] == nil else {
+        guard ![.preparing, .running, .waiting].contains(snapshot.state),
+              await authority.activeBinding() == nil
+        else {
             throw ServiceAPIError(code: .runAlreadyActive, message: "Active child sessions cannot be deleted")
         }
         guard try await childSessionSnapshots(parentSessionID: sessionID).isEmpty else {
@@ -3342,6 +3425,118 @@ public actor RepoPromptHeadlessAuthority {
         selections.removeValue(forKey: sessionID)
         providerToolInvocations.removeValue(forKey: sessionID)
         await eventHub.publish(event)
+    }
+
+    /// Deletes a session and its complete descendant tree after proving every
+    /// member is inactive. Descendants are removed leaf-first, matching the
+    /// desktop sidebar's cascade behavior while preserving parent references.
+    @discardableResult
+    public func deleteSessionTree(
+        sessionID: UUID,
+        expectedRevision: Int64,
+        actor: ExternalActor,
+        idempotencyKey: String,
+        requestDigest: String
+    ) async throws -> [UUID] {
+        try ensureWritable()
+        let idempotency = IdempotencyInput(
+            actorID: actor.userID,
+            operation: "deleteSession",
+            key: idempotencyKey,
+            requestDigest: requestDigest
+        )
+        if let existing = try await store.idempotencyResult(idempotency) {
+            return try JSONDecoder.serviceDecoder.decode([UUID].self, from: existing.response)
+        }
+        guard let rootAuthority = sessions[sessionID] else {
+            throw ServiceAPIError(code: .notFound, message: "Session not found")
+        }
+        let root = await rootAuthority.snapshot()
+        guard root.revision == expectedRevision else {
+            throw ServiceAPIError(
+                code: .staleRevision,
+                message: "Session revision is stale",
+                currentRevision: root.revision
+            )
+        }
+        guard projectRepositoryMutationBarriers.insert(root.projectID).inserted else {
+            throw ServiceAPIError(
+                code: .runAlreadyActive,
+                message: "A repository or session mutation is active for this project"
+            )
+        }
+        guard cancellationBarriers.insert(root.rootSessionID).inserted else {
+            projectRepositoryMutationBarriers.remove(root.projectID)
+            throw ServiceAPIError(code: .quiescing, message: "The session tree is changing")
+        }
+        defer {
+            cancellationBarriers.remove(root.rootSessionID)
+            projectRepositoryMutationBarriers.remove(root.projectID)
+        }
+
+        let available = try await sessionSnapshots()
+        let byID = Dictionary(uniqueKeysWithValues: available.map { ($0.sessionID, $0) })
+        let children = Dictionary(grouping: available.compactMap { snapshot in
+            snapshot.parentSessionID.map { ($0, snapshot.sessionID) }
+        }, by: \.0).mapValues { $0.map(\.1) }
+        var visited = Set<UUID>()
+        var leafFirst: [SessionSnapshot] = []
+        func collect(_ currentID: UUID) throws {
+            guard visited.insert(currentID).inserted else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Session hierarchy contains a cycle")
+            }
+            for childID in children[currentID] ?? [] {
+                try collect(childID)
+            }
+            guard let snapshot = byID[currentID] else {
+                throw ServiceAPIError(code: .notFound, message: "Session hierarchy changed before deletion")
+            }
+            leafFirst.append(snapshot)
+        }
+        try collect(sessionID)
+        for snapshot in leafFirst {
+            guard let authority = sessions[snapshot.sessionID] else {
+                throw ServiceAPIError(code: .notFound, message: "Session hierarchy changed before deletion")
+            }
+            guard ![.preparing, .running, .waiting].contains(snapshot.state),
+                  await authority.activeBinding() == nil
+            else {
+                throw ServiceAPIError(
+                    code: .runAlreadyActive,
+                    message: "Stop the session and all of its sub-agents before deleting it"
+                )
+            }
+        }
+
+        let deletedIDs = leafFirst.map(\.sessionID)
+        let response = try JSONEncoder.serviceEncoder.encode(deletedIDs)
+        for snapshot in leafFirst {
+            let isRoot = snapshot.sessionID == sessionID
+            let cursor = try await store.nextCursor()
+            let tombstone = snapshot.replacing(
+                state: .archived,
+                revision: snapshot.revision + 1,
+                cursor: cursor
+            )
+            do {
+                let event = try await store.deleteSession(
+                    tombstone: tombstone,
+                    actor: actor,
+                    correlationID: ids.next(),
+                    idempotency: isRoot ? idempotency : nil,
+                    expectedRevision: isRoot ? expectedRevision : snapshot.revision,
+                    idempotencyResponse: isRoot ? response : nil
+                )
+                sessions.removeValue(forKey: snapshot.sessionID)
+                agents.removeValue(forKey: snapshot.sessionID)
+                selections.removeValue(forKey: snapshot.sessionID)
+                providerToolInvocations.removeValue(forKey: snapshot.sessionID)
+                await eventHub.publish(event)
+            } catch let existing as ExistingIdempotency where isRoot {
+                return try JSONDecoder.serviceDecoder.decode([UUID].self, from: existing.response)
+            }
+        }
+        return deletedIDs
     }
 
     public func events(after cursor: ServiceCursor?, limit: Int, projectID: UUID? = nil, sessionID: UUID? = nil) async throws -> EventPage {

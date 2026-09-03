@@ -600,6 +600,57 @@ final class AuthorityTests: XCTestCase {
         try await store.close()
     }
 
+    func testSessionTreeDeletionCascadesLeafFirstAndReplaysIdempotently() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
+        let project = try await authority.createProject(
+            input: .init(name: "P", roots: []),
+            externalActor: actor,
+            idempotencyKey: "delete-tree-project",
+            requestDigest: "delete-tree-project"
+        )
+        let root = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "delete-tree-root",
+            requestDigest: "delete-tree-root"
+        )
+        let child = try await authority.spawnChildSession(
+            parentSessionID: root.sessionID,
+            initialPrompt: "child"
+        )
+        let grandchild = try await authority.spawnChildSession(
+            parentSessionID: child.sessionID,
+            initialPrompt: "grandchild"
+        )
+
+        let deleted = try await authority.deleteSessionTree(
+            sessionID: root.sessionID,
+            expectedRevision: root.revision,
+            actor: actor,
+            idempotencyKey: "delete-tree",
+            requestDigest: "delete-tree"
+        )
+        XCTAssertEqual(deleted, [grandchild.sessionID, child.sessionID, root.sessionID])
+        let remaining = try await authority.sessionSnapshots()
+        XCTAssertEqual(remaining, [])
+
+        let replay = try await authority.deleteSessionTree(
+            sessionID: root.sessionID,
+            expectedRevision: root.revision,
+            actor: actor,
+            idempotencyKey: "delete-tree",
+            requestDigest: "delete-tree"
+        )
+        XCTAssertEqual(replay, deleted)
+        let removed = try await authority.events(after: nil, limit: 100).events
+            .filter { $0.eventType == .sessionRemoved }
+            .compactMap(\.sessionID)
+        XCTAssertEqual(removed, deleted)
+        try await store.close()
+    }
+
     func testChildCancellationDoesNotCancelParentOrSiblings() async throws {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .resolvingSymlinksInPath()

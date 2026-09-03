@@ -135,6 +135,50 @@ public struct PortalRemoveProjectRequest: Codable, Hashable, Sendable {
     }
 }
 
+public struct PortalRenameSessionRequest: Codable, Hashable, Sendable {
+    public let operationID: UUID
+    public let expectedAgentRevision: Int64
+    public let name: String
+
+    public init(operationID: UUID, expectedAgentRevision: Int64, name: String) {
+        self.operationID = operationID
+        self.expectedAgentRevision = expectedAgentRevision
+        self.name = name
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case operationID = "operationId"
+        case expectedAgentRevision, name
+    }
+}
+
+public struct PortalDeleteSessionRequest: Codable, Hashable, Sendable {
+    public let operationID: UUID
+    public let expectedRevision: Int64
+
+    public init(operationID: UUID, expectedRevision: Int64) {
+        self.operationID = operationID
+        self.expectedRevision = expectedRevision
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case operationID = "operationId"
+        case expectedRevision
+    }
+}
+
+public struct PortalDeleteSessionResponse: Codable, Hashable, Sendable {
+    public let deletedSessionIDs: [UUID]
+
+    public init(deletedSessionIDs: [UUID]) {
+        self.deletedSessionIDs = deletedSessionIDs
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case deletedSessionIDs = "deletedSessionIds"
+    }
+}
+
 /// Compact session projection used by the project/session sidebar.
 public struct PortalSessionSummary: Codable, Hashable, Sendable {
     public let sessionID: UUID
@@ -146,6 +190,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
     public let model: String?
     public let state: SessionLifecycleState
     public let revision: Int64
+    public let agentRevision: Int64
     public let runGeneration: Int64
     public let turnEpoch: Int64
     public let lastActivityAt: Date?
@@ -165,6 +210,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         model: String?,
         state: SessionLifecycleState,
         revision: Int64,
+        agentRevision: Int64 = 0,
         runGeneration: Int64,
         turnEpoch: Int64,
         lastActivityAt: Date?,
@@ -183,6 +229,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         self.model = model
         self.state = state
         self.revision = revision
+        self.agentRevision = agentRevision
         self.runGeneration = runGeneration
         self.turnEpoch = turnEpoch
         self.lastActivityAt = lastActivityAt
@@ -204,6 +251,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         model = try container.decodeIfPresent(String.self, forKey: .model)
         state = try container.decode(SessionLifecycleState.self, forKey: .state)
         revision = try container.decode(Int64.self, forKey: .revision)
+        agentRevision = try container.decodeIfPresent(Int64.self, forKey: .agentRevision) ?? 0
         runGeneration = try container.decode(Int64.self, forKey: .runGeneration)
         turnEpoch = try container.decode(Int64.self, forKey: .turnEpoch)
         lastActivityAt = try container.decodeIfPresent(Date.self, forKey: .lastActivityAt)
@@ -220,7 +268,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         case parentSessionID = "parentSessionId"
         case title, provider
         case providerSettingsID = "providerSettingsId"
-        case model, state, revision, runGeneration, turnEpoch, lastActivityAt, sidebarDepth, effectiveContextWindowTokens
+        case model, state, revision, agentRevision, runGeneration, turnEpoch, lastActivityAt, sidebarDepth, effectiveContextWindowTokens
         case runPresentation, agentControl, contextUsage
     }
 }
