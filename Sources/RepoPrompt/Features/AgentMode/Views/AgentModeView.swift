@@ -3284,17 +3284,21 @@ struct AgentModeChatDetailView: View {
     }
 
     private var runningIndicatorSlot: some View {
-        runningIndicator
-            .frame(height: runningIndicatorReservedHeight, alignment: .leading)
-            .opacity(shouldShowRunningIndicator ? 1 : 0)
-            .allowsHitTesting(shouldShowRunningIndicator)
-            .accessibilityHidden(!shouldShowRunningIndicator)
+        Group {
+            if shouldShowRunningIndicator {
+                runningIndicator
+            } else {
+                Color.clear
+            }
+        }
+        .frame(height: runningIndicatorReservedHeight, alignment: .leading)
+        .allowsHitTesting(shouldShowRunningIndicator)
+        .accessibilityHidden(!shouldShowRunningIndicator)
     }
 
     private var runningIndicator: some View {
         HStack(spacing: 6) {
-            ProgressView()
-                .scaleEffect(0.7)
+            AgentActivityArc()
             Text(runInteractionSnapshot.runningStatusText ?? "Thinking…")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                 .foregroundColor(.secondary)

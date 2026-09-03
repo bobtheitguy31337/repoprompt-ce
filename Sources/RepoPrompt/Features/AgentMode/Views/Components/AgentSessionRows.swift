@@ -190,7 +190,7 @@ struct AgentSessionRow: View {
             // MCP-controlled cue is folded into the existing status plate
             // (orange-tinted dot/chevron + orange running arc) so it no
             // longer pushes the title sideways. See `mcpAccentColor`,
-            // `plateGlyph`, and `AgentRowActivityArc(tint:)` below.
+            // `plateGlyph`, and `AgentActivityArc(tint:)` below.
 
             // Unified 14pt status plate.
             //
@@ -498,7 +498,7 @@ struct AgentSessionRow: View {
             // plate fill and the identity glyph so the chevron/arrow/dot
             // remains visually centered while the ring conveys motion.
             if runState == .running {
-                AgentRowActivityArc(tint: runningAccentColor)
+                AgentActivityArc(tint: runningAccentColor)
                     .allowsHitTesting(false)
             }
 
@@ -927,9 +927,12 @@ struct AgentStashedSessionRow: View {
 /// - Read as "actively processing" without competing with the green waiting
 ///   dot — running is informational, waiting is actionable, so running
 ///   should not out-shout it.
-private struct AgentRowActivityArc: View {
+struct AgentActivityArc: View {
     var tint: Color = .accentColor
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var rotation: Double = 0
+
+    private static let rotationDuration = 2.0
 
     var body: some View {
         Circle()
@@ -939,9 +942,10 @@ private struct AgentRowActivityArc: View {
                 style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
             )
             .frame(width: 15, height: 15)
-            .rotationEffect(.degrees(rotation))
+            .rotationEffect(.degrees(reduceMotion ? 35 : rotation))
             .onAppear {
-                withAnimation(.linear(duration: 1.0).repeatForever(autoreverses: false)) {
+                guard !reduceMotion else { return }
+                withAnimation(.linear(duration: Self.rotationDuration).repeatForever(autoreverses: false)) {
                     rotation = 360
                 }
             }
