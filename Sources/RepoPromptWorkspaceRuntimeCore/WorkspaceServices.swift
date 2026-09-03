@@ -565,7 +565,7 @@ public actor WorktreeRuntimeService {
                     guard candidates.count == 1, let binding = candidates.first else {
                         throw ServiceAPIError(code: .worktreeConflict, message: "Every writable project root requires exactly one active session worktree")
                     }
-                    executionPath = try Self.lexicallyContainedPath(root: baseDirectory, candidate: binding.physicalPath)
+                    executionPath = URL(fileURLWithPath: binding.physicalPath).standardizedFileURL.path
                     try PinnedFilesystemRoot.validateDirectoryChain(at: executionPath)
                     if let resources {
                         let identityDigest = try await WorktreeRuntimeIdentity.digest(path: executionPath, runner: runner, gitExecutable: gitExecutable)
@@ -734,12 +734,29 @@ public actor WorktreeRuntimeService {
         try pinnedBase.validateReachableIdentity()
     }
 
-    public func create(project: ProjectSnapshot, root: ProjectRootSnapshot, sessionID: UUID, baseRef: String, branch: String) async throws -> WorktreeBindingSnapshot {
+    public func create(
+        project: ProjectSnapshot,
+        root: ProjectRootSnapshot,
+        sessionID: UUID,
+        baseRef: String,
+        branch: String,
+        requestedPath: String? = nil,
+        allowExternalPath: Bool = false
+    ) async throws -> WorktreeBindingSnapshot {
         guard root.writable else { throw ServiceAPIError(code: .rootUnauthorized, message: "Worktree root is read-only") }
         guard Self.safeRef(baseRef), Self.safeBranch(branch) else { throw ServiceAPIError(code: .invalidRequest, message: "Worktree ref or branch is invalid") }
         let bindingID = UUID()
-        let candidate = URL(fileURLWithPath: baseDirectory).appendingPathComponent(project.projectID.uuidString).appendingPathComponent(bindingID.uuidString).path
-        let path = try Self.lexicallyContainedPath(root: baseDirectory, candidate: candidate)
+        let managedCandidate = URL(fileURLWithPath: baseDirectory).appendingPathComponent(project.projectID.uuidString).appendingPathComponent(bindingID.uuidString).path
+        let requested = requestedPath.map { NSString(string: $0).expandingTildeInPath }
+        let candidate = URL(fileURLWithPath: requested ?? managedCandidate).standardizedFileURL.path
+        let isManaged = (try? Self.lexicallyContainedPath(root: baseDirectory, candidate: candidate)) != nil
+        guard requested == nil || isManaged || allowExternalPath else {
+            throw ServiceAPIError(code: .rootUnauthorized, message: "External worktree_path requires allow_external_worktree_path=true")
+        }
+        guard candidate != root.canonicalPath, !FileManager.default.fileExists(atPath: candidate) else {
+            throw ServiceAPIError(code: .worktreeConflict, message: "Requested worktree path already exists or aliases the source root")
+        }
+        let path = candidate
         let reservation = OwnedResourceRecord(
             kind: .worktree,
             projectID: project.projectID,
@@ -752,7 +769,11 @@ public actor WorktreeRuntimeService {
         )
         try await resources?.reserveOwnedResource(reservation)
         try pinnedBase.validateReachableIdentity()
-        _ = try pinnedBase.createDirectory(at: URL(fileURLWithPath: path).deletingLastPathComponent().path)
+        if isManaged {
+            _ = try pinnedBase.createDirectory(at: URL(fileURLWithPath: path).deletingLastPathComponent().path)
+        } else {
+            try FileManager.default.createDirectory(at: URL(fileURLWithPath: path).deletingLastPathComponent(), withIntermediateDirectories: true)
+        }
         do {
             _ = try await runner.run(executable: gitExecutable, arguments: ["-C", root.canonicalPath, "worktree", "add", "-b", branch, path, baseRef], workingDirectory: root.canonicalPath, maximumBytes: 65536)
             let verification = try await runner.run(executable: gitExecutable, arguments: ["-C", path, "rev-parse", "--show-toplevel"], workingDirectory: path, maximumBytes: 65536)

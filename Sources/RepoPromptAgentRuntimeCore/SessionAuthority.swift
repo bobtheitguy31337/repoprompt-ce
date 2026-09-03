@@ -160,6 +160,25 @@ public actor SessionAuthority {
         replaceSnapshot(visibility: visibility)
     }
 
+    public func updateRoute(
+        provider: ProviderKind,
+        providerSettingsID: ProviderSettingsID?,
+        model: String?,
+        expectedRevision: Int64,
+        cursor: ServiceCursor
+    ) throws -> SessionSnapshot {
+        guard state.activeRunID == nil else { throw ServiceAPIError(code: .runAlreadyActive, message: "An active session route cannot be changed") }
+        guard expectedRevision == state.snapshot.revision else { throw ServiceAPIError(code: .staleRevision, message: "Session revision is stale", currentRevision: state.snapshot.revision) }
+        state.snapshot = state.snapshot.replacingRoute(
+            provider: provider,
+            providerSettingsID: providerSettingsID,
+            model: model,
+            revision: state.snapshot.revision + 1,
+            cursor: cursor
+        )
+        return state.snapshot
+    }
+
     public func steer(_ text: String, actor: ExternalActor, targetTurnEpoch: Int64) throws -> RunBindingIdentity {
         guard var gate = state.gate, gate.binding.turnEpoch == targetTurnEpoch else {
             throw ServiceAPIError(code: .staleRevision, message: "Turn epoch is stale", currentRevision: state.snapshot.turnEpoch)

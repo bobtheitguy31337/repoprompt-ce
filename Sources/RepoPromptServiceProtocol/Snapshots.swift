@@ -310,6 +310,37 @@ public struct SessionSnapshot: Codable, Hashable, Sendable {
         )
     }
 
+    public func replacingRoute(
+        provider: ProviderKind,
+        providerSettingsID: ProviderSettingsID?,
+        model: String?,
+        revision: Int64,
+        cursor: ServiceCursor
+    ) -> SessionSnapshot {
+        SessionSnapshot(
+            sessionID: sessionID,
+            projectID: projectID,
+            parentSessionID: parentSessionID,
+            rootSessionID: rootSessionID,
+            creator: creator,
+            provider: provider,
+            providerSettingsID: providerSettingsID,
+            model: model,
+            visibility: visibility,
+            state: state,
+            runGeneration: runGeneration,
+            turnEpoch: turnEpoch,
+            revision: revision,
+            transcript: transcript,
+            interactions: interactions,
+            cursor: cursor,
+            effectiveTurnConfiguration: effectiveTurnConfiguration,
+            nextTurnDefaults: nextTurnDefaults,
+            runPresentation: runPresentation,
+            contextUsage: contextUsage
+        )
+    }
+
     private enum CodingKeys: String, CodingKey {
         case schemaVersion
         case sessionID = "sessionId"

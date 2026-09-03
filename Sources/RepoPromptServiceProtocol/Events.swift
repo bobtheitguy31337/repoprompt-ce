@@ -97,7 +97,7 @@ public struct EventPayload: Codable, Hashable, Sendable {
 
 public enum EventType: String, Codable, CaseIterable, Sendable {
     case projectCreated = "project.created", projectUpdated = "project.updated", projectRemoved = "project.removed", projectRefreshed = "project.refreshed", workflowUpdated = "workflow.updated"
-    case sessionCreated = "session.created", sessionUpdated = "session.updated", sessionWaiting = "session.waiting", sessionCompleted = "session.completed", sessionFailed = "session.failed", sessionCanceled = "session.canceled", sessionInterrupted = "session.interrupted", sessionResumed = "session.resumed", sessionArchived = "session.archived"
+    case sessionCreated = "session.created", sessionUpdated = "session.updated", sessionWaiting = "session.waiting", sessionCompleted = "session.completed", sessionFailed = "session.failed", sessionCanceled = "session.canceled", sessionInterrupted = "session.interrupted", sessionResumed = "session.resumed", sessionArchived = "session.archived", sessionRemoved = "session.removed"
     case agentStarted = "agent.started", agentUpdated = "agent.updated", agentCompleted = "agent.completed", agentFailed = "agent.failed"
     case transcriptMessage = "transcript.message", transcriptProgress = "transcript.progress"
     case toolStarted = "tool.started", toolUpdated = "tool.updated", toolCompleted = "tool.completed", toolFailed = "tool.failed"

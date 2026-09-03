@@ -809,6 +809,12 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
         if let effort = request.policy.providerSettings["provider.reasoningEffort"] { params["effort"] = effort }
         if let tier = request.policy.providerSettings["provider.serviceTier"] { params["serviceTier"] = tier }
         if let threadID { params["threadId"] = threadID }
+        if threadID == nil,
+           let baseInstructions = request.baseInstructions?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !baseInstructions.isEmpty
+        {
+            params["baseInstructions"] = baseInstructions
+        }
         return try JSONSerialization.data(withJSONObject: params)
     }
 

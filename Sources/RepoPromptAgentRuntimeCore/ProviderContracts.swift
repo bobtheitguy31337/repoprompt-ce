@@ -170,10 +170,14 @@ public struct ProviderExecutionRequest: Sendable {
     /// only after a provider explicitly reports that the saved conversation is
     /// missing; successful native resume continues to receive `prompt` alone.
     public let resumeFallbackPrompt: String?
+    /// Stable RepoPrompt-owned operating instructions for a newly-created native
+    /// provider conversation. Native resume must retain the original instructions
+    /// rather than resending them on every turn.
+    public let baseInstructions: String?
     public let policy: ProviderExecutionPolicy
     private let launchValidation: @Sendable () throws -> Void
 
-    public init(kind: ProviderKind, model: String?, prompt: String, structuredInput: CompiledProviderTurnInput? = nil, workingDirectory: String, maximumBytes: Int = 8_388_608, runID: UUID, resumeProviderSessionID: String? = nil, resumeFallbackPrompt: String? = nil, policy: ProviderExecutionPolicy = .init(), launchValidation: @escaping @Sendable () throws -> Void = {}) {
+    public init(kind: ProviderKind, model: String?, prompt: String, structuredInput: CompiledProviderTurnInput? = nil, workingDirectory: String, maximumBytes: Int = 8_388_608, runID: UUID, resumeProviderSessionID: String? = nil, resumeFallbackPrompt: String? = nil, baseInstructions: String? = nil, policy: ProviderExecutionPolicy = .init(), launchValidation: @escaping @Sendable () throws -> Void = {}) {
         self.kind = kind
         self.model = model
         self.prompt = structuredInput?.prompt ?? prompt
@@ -183,6 +187,7 @@ public struct ProviderExecutionRequest: Sendable {
         self.runID = runID
         self.resumeProviderSessionID = resumeProviderSessionID
         self.resumeFallbackPrompt = resumeFallbackPrompt
+        self.baseInstructions = baseInstructions
         self.policy = policy
         self.launchValidation = launchValidation
     }
@@ -207,6 +212,7 @@ public struct ProviderExecutionRequest: Sendable {
             runID: runID,
             resumeProviderSessionID: resumeProviderSessionID,
             resumeFallbackPrompt: resumeFallbackPrompt,
+            baseInstructions: baseInstructions,
             policy: ProviderExecutionPolicy(mode: policy.mode, writableRoots: policy.writableRoots, providerSettings: settings),
             launchValidation: launchValidation
         )

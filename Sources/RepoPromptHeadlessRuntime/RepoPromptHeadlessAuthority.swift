@@ -1313,6 +1313,55 @@ public actor RepoPromptHeadlessAuthority {
         )
     }
 
+    public func reconfigureManagedChildSession(
+        sessionID: UUID,
+        controllingParentSessionID: UUID,
+        role: String,
+        provider: ProviderKind?,
+        providerSettingsID: ProviderSettingsID?,
+        model: String?,
+        actor: ExternalActor
+    ) async throws -> SessionSnapshot {
+        guard let authority = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
+        let current = await authority.snapshot()
+        guard current.parentSessionID == controllingParentSessionID else {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Session is not a directly controlled child")
+        }
+        guard await authority.activeBinding() == nil else {
+            throw ServiceAPIError(code: .runAlreadyActive, message: "An active session route cannot be changed")
+        }
+        let explicitProviderID = providerSettingsID ?? provider.flatMap { ProviderSettingsID.defaultSettingsID(for: $0) }
+        let roleTarget = AgentRoutingTarget(rawValue: role)
+        let routed: ResolvedAgentModelRoute?
+        if provider == nil, providerSettingsID == nil, model == nil,
+           let roleTarget, roleTarget.isSubagentRole, let serverSettings
+        {
+            routed = try await serverSettings.resolveAgentTarget(projectID: current.projectID, target: roleTarget)
+        } else {
+            routed = nil
+        }
+        let resolvedProvider = provider ?? explicitProviderID?.runtimeKind ?? routed?.provider ?? current.provider
+        let resolvedProviderID = explicitProviderID ?? routed?.providerID ?? current.providerSettingsID
+        let resolvedModel = model ?? routed?.modelID ?? current.model
+        let cursor = try await store.nextCursor()
+        let updated = try await authority.updateRoute(
+            provider: resolvedProvider,
+            providerSettingsID: resolvedProviderID,
+            model: resolvedModel,
+            expectedRevision: current.revision,
+            cursor: cursor
+        )
+        let event = try await store.persistSession(updated, eventType: .sessionUpdated, actor: actor, correlationID: ids.next(), idempotency: nil)
+        await eventHub.publish(event)
+        if var agent = agents[sessionID], agent.role != role {
+            agent = AgentSnapshot(agentID: agent.agentID, sessionID: agent.sessionID, rootSessionID: agent.rootSessionID, parentAgentID: agent.parentAgentID, providerNativeIdentity: agent.providerNativeIdentity, role: role, label: agent.label, state: agent.state, revision: agent.revision + 1)
+            let agentEvent = try await store.persistAgent(agent, projectID: updated.projectID, actor: actor, correlationID: ids.next(), eventType: .agentUpdated)
+            agents[sessionID] = agent
+            await eventHub.publish(agentEvent)
+        }
+        return updated
+    }
+
     public func cancelChildAgentRun(sessionID: UUID) async throws -> CommandReceipt {
         try ensureWritable()
         guard let session = sessions[sessionID] else {
@@ -2586,7 +2635,10 @@ public actor RepoPromptHeadlessAuthority {
         guard session.parentSessionID == nil else {
             throw ServiceAPIError(code: .worktreeConflict, message: "Only a root session may replace the project execution workspace")
         }
-        try await ensureProjectHasNoActiveProviderRun(projectID: session.projectID)
+        try await ensureProjectHasNoActiveProviderRun(
+            projectID: session.projectID,
+            excludingSessionIDs: Set([session.sessionID, session.parentSessionID].compactMap { $0 })
+        )
         guard projectRepositoryMutationBarriers.insert(session.projectID).inserted else {
             throw ServiceAPIError(code: .runAlreadyActive, message: "Project repositories or worktrees are changing")
         }
@@ -2650,16 +2702,16 @@ public actor RepoPromptHeadlessAuthority {
         return try await authoritySessionSnapshot(sessionID: sessionID)
     }
 
-    public func createWorktree(sessionID: UUID, rootID: UUID, baseRef: String, branch: String, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil, authorizationDecision: AuthorizationDecision? = nil) async throws -> WorktreeBindingSnapshot {
+    public func createWorktree(sessionID: UUID, rootID: UUID, baseRef: String, branch: String, requestedPath: String? = nil, allowExternalPath: Bool = false, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil, authorizationDecision: AuthorizationDecision? = nil) async throws -> WorktreeBindingSnapshot {
         let idempotency = try mutationIdempotency(actor: actor, operation: "createWorktree", key: idempotencyKey, digest: requestDigest)
         if let idempotency, let prior: WorktreeBindingSnapshot = try await priorResult(idempotency) { return prior }
         guard let worktreeService else { throw ServiceAPIError(code: .capabilityMissing, message: "Worktree storage is not configured") }
         let session = try await sessionSnapshot(sessionID: sessionID)
         try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "createWorktree", requestDigest: requestDigest, authorizationDecision: authorizationDecision)
-        guard session.parentSessionID == nil else {
-            throw ServiceAPIError(code: .worktreeConflict, message: "Only a root session may create project worktrees")
-        }
-        try await ensureProjectHasNoActiveProviderRun(projectID: session.projectID)
+        try await ensureProjectHasNoActiveProviderRun(
+            projectID: session.projectID,
+            excludingSessionIDs: Set([session.sessionID, session.parentSessionID].compactMap { $0 })
+        )
         guard projectRepositoryMutationBarriers.insert(session.projectID).inserted else {
             throw ServiceAPIError(code: .runAlreadyActive, message: "Project repositories or worktrees are changing")
         }
@@ -2670,7 +2722,7 @@ public actor RepoPromptHeadlessAuthority {
         guard !currentBindings.contains(where: { $0.rootID == rootID }) else {
             throw ServiceAPIError(code: .worktreeConflict, message: "Project root already has an active session worktree")
         }
-        let snapshot = try await worktreeService.create(project: project, root: root, sessionID: sessionID, baseRef: baseRef, branch: branch)
+        let snapshot = try await worktreeService.create(project: project, root: root, sessionID: sessionID, baseRef: baseRef, branch: branch, requestedPath: requestedPath, allowExternalPath: allowExternalPath)
         do {
             let event = try await store.persistWorktree(snapshot, actor: actor, correlationID: ids.next(), idempotency: idempotency)
             await eventHub.publish(event)
@@ -3178,6 +3230,120 @@ public actor RepoPromptHeadlessAuthority {
         return try await sessionSnapshots().filter { $0.parentSessionID == parentSessionID }
     }
 
+    public func setManagedChildWorktreeInheritance(
+        sessionID: UUID,
+        controllingParentSessionID: UUID,
+        inherit: Bool,
+        actor: ExternalActor
+    ) async throws {
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        guard session.parentSessionID == controllingParentSessionID,
+              let current = try await store.permissions(sessionID: sessionID)
+        else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Session is not a directly controlled child") }
+        var settings = current.providerSettings
+        settings["repoprompt.worktree.inherit"] = inherit ? "true" : "false"
+        let updated = ExecutionPermissionSnapshot(
+            sessionID: sessionID,
+            mode: current.mode,
+            providerSettings: settings,
+            revision: current.revision + 1,
+            updatedActor: actor
+        )
+        let event = try await store.persistPermissions(
+            updated,
+            projectID: session.projectID,
+            rootSessionID: session.rootSessionID,
+            correlationID: ids.next()
+        )
+        await eventHub.publish(event)
+    }
+
+    public func setManagedChildWorktreeSelection(
+        sessionID: UUID,
+        controllingParentSessionID: UUID,
+        bindingIDs: [UUID],
+        actor: ExternalActor
+    ) async throws {
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        guard session.parentSessionID == controllingParentSessionID,
+              let current = try await store.permissions(sessionID: sessionID)
+        else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Session is not a directly controlled child") }
+        let available = try await store.worktrees(projectID: session.projectID)
+        guard bindingIDs.allSatisfy({ ID in available.contains { $0.bindingID == ID && $0.ownershipState == .active } }) else {
+            throw ServiceAPIError(code: .notFound, message: "A selected worktree is unavailable")
+        }
+        var settings = current.providerSettings
+        settings["repoprompt.worktree.binding_ids"] = bindingIDs.map(\.uuidString).joined(separator: ",")
+        let updated = ExecutionPermissionSnapshot(
+            sessionID: sessionID,
+            mode: current.mode,
+            providerSettings: settings,
+            revision: current.revision + 1,
+            updatedActor: actor
+        )
+        let event = try await store.persistPermissions(updated, projectID: session.projectID, rootSessionID: session.rootSessionID, correlationID: ids.next())
+        await eventHub.publish(event)
+    }
+
+    public func setManagedChildWorktreePresentation(
+        sessionID: UUID,
+        controllingParentSessionID: UUID,
+        label: String?,
+        colorHex: String?,
+        actor: ExternalActor
+    ) async throws {
+        let session = try await sessionSnapshot(sessionID: sessionID)
+        guard session.parentSessionID == controllingParentSessionID,
+              let current = try await store.permissions(sessionID: sessionID)
+        else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Session is not a directly controlled child") }
+        var settings = current.providerSettings
+        settings["repoprompt.worktree.visual_label"] = label?.trimmingCharacters(in: .whitespacesAndNewlines)
+        settings["repoprompt.worktree.visual_color_hex"] = colorHex
+        let updated = ExecutionPermissionSnapshot(sessionID: sessionID, mode: current.mode, providerSettings: settings, revision: current.revision + 1, updatedActor: actor)
+        let event = try await store.persistPermissions(updated, projectID: session.projectID, rootSessionID: session.rootSessionID, correlationID: ids.next())
+        await eventHub.publish(event)
+    }
+
+    /// Deletes an inactive authority-managed child and all of its durable
+    /// mutable state. Root/user-created sessions and parents with descendants
+    /// are never eligible through this control-plane entry point.
+    public func deleteManagedChildSession(
+        sessionID: UUID,
+        controllingParentSessionID: UUID,
+        actor: ExternalActor
+    ) async throws {
+        try ensureWritable()
+        guard let authority = sessions[sessionID] else {
+            throw ServiceAPIError(code: .notFound, message: "Session not found")
+        }
+        let snapshot = await authority.snapshot()
+        guard snapshot.parentSessionID == controllingParentSessionID else {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Only a directly controlled child session can be deleted")
+        }
+        guard ![.preparing, .running, .waiting].contains(snapshot.state), providerTasks[sessionID] == nil else {
+            throw ServiceAPIError(code: .runAlreadyActive, message: "Active child sessions cannot be deleted")
+        }
+        guard try await childSessionSnapshots(parentSessionID: sessionID).isEmpty else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Delete descendant sessions before deleting their parent")
+        }
+        let cursor = try await store.nextCursor()
+        let tombstone = snapshot.replacing(
+            state: .archived,
+            revision: snapshot.revision + 1,
+            cursor: cursor
+        )
+        let event = try await store.deleteSession(
+            tombstone: tombstone,
+            actor: actor,
+            correlationID: ids.next()
+        )
+        sessions.removeValue(forKey: sessionID)
+        agents.removeValue(forKey: sessionID)
+        selections.removeValue(forKey: sessionID)
+        providerToolInvocations.removeValue(forKey: sessionID)
+        await eventHub.publish(event)
+    }
+
     public func events(after cursor: ServiceCursor?, limit: Int, projectID: UUID? = nil, sessionID: UUID? = nil) async throws -> EventPage {
         let page = try await store.events(after: cursor, limit: limit)
         let filtered = page.events.filter { (projectID == nil || $0.projectID == projectID) && (sessionID == nil || $0.sessionID == sessionID) }
@@ -3429,10 +3595,16 @@ public actor RepoPromptHeadlessAuthority {
         try? await worktreeService.removeExecutionWorkspace(projectID: project.projectID, ownerSessionID: ownerSessionID)
     }
 
-    private func ensureProjectHasNoActiveProviderRun(projectID: UUID) async throws {
+    private func ensureProjectHasNoActiveProviderRun(
+        projectID: UUID,
+        excludingSessionIDs: Set<UUID> = []
+    ) async throws {
         for session in sessions.values {
             let snapshot = await session.snapshot()
-            if snapshot.projectID == projectID, await session.activeBinding() != nil {
+            if snapshot.projectID == projectID,
+               !excludingSessionIDs.contains(snapshot.sessionID),
+               await session.activeBinding() != nil
+            {
                 throw ServiceAPIError(code: .runAlreadyActive, message: "Repositories cannot change while a project provider run is active")
             }
         }
@@ -3970,6 +4142,15 @@ public actor RepoPromptHeadlessAuthority {
                 providerSettings,
                 modelRaw: acceptedSubmission?.providerModel ?? initial.model
             )
+            let baseInstructions = AgentModeInstructionCore.serviceBaseInstructions(
+                isRootSession: initial.parentSessionID == nil,
+                isCodexNative: providerKind == .codex
+            )
+            if providerKind == .claudeCompatible,
+               providerSettings["claude.agentModeInstructions"] == nil
+            {
+                providerSettings["claude.agentModeInstructions"] = baseInstructions
+            }
             let resumeFallbackPrompt: String?
             if run.providerSessionID == nil {
                 resumeFallbackPrompt = nil
@@ -3992,6 +4173,7 @@ public actor RepoPromptHeadlessAuthority {
                     runID: binding.runID,
                     resumeProviderSessionID: run.providerSessionID,
                     resumeFallbackPrompt: resumeFallbackPrompt,
+                    baseInstructions: baseInstructions,
                     policy: .init(mode: executionMode, writableRoots: executionMode == .workspaceWrite ? executionLocation.writableRoots : [], providerSettings: providerSettings),
                     launchValidation: { try executionLocation.validateLaunch() }
                 )
@@ -4390,9 +4572,17 @@ public actor RepoPromptHeadlessAuthority {
     }
 
     private func effectiveWorktreeBindings(session: SessionSnapshot) async throws -> [WorktreeBindingSnapshot] {
-        let effective = try await store.worktrees(projectID: session.projectID).filter {
-            $0.sessionID == session.rootSessionID && $0.ownershipState == .active
-        }
+        let all = try await store.worktrees(projectID: session.projectID).filter { $0.ownershipState == .active }
+        let direct = all.filter { $0.sessionID == session.sessionID }
+        let settings = try await store.permissions(sessionID: session.sessionID)?.providerSettings ?? [:]
+        let selectedIDs = Set((settings["repoprompt.worktree.binding_ids"] ?? "")
+            .split(separator: ",").compactMap { UUID(uuidString: String($0)) })
+        let inheritanceDisabled = settings["repoprompt.worktree.inherit"] == "false"
+        let effective = !direct.isEmpty
+            ? direct
+            : (!selectedIDs.isEmpty
+                ? all.filter { selectedIDs.contains($0.bindingID) }
+                : (session.parentSessionID != nil && inheritanceDisabled ? [] : all.filter { $0.sessionID == session.rootSessionID }))
         let grouped = Dictionary(grouping: effective, by: \.rootID)
         guard grouped.values.allSatisfy({ $0.count == 1 }) else {
             throw ServiceAPIError(code: .worktreeConflict, message: "A project root has multiple active session worktrees")
@@ -4414,7 +4604,7 @@ public actor RepoPromptHeadlessAuthority {
             let bindings = try await effectiveWorktreeBindings(session: session)
             let workspace = try await worktreeService.materializeExecutionWorkspace(
                 project: project,
-                ownerSessionID: session.rootSessionID,
+                ownerSessionID: bindings.first?.sessionID ?? session.rootSessionID,
                 bindings: bindings,
                 readOnlyRootIdentities: try await validatedReadOnlyRootIdentities(project: project)
             )

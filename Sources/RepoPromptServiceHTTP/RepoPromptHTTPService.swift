@@ -123,7 +123,11 @@ public struct RepoPromptHTTPService: Sendable {
                 for try await frame in heartbeatFrames(stream) {
                     switch frame {
                     case let .event(event):
-                        let refresh = PortalRefreshEvent(projectID: event.projectID, sessionID: event.sessionID)
+                        let refresh = ClientRefreshEvent(
+                            projectID: event.projectID,
+                            sessionID: event.sessionID,
+                            eventType: event.eventType
+                        )
                         let json = try String(decoding: JSONEncoder.serviceEncoder.encode(refresh), as: UTF8.self)
                         try await writer.write(ByteBuffer(string: "id: \(event.storeID.uuidString):\(event.globalSequence)\nevent: refresh\ndata: \(json)\n\n"))
                     case .heartbeat:
@@ -298,7 +302,7 @@ public struct RepoPromptHTTPService: Sendable {
             let next = try await store.nextCursor()
             let cursor = ServiceCursor(storeID: next.storeID, globalSequence: max(0, next.globalSequence - 1))
             let stream = try await authority.subscribe(after: cursor)
-            let initialRefresh = PortalRefreshEvent(projectID: session.projectID, sessionID: sessionID)
+            let initialRefresh = ClientRefreshEvent(projectID: session.projectID, sessionID: sessionID)
             let initialJSON = try String(decoding: JSONEncoder.serviceEncoder.encode(initialRefresh), as: UTF8.self)
             var headers = HTTPFields()
             headers[.contentType] = "text/event-stream"
@@ -307,8 +311,14 @@ public struct RepoPromptHTTPService: Sendable {
                 try await writer.write(ByteBuffer(string: ": repoprompt-client-session-stream-v1\n\nevent: refresh\ndata: \(initialJSON)\n\n"))
                 for try await frame in heartbeatFrames(stream) {
                     switch frame {
-                    case let .event(event) where event.sessionID == sessionID:
-                        let refresh = PortalRefreshEvent(projectID: event.projectID, sessionID: sessionID)
+                    case let .event(event)
+                        where event.projectID == session.projectID
+                        && (event.sessionID == sessionID || event.rootSessionID == session.rootSessionID):
+                        let refresh = ClientRefreshEvent(
+                            projectID: event.projectID,
+                            sessionID: event.sessionID,
+                            eventType: event.eventType
+                        )
                         let json = try String(decoding: JSONEncoder.serviceEncoder.encode(refresh), as: UTF8.self)
                         try await writer.write(ByteBuffer(string: "id: \(event.storeID.uuidString):\(event.globalSequence)\nevent: refresh\ndata: \(json)\n\n"))
                     case .event:
@@ -2489,13 +2499,21 @@ public struct RepoPromptHTTPService: Sendable {
         let passwordLoginEnabled: Bool
     }
 
-    private struct PortalRefreshEvent: Encodable {
+    private struct ClientRefreshEvent: Encodable {
         let projectID: UUID
         let sessionID: UUID?
+        let eventType: EventType?
+
+        init(projectID: UUID, sessionID: UUID?, eventType: EventType? = nil) {
+            self.projectID = projectID
+            self.sessionID = sessionID
+            self.eventType = eventType
+        }
 
         private enum CodingKeys: String, CodingKey {
             case projectID = "projectId"
             case sessionID = "sessionId"
+            case eventType
         }
     }
 

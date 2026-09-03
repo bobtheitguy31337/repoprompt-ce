@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentRuntimeCore
 import RepoPromptShared
 
 class SystemPromptService {
@@ -801,22 +802,11 @@ class SystemPromptService {
         // The prompt must never name a delegation tool the caller
         // cannot see in its own `ListTools` response.
         let isTopLevelAgentSession = taskLabelKind == nil
-        let codexNativeDelegationNote = agentKind == .codexExec ? """
-        - Codex MultiAgentV2 `spawn_agent` children are Codex-native threads, not RepoPrompt-managed `agent_run` sessions. Use `agent_run` when you need a child that RepoPrompt can list, wait, steer, cancel, or permission/profile as a RepoPrompt session; do not expect `spawn_agent` children to appear in `agent_manage` or `AgentRunSessionStore` unless RepoPrompt adds an explicit bridge.
-        """ : ""
         let agentDelegationSection: String
         let agentDelegationFinalNote: String
         if isTopLevelAgentSession {
             agentDelegationSection = """
-            *Agent Delegation:*
-            - `agent_run` - Spawn and control a separate Agent Mode session in another tab
-            - `agent_manage` - List agents, sessions, logs, and workflows for delegated sessions
-            - Use `model_id` with a role label (`explore`, `engineer`, `pair`, `design`) to auto-pick the best agent+model for each role
-            - Explore agents (`model_id="explore"`) are read-only child sessions for narrow, self-contained investigations
-            - Engineer, pair, and design agents perform heavier work — launch these when the user asks for delegation
-            - Design agents (`model_id="design"`) produce a written markdown report as their primary deliverable for review, architecture-critique, or extended-analysis tasks — they will save it under `docs/reviews/`, `docs/designs/`, or `docs/analysis/` (this is expected behavior, not an edit violation). Their summary includes the report path; pass that path to downstream agents to hand off findings
-            - Research/planning tools (`ask_oracle`, `context_builder` when available) stay in the current session and do not create another agent
-            \(codexNativeDelegationNote.trimmingCharacters(in: .whitespacesAndNewlines))
+            \(AgentModeInstructionCore.delegationSection(isRootSession: true, isCodexNative: agentKind == .codexExec))
             \(AgentModePrompts.Fragments.agentRunExportGuidance.trimmingCharacters(in: .whitespacesAndNewlines))
 
             \(AgentModePrompts.Fragments.agentRunExploreWhenToDispatchGuidance.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -826,9 +816,7 @@ class SystemPromptService {
             """
         } else {
             agentDelegationSection = """
-            *Read-only Sub-agent Probes:*
-            - `agent_explore` - Launch/control short read-only explore child agents (`start`, `poll`, `wait`, `cancel` only; pass `messages` to start several probes in one call)
-            - Research/planning tools (`ask_oracle`, `context_builder` when available) stay in the current session and do not create another agent
+            \(AgentModeInstructionCore.delegationSection(isRootSession: false, isCodexNative: agentKind == .codexExec))
             \(AgentModePrompts.Fragments.agentExploreExportGuidance.trimmingCharacters(in: .whitespacesAndNewlines))
 
             \(AgentModePrompts.Fragments.agentExploreWhenToDispatchGuidance.trimmingCharacters(in: .whitespacesAndNewlines))

@@ -14,6 +14,8 @@ final class ClientIntegrationHTTPTests: XCTestCase {
         let script = String(decoding: try RepoPromptPortalAssets.data(for: .script), as: UTF8.self)
         let html = String(decoding: try RepoPromptPortalAssets.data(for: .index), as: UTF8.self)
         XCTAssertTrue(script.contains("Connect an app to RepoPrompt."))
+        XCTAssertTrue(script.contains("eventType.startsWith(\"session.\")"))
+        XCTAssertTrue(script.contains("eventRefreshNeedsBootstrap"))
         XCTAssertFalse(script.localizedCaseInsensitiveContains("gabblin"))
         XCTAssertFalse(html.localizedCaseInsensitiveContains("gabblin"))
     }

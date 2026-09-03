@@ -117,6 +117,8 @@
       eventRefreshRevision: 0,
       appliedEventRefreshRevision: 0,
       eventRefreshPromise: null,
+      eventRefreshNeedsBootstrap: false,
+      eventRefreshNeedsTranscript: false,
       runClockTimer: null,
       actionPromise: null,
       actionName: null,
@@ -1773,7 +1775,7 @@
     });
   }
 
-  // Use the same mature GFM parser family as Gabblin. The DOM allowlist keeps
+  // Use the same mature GFM parser family as the desktop client. The DOM allowlist keeps
   // provider output inside the portal's existing no-raw-HTML security boundary.
   function renderMarkdown(source) {
     const root = element("div", "presentation-row-content markdown-content");
@@ -2474,14 +2476,21 @@
   }
 
   function requestAgentEventRefresh(event) {
-    const selectedSessionID = state.agent.selectedSessionID;
+    if (state.route !== "home") return;
+    const eventType = event?.eventType || "";
+    const affectsHierarchy =
+      !eventType ||
+      eventType.startsWith("project.") ||
+      eventType.startsWith("session.") ||
+      eventType.startsWith("agent.") ||
+      eventType.startsWith("worktree.");
+    if (affectsHierarchy) state.agent.eventRefreshNeedsBootstrap = true;
     if (
-      state.route !== "home" ||
-      !selectedSessionID ||
-      state.agent.newSessionMode ||
-      (event?.sessionId && event.sessionId !== selectedSessionID)
+      state.agent.selectedSessionID &&
+      !state.agent.newSessionMode &&
+      (!event?.sessionId || event.sessionId === state.agent.selectedSessionID)
     )
-      return;
+      state.agent.eventRefreshNeedsTranscript = true;
     state.agent.eventRefreshRevision += 1;
     if (state.agent.eventRefreshPromise) return;
     state.agent.eventRefreshPromise = (async () => {
@@ -2491,7 +2500,38 @@
       ) {
         state.agent.appliedEventRefreshRevision =
           state.agent.eventRefreshRevision;
-        await loadTranscript({ silent: true });
+        const refreshBootstrap = state.agent.eventRefreshNeedsBootstrap;
+        const refreshTranscript = state.agent.eventRefreshNeedsTranscript;
+        state.agent.eventRefreshNeedsBootstrap = false;
+        state.agent.eventRefreshNeedsTranscript = false;
+
+        if (refreshBootstrap) {
+          const previousSessionID = state.agent.selectedSessionID;
+          const bootstrap = await api("api/v1/bootstrap");
+          state.bootstrap = bootstrap || {
+            projects: [],
+            sessions: [],
+            workflows: [],
+          };
+          state.bootstrap.projects ||= [];
+          state.bootstrap.sessions ||= [];
+          state.bootstrap.workflows ||= [];
+          reconcileAgentSelection();
+          if (previousSessionID !== state.agent.selectedSessionID) {
+            state.agent.selectionGeneration += 1;
+            state.agent.transcriptItems = [];
+            state.agent.transcriptPage = null;
+          }
+          rememberSelectedProjectID(state.agent.selectedProjectID);
+          rememberSelectedSessionID(state.agent.selectedSessionID);
+          renderHomeProviders();
+        }
+        if (
+          (refreshTranscript || refreshBootstrap) &&
+          state.agent.selectedSessionID &&
+          !state.agent.newSessionMode
+        )
+          await loadTranscript({ silent: true });
       }
     })().finally(() => {
       state.agent.eventRefreshPromise = null;

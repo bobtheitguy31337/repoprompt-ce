@@ -290,9 +290,9 @@ private actor AuthorityToolBackend {
         case MCPWindowToolName.askUser:
             try await askUser(arguments)
         case MCPWindowToolName.agentExplore:
-            try await agentLifecycle(arguments, defaultRole: "explore")
+            try await agentLifecycle(arguments, defaultRole: "explore", exploreOnly: true)
         case MCPWindowToolName.agentRun:
-            try await agentLifecycle(arguments, defaultRole: "pair")
+            try await agentLifecycle(arguments, defaultRole: "pair", exploreOnly: false)
         case MCPWindowToolName.agentManage:
             try await agentManage(arguments)
         case MCPWindowToolName.history:
@@ -1722,12 +1722,52 @@ private actor AuthorityToolBackend {
         }
     }
 
-    private func agentLifecycle(_ arguments: [String: Value], defaultRole: String) async throws -> Value {
+    private func agentLifecycle(
+        _ arguments: [String: Value],
+        defaultRole: String,
+        exploreOnly: Bool
+    ) async throws -> Value {
         let operation = arguments["op"]?.stringValue ?? "start"
+        if exploreOnly {
+            guard ["start", "poll", "wait", "cancel"].contains(operation) else {
+                throw ServiceAPIError(code: .invalidRequest, message: "agent_explore supports start, poll, wait, and cancel")
+            }
+            let allowed: Set<String> = switch operation {
+            case "start": ["op", "message", "messages", "detach", "timeout", "inherit_worktree", "worktree", "worktree_id", "worktree_create", "worktree_repo_root", "worktree_branch", "worktree_base_ref", "worktree_path", "worktree_label", "worktree_color", "allow_external_worktree_path"]
+            case "poll": ["op", "session_id", "session_ids"]
+            case "wait": ["op", "session_id", "session_ids", "timeout"]
+            case "cancel": ["op", "session_id"]
+            default: []
+            }
+            if let field = arguments.keys.sorted().first(where: { !allowed.contains($0) }) {
+                throw ServiceAPIError(code: .invalidRequest, message: "agent_explore \(operation) does not support '\(field)'")
+            }
+        }
         switch operation {
         case "start":
-            guard let message = arguments["message"]?.stringValue, !message.isEmpty else {
-                throw ServiceAPIError(code: .invalidRequest, message: "Agent start requires message")
+            let singleMessage = arguments["message"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let messageValues = arguments["messages"]?.arrayValue
+            guard singleMessage == nil || messageValues == nil else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Agent start requires either message or messages, not both")
+            }
+            let messages: [String]
+            if let singleMessage, !singleMessage.isEmpty {
+                messages = [singleMessage]
+            } else if exploreOnly, let messageValues, !messageValues.isEmpty {
+                messages = try messageValues.enumerated().map { index, value in
+                    guard let message = value.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !message.isEmpty else {
+                        throw ServiceAPIError(code: .invalidRequest, message: "messages[\(index)] must be a non-empty string")
+                    }
+                    return message
+                }
+            } else {
+                throw ServiceAPIError(code: .invalidRequest, message: exploreOnly ? "Agent start requires message or messages" : "Agent start requires message")
+            }
+            if messages.count > 1,
+               arguments["worktree_create"]?.boolValue == true,
+               (arguments["worktree_branch"] != nil || arguments["worktree_path"] != nil)
+            {
+                throw ServiceAPIError(code: .invalidRequest, message: "Batch worktree creation requires implicit per-session branch and path values")
             }
             let start = try MCPAgentStartTarget.resolve(
                 modelID: arguments["model_id"]?.stringValue,
@@ -1736,38 +1776,157 @@ private actor AuthorityToolBackend {
                 providerSettingsID: arguments["provider_settings_id"]?.stringValue.flatMap(ProviderSettingsID.init(rawValue:)),
                 model: arguments["model"]?.stringValue
             )
-            let child = try await authority.spawnChildSession(
-                parentSessionID: binding.sessionID,
-                provider: start.provider,
-                providerSettingsID: start.providerSettingsID,
-                model: start.model,
-                initialPrompt: message,
-                role: start.role,
-                label: arguments["session_name"]?.stringValue
-            )
-            // Desktop copies the parent's worktree bindings onto the child
-            // session before provider start. Linux keeps a single root-owned
-            // binding and exposes it through `effectiveWorktreeBindings` /
-            // `authoritySessionSnapshot.worktrees`, so MCP path resolution and
-            // session-scoped file tools inherit the same workspace.
-            _ = try await authority.startChildAgentRun(sessionID: child.sessionID)
-            return try await value(authority.sessionSnapshot(sessionID: child.sessionID))
-        case "poll":
-            return try await agentSnapshotOrExpired(sessionID: agentSessionID(arguments))
-        case "wait":
-            let sessionID = try agentSessionID(arguments)
-            do {
-                return try await value(waitForTerminal(
-                    sessionID: sessionID,
-                    timeout: arguments["timeout"]?.doubleValue ?? 120
-                ))
-            } catch let error as ServiceAPIError where error.code == .notFound {
-                return DomainAgentRunSnapshot.expired(sessionID: sessionID).toValue()
+            var startedIDs: [UUID] = []
+            for (index, message) in messages.enumerated() {
+                let prompt = try await workflowWrappedMessage(message, arguments: arguments)
+                let child = try await authority.spawnChildSession(
+                    parentSessionID: binding.sessionID,
+                    provider: start.provider,
+                    providerSettingsID: start.providerSettingsID,
+                    model: start.model,
+                    initialPrompt: prompt,
+                    role: start.role,
+                    label: arguments["session_name"]?.stringValue
+                )
+                do {
+                    try await configureChildWorktree(sessionID: child.sessionID, arguments: arguments)
+                    _ = try await authority.startChildAgentRun(sessionID: child.sessionID)
+                    startedIDs.append(child.sessionID)
+                } catch {
+                    try? await authority.deleteManagedChildSession(
+                        sessionID: child.sessionID,
+                        controllingParentSessionID: binding.sessionID,
+                        actor: binding.actor
+                    )
+                    let retained = startedIDs.map(\.uuidString).joined(separator: ", ")
+                    let suffix = retained.isEmpty ? "" : " Already-started session_ids: \(retained)."
+                    let detail = (error as? ServiceAPIError)?.message ?? error.localizedDescription
+                    throw ServiceAPIError(
+                        code: .dependencyUnavailable,
+                        message: "Agent batch failed at index \(index) after starting \(startedIDs.count) of \(messages.count).\(suffix) \(detail)"
+                    )
+                }
             }
+            if startedIDs.count > 1 {
+                if arguments["detach"]?.boolValue == true || (arguments["timeout"]?.doubleValue ?? 120) <= 0 {
+                    return try await batchStartSnapshot(sessionIDs: startedIDs, result: arguments["detach"]?.boolValue == true ? "detached" : "poll")
+                }
+                return try await waitForInteresting(
+                    sessionIDs: startedIDs,
+                    timeout: arguments["timeout"]?.doubleValue ?? 120,
+                    multiple: true
+                )
+            }
+            let sessionID = startedIDs[0]
+            if arguments["detach"]?.boolValue == true {
+                return try await canonicalAgentSnapshot(sessionID: sessionID)
+            }
+            return try await waitForInteresting(
+                sessionIDs: [sessionID],
+                timeout: arguments["timeout"]?.doubleValue ?? 120,
+                multiple: false
+            )
+        case "poll":
+            let IDs = try agentSessionIDs(arguments, allowMany: true)
+            if exploreOnly { try await requireExploreChildren(IDs) }
+            if arguments["session_id"] != nil { return try await agentSnapshotOrExpired(sessionID: IDs[0]) }
+            var values: [Value] = []
+            for ID in IDs { values.append(try await agentSnapshotOrExpired(sessionID: ID)) }
+            return .array(values)
+        case "wait":
+            let IDs = try agentSessionIDs(arguments, allowMany: true)
+            if exploreOnly { try await requireExploreChildren(IDs) }
+            return try await waitForInteresting(
+                sessionIDs: IDs,
+                timeout: arguments["timeout"]?.doubleValue ?? 120,
+                multiple: IDs.count > 1
+            )
         case "cancel":
             let sessionID = try agentSessionID(arguments)
+            if exploreOnly { try await requireExploreChildren([sessionID]) }
+            let snapshot = try await canonicalAgentSnapshotModel(sessionID: sessionID)
+            guard snapshot.status == .running || snapshot.status == .waitingForInput else {
+                throw ServiceAPIError(code: .invalidRequest, message: "cancel requires a running or waiting_for_input session")
+            }
             _ = try await authority.cancelChildAgentRun(sessionID: sessionID)
-            return try await value(authority.sessionSnapshot(sessionID: sessionID))
+            return try await canonicalAgentSnapshot(sessionID: sessionID)
+        case "steer":
+            let sessionID = try agentSessionID(arguments)
+            guard let message = arguments["message"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !message.isEmpty else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Agent steer requires message")
+            }
+            let current = try await controlledChild(sessionID)
+            guard !current.interactions.contains(where: { $0.state == .pending }) else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Session is waiting for input; use respond")
+            }
+            let prompt = try await workflowWrappedMessage(message, arguments: arguments)
+            let digest = CanonicalSigning.bodyDigest(Data(prompt.utf8))
+            if [.preparing, .running, .waiting].contains(current.state) {
+                _ = try await authority.steerEmbeddedProviderRun(
+                    sessionID: sessionID,
+                    text: prompt,
+                    targetTurnEpoch: current.turnEpoch,
+                    actor: binding.actor,
+                    idempotencyKey: "agent-steer:\(UUID().uuidString)",
+                    requestDigest: digest
+                )
+            } else {
+                _ = try await authority.startEmbeddedProviderRun(
+                    sessionID: sessionID,
+                    actor: binding.actor,
+                    userMessage: message,
+                    providerPrompt: prompt,
+                    idempotencyKey: "agent-steer:\(UUID().uuidString)",
+                    requestDigest: digest
+                )
+            }
+            if arguments["wait"]?.boolValue == true || arguments["timeout_seconds"] != nil {
+                return try await waitForInteresting(
+                    sessionIDs: [sessionID],
+                    timeout: arguments["timeout_seconds"]?.doubleValue ?? 120,
+                    multiple: false
+                )
+            }
+            return try await canonicalAgentSnapshot(sessionID: sessionID)
+        case "respond":
+            let sessionID = try agentSessionID(arguments)
+            let current = try await controlledChild(sessionID)
+            guard let rawInteractionID = arguments["interaction_id"]?.stringValue,
+                  let interactionID = UUID(uuidString: rawInteractionID),
+                  let interaction = current.interactions.first(where: { $0.interactionID == interactionID && $0.state == .pending })
+            else { throw ServiceAPIError(code: .interactionSettled, message: "The pending interaction_id is missing or stale") }
+            let payload: Data
+            if let amendment = arguments["amendment"]?.stringValue {
+                guard let response = arguments["response"]?.stringValue else {
+                    throw ServiceAPIError(code: .invalidRequest, message: "amendment requires response")
+                }
+                payload = try JSONEncoder().encode([
+                    "optionId": Value.string(response),
+                    "decision": .string(response),
+                    "amendment": .string(amendment)
+                ])
+            } else if arguments["content"] != nil || arguments["meta"] != nil {
+                guard let action = arguments["response"]?.stringValue,
+                      ["accept", "decline", "cancel"].contains(action)
+                else { throw ServiceAPIError(code: .invalidRequest, message: "MCP elicitation response must be accept, decline, or cancel") }
+                var object: [String: Value] = ["action": .string(action)]
+                if let content = arguments["content"] { object["content"] = content }
+                if let meta = arguments["meta"] { object["_meta"] = meta }
+                payload = try JSONEncoder().encode(object)
+            } else {
+                let response = try interactionResponse(arguments, interaction: interaction)
+                payload = try AgentInteractionPresentationAdapter.compile(response: response, for: interaction)
+            }
+            _ = try await authority.answerInteraction(
+                sessionID: sessionID,
+                interactionID: interactionID,
+                expectedRevision: interaction.revision,
+                payload: payload,
+                actor: binding.actor,
+                idempotencyKey: "agent-respond:\(UUID().uuidString)",
+                requestDigest: CanonicalSigning.bodyDigest(payload)
+            )
+            return try await canonicalAgentSnapshot(sessionID: sessionID)
         default:
             throw ServiceAPIError(code: .invalidRequest, message: "Unsupported agent operation")
         }
@@ -1782,8 +1941,189 @@ private actor AuthorityToolBackend {
                 rolesOnly: arguments["roles_only"]?.boolValue ?? false
             ))
         case "list", "list_sessions":
-            let root = try await session().rootSessionID
-            return try await value(authority.agentSnapshots(rootSessionID: root))
+            var snapshots = try await authority.childSessionSnapshots(parentSessionID: binding.sessionID)
+            if let agent = arguments["agent"]?.stringValue?.lowercased() {
+                let agents = try await authority.agentSnapshots(rootSessionID: try await session().rootSessionID)
+                let IDs = Set(agents.filter { $0.role.lowercased() == agent || $0.label?.lowercased() == agent }.map(\.sessionID))
+                snapshots.removeAll { !IDs.contains($0.sessionID) }
+            }
+            var values: [DomainAgentRunSnapshot] = []
+            for snapshot in snapshots { values.append(try await canonicalAgentSnapshotModel(sessionID: snapshot.sessionID)) }
+            if let state = arguments["state"]?.stringValue { values.removeAll { $0.status.rawValue != state } }
+            let limit = min(max(arguments["limit"]?.intValue ?? 100, 1), 1000)
+            values.sort { $0.updatedAt > $1.updatedAt }
+            return .object([
+                "sessions": .array(values.prefix(limit).map { .object(managedSessionSummary($0)) })
+            ])
+        case "get_log":
+            let target = try await controlledChild(agentSessionID(arguments))
+            let offset = max(arguments["offset"]?.intValue ?? 0, 0)
+            let limit = min(max(arguments["limit"]?.intValue ?? 100, 1), 1000)
+            let entries = Array(target.transcript.dropFirst(offset).prefix(limit))
+            return .object([
+                "session_id": .string(target.sessionID.uuidString),
+                "turn_offset": .int(offset),
+                "turn_limit": .int(limit),
+                "returned_turn_count": .int(entries.count),
+                "total_turns": .int(target.transcript.count),
+                "transcript_xml": .string(transcriptXML(entries, root: "session_log", sessionID: target.sessionID))
+            ])
+        case "extract_handoff", "handoff":
+            let target = try await controlledChild(agentSessionID(arguments))
+            let maximum = min(max(arguments["max_transcript_items"]?.intValue ?? 200, 1), 1000)
+            var entries = Array(target.transcript.prefix(maximum))
+            let cutoff = arguments["up_to_item_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+            if arguments["up_to_item_id"] != nil, cutoff == nil {
+                throw ServiceAPIError(code: .invalidRequest, message: "up_to_item_id must be a valid UUID")
+            }
+            if let cutoff {
+                guard let index = entries.firstIndex(where: { $0.entryID == cutoff }) else {
+                    throw ServiceAPIError(code: .invalidRequest, message: "up_to_item_id was not found in the session transcript")
+                }
+                entries = Array(entries.prefix(index + 1))
+            }
+            var xml = transcriptXML(entries, root: "forked_session", sessionID: target.sessionID)
+            var includedFileContents = false
+            var fileContentsStatus = "not_requested"
+            if arguments["include_file_contents"]?.boolValue == true {
+                let selection = try await authority.selectionSnapshot(sessionID: target.sessionID)
+                var files: [String] = []
+                for entry in selection.entries.prefix(200) {
+                    guard let file = try? await authority.sessionProjectFile(
+                        sessionID: target.sessionID,
+                        request: .init(rootID: entry.rootID, logicalPath: entry.logicalPath, maximumBytes: 2_097_152)
+                    ) else { continue }
+                    files.append("    <file root_id=\"\(entry.rootID.uuidString)\" path=\"\(xmlEscaped(entry.logicalPath))\">\(xmlEscaped(file.content))</file>")
+                }
+                let block = files.isEmpty ? "" : "\n  <files>\n\(files.joined(separator: "\n"))\n  </files>"
+                xml = xml.replacingOccurrences(of: "\n</forked_session>", with: "\(block)\n</forked_session>")
+                includedFileContents = !files.isEmpty
+                fileContentsStatus = files.isEmpty ? "empty_selection" : "included"
+            }
+            let outputPath = arguments["output_path"]?.stringValue
+            let inline = arguments["inline"]?.boolValue ?? (outputPath == nil)
+            let maximumToolArguments = min(max(arguments["max_tool_args_characters"]?.intValue ?? 2000, 0), 20_000)
+            let deliveryID = UUID().uuidString
+            let agent = try await authority.agentSnapshots(rootSessionID: target.rootSessionID).first { $0.sessionID == target.sessionID }
+            var result: [String: Value] = [
+                "session_id": .string(target.sessionID.uuidString),
+                "name": .string(agent?.label ?? "Agent Session"),
+                "content_kind": .string("forked_session"),
+                "source": .string([.preparing, .running, .waiting].contains(target.state) ? "live" : "persisted"),
+                "source_tab_name": .string(agent?.label ?? "Agent Session"),
+                "delivery_id": .string(deliveryID),
+                "included_file_contents": .bool(includedFileContents),
+                "file_contents_status": .string(fileContentsStatus),
+                "inline": .bool(inline),
+                "bytes": .int(Data(xml.utf8).count),
+                "max_transcript_items": .int(maximum),
+                "max_tool_args_characters": .int(maximumToolArguments)
+            ]
+            if let cutoff { result["up_to_item_id"] = .string(cutoff.uuidString) }
+            if inline { result["handoff_xml"] = .string(xml) }
+            if let outputPath {
+                let expanded = NSString(string: outputPath).expandingTildeInPath
+                guard expanded.hasPrefix("/") else { throw ServiceAPIError(code: .invalidRequest, message: "output_path must be absolute") }
+                if FileManager.default.fileExists(atPath: expanded), arguments["overwrite"]?.boolValue == false {
+                    throw ServiceAPIError(code: .invalidRequest, message: "output_path exists and overwrite is false")
+                }
+                try Data(xml.utf8).write(to: URL(fileURLWithPath: expanded), options: .atomic)
+                result["output_path"] = .string(expanded)
+                result["bytes_written"] = .int(Data(xml.utf8).count)
+            }
+            return .object(result)
+        case "create_session":
+            let start = try MCPAgentStartTarget.resolve(modelID: arguments["model_id"]?.stringValue, defaultRole: "engineer")
+            let child = try await authority.spawnChildSession(
+                parentSessionID: binding.sessionID,
+                provider: start.provider,
+                providerSettingsID: start.providerSettingsID,
+                model: start.model,
+                initialPrompt: "",
+                role: start.role,
+                label: arguments["session_name"]?.stringValue
+            )
+            return .object(managedSessionSummary(try await canonicalAgentSnapshotModel(sessionID: child.sessionID)))
+        case "resume_session":
+            let target = try await controlledChild(agentSessionID(arguments))
+            let route = try MCPAgentStartTarget.resolve(modelID: arguments["model_id"]?.stringValue, defaultRole: "pair")
+            _ = try await authority.reconfigureManagedChildSession(
+                sessionID: target.sessionID,
+                controllingParentSessionID: binding.sessionID,
+                role: route.role,
+                provider: route.provider,
+                providerSettingsID: route.providerSettingsID,
+                model: route.model,
+                actor: binding.actor
+            )
+            return .object(managedSessionSummary(try await canonicalAgentSnapshotModel(sessionID: target.sessionID)))
+        case "stop_session":
+            let target = try await controlledChild(agentSessionID(arguments))
+            let wasActive = [.preparing, .running, .waiting].contains(target.state)
+            if wasActive { _ = try await authority.cancelChildAgentRun(sessionID: target.sessionID) }
+            var summary = managedSessionSummary(try await canonicalAgentSnapshotModel(sessionID: target.sessionID))
+            summary["stop_requested"] = .bool(wasActive)
+            return .object(summary)
+        case "cleanup_sessions":
+            let IDs = try cleanupSessionIDs(arguments)
+            var deleted: [Value] = []
+            var skipped: [Value] = []
+            var errors: [Value] = []
+            var unprocessed: [Value] = []
+            var retry: [Value] = []
+            for (index, ID) in IDs.enumerated() {
+                if Task.isCancelled {
+                    let remaining = IDs[index...].map { Value.string($0.uuidString) }
+                    unprocessed.append(contentsOf: remaining)
+                    retry.append(contentsOf: remaining)
+                    break
+                }
+                do {
+                    let target = try await controlledChild(ID)
+                    if [.preparing, .running, .waiting].contains(target.state) {
+                        skipped.append(.object(["session_id": .string(ID.uuidString), "reason": .string("skipped_active")]))
+                        continue
+                    }
+                    try await authority.deleteManagedChildSession(
+                        sessionID: ID,
+                        controllingParentSessionID: binding.sessionID,
+                        actor: binding.actor
+                    )
+                    deleted.append(.object(["session_id": .string(ID.uuidString), "durable": .bool(true)]))
+                } catch is CancellationError {
+                    errors.append(.object(["session_id": .string(ID.uuidString), "reason": .string("mutation_cancelled"), "durable": .bool(false)]))
+                    retry.append(.string(ID.uuidString))
+                    let remaining = IDs.dropFirst(index + 1).map { Value.string($0.uuidString) }
+                    unprocessed.append(contentsOf: remaining)
+                    retry.append(contentsOf: remaining)
+                    break
+                } catch let error as ServiceAPIError where error.code == .notFound {
+                    skipped.append(.object(["session_id": .string(ID.uuidString), "reason": .string("already_absent")]))
+                } catch let error as ServiceAPIError {
+                    errors.append(.object([
+                        "session_id": .string(ID.uuidString),
+                        "reason": .string(error.code.rawValue),
+                        "message": .string(error.message)
+                    ]))
+                }
+            }
+            let cancelled = Task.isCancelled || !unprocessed.isEmpty
+            let onlyAbsent = !skipped.isEmpty && skipped.allSatisfy { $0.objectValue?["reason"]?.stringValue == "already_absent" }
+            let status = cancelled ? "cancelled" : (errors.isEmpty && (skipped.isEmpty || onlyAbsent) ? "completed" : "partial")
+            return .object([
+                "status": .string(status),
+                "cancelled": .bool(cancelled),
+                "processed_count": .int(deleted.count + skipped.count + errors.count),
+                "deleted_count": .int(deleted.count),
+                "skipped_count": .int(skipped.count + errors.count),
+                "unprocessed_count": .int(unprocessed.count),
+                "deleted_sessions": .array(deleted),
+                "skipped_sessions": .array(skipped + errors),
+                "unprocessed_sessions": .array(unprocessed.map { value in
+                    .object(["session_id": value, "reason": .string("cancelled_before_processing")])
+                }),
+                "retry_session_ids": .array(retry)
+            ])
         case "list_workflows":
             let repository = try await authority.workflowRepositorySnapshot()
             return try value(MCPWorkflowListResult(
@@ -1970,12 +2310,396 @@ private actor AuthorityToolBackend {
         return sessionID
     }
 
+    private func agentSessionIDs(_ arguments: [String: Value], allowMany: Bool) throws -> [UUID] {
+        let hasOne = arguments["session_id"] != nil
+        let hasMany = arguments["session_ids"] != nil
+        guard hasOne != hasMany else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Provide exactly one of session_id or session_ids")
+        }
+        if hasOne { return [try agentSessionID(arguments)] }
+        guard allowMany,
+              let values = arguments["session_ids"]?.arrayValue,
+              !values.isEmpty,
+              values.count <= 256
+        else { throw ServiceAPIError(code: .invalidRequest, message: "session_ids must contain 1...256 UUIDs") }
+        var seen = Set<UUID>()
+        return try values.map { value in
+            guard let raw = value.stringValue, let ID = UUID(uuidString: raw), seen.insert(ID).inserted else {
+                throw ServiceAPIError(code: .invalidRequest, message: "session_ids must contain unique valid UUID strings")
+            }
+            return ID
+        }
+    }
+
+    private func cleanupSessionIDs(_ arguments: [String: Value]) throws -> [UUID] {
+        guard let values = arguments["session_ids"]?.arrayValue,
+              (1...256).contains(values.count)
+        else { throw ServiceAPIError(code: .invalidRequest, message: "session_ids must contain 1...256 UUIDs") }
+        var seen = Set<UUID>()
+        return try values.map { value in
+            guard let raw = value.stringValue,
+                  let ID = UUID(uuidString: raw),
+                  seen.insert(ID).inserted
+            else { throw ServiceAPIError(code: .invalidRequest, message: "session_ids must contain unique valid UUID strings") }
+            return ID
+        }
+    }
+
+    private func controlledChild(_ sessionID: UUID) async throws -> SessionSnapshot {
+        let snapshot = try await authority.sessionSnapshot(sessionID: sessionID)
+        guard snapshot.parentSessionID == binding.sessionID else {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Session is not controlled by this agent")
+        }
+        return snapshot
+    }
+
+    private func canonicalAgentSnapshotModel(sessionID: UUID) async throws -> DomainAgentRunSnapshot {
+        let authoritySnapshot = try await authority.authoritySessionSnapshot(sessionID: sessionID)
+        let session = authoritySnapshot.session
+        guard session.parentSessionID == binding.sessionID else {
+            throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Session is not controlled by this agent")
+        }
+        let agent = try await authority.agentSnapshots(rootSessionID: session.rootSessionID).first { $0.sessionID == sessionID }
+        let pending = authoritySnapshot.interactions.last { $0.state == .pending }
+        let presentation = pending.map {
+            AgentInteractionPresentationAdapter.project($0, turnID: String(session.turnEpoch), mutable: true)
+        }
+        let interaction: DomainAgentRunSnapshot.Interaction? = if let pending, let presentation {
+            DomainAgentRunSnapshot.Interaction(
+                id: pending.interactionID,
+                kind: pending.kind == .approval ? .approval : .question,
+                responseType: pending.kind == .approval ? .choice : .text,
+                title: nil,
+                prompt: presentation.prompt,
+                context: nil,
+                allowsMultiple: nil,
+                options: presentation.choices.map { .init(label: $0) },
+                fields: [],
+                details: []
+            )
+        } else { nil }
+        let status: DomainAgentRunSnapshot.Status = if pending != nil || session.state == .waiting {
+            .waitingForInput
+        } else {
+            switch session.state {
+            case .preparing, .running: .running
+            case .failed: .failed
+            case .canceled, .interrupted: .cancelled
+            case .archived: .expired
+            case .idle, .completed: .completed
+            case .waiting: .waitingForInput
+            }
+        }
+        let updatedAt = session.transcript.last?.timestamp
+            ?? authoritySnapshot.activeRun?.endedAt
+            ?? authoritySnapshot.activeRun?.startedAt
+            ?? Date()
+        let project = try await authority.projectSnapshot(projectID: session.projectID)
+        let worktrees = authoritySnapshot.worktrees.compactMap { binding -> DomainAgentRunSnapshot.WorktreeBinding? in
+            guard let root = project.roots.first(where: { $0.rootID == binding.rootID }) else { return nil }
+            return .init(
+                id: binding.bindingID.uuidString,
+                repositoryID: binding.rootID.uuidString,
+                repoKey: root.logicalName,
+                logicalRootPath: root.canonicalPath,
+                logicalRootName: root.logicalName,
+                worktreeID: binding.bindingID.uuidString,
+                worktreeRootPath: binding.physicalPath,
+                worktreeName: binding.branch,
+                branch: binding.branch,
+                head: binding.baseRef,
+                visualLabel: authoritySnapshot.permissions.providerSettings["repoprompt.worktree.visual_label"],
+                visualColorHex: authoritySnapshot.permissions.providerSettings["repoprompt.worktree.visual_color_hex"],
+                boundAt: updatedAt,
+                source: "service",
+                unavailable: binding.ownershipState != .active
+            )
+        }
+        return DomainAgentRunSnapshot(
+            sessionID: sessionID,
+            runID: authoritySnapshot.activeRun?.runID,
+            tabID: nil,
+            sessionName: agent?.label,
+            agentRaw: session.providerSettingsID?.rawValue ?? session.provider.rawValue,
+            agentDisplayName: agent?.role,
+            modelRaw: session.model,
+            reasoningEffortRaw: session.effectiveTurnConfiguration?.configuration.effortID,
+            status: status,
+            statusText: session.runPresentation?.runningStatusText
+                ?? session.runPresentation?.terminalSettlementCode
+                ?? authoritySnapshot.activeRun?.endReason,
+            latestAssistantPreview: session.transcript.last(where: { $0.kind == .assistant })?.content,
+            interaction: interaction,
+            transcriptItemCount: session.transcript.count,
+            updatedAt: updatedAt,
+            parentSessionID: session.parentSessionID,
+            failureReason: DomainAgentRunSnapshot.FailureReason.classify(
+                status: status,
+                statusText: authoritySnapshot.activeRun?.endReason
+            ),
+            worktreeBindings: worktrees,
+            activeWorktreeMerges: []
+        )
+    }
+
+    private func canonicalAgentSnapshot(sessionID: UUID) async throws -> Value {
+        try await canonicalAgentSnapshotModel(sessionID: sessionID).toValue()
+    }
+
+    private func managedSessionSummary(_ snapshot: DomainAgentRunSnapshot) -> [String: Value] {
+        var object: [String: Value] = [
+            "session_id": .string(snapshot.sessionID.uuidString),
+            "name": .string(snapshot.sessionName ?? "Agent Session"),
+            "last_modified": .string(ISO8601DateFormatter().string(from: snapshot.updatedAt)),
+            "item_count": .int(snapshot.transcriptItemCount),
+            "state": .string(snapshot.status.rawValue),
+            "is_live": .bool(!snapshot.status.isTerminal),
+            "is_mcp_originated": .bool(true),
+            "agent": .object([
+                "id": snapshot.agentRaw.map(Value.string) ?? .null,
+                "model": snapshot.modelRaw.map(Value.string) ?? .null
+            ])
+        ]
+        if let parentSessionID = snapshot.parentSessionID {
+            object["parent_session_id"] = .string(parentSessionID.uuidString)
+        }
+        return object
+    }
+
+    private func requireExploreChildren(_ sessionIDs: [UUID]) async throws {
+        let agents = try await authority.agentSnapshots(rootSessionID: try await session().rootSessionID)
+        for sessionID in sessionIDs {
+            _ = try await controlledChild(sessionID)
+            guard agents.contains(where: { $0.sessionID == sessionID && $0.role == "explore" }) else {
+                throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Session is not an explore child of this agent")
+            }
+        }
+    }
+
+    private func batchStartSnapshot(sessionIDs: [UUID], result: String) async throws -> Value {
+        var snapshots: [DomainAgentRunSnapshot] = []
+        for sessionID in sessionIDs {
+            snapshots.append(try await canonicalAgentSnapshotModel(sessionID: sessionID))
+        }
+        let running = snapshots.filter { $0.status == .running }.map(\.sessionID)
+        let terminal = snapshots.filter { $0.status.isTerminal }.map(\.sessionID)
+        let interesting = snapshots.filter { $0.interaction != nil || $0.status.isTerminal }.map(\.sessionID)
+        return .object([
+            "start": .object([
+                "mode": .string("many"),
+                "result": .string(result),
+                "started_count": .int(sessionIDs.count),
+                "session_ids": .array(sessionIDs.map { .string($0.uuidString) }),
+                "running_session_ids": .array(running.map { .string($0.uuidString) }),
+                "terminal_session_ids": .array(terminal.map { .string($0.uuidString) }),
+                "interesting_session_ids": .array(interesting.map { .string($0.uuidString) })
+            ]),
+            "session_ids": .array(sessionIDs.map { .string($0.uuidString) }),
+            "snapshots": .array(snapshots.map { $0.toValue() })
+        ])
+    }
+
     private func agentSnapshotOrExpired(sessionID: UUID) async throws -> Value {
         do {
-            return try await value(authority.sessionSnapshot(sessionID: sessionID))
+            return try await canonicalAgentSnapshot(sessionID: sessionID)
         } catch let error as ServiceAPIError where error.code == .notFound {
             return DomainAgentRunSnapshot.expired(sessionID: sessionID).toValue()
         }
+    }
+
+    private func waitForInteresting(sessionIDs: [UUID], timeout: Double, multiple: Bool) async throws -> Value {
+        let deadline = ContinuousClock().now.advanced(by: .seconds(min(max(timeout, 0), 3600)))
+        while true {
+            var snapshots: [DomainAgentRunSnapshot] = []
+            for ID in sessionIDs {
+                do { snapshots.append(try await canonicalAgentSnapshotModel(sessionID: ID)) }
+                catch let error as ServiceAPIError where error.code == .notFound { snapshots.append(.expired(sessionID: ID)) }
+            }
+            if let actionable = snapshots.first(where: \.isActionableForMCPWait) {
+                guard multiple else { return actionable.toValue() }
+                var object = actionable.asObject()
+                object["wait"] = .object([
+                    "mode": .string("any"),
+                    "result": .string(actionable.status == .expired ? "expired" : "snapshot_ready"),
+                    "winner_session_id": .string(actionable.sessionID.uuidString),
+                    "session_ids": .array(sessionIDs.map { .string($0.uuidString) }),
+                    "waited_count": .int(sessionIDs.count),
+                    "pending_session_ids": .array(snapshots.filter { !$0.isActionableForMCPWait }.map { .string($0.sessionID.uuidString) }),
+                    "instruction": .null
+                ])
+                object["snapshots"] = .array(snapshots.map { $0.toValue() })
+                return .object(object)
+            }
+            if ContinuousClock().now >= deadline {
+                guard multiple else { return snapshots[0].toValue() }
+                var object = snapshots[0].asObject()
+                object["wait"] = .object([
+                    "mode": .string("any"),
+                    "result": .string("timed_out"),
+                    "winner_session_id": .null,
+                    "session_ids": .array(sessionIDs.map { .string($0.uuidString) }),
+                    "waited_count": .int(sessionIDs.count),
+                    "pending_session_ids": .array(sessionIDs.map { .string($0.uuidString) }),
+                    "instruction": .null
+                ])
+                object["snapshots"] = .array(snapshots.map { $0.toValue() })
+                return .object(object)
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
+    private func workflowWrappedMessage(_ message: String, arguments: [String: Value]) async throws -> String {
+        let ID = arguments["workflow_id"]?.stringValue
+        let name = arguments["workflow_name"]?.stringValue
+        guard ID == nil || name == nil else { throw ServiceAPIError(code: .invalidRequest, message: "workflow_id and workflow_name are mutually exclusive") }
+        if let ID { return try await authority.wrapWorkflowUserText(workflowID: ID, userText: message) }
+        if let name {
+            let matches = try await authority.workflowSnapshots().filter { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+            guard matches.count == 1, let workflow = matches.first else {
+                throw ServiceAPIError(code: .notFound, message: "Workflow name was not found or is ambiguous")
+            }
+            return try await authority.wrapWorkflowUserText(workflowID: workflow.workflowID, userText: message)
+        }
+        return message
+    }
+
+    private func configureChildWorktree(sessionID: UUID, arguments: [String: Value]) async throws {
+        let selector = arguments["worktree"]?.stringValue
+        let explicitID = arguments["worktree_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+        let create = arguments["worktree_create"]?.boolValue == true
+        guard [selector != nil, explicitID != nil, create].filter({ $0 }).count <= 1 else {
+            throw ServiceAPIError(code: .invalidRequest, message: "worktree, worktree_id, and worktree_create are mutually exclusive")
+        }
+        let explicit = selector != nil || explicitID != nil || create
+        let visualLabel = arguments["worktree_label"]?.stringValue
+        let visualColor = arguments["worktree_color"]?.stringValue
+        if let visualColor,
+           visualColor.range(of: #"^#[0-9A-Fa-f]{6}$"#, options: .regularExpression) == nil
+        {
+            throw ServiceAPIError(code: .invalidRequest, message: "worktree_color must use #RRGGBB")
+        }
+        try await authority.setManagedChildWorktreeInheritance(
+            sessionID: sessionID,
+            controllingParentSessionID: binding.sessionID,
+            inherit: explicit ? false : (arguments["inherit_worktree"]?.boolValue ?? true),
+            actor: binding.actor
+        )
+        guard explicit else {
+            if visualLabel != nil || visualColor != nil {
+                try await authority.setManagedChildWorktreePresentation(
+                    sessionID: sessionID,
+                    controllingParentSessionID: binding.sessionID,
+                    label: visualLabel,
+                    colorHex: visualColor,
+                    actor: binding.actor
+                )
+            }
+            return
+        }
+        let parent = try await session()
+        let project = try await authority.projectSnapshot(projectID: parent.projectID)
+        let requestedRoot = arguments["worktree_repo_root"]?.stringValue
+        let root: ProjectRootSnapshot? = if let requestedRoot {
+            project.roots.first { $0.rootID.uuidString == requestedRoot || $0.logicalName == requestedRoot || $0.canonicalPath == requestedRoot }
+        } else if project.roots.count == 1 {
+            project.roots.first
+        } else { nil }
+        guard let root else { throw ServiceAPIError(code: .invalidRequest, message: "worktree_repo_root is required for a multi-root project") }
+        if create {
+            let branch = arguments["worktree_branch"]?.stringValue
+                ?? "rp/agent/\(sessionID.uuidString.lowercased().prefix(12))"
+            _ = try await authority.createWorktree(
+                sessionID: sessionID,
+                rootID: root.rootID,
+                baseRef: arguments["worktree_base_ref"]?.stringValue ?? "HEAD",
+                branch: branch,
+                requestedPath: arguments["worktree_path"]?.stringValue,
+                allowExternalPath: arguments["allow_external_worktree_path"]?.boolValue ?? false,
+                actor: binding.actor,
+                idempotencyKey: "agent-worktree-create:\(UUID().uuidString)",
+                requestDigest: CanonicalSigning.bodyDigest(Data(branch.utf8))
+            )
+            try await authority.setManagedChildWorktreePresentation(
+                sessionID: sessionID,
+                controllingParentSessionID: binding.sessionID,
+                label: visualLabel,
+                colorHex: visualColor,
+                actor: binding.actor
+            )
+            return
+        }
+        let candidates = try await authority.worktreeSnapshots(projectID: parent.projectID).filter {
+            guard $0.rootID == root.rootID, $0.ownershipState == .active else { return false }
+            if let explicitID { return $0.bindingID == explicitID }
+            guard let selector else { return false }
+            if selector == "@current" { return $0.sessionID == parent.rootSessionID }
+            if selector == "@main" { return $0.branch == "main" || $0.branch == "master" }
+            if selector.hasPrefix("@id:") { return $0.bindingID.uuidString == String(selector.dropFirst(4)) }
+            if selector.hasPrefix("@branch:") { return $0.branch == String(selector.dropFirst(8)) }
+            return $0.branch == selector || $0.physicalPath == NSString(string: selector).expandingTildeInPath
+        }
+        guard candidates.count == 1, let worktree = candidates.first else {
+            throw ServiceAPIError(code: .notFound, message: "Worktree selector did not resolve uniquely")
+        }
+        try await authority.setManagedChildWorktreeSelection(
+            sessionID: sessionID,
+            controllingParentSessionID: binding.sessionID,
+            bindingIDs: [worktree.bindingID],
+            actor: binding.actor
+        )
+        try await authority.setManagedChildWorktreePresentation(
+            sessionID: sessionID,
+            controllingParentSessionID: binding.sessionID,
+            label: visualLabel,
+            colorHex: visualColor,
+            actor: binding.actor
+        )
+    }
+
+    private func interactionResponse(_ arguments: [String: Value], interaction: InteractionSnapshot) throws -> AgentPresentationInteractionResponseWire {
+        if let answers = arguments["answers"]?.objectValue {
+            let values = answers.map { key, value in
+                if let text = value.stringValue {
+                    return AgentPresentationQuestionAnswerWire(questionID: key, customText: text)
+                }
+                if let selected = value.arrayValue?.compactMap(\.stringValue) {
+                    return AgentPresentationQuestionAnswerWire(questionID: key, selectedChoiceIDs: selected)
+                }
+                let object = value.objectValue ?? [:]
+                let selected = object["selected_options"]?.arrayValue?.compactMap(\.stringValue)
+                    ?? object["selected_choice_ids"]?.arrayValue?.compactMap(\.stringValue)
+                    ?? object["selected_option"]?.stringValue.map { [$0] }
+                    ?? []
+                return AgentPresentationQuestionAnswerWire(
+                    questionID: key,
+                    selectedChoiceIDs: selected,
+                    customText: object["custom_response"]?.stringValue ?? object["answer"]?.stringValue,
+                    skipped: object["skipped"]?.boolValue ?? false
+                )
+            }
+            return .questionnaire(values)
+        }
+        guard let text = arguments["response"]?.stringValue else {
+            throw ServiceAPIError(code: .invalidRequest, message: "respond requires response or answers")
+        }
+        let provider = try? JSONDecoder.serviceDecoder.decode(ProviderInteractionPayload.self, from: interaction.payload)
+        if provider?.choices.isEmpty == false { return .choice(choiceID: text, customText: arguments["amendment"]?.stringValue) }
+        return .text(text)
+    }
+
+    private func transcriptXML(_ entries: [TranscriptEntry], root: String, sessionID: UUID) -> String {
+        let body = entries.map { entry in
+            "  <message id=\"\(entry.entryID.uuidString)\" role=\"\(entry.kind.rawValue)\">\(xmlEscaped(entry.content))</message>"
+        }.joined(separator: "\n")
+        return "<\(root) session_id=\"\(sessionID.uuidString)\">\n\(body)\n</\(root)>"
+    }
+
+    private func xmlEscaped(_ value: String) -> String {
+        value.replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
     }
 
     private func waitForTerminal(sessionID: UUID, timeout: Double) async throws -> SessionSnapshot {

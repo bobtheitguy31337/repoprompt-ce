@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentRuntimeCore
 import RepoPromptHeadlessRuntime
 import RepoPromptMCPAdapter
 import RepoPromptServicePersistence
@@ -7,6 +8,233 @@ import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 final class RepoPromptMCPAdapterTests: XCTestCase {
+    func testAgentControlPlaneCreatesScopesListsPollsAndDurablyCleansUpChildren() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(store: store)
+        let actor = ExternalActor(userID: "control", username: "control", displayName: "Control")
+        let project = try await authority.createProject(
+            input: .init(name: "Control", roots: []),
+            externalActor: actor,
+            idempotencyKey: "control-project",
+            requestDigest: "control-project"
+        )
+        let parent = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "control-parent",
+            requestDigest: "control-parent"
+        )
+        let otherParent = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "control-other-parent",
+            requestDigest: "control-other-parent"
+        )
+        let adapter = RepoPromptMCPAdapter(authority: authority)
+        let binding = RepoPromptMCPBinding(sessionID: parent.sessionID, actor: actor)
+        let createdData = try await adapter.invoke(
+            toolName: "agent_manage",
+            argumentsJSON: json(["op": "create_session", "model_id": "pair", "session_name": "Child One"]),
+            binding: binding
+        )
+        let created = try XCTUnwrap(JSONSerialization.jsonObject(with: createdData) as? [String: Any])
+        let childID = try XCTUnwrap((created["session_id"] as? String).flatMap(UUID.init(uuidString:)))
+        XCTAssertEqual(created["state"] as? String, "completed")
+        XCTAssertEqual(created["name"] as? String, "Child One")
+
+        let listedData = try await adapter.invoke(
+            toolName: "agent_manage",
+            argumentsJSON: json(["op": "list_sessions"]),
+            binding: binding
+        )
+        let listedEnvelope = try XCTUnwrap(JSONSerialization.jsonObject(with: listedData) as? [String: Any])
+        let listed = try XCTUnwrap(listedEnvelope["sessions"] as? [[String: Any]])
+        XCTAssertEqual(listed.compactMap { $0["session_id"] as? String }, [childID.uuidString])
+
+        let logData = try await adapter.invoke(
+            toolName: "agent_manage",
+            argumentsJSON: json(["op": "get_log", "session_id": childID.uuidString]),
+            binding: binding
+        )
+        let log = try XCTUnwrap(JSONSerialization.jsonObject(with: logData) as? [String: Any])
+        XCTAssertTrue((log["transcript_xml"] as? String)?.contains("<session_log") == true)
+
+        let handoffData = try await adapter.invoke(
+            toolName: "agent_manage",
+            argumentsJSON: json(["op": "extract_handoff", "session_id": childID.uuidString]),
+            binding: binding
+        )
+        let handoff = try XCTUnwrap(JSONSerialization.jsonObject(with: handoffData) as? [String: Any])
+        XCTAssertTrue((handoff["handoff_xml"] as? String)?.contains("<forked_session") == true)
+
+        _ = try await adapter.invoke(
+            toolName: "agent_manage",
+            argumentsJSON: json(["op": "resume_session", "session_id": childID.uuidString, "model_id": "pair"]),
+            binding: binding
+        )
+        _ = try await adapter.invoke(
+            toolName: "agent_manage",
+            argumentsJSON: json(["op": "stop_session", "session_id": childID.uuidString]),
+            binding: binding
+        )
+
+        let pollData = try await adapter.invoke(
+            toolName: "agent_run",
+            argumentsJSON: json(["op": "poll", "session_ids": [childID.uuidString]]),
+            binding: binding
+        )
+        XCTAssertEqual((try JSONSerialization.jsonObject(with: pollData) as? [[String: Any]])?.count, 1)
+
+        do {
+            _ = try await adapter.invoke(
+                toolName: "agent_run",
+                argumentsJSON: json(["op": "poll", "session_id": childID.uuidString]),
+                binding: .init(sessionID: otherParent.sessionID, actor: actor)
+            )
+            XCTFail("Unrelated roots must not control the child")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .authorizationDecisionRejected)
+        }
+
+        let releasedBindingID = UUID()
+        _ = try await store.persistWorktree(
+            WorktreeBindingSnapshot(
+                bindingID: releasedBindingID,
+                projectID: project.projectID,
+                rootID: UUID(),
+                sessionID: childID,
+                baseRef: "HEAD",
+                branch: "rp/test-release",
+                physicalPath: "/tmp/rp-test-release-\(releasedBindingID.uuidString)",
+                ownershipState: .active,
+                mergeState: .clean,
+                revision: 1
+            ),
+            actor: actor,
+            correlationID: UUID()
+        )
+        let cleanupData = try await adapter.invoke(
+            toolName: "agent_manage",
+            argumentsJSON: json(["op": "cleanup_sessions", "session_ids": [childID.uuidString]]),
+            binding: binding
+        )
+        let cleanup = try XCTUnwrap(JSONSerialization.jsonObject(with: cleanupData) as? [String: Any])
+        XCTAssertEqual((cleanup["deleted_sessions"] as? [[String: Any]])?.count, 1)
+        do {
+            _ = try await authority.sessionSnapshot(sessionID: childID)
+            XCTFail("Deleted child must not remain in authority state")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .notFound)
+        }
+        let storedReleasedBinding = try await store.worktree(bindingID: releasedBindingID)
+        let releasedBinding = try XCTUnwrap(storedReleasedBinding)
+        XCTAssertNil(releasedBinding.sessionID)
+        XCTAssertEqual(releasedBinding.ownershipState, .released)
+        let events = try await authority.events(after: nil, limit: 1000).events
+        XCTAssertTrue(events.contains { $0.eventType == .sessionRemoved && $0.sessionID == childID })
+        try await store.close()
+    }
+
+    func testSharedAgentModeInstructionsRequireObservableToolDispatch() {
+        let root = AgentModeInstructionCore.serviceBaseInstructions(isRootSession: true, isCodexNative: false)
+        XCTAssertTrue(root.contains("agent_run"))
+        XCTAssertTrue(root.contains("Do not claim that a child was started unless"))
+        let child = AgentModeInstructionCore.serviceBaseInstructions(isRootSession: false, isCodexNative: false)
+        XCTAssertTrue(child.contains("cannot recursively"))
+        XCTAssertFalse(child.contains("Launch independent tasks with `agent_run`"))
+    }
+
+    func testAgentExploreBatchStartsThreeObservableReadOnlyChildren() async throws {
+        let runtimeRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/control-plane-tests/\(UUID().uuidString)", isDirectory: true)
+        let worktrees = runtimeRoot.appendingPathComponent("worktrees", isDirectory: true)
+        try FileManager.default.createDirectory(at: worktrees, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: runtimeRoot) }
+        let runtime = BaseInstructionRecordingRuntime()
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = try RepoPromptHeadlessAuthority(
+            store: store,
+            worktreeService: WorktreeRuntimeService(baseDirectory: worktrees.path, resources: store),
+            providerAdapter: ProviderCLIAdapter(runtimes: [runtime])
+        )
+        let actor = ExternalActor(userID: "explore", username: "explore", displayName: "Explore")
+        let project = try await authority.createProject(
+            input: .init(name: "Explore", roots: [
+                .init(logicalName: "source", path: runtimeRoot.path, writable: false)
+            ]),
+            externalActor: actor,
+            idempotencyKey: "explore-project",
+            requestDigest: "explore-project"
+        )
+        let parent = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "explore-parent",
+            requestDigest: "explore-parent"
+        )
+        let adapter = RepoPromptMCPAdapter(authority: authority)
+        let resultData = try await adapter.invoke(
+            toolName: "agent_explore",
+            argumentsJSON: json([
+                "op": "start",
+                "messages": ["inspect one", "inspect two", "inspect three"],
+                "detach": true
+            ]),
+            binding: .init(sessionID: parent.sessionID, actor: actor)
+        )
+        let result = try XCTUnwrap(JSONSerialization.jsonObject(with: resultData) as? [String: Any])
+        let start = try XCTUnwrap(result["start"] as? [String: Any])
+        XCTAssertEqual(start["mode"] as? String, "many")
+        XCTAssertEqual(start["result"] as? String, "detached")
+        XCTAssertEqual(start["started_count"] as? Int, 3)
+        XCTAssertEqual((result["session_ids"] as? [String])?.count, 3)
+        let children = try await authority.childSessionSnapshots(parentSessionID: parent.sessionID)
+        XCTAssertEqual(children.count, 3)
+        let agents = try await authority.agentSnapshots(rootSessionID: parent.sessionID)
+        XCTAssertEqual(agents.filter { $0.parentAgentID != nil && $0.role == "explore" }.count, 3)
+        await authority.waitForProviderRunsToSettle()
+        try await authority.quiesce()
+        try await store.close()
+    }
+
+    func testAgentStartInjectsSharedBaseInstructionsIntoProviderRequest() async throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/control-plane-tests/\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = BaseInstructionRecordingRuntime()
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let authority = RepoPromptHeadlessAuthority(
+            store: store,
+            providerAdapter: ProviderCLIAdapter(runtimes: [runtime])
+        )
+        let actor = ExternalActor(userID: "instructions", username: "instructions", displayName: "Instructions")
+        let project = try await authority.createProject(
+            input: .init(name: "Instructions", roots: [.init(logicalName: "source", path: root.path, writable: true)]),
+            externalActor: actor,
+            idempotencyKey: "instructions-project",
+            requestDigest: "instructions-project"
+        )
+        let parent = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: actor,
+            idempotencyKey: "instructions-parent",
+            requestDigest: "instructions-parent"
+        )
+        let adapter = RepoPromptMCPAdapter(authority: authority)
+        _ = try await adapter.invoke(
+            toolName: "agent_run",
+            argumentsJSON: json(["op": "start", "message": "Inspect only", "model_id": "pair", "detach": true]),
+            binding: .init(sessionID: parent.sessionID, actor: actor)
+        )
+        await authority.waitForProviderRunsToSettle()
+        let recorded = await runtime.recordedBaseInstructions()
+        XCTAssertTrue(recorded?.contains("agent_run") == true)
+        XCTAssertTrue(recorded?.contains("cannot recursively use `agent_run`") == true)
+        try await authority.quiesce()
+        try await store.close()
+    }
+
     func testCanonicalCatalogDispatchesWorkspaceStateThroughDurableAuthority() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -230,6 +458,32 @@ final class RepoPromptMCPAdapterTests: XCTestCase {
     private func json(_ object: Any) throws -> Data {
         try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
+}
+
+private actor BaseInstructionRecordingRuntime: AgentProviderRuntime {
+    let kind = ProviderKind.codex
+    private var instructions: String?
+
+    func capability() -> ProviderCapability {
+        .init(kind: kind, enabled: true, executable: "/test/codex", supportsResume: true, supportsSteering: true)
+    }
+
+    func preflight() -> ProviderCapability { capability() }
+
+    func execute(
+        _ request: ProviderExecutionRequest,
+        onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
+    ) async throws -> ProviderExecutionResult {
+        instructions = request.baseInstructions
+        await onEvent(.providerIdentity("control-plane-thread"))
+        await onEvent(.assistantFinal("done"))
+        await onEvent(.completed(providerSessionID: "control-plane-thread"))
+        return .init(output: "done", providerSessionID: "control-plane-thread")
+    }
+
+    func interrupt(runID _: UUID) {}
+
+    func recordedBaseInstructions() -> String? { instructions }
 }
 
 private actor NativeOracleRunner: WorkspaceCommandRunning {
