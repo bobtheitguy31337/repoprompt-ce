@@ -3497,7 +3497,11 @@
     });
   }
 
-  async function runGabblinMutation(control, operation) {
+  function clientIntegrationState(inventory) {
+    return inventory?.client || null;
+  }
+
+  async function runClientIntegrationMutation(control, operation) {
     if (state.lifecycleMutation) return state.lifecycleMutation;
     setDisabledReason(control, true, "An integration operation is in progress.");
     state.lifecycleMutation = (async () => {
@@ -3515,16 +3519,16 @@
     return state.lifecycleMutation;
   }
 
-  function gabblinDisclosureCard() {
+  function clientDisclosureCard() {
     const disclosure = state.lifecycleDisclosure;
     if (!disclosure) return null;
     const card = desktopCard(
-      "Gabblin API Token",
-      "Copy this token into Gabblin now. It will not be shown again.",
+      "API token",
+      "Copy this token into the connecting app now. It will not be shown again.",
     );
     const secret = element("pre", "lifecycle-secret", disclosure);
     secret.dataset.lifecycleSecret = "true";
-    secret.setAttribute("aria-label", "Gabblin API token");
+    secret.setAttribute("aria-label", "API token");
     const actions = element("div", "button-row");
     const copy = element("button", "secondary-button", "Copy token");
     copy.type = "button";
@@ -3547,16 +3551,16 @@
     return card;
   }
 
-  function gabblinIntegrationCard(gabblin) {
-    const integration = gabblin?.integration;
-    const card = desktopCard("Gabblin", "Connect Gabblin to RepoPrompt.");
+  function clientIntegrationCard(client) {
+    const integration = client?.integration;
+    const card = desktopCard("API client", "Connect an app to RepoPrompt.");
     if (!integration || integration.status !== "active") {
       const create = element("button", "primary-button", "Generate API token");
       create.type = "button";
       create.addEventListener("click", () =>
-        runGabblinMutation(create, async () => {
+        runClientIntegrationMutation(create, async () => {
           disposeLifecycleDisclosure();
-          const disclosure = await api("api/v1/client-integrations/gabblin", {
+          const disclosure = await api("api/v1/client-integrations", {
             method: "POST",
           });
           state.lifecycleDisclosure = disclosure.token;
@@ -3565,10 +3569,10 @@
       card.append(create);
       return card;
     }
-    const members = gabblin.members || [];
+    const members = client.members || [];
     card.append(
       desktopRow(
-        "Gabblin connected",
+        "API client connected",
         `Connected ${formatDate(integration.createdAt)} · ${members.length} ${members.length === 1 ? "member" : "members"}`,
         element("span", "status-pill connected", "Connected"),
       ),
@@ -3577,12 +3581,11 @@
     const rotate = element("button", "secondary-button", "Generate new token");
     rotate.type = "button";
     rotate.addEventListener("click", () =>
-      runGabblinMutation(rotate, async () => {
+      runClientIntegrationMutation(rotate, async () => {
         disposeLifecycleDisclosure();
-        const disclosure = await api(
-          "api/v1/client-integrations/gabblin/rotate",
-          { method: "POST" },
-        );
+        const disclosure = await api("api/v1/client-integrations/rotate", {
+          method: "POST",
+        });
         state.lifecycleDisclosure = disclosure.token;
       }),
     );
@@ -3590,15 +3593,15 @@
     disconnect.type = "button";
     disconnect.addEventListener("click", async () => {
       const accepted = await confirmAction({
-        title: "Disconnect Gabblin?",
+        title: "Disconnect API client?",
         message:
-          "Gabblin will lose access to RepoPrompt until you generate and save a new token.",
+          "The connected app will lose access to RepoPrompt until you generate and save a new token.",
         label: "Disconnect",
         returnFocus: disconnect,
       });
       if (!accepted) return;
-      await runGabblinMutation(disconnect, async () => {
-        await api("api/v1/client-integrations/gabblin", { method: "DELETE" });
+      await runClientIntegrationMutation(disconnect, async () => {
+        await api("api/v1/client-integrations", { method: "DELETE" });
         disposeLifecycleDisclosure();
       });
     });
@@ -3621,15 +3624,15 @@
     if (!inventory) {
       settingsPage(
         "Client Integrations",
-        "Loading Gabblin integration state…",
+        "Loading client integration state…",
         "link",
       );
       return;
     }
     const cards = [];
-    const disclosure = gabblinDisclosureCard();
+    const disclosure = clientDisclosureCard();
     if (disclosure) cards.push(disclosure);
-    cards.push(gabblinIntegrationCard(inventory.gabblin));
+    cards.push(clientIntegrationCard(clientIntegrationState(inventory)));
     settingsPage(
       "Client Integrations",
       "Connect and manage apps that use RepoPrompt.",

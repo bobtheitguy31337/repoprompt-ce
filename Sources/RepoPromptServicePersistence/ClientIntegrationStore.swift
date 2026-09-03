@@ -3,7 +3,7 @@ import Foundation
 import RepoPromptServiceProtocol
 import SQLiteNIO
 
-public struct GabblinIntegrationRecord: Codable, Sendable, Equatable {
+public struct ClientIntegrationRecord: Codable, Sendable, Equatable {
     public enum Status: String, Codable, Sendable { case active, revoked }
 
     public let integrationID: UUID
@@ -14,7 +14,7 @@ public struct GabblinIntegrationRecord: Codable, Sendable, Equatable {
     public let revokedAt: Date?
 }
 
-public struct GabblinMemberRecord: Codable, Sendable, Equatable {
+public struct ClientMemberRecord: Codable, Sendable, Equatable {
     public let memberID: UUID
     public let username: String
     public let displayName: String
@@ -23,14 +23,20 @@ public struct GabblinMemberRecord: Codable, Sendable, Equatable {
     public let profileObservedAt: Date
 }
 
-public struct GabblinCredentialIssue: Sendable {
-    public let integration: GabblinIntegrationRecord
+public struct ClientCredentialIssue: Sendable {
+    public let integration: ClientIntegrationRecord
     public let token: String
 }
 
-private enum GabblinCredentialCrypto {
+/// Client-token crypto. New tokens are unbranded. The legacy prefix and digest
+/// domain remain accepted so already-issued tokens keep working.
+private enum ClientCredentialCrypto {
+    static let issuedTokenPrefix = "rp_client_v1"
+    static let legacyTokenPrefix = "rp_gabblin_v1"
+    static let digestDomain = "repoprompt.external.gabblin.v1"
+
     static func digest(credentialID: UUID, secret: Data) -> String {
-        var material = Data("repoprompt.external.gabblin.v1".utf8)
+        var material = Data(digestDomain.utf8)
         material.append(0)
         let bytes = credentialID.uuid
         material.append(contentsOf: [
@@ -50,14 +56,14 @@ private enum GabblinCredentialCrypto {
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
-        let token = "rp_gabblin_v1.\(credentialID.uuidString.lowercased()).\(encoded)"
+        let token = "\(issuedTokenPrefix).\(credentialID.uuidString.lowercased()).\(encoded)"
         return (credentialID, token, digest(credentialID: credentialID, secret: secret))
     }
 
     static func parse(_ token: String) -> (id: UUID, digest: String)? {
         let parts = token.split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 3,
-              parts[0] == "rp_gabblin_v1",
+              parts[0] == issuedTokenPrefix || parts[0] == legacyTokenPrefix,
               let credentialID = UUID(uuidString: String(parts[1])),
               let secret = CanonicalSigning.base64URLDecode(String(parts[2])),
               secret.count == 32
@@ -67,15 +73,15 @@ private enum GabblinCredentialCrypto {
 }
 
 public extension SQLiteServiceStore {
-    func authenticateGabblinCredential(
+    func authenticateClientCredential(
         token: String,
         subject: String,
         username: String,
         displayName: String,
         now: Date = Date()
     ) async throws {
-        guard let credential = GabblinCredentialCrypto.parse(token) else {
-            throw ServiceAPIError(code: .internalAuthFailed, message: "Gabblin API token is invalid")
+        guard let credential = ClientCredentialCrypto.parse(token) else {
+            throw ServiceAPIError(code: .internalAuthFailed, message: "API token is invalid")
         }
         try await transaction {
             guard let row = try await connection.query(
@@ -86,7 +92,7 @@ public extension SQLiteServiceStore {
                 let integrationID = row.column("integration_id")?.string,
                 CanonicalSigning.secureEquals(storedDigest, credential.digest)
             else {
-                throw ServiceAPIError(code: .internalAuthFailed, message: "Gabblin API token is invalid")
+                throw ServiceAPIError(code: .internalAuthFailed, message: "API token is invalid")
             }
             let staleBefore = now.addingTimeInterval(-60).timeIntervalSince1970
             _ = try await connection.query(
@@ -100,21 +106,21 @@ public extension SQLiteServiceStore {
         }
     }
 
-    func gabblinIntegration() async throws -> GabblinIntegrationRecord? {
+    func clientIntegration() async throws -> ClientIntegrationRecord? {
         guard let row = try await connection.query(
             "SELECT integration_id,workspace_id,status,created_at,updated_at,revoked_at FROM external_gabblin_integration WHERE fixed_id=1"
         ).first else { return nil }
-        return try decodeGabblinIntegration(row)
+        return try decodeClientIntegration(row)
     }
 
-    func gabblinMembers() async throws -> [GabblinMemberRecord] {
+    func clientMembers() async throws -> [ClientMemberRecord] {
         try await connection.query(
             "SELECT member_id,username,display_name,first_seen_at,last_seen_at,profile_observed_at FROM external_gabblin_members ORDER BY first_seen_at,member_id"
         ).map { row in
             guard let memberID = row.column("member_id")?.string.flatMap(UUID.init(uuidString:)) else {
-                throw ServiceAPIError(code: .persistenceUnavailable, message: "Gabblin member record is invalid")
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Client member record is invalid")
             }
-            return GabblinMemberRecord(
+            return ClientMemberRecord(
                 memberID: memberID,
                 username: row.column("username")?.string ?? "",
                 displayName: row.column("display_name")?.string ?? "",
@@ -125,9 +131,9 @@ public extension SQLiteServiceStore {
         }
     }
 
-    func createGabblinIntegration(now: Date = Date()) async throws -> GabblinCredentialIssue {
+    func createClientIntegration(now: Date = Date()) async throws -> ClientCredentialIssue {
         let correlationID = UUID()
-        let prepared = GabblinCredentialCrypto.prepare()
+        let prepared = ClientCredentialCrypto.prepare()
         return try await transaction {
             let existingRow = try await connection.query(
                 "SELECT integration_id,workspace_id,status,created_at,updated_at,revoked_at FROM external_gabblin_integration WHERE fixed_id=1"
@@ -136,9 +142,9 @@ public extension SQLiteServiceStore {
             let workspaceID: String
             let createdAt: Date
             if let existingRow {
-                let existing = try decodeGabblinIntegration(existingRow)
+                let existing = try decodeClientIntegration(existingRow)
                 guard existing.status == .revoked else {
-                    throw ServiceAPIError(code: .invalidRequest, message: "Gabblin integration already exists")
+                    throw ServiceAPIError(code: .invalidRequest, message: "Client integration already exists")
                 }
                 integrationID = existing.integrationID
                 workspaceID = existing.workspaceID
@@ -160,23 +166,23 @@ public extension SQLiteServiceStore {
                 "INSERT INTO external_gabblin_credentials(credential_id,integration_id,secret_digest,issued_at,last_used_at) VALUES(?,?,?,?,?)",
                 [.text(prepared.id.uuidString.lowercased()), .text(integrationID.uuidString.lowercased()), .text(prepared.digest), .float(now.timeIntervalSince1970), .float(now.timeIntervalSince1970)]
             )
-            return GabblinCredentialIssue(
-                integration: GabblinIntegrationRecord(integrationID: integrationID, workspaceID: workspaceID, status: .active, createdAt: createdAt, updatedAt: now, revokedAt: nil),
+            return ClientCredentialIssue(
+                integration: ClientIntegrationRecord(integrationID: integrationID, workspaceID: workspaceID, status: .active, createdAt: createdAt, updatedAt: now, revokedAt: nil),
                 token: prepared.token
             )
         }
     }
 
-    func rotateGabblinCredential(now: Date = Date()) async throws -> GabblinCredentialIssue {
-        let prepared = GabblinCredentialCrypto.prepare()
+    func rotateClientCredential(now: Date = Date()) async throws -> ClientCredentialIssue {
+        let prepared = ClientCredentialCrypto.prepare()
         let correlationID = UUID()
         return try await transaction {
             guard let row = try await connection.query(
                 "SELECT integration_id,workspace_id,status,created_at,updated_at,revoked_at FROM external_gabblin_integration WHERE fixed_id=1 AND status='active'"
             ).first else {
-                throw ServiceAPIError(code: .notFound, message: "Active Gabblin integration does not exist")
+                throw ServiceAPIError(code: .notFound, message: "Active client integration does not exist")
             }
-            let integration = try decodeGabblinIntegration(row)
+            let integration = try decodeClientIntegration(row)
             _ = try await connection.query(
                 "UPDATE external_gabblin_credentials SET secret_digest=NULL,revoked_at=?,revocation_reason='rotated' WHERE integration_id=? AND revoked_at IS NULL",
                 [.float(now.timeIntervalSince1970), .text(integration.integrationID.uuidString.lowercased())]
@@ -189,15 +195,15 @@ public extension SQLiteServiceStore {
                 "UPDATE external_gabblin_integration SET updated_at=?,correlation_id=? WHERE fixed_id=1",
                 [.float(now.timeIntervalSince1970), .text(correlationID.uuidString.lowercased())]
             )
-            return GabblinCredentialIssue(
-                integration: GabblinIntegrationRecord(integrationID: integration.integrationID, workspaceID: integration.workspaceID, status: .active, createdAt: integration.createdAt, updatedAt: now, revokedAt: nil),
+            return ClientCredentialIssue(
+                integration: ClientIntegrationRecord(integrationID: integration.integrationID, workspaceID: integration.workspaceID, status: .active, createdAt: integration.createdAt, updatedAt: now, revokedAt: nil),
                 token: prepared.token
             )
         }
     }
 
     @discardableResult
-    func revokeGabblinIntegration(now: Date = Date()) async throws -> Bool {
+    func revokeClientIntegration(now: Date = Date()) async throws -> Bool {
         let correlationID = UUID()
         return try await transaction {
             let rows = try await connection.query(
@@ -213,14 +219,14 @@ public extension SQLiteServiceStore {
         }
     }
 
-    private func decodeGabblinIntegration(_ row: SQLiteRow) throws -> GabblinIntegrationRecord {
+    private func decodeClientIntegration(_ row: SQLiteRow) throws -> ClientIntegrationRecord {
         guard let integrationID = row.column("integration_id")?.string.flatMap(UUID.init(uuidString:)),
               let workspaceID = row.column("workspace_id")?.string,
-              let status = row.column("status")?.string.flatMap(GabblinIntegrationRecord.Status.init(rawValue:)),
+              let status = row.column("status")?.string.flatMap(ClientIntegrationRecord.Status.init(rawValue:)),
               let createdAt = row.column("created_at")?.double,
               let updatedAt = row.column("updated_at")?.double
-        else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Gabblin integration record is invalid") }
-        return GabblinIntegrationRecord(
+        else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Client integration record is invalid") }
+        return ClientIntegrationRecord(
             integrationID: integrationID,
             workspaceID: workspaceID,
             status: status,

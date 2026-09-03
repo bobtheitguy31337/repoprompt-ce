@@ -151,16 +151,16 @@ public struct RepoPromptHTTPService: Sendable {
             return try portalJSON(bootstrap)
         } }
         router.get("/external/v1/bootstrap") { request, _ in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             return try portalJSON(try await bootstrap(actor: actor))
         } }
         router.post("/external/v1/projects") { request, _ in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let data = try await bodyData(request)
-            let input = try JSONDecoder.serviceDecoder.decode(GabblinCreateProjectRequest.self, from: data)
+            let input = try JSONDecoder.serviceDecoder.decode(ExternalCreateProjectRequest.self, from: data)
             let key = try requireIdempotency(request)
             guard let operationID = UUID(uuidString: key) else {
-                throw ServiceAPIError(code: .invalidRequest, message: "Gabblin project creation requires a UUID idempotency key")
+                throw ServiceAPIError(code: .invalidRequest, message: "Project creation requires a UUID idempotency key")
             }
             let result = try await authority.createProjectFromSource(
                 input: .init(
@@ -176,12 +176,12 @@ public struct RepoPromptHTTPService: Sendable {
             )
             let project = try await authority.projectSnapshot(projectID: result.projectID)
             return try portalJSON(
-                GabblinProjectResponse(project: RepoPromptPortalSessionProjection.project(project)),
+                ExternalProjectResponse(project: RepoPromptPortalSessionProjection.project(project)),
                 status: .created
             )
         } }
         router.get("/external/v1/projects/:id/composer-catalog") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             _ = try await authority.projectSnapshot(projectID: projectID)
             return try await portalJSON(requireComposerCatalog().snapshot(
@@ -189,18 +189,18 @@ public struct RepoPromptHTTPService: Sendable {
             ))
         } }
         router.get("/external/v1/projects/:id/composer-suggestions") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             _ = try await authority.projectSnapshot(projectID: projectID)
             return try await portalJSON(requireComposerCatalog().suggestions(
                 context: .init(kind: .project, projectID: projectID, actorID: actor.userID),
-                query: try gabblinSuggestionQuery(request),
+                query: try composerSuggestionQuery(request),
                 kinds: [.nativeCommand, .skill, .file],
                 limit: 50
             ))
         } }
         router.post("/external/v1/projects/:id/composer-attachments") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             _ = try requireIdempotency(request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             _ = try await authority.projectSnapshot(projectID: projectID)
@@ -223,7 +223,7 @@ public struct RepoPromptHTTPService: Sendable {
             return try portalJSON(attachment, status: .created)
         } }
         router.post("/external/v1/projects/:id/composer-attachments/resolve") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             _ = try requireIdempotency(request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             _ = try await authority.projectSnapshot(projectID: projectID)
@@ -238,10 +238,10 @@ public struct RepoPromptHTTPService: Sendable {
             ))
         } }
         router.get("/external/v1/projects/:id/composer-attachments/:attachmentId/preview") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             let attachmentID = try context.parameters.require("attachmentId", as: UUID.self)
-            let sessionID = try optionalGabblinSessionID(request)
+            let sessionID = try optionalExternalSessionID(request)
             if let sessionID {
                 let session = try await authority.sessionSnapshot(sessionID: sessionID)
                 guard session.projectID == projectID else {
@@ -259,7 +259,7 @@ public struct RepoPromptHTTPService: Sendable {
             return portalBytes(preview.1, contentType: preview.0.mediaType)
         } }
         router.delete("/external/v1/projects/:id/composer-attachments/:attachmentId") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             _ = try requireIdempotency(request)
             let projectID = try context.parameters.require("id", as: UUID.self)
             let attachmentID = try context.parameters.require("attachmentId", as: UUID.self)
@@ -272,7 +272,7 @@ public struct RepoPromptHTTPService: Sendable {
             return portalEmpty()
         } }
         router.get("/external/v1/sessions/:id") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let session = try await authority.sessionSnapshot(sessionID: sessionID)
             let collaboration = try await authority.collaborationMetadata(sessionID: sessionID)
@@ -281,13 +281,13 @@ public struct RepoPromptHTTPService: Sendable {
                 actor: actor,
                 composerAvailable: composerCatalog != nil
             )
-            return try portalJSON(GabblinSessionDetailResponse(
+            return try portalJSON(ExternalSessionDetailResponse(
                 session: RepoPromptPortalSessionProjection.project(session, agentControl: control),
                 collaboration: collaboration
             ))
         } }
         router.get("/external/v1/sessions/:id/events/stream") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let session = try await authority.sessionSnapshot(sessionID: sessionID)
             _ = try await authority.agentSessionActionSnapshot(
@@ -304,7 +304,7 @@ public struct RepoPromptHTTPService: Sendable {
             headers[.contentType] = "text/event-stream"
             headers[.cacheControl] = "private, no-store"
             return Response(status: .ok, headers: headers, body: ResponseBody { writer in
-                try await writer.write(ByteBuffer(string: ": repoprompt-gabblin-session-stream-v1\n\nevent: refresh\ndata: \(initialJSON)\n\n"))
+                try await writer.write(ByteBuffer(string: ": repoprompt-client-session-stream-v1\n\nevent: refresh\ndata: \(initialJSON)\n\n"))
                 for try await frame in heartbeatFrames(stream) {
                     switch frame {
                     case let .event(event) where event.sessionID == sessionID:
@@ -321,7 +321,7 @@ public struct RepoPromptHTTPService: Sendable {
             })
         } }
         router.get("/external/v1/sessions/:id/composer-catalog") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let snapshot = try await authority.authoritySessionSnapshot(sessionID: sessionID)
             return try await portalJSON(requireComposerCatalog().snapshot(context: .init(
@@ -333,7 +333,7 @@ public struct RepoPromptHTTPService: Sendable {
             )))
         } }
         router.get("/external/v1/sessions/:id/composer-suggestions") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let snapshot = try await authority.authoritySessionSnapshot(sessionID: sessionID)
             return try await portalJSON(requireComposerCatalog().suggestions(
@@ -344,13 +344,13 @@ public struct RepoPromptHTTPService: Sendable {
                     actorID: actor.userID,
                     activeRun: snapshot.activeBinding != nil
                 ),
-                query: try gabblinSuggestionQuery(request),
+                query: try composerSuggestionQuery(request),
                 kinds: [.nativeCommand, .skill, .file],
                 limit: 50
             ))
         } }
         router.get("/external/v1/sessions/:id/presentation") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let limit = request.uri.queryParameters.get("limit", as: Int.self) ?? 25
             guard (1 ... 100).contains(limit) else {
@@ -371,7 +371,7 @@ public struct RepoPromptHTTPService: Sendable {
             return try portalJSON(page)
         } }
         router.get("/external/v1/sessions/:id/children") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             _ = try await authority.sessionSnapshot(sessionID: sessionID)
             let children = try await authority.childSessionSnapshots(parentSessionID: sessionID)
@@ -392,7 +392,7 @@ public struct RepoPromptHTTPService: Sendable {
             ))
         } }
         router.get("/external/v1/sessions/:id/artifacts") { request, context in await portalRespond(request) {
-            _ = try await authenticateGabblin(request: request)
+            _ = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let artifacts = try await authority.artifactSnapshots(sessionID: sessionID)
             return try await portalJSON(page(
@@ -404,7 +404,7 @@ public struct RepoPromptHTTPService: Sendable {
             ))
         } }
         router.get("/external/v1/sessions/:id/artifacts/:artifactId/content") { request, context in await portalRespond(request) {
-            _ = try await authenticateGabblin(request: request)
+            _ = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let artifactID = try context.parameters.require("artifactId", as: UUID.self)
             let requestedRange = try parseByteRange(request.headers[.range])
@@ -428,17 +428,17 @@ public struct RepoPromptHTTPService: Sendable {
             )
         } }
         router.get("/external/v1/sessions/:id/selection") { request, context in await portalRespond(request) {
-            _ = try await authenticateGabblin(request: request)
+            _ = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             return try await portalJSON(authority.selectionSnapshot(sessionID: sessionID))
         } }
         router.post("/external/v1/agent-sessions") { request, _ in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(PortalStartAgentSessionRequest.self, from: data)
-            let key = try requireGabblinOperationKey(request, operationID: input.operationID)
+            let key = try requireExternalOperationKey(request, operationID: input.operationID)
             guard input.start.visibility == .privateSession, input.start.selectedMessageContext == nil else {
-                throw ServiceAPIError(code: .invalidRequest, message: "Gabblin Agent sessions must be private root sessions")
+                throw ServiceAPIError(code: .invalidRequest, message: "Agent sessions must be private root sessions")
             }
             guard let provider = input.start.turn.configuration.providerID.runtimeKind else {
                 throw ServiceAPIError(code: .capabilityMissing, message: "Selected provider has no execution adapter")
@@ -481,11 +481,11 @@ public struct RepoPromptHTTPService: Sendable {
             )
         } }
         router.post("/external/v1/sessions/:id/turns") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(PortalSubmitAgentTurnRequest.self, from: data)
-            let key = try requireGabblinOperationKey(request, operationID: input.operationID)
+            let key = try requireExternalOperationKey(request, operationID: input.operationID)
             let digest = CanonicalSigning.bodyDigest(data)
             let snapshot = try await authority.authoritySessionSnapshot(sessionID: sessionID)
             try await authority.authorizeSessionCollaboration(
@@ -539,11 +539,11 @@ public struct RepoPromptHTTPService: Sendable {
             return try portalJSON(PortalAgentSubmissionReceipt(accepted.receipt), status: .accepted)
         } }
         router.post("/external/v1/sessions/:id/agent-commands") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let input = try JSONDecoder.serviceDecoder.decode(GabblinAgentCommandRequest.self, from: data)
-            let key = try requireGabblinOperationKey(request, operationID: input.operationID)
+            let input = try JSONDecoder.serviceDecoder.decode(ExternalAgentCommandRequest.self, from: data)
+            let key = try requireExternalOperationKey(request, operationID: input.operationID)
             let receipt = try await authority.execute(
                 command: try input.sessionCommand(),
                 sessionID: sessionID,
@@ -554,12 +554,12 @@ public struct RepoPromptHTTPService: Sendable {
             return try portalJSON(receipt, status: .accepted)
         } }
         router.post("/external/v1/sessions/:id/interactions/:interactionId/answer") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let interactionID = try context.parameters.require("interactionId", as: UUID.self)
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(PortalInteractionAnswerRequest.self, from: data)
-            let key = try requireGabblinOperationKey(request, operationID: input.operationID)
+            let key = try requireExternalOperationKey(request, operationID: input.operationID)
             guard let interaction = try await authority.interactionSnapshots(sessionID: sessionID)
                 .first(where: { $0.interactionID == interactionID })
             else {
@@ -588,7 +588,7 @@ public struct RepoPromptHTTPService: Sendable {
             return try portalJSON(result)
         } }
         router.put("/external/v1/sessions/:id/selection") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(SelectionMutationInput.self, from: data)
@@ -609,7 +609,7 @@ public struct RepoPromptHTTPService: Sendable {
             ))
         } }
         router.post("/external/v1/sessions/:id/selection/add") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(SelectionMutationInput.self, from: data)
@@ -630,7 +630,7 @@ public struct RepoPromptHTTPService: Sendable {
             ))
         } }
         router.post("/external/v1/sessions/:id/selection/remove") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
             let input = try JSONDecoder.serviceDecoder.decode(SelectionRemovalInput.self, from: data)
@@ -652,7 +652,7 @@ public struct RepoPromptHTTPService: Sendable {
             ))
         } }
         router.post("/external/v1/sessions/:id/context-builder") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             _ = try requireIdempotency(request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
@@ -676,7 +676,7 @@ public struct RepoPromptHTTPService: Sendable {
             ))
         } }
         router.post("/external/v1/sessions/:id/oracle") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             _ = try requireIdempotency(request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
@@ -696,10 +696,10 @@ public struct RepoPromptHTTPService: Sendable {
             ))
         } }
         router.patch("/external/v1/sessions/:id/visibility") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let input = try JSONDecoder.serviceDecoder.decode(GabblinVisibilityRequest.self, from: data)
+            let input = try JSONDecoder.serviceDecoder.decode(ExternalVisibilityRequest.self, from: data)
             let current = try await authority.collaborationMetadata(sessionID: sessionID)
             let collaboration = try await authority.updateCollaborationMetadata(
                 sessionID: sessionID,
@@ -713,13 +713,13 @@ public struct RepoPromptHTTPService: Sendable {
                 idempotencyKey: requireIdempotency(request),
                 requestDigest: CanonicalSigning.bodyDigest(data)
             )
-            return try portalJSON(GabblinCollaborationResponse(collaboration: collaboration))
+            return try portalJSON(ExternalCollaborationResponse(collaboration: collaboration))
         } }
         router.patch("/external/v1/sessions/:id/collaborative-steering") { request, context in await portalRespond(request) {
-            let actor = try await authenticateGabblin(request: request)
+            let actor = try await authenticateExternalClient(request: request)
             let sessionID = try context.parameters.require("id", as: UUID.self)
             let data = try await bodyData(request)
-            let input = try JSONDecoder.serviceDecoder.decode(GabblinSteeringRequest.self, from: data)
+            let input = try JSONDecoder.serviceDecoder.decode(ExternalSteeringRequest.self, from: data)
             let current = try await authority.collaborationMetadata(sessionID: sessionID)
             let collaboration = try await authority.updateCollaborationMetadata(
                 sessionID: sessionID,
@@ -733,51 +733,26 @@ public struct RepoPromptHTTPService: Sendable {
                 idempotencyKey: requireIdempotency(request),
                 requestDigest: CanonicalSigning.bodyDigest(data)
             )
-            return try portalJSON(GabblinCollaborationResponse(collaboration: collaboration))
+            return try portalJSON(ExternalCollaborationResponse(collaboration: collaboration))
         } }
         router.get("/portal/api/v1/client-integrations") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(request: request, context: context)
-            let integration = try await store.gabblinIntegration()
-            let members = try await store.gabblinMembers()
-            return try portalJSON(PortalClientIntegrationInventory(
-                gabblin: PortalGabblinInventory(
-                    integration: integration.map {
-                        PortalGabblinIntegrationView(
-                            status: $0.status.rawValue,
-                            createdAt: $0.createdAt,
-                            updatedAt: $0.updatedAt,
-                            revokedAt: $0.revokedAt
-                        )
-                    },
-                    members: members.map {
-                        PortalGabblinMemberView(
-                            memberID: $0.memberID,
-                            username: $0.username,
-                            displayName: $0.displayName,
-                            firstSeenAt: $0.firstSeenAt,
-                            lastSeenAt: $0.lastSeenAt,
-                            profileObservedAt: $0.profileObservedAt
-                        )
-                    }
-                )
-            ))
+            return try portalJSON(try await clientIntegrationInventory())
         } }
-        router.post("/portal/api/v1/client-integrations/gabblin") { request, context in await portalRespond(request) {
+        router.post("/portal/api/v1/client-integrations") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request, requireJSON: false)
-            let issue = try await store.createGabblinIntegration()
-            return try portalJSON(PortalGabblinCredentialDisclosureResponse(token: issue.token), status: .created)
+            return try await issueClientCredential(status: .created)
         } }
-        router.post("/portal/api/v1/client-integrations/gabblin/rotate") { request, context in await portalRespond(request) {
+        router.post("/portal/api/v1/client-integrations/rotate") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request, requireJSON: false)
-            let issue = try await store.rotateGabblinCredential()
-            return try portalJSON(PortalGabblinCredentialDisclosureResponse(token: issue.token))
+            return try await rotateClientCredential()
         } }
-        router.delete("/portal/api/v1/client-integrations/gabblin") { request, context in await portalRespond(request) {
+        router.delete("/portal/api/v1/client-integrations") { request, context in await portalRespond(request) {
             _ = try await authenticatePortal(request: request, context: context)
             try validatePortalMutation(request, requireJSON: false)
-            _ = try await store.revokeGabblinIntegration()
+            _ = try await store.revokeClientIntegration()
             return portalEmpty()
         } }
         router.post("/portal/api/v1/projects") { request, context in await portalRespond(request) {
@@ -2418,41 +2393,41 @@ public struct RepoPromptHTTPService: Sendable {
         let externalActor: ExternalActor
     }
 
-    private struct GabblinActorEnvelope: Decodable {
+    private struct ExternalActorEnvelope: Decodable {
         let schemaVersion: Int
         let subject: String
         let username: String
         let displayName: String
     }
 
-    private struct GabblinCreateProjectRequest: Decodable {
+    private struct ExternalCreateProjectRequest: Decodable {
         let name: String
     }
 
-    private struct GabblinProjectResponse: Encodable {
+    private struct ExternalProjectResponse: Encodable {
         let project: PortalProjectSummary
     }
 
-    private struct GabblinSessionDetailResponse: Encodable {
+    private struct ExternalSessionDetailResponse: Encodable {
         let session: PortalSessionSummary
         let collaboration: CollaborationMetadataSnapshot
     }
 
-    private struct GabblinCollaborationResponse: Encodable {
+    private struct ExternalCollaborationResponse: Encodable {
         let collaboration: CollaborationMetadataSnapshot
     }
 
-    private struct GabblinVisibilityRequest: Decodable {
+    private struct ExternalVisibilityRequest: Decodable {
         let expectedPolicyRevision: Int64
         let visibility: Visibility
     }
 
-    private struct GabblinSteeringRequest: Decodable {
+    private struct ExternalSteeringRequest: Decodable {
         let expectedPolicyRevision: Int64
         let enabled: Bool
     }
 
-    private struct GabblinAgentCommandRequest: Decodable {
+    private struct ExternalAgentCommandRequest: Decodable {
         let operation: String
         let operationID: UUID
         let text: String?
@@ -2502,7 +2477,7 @@ public struct RepoPromptHTTPService: Sendable {
                     fromTranscriptEntryID: fromTranscriptEntryID
                 )
             default:
-                throw ServiceAPIError(code: .invalidRequest, message: "Unsupported Gabblin session command")
+                throw ServiceAPIError(code: .invalidRequest, message: "Unsupported session command")
             }
         }
     }
@@ -2525,22 +2500,22 @@ public struct RepoPromptHTTPService: Sendable {
     }
 
     private struct PortalClientIntegrationInventory: Encodable {
-        let gabblin: PortalGabblinInventory
+        let client: PortalClientInventory
     }
 
-    private struct PortalGabblinInventory: Encodable {
-        let integration: PortalGabblinIntegrationView?
-        let members: [PortalGabblinMemberView]
+    private struct PortalClientInventory: Encodable {
+        let integration: PortalClientIntegrationView?
+        let members: [PortalClientMemberView]
     }
 
-    private struct PortalGabblinIntegrationView: Encodable {
+    private struct PortalClientIntegrationView: Encodable {
         let status: String
         let createdAt: Date
         let updatedAt: Date
         let revokedAt: Date?
     }
 
-    private struct PortalGabblinMemberView: Encodable {
+    private struct PortalClientMemberView: Encodable {
         let memberID: UUID
         let username: String
         let displayName: String
@@ -2549,7 +2524,7 @@ public struct RepoPromptHTTPService: Sendable {
         let profileObservedAt: Date
     }
 
-    private struct PortalGabblinCredentialDisclosureResponse: Encodable {
+    private struct PortalClientCredentialDisclosureResponse: Encodable {
         let token: String
     }
 
@@ -2673,16 +2648,18 @@ public struct RepoPromptHTTPService: Sendable {
         )
     }
 
-    private func authenticateGabblin(request: Request) async throws -> ExternalActor {
+    private func authenticateExternalClient(request: Request) async throws -> ExternalActor {
         let authorization = request.headers[.init("Authorization")!] ?? ""
         guard authorization.hasPrefix("Bearer ") else {
-            throw ServiceAPIError(code: .internalAuthFailed, message: "Gabblin API token is required")
+            throw ServiceAPIError(code: .internalAuthFailed, message: "API token is required")
         }
         let token = String(authorization.dropFirst("Bearer ".count))
-        guard let encodedActor = request.headers[.init("X-RepoPrompt-Gabblin-Actor")!],
+        let encodedActor = request.headers[.init("X-RepoPrompt-Actor")!]
+            ?? request.headers[.init("X-RepoPrompt-Gabblin-Actor")!]
+        guard let encodedActor,
               encodedActor.utf8.count <= 1_024,
               let actorData = CanonicalSigning.base64URLDecode(encodedActor),
-              let envelope = try? JSONDecoder.serviceDecoder.decode(GabblinActorEnvelope.self, from: actorData),
+              let envelope = try? JSONDecoder.serviceDecoder.decode(ExternalActorEnvelope.self, from: actorData),
               envelope.schemaVersion == 1,
               envelope.subject.range(of: "^[A-Za-z0-9_-]{1,128}$", options: .regularExpression) != nil,
               !envelope.username.isEmpty,
@@ -2690,9 +2667,9 @@ public struct RepoPromptHTTPService: Sendable {
               !envelope.displayName.isEmpty,
               envelope.displayName.utf8.count <= 256
         else {
-            throw ServiceAPIError(code: .internalAuthFailed, message: "Gabblin actor header is invalid")
+            throw ServiceAPIError(code: .internalAuthFailed, message: "Actor header is invalid")
         }
-        try await store.authenticateGabblinCredential(
+        try await store.authenticateClientCredential(
             token: token,
             subject: envelope.subject,
             username: envelope.username,
@@ -2701,15 +2678,15 @@ public struct RepoPromptHTTPService: Sendable {
         return ExternalActor(userID: envelope.subject, username: envelope.username, displayName: envelope.displayName)
     }
 
-    private func requireGabblinOperationKey(_ request: Request, operationID: UUID) throws -> String {
+    private func requireExternalOperationKey(_ request: Request, operationID: UUID) throws -> String {
         let key = try requireIdempotency(request)
         guard key.caseInsensitiveCompare(operationID.uuidString) == .orderedSame else {
-            throw ServiceAPIError(code: .invalidRequest, message: "Gabblin operation and idempotency IDs do not match")
+            throw ServiceAPIError(code: .invalidRequest, message: "Operation and idempotency IDs do not match")
         }
         return key
     }
 
-    private func gabblinSuggestionQuery(_ request: Request) throws -> String {
+    private func composerSuggestionQuery(_ request: Request) throws -> String {
         let query = String(request.uri.queryParameters["query"] ?? "")
         guard query.utf8.count <= 512,
               query.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
@@ -2719,12 +2696,48 @@ public struct RepoPromptHTTPService: Sendable {
         return query.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func optionalGabblinSessionID(_ request: Request) throws -> UUID? {
+    private func optionalExternalSessionID(_ request: Request) throws -> UUID? {
         guard let raw = request.uri.queryParameters["sessionId"] else { return nil }
         guard let sessionID = UUID(uuidString: String(raw)) else {
             throw ServiceAPIError(code: .invalidRequest, message: "Composer attachment session ID is invalid")
         }
         return sessionID
+    }
+
+    private func clientIntegrationInventory() async throws -> PortalClientIntegrationInventory {
+        let integration = try await store.clientIntegration()
+        let members = try await store.clientMembers()
+        let inventory = PortalClientInventory(
+            integration: integration.map {
+                PortalClientIntegrationView(
+                    status: $0.status.rawValue,
+                    createdAt: $0.createdAt,
+                    updatedAt: $0.updatedAt,
+                    revokedAt: $0.revokedAt
+                )
+            },
+            members: members.map {
+                PortalClientMemberView(
+                    memberID: $0.memberID,
+                    username: $0.username,
+                    displayName: $0.displayName,
+                    firstSeenAt: $0.firstSeenAt,
+                    lastSeenAt: $0.lastSeenAt,
+                    profileObservedAt: $0.profileObservedAt
+                )
+            }
+        )
+        return PortalClientIntegrationInventory(client: inventory)
+    }
+
+    private func issueClientCredential(status: HTTPResponse.Status) async throws -> Response {
+        let issue = try await store.createClientIntegration()
+        return try portalJSON(PortalClientCredentialDisclosureResponse(token: issue.token), status: status)
+    }
+
+    private func rotateClientCredential() async throws -> Response {
+        let issue = try await store.rotateClientCredential()
+        return try portalJSON(PortalClientCredentialDisclosureResponse(token: issue.token))
     }
 
     private func portalIdempotencyKey(principal: PortalAuthenticatedPrincipal, operationID: UUID) -> String {
