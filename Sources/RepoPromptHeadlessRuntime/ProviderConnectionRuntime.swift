@@ -31,9 +31,9 @@ public struct UnavailableProviderCredentialTester: ProviderCredentialTesting {
 public protocol ProviderCredentialSourceProviding: Sendable {
     func sourceDirectory(for kind: ProviderKind) async throws -> String?
     /// Returns a protected, durable provider environment when the provider's
-    /// native conversation state must survive across turns. RepoPrompt Desktop
-    /// uses one managed Codex home for authentication and thread persistence;
-    /// the server runtime must not replace it with a disposable per-turn copy.
+    /// native conversation state must survive across turns. Callers that need
+    /// concurrent provider isolation may instead project stable credentials
+    /// into a per-run home and persist the provider's native session identity.
     func persistentRuntimeEnvironment(for kind: ProviderKind) async throws -> [String: String]?
 }
 

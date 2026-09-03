@@ -4,6 +4,11 @@ import RepoPromptServicePersistence
 import RepoPromptServiceProtocol
 import RepoPromptWorkspaceRuntimeCore
 
+public enum AgentSessionControlScope: Sendable, Equatable {
+    case participant
+    case operatorControl
+}
+
 public actor RepoPromptHeadlessAuthority {
     private struct InFlightProjectSourceOperation {
         let requestDigest: String
@@ -1289,9 +1294,9 @@ public actor RepoPromptHeadlessAuthority {
         return child
     }
 
-    /// Starts a provider run for an authority-created child without weakening the public
-    /// root-only command contract. MCP/Agent Mode adapters call this only after the parent
-    /// session has created and durably bound the child through `spawnChildSession`.
+    /// Starts the initial provider run for an authority-created child. MCP/Agent
+    /// Mode adapters call this only after the parent session has created and
+    /// durably bound the child through `spawnChildSession`.
     public func startChildAgentRun(sessionID: UUID) async throws -> CommandReceipt {
         try ensureWritable()
         guard let session = sessions[sessionID] else {
@@ -1412,7 +1417,15 @@ public actor RepoPromptHeadlessAuthority {
         try await store.agents()
     }
 
-    public func execute(command: SessionCommand, sessionID: UUID, externalActor: ExternalActor, idempotencyKey: String, requestDigest: String, authorizationDecision: AuthorizationDecision? = nil) async throws -> CommandReceipt {
+    public func execute(
+        command: SessionCommand,
+        sessionID: UUID,
+        externalActor: ExternalActor,
+        idempotencyKey: String,
+        requestDigest: String,
+        authorizationDecision: AuthorizationDecision? = nil,
+        controlScope: AgentSessionControlScope = .participant
+    ) async throws -> CommandReceipt {
         try ensureWritable()
         let idempotency = IdempotencyInput(actorID: externalActor.userID, operation: command.operation, key: idempotencyKey, requestDigest: requestDigest)
         if let existing = try await store.idempotencyResult(idempotency) {
@@ -1420,13 +1433,13 @@ public actor RepoPromptHeadlessAuthority {
         }
         guard let session = sessions[sessionID] else { throw ServiceAPIError(code: .notFound, message: "Session not found") }
         let before = await session.snapshot()
-        guard before.parentSessionID == nil else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "External commands may target only root sessions") }
         try await authorizeExternalCommand(
             command,
             session: before,
             actor: externalActor,
             requestDigest: requestDigest,
-            authorizationDecision: authorizationDecision
+            authorizationDecision: authorizationDecision,
+            controlScope: controlScope
         )
         let eventType: EventType
         switch command {
@@ -2016,7 +2029,8 @@ public actor RepoPromptHeadlessAuthority {
     public func agentSessionActionSnapshot(
         sessionID: UUID,
         actor: ExternalActor,
-        composerAvailable: Bool
+        composerAvailable: Bool,
+        controlScope: AgentSessionControlScope = .participant
     ) async throws -> AgentSessionActionSnapshotWire {
         let detail = try await authoritySessionSnapshot(sessionID: sessionID)
         let metadata = try await collaborationMetadata(sessionID: sessionID)
@@ -2033,6 +2047,7 @@ public actor RepoPromptHeadlessAuthority {
             sessionRevision: detail.session.revision,
             lifecycleState: detail.session.state,
             isController: metadata.controllerUserID == actor.userID,
+            hasOperatorControl: controlScope == .operatorControl,
             collaborativeSteeringAllowed: metadata.visibility == .collaborative
                 && metadata.collaborativeSteeringEnabled,
             composerAvailable: composerAvailable,
@@ -2050,14 +2065,16 @@ public actor RepoPromptHeadlessAuthority {
     public func agentSessionActionSnapshots(
         sessionIDs: [UUID],
         actor: ExternalActor,
-        composerAvailable: Bool
+        composerAvailable: Bool,
+        controlScope: AgentSessionControlScope = .participant
     ) async throws -> [UUID: AgentSessionActionSnapshotWire] {
         var result: [UUID: AgentSessionActionSnapshotWire] = [:]
         for sessionID in sessionIDs {
             result[sessionID] = try await agentSessionActionSnapshot(
                 sessionID: sessionID,
                 actor: actor,
-                composerAvailable: composerAvailable
+                composerAvailable: composerAvailable,
+                controlScope: controlScope
             )
         }
         return result
@@ -2480,7 +2497,8 @@ public actor RepoPromptHeadlessAuthority {
         actor: ExternalActor,
         operation: String,
         requestDigest: String? = nil,
-        authorizationDecision: AuthorizationDecision? = nil
+        authorizationDecision: AuthorizationDecision? = nil,
+        controlScope: AgentSessionControlScope = .participant
     ) async throws {
         let session = try await sessionSnapshot(sessionID: sessionID)
         try await authorizeCollaborationPolicy(
@@ -2488,7 +2506,8 @@ public actor RepoPromptHeadlessAuthority {
             actor: actor,
             operation: operation,
             requestDigest: requestDigest,
-            authorizationDecision: authorizationDecision
+            authorizationDecision: authorizationDecision,
+            controlScope: controlScope
         )
     }
 
@@ -2614,11 +2633,28 @@ public actor RepoPromptHeadlessAuthority {
         return interaction
     }
 
-    public func answerInteraction(sessionID: UUID, interactionID: UUID, expectedRevision: Int64, payload: Data, actor: ExternalActor, idempotencyKey: String? = nil, requestDigest: String? = nil, authorizationDecision: AuthorizationDecision? = nil) async throws -> InteractionSnapshot {
+    public func answerInteraction(
+        sessionID: UUID,
+        interactionID: UUID,
+        expectedRevision: Int64,
+        payload: Data,
+        actor: ExternalActor,
+        idempotencyKey: String? = nil,
+        requestDigest: String? = nil,
+        authorizationDecision: AuthorizationDecision? = nil,
+        controlScope: AgentSessionControlScope = .participant
+    ) async throws -> InteractionSnapshot {
         let idempotency = try mutationIdempotency(actor: actor, operation: "answerInteraction", key: idempotencyKey, digest: requestDigest)
         if let idempotency, let prior: InteractionSnapshot = try await priorResult(idempotency) { return prior }
         let session = try await sessionSnapshot(sessionID: sessionID)
-        try await authorizeCollaborationPolicy(session: session, actor: actor, operation: "answerInteraction", requestDigest: requestDigest, authorizationDecision: authorizationDecision)
+        try await authorizeCollaborationPolicy(
+            session: session,
+            actor: actor,
+            operation: "answerInteraction",
+            requestDigest: requestDigest,
+            authorizationDecision: authorizationDecision,
+            controlScope: controlScope
+        )
         guard let current = try await store.interactions(sessionID: sessionID).first(where: { $0.interactionID == interactionID }) else { throw ServiceAPIError(code: .notFound, message: "Interaction not found") }
         guard current.state == .pending, current.revision == expectedRevision else { throw ServiceAPIError(code: .staleRevision, message: "Interaction revision is stale", currentRevision: current.revision) }
         if let expiresAt = current.expiresAt, expiresAt <= clock.now() { throw ServiceAPIError(code: .interactionSettled, message: "Interaction expired") }
@@ -4124,14 +4160,16 @@ public actor RepoPromptHeadlessAuthority {
         session: SessionSnapshot,
         actor: ExternalActor,
         requestDigest: String? = nil,
-        authorizationDecision: AuthorizationDecision? = nil
+        authorizationDecision: AuthorizationDecision? = nil,
+        controlScope: AgentSessionControlScope = .participant
     ) async throws {
         try await authorizeCollaborationPolicy(
             session: session,
             actor: actor,
             operation: command.operation,
             requestDigest: requestDigest,
-            authorizationDecision: authorizationDecision
+            authorizationDecision: authorizationDecision,
+            controlScope: controlScope
         )
     }
 
@@ -4140,9 +4178,11 @@ public actor RepoPromptHeadlessAuthority {
         actor: ExternalActor,
         operation: String,
         requestDigest: String? = nil,
-        authorizationDecision: AuthorizationDecision? = nil
+        authorizationDecision: AuthorizationDecision? = nil,
+        controlScope: AgentSessionControlScope = .participant
     ) async throws {
         let metadata = try await collaborationMetadata(sessionID: session.sessionID)
+        if controlScope == .operatorControl { return }
         if let authorizationDecision {
             try bindAuthorizationDecision(
                 authorizationDecision,

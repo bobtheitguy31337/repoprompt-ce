@@ -275,11 +275,28 @@ private struct NativeProviderProcessSupport {
             records.append(credentialRecord)
             do {
                 try FileManager.default.removeItem(at: credentialDestination)
-                try FileManager.default.copyItem(at: URL(fileURLWithPath: sourcePath, isDirectory: true), to: credentialDestination)
+                if configuration.kind == .codex {
+                    try copyCodexCredentialSnapshot(
+                        from: URL(fileURLWithPath: sourcePath, isDirectory: true),
+                        to: credentialDestination
+                    )
+                } else {
+                    try FileManager.default.copyItem(
+                        at: URL(fileURLWithPath: sourcePath, isDirectory: true),
+                        to: credentialDestination
+                    )
+                }
             } catch {
                 try? FileManager.default.removeItem(at: home)
                 for record in records {
                     _ = try? await processStore?.transitionOwnedResource(resourceID: record.resourceID, expectedStates: [.preparing], to: .failed, observedBytes: nil, contentDigest: nil, cleanupError: "credential_copy_failed")
+                }
+                if configuration.kind == .codex {
+                    throw ServiceAPIError(
+                        code: .dependencyUnavailable,
+                        message: "Codex credential snapshot could not be prepared",
+                        retryable: true
+                    )
                 }
                 throw error
             }
@@ -303,6 +320,37 @@ private struct NativeProviderProcessSupport {
             try await activated.append(processStore?.transitionOwnedResource(resourceID: record.resourceID, expectedStates: [.preparing], to: .active, observedBytes: nil, contentDigest: nil, cleanupError: nil) ?? record.replacing(lifecycleState: .active))
         }
         return PreparedHome(url: home, resources: activated, baseEnvironment: nil, disposable: true)
+    }
+
+    /// Codex mutates plugin, cache, SQLite, and temporary trees while it is
+    /// running. A recursive copy races those writes when a parent starts
+    /// several children concurrently. Per-run homes need only the durable
+    /// authentication document; runtime state and RepoPrompt MCP config are
+    /// created independently inside each isolated home.
+    private func copyCodexCredentialSnapshot(from source: URL, to destination: URL) throws {
+        try FileManager.default.createDirectory(
+            at: destination,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let authSource = source.appendingPathComponent("auth.json", isDirectory: false)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: authSource.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue
+        else { return }
+        let attributes = try FileManager.default.attributesOfItem(atPath: authSource.path)
+        guard attributes[.type] as? FileAttributeType == .typeRegular else {
+            throw ServiceAPIError(
+                code: .dependencyUnavailable,
+                message: "Codex credential source is unsafe"
+            )
+        }
+        let authDestination = destination.appendingPathComponent("auth.json", isDirectory: false)
+        try FileManager.default.copyItem(at: authSource, to: authDestination)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: authDestination.path
+        )
     }
 }
 

@@ -9,6 +9,10 @@ public struct AgentSessionPresentationFacts: Sendable {
     public let sessionRevision: Int64
     public let lifecycleState: SessionLifecycleState
     public let isController: Bool
+    /// A trusted operator surface may control a session without impersonating
+    /// its durable collaboration controller. The actor remains the mutation
+    /// attribution authority.
+    public let hasOperatorControl: Bool
     /// The durable collaboration policy permits this actor to submit a
     /// follow-up or steer an active turn without owning the session.
     public let collaborativeSteeringAllowed: Bool
@@ -27,6 +31,7 @@ public struct AgentSessionPresentationFacts: Sendable {
         sessionRevision: Int64,
         lifecycleState: SessionLifecycleState,
         isController: Bool,
+        hasOperatorControl: Bool = false,
         collaborativeSteeringAllowed: Bool = false,
         composerAvailable: Bool,
         providerAvailable: Bool,
@@ -42,6 +47,7 @@ public struct AgentSessionPresentationFacts: Sendable {
         self.sessionRevision = sessionRevision
         self.lifecycleState = lifecycleState
         self.isController = isController
+        self.hasOperatorControl = hasOperatorControl
         self.collaborativeSteeringAllowed = collaborativeSteeringAllowed
         self.composerAvailable = composerAvailable
         self.providerAvailable = providerAvailable
@@ -71,13 +77,10 @@ public enum AgentSessionPresentationPolicy {
         }
 
         func commonDenial(allowsCollaborativeSteering: Bool = false) -> AgentSessionActionWire? {
-            if !facts.isRootSession {
-                return denied("root_session_only", "Only root Agent sessions can be controlled here.")
-            }
             if facts.lifecycleState == .archived {
                 return denied("session_archived", "This session is archived.")
             }
-            if !facts.isController,
+            if !facts.isController, !facts.hasOperatorControl,
                !(allowsCollaborativeSteering && facts.collaborativeSteeringAllowed)
             {
                 return denied("not_controller", "Only the session controller can perform this action.")

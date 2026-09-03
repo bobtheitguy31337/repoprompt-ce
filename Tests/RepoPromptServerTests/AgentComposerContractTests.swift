@@ -88,6 +88,67 @@ final class AgentContextWindowAuthorityTests: XCTestCase {
 }
 
 final class AgentSessionPresentationPolicyTests: XCTestCase {
+    func testChildControllerAndOperatorCanControlChildSession() {
+        let sessionID = UUID()
+        let runID = UUID()
+        let childController = AgentSessionPresentationPolicy.evaluate(.init(
+            isRootSession: false,
+            sessionRevision: 4,
+            lifecycleState: .failed,
+            isController: true,
+            composerAvailable: true,
+            providerAvailable: true,
+            supportsResume: true,
+            supportsSteering: true,
+            activeRunID: nil,
+            activeGeneration: nil,
+            activeTurnEpoch: nil,
+            steeringReady: false,
+            runPresentation: .init(
+                sessionID: sessionID,
+                runID: runID,
+                generation: 1,
+                turnEpoch: 1,
+                phase: nil,
+                phaseRevision: 2,
+                runStartedAt: Date(),
+                terminalSettlementCode: "provider_error",
+                terminalSettledAt: Date()
+            )
+        ))
+        XCTAssertTrue(childController.submitTurn.allowed)
+        XCTAssertTrue(childController.retry.allowed)
+
+        let operatorControl = AgentSessionPresentationPolicy.evaluate(.init(
+            isRootSession: false,
+            sessionRevision: 4,
+            lifecycleState: .failed,
+            isController: false,
+            hasOperatorControl: true,
+            composerAvailable: true,
+            providerAvailable: true,
+            supportsResume: true,
+            supportsSteering: true,
+            activeRunID: nil,
+            activeGeneration: nil,
+            activeTurnEpoch: nil,
+            steeringReady: false,
+            runPresentation: .init(
+                sessionID: sessionID,
+                runID: runID,
+                generation: 1,
+                turnEpoch: 1,
+                phase: nil,
+                phaseRevision: 2,
+                runStartedAt: Date(),
+                terminalSettlementCode: "provider_error",
+                terminalSettledAt: Date()
+            )
+        ))
+        XCTAssertTrue(operatorControl.submitTurn.allowed)
+        XCTAssertTrue(operatorControl.retry.allowed)
+    }
+
     func testUnknownHistoricalSettlementDoesNotMakeIdleSessionReadOnly() {
         let control = AgentSessionPresentationPolicy.evaluate(.init(
             isRootSession: true,

@@ -8,6 +8,63 @@ import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 final class AuthorityTests: XCTestCase {
+    func testOperatorControlCanAddressForeignChildWithoutChangingController() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let provider = ProviderCLIAdapter(
+            configurations: [.init(kind: .codex, executable: "/usr/bin/true")],
+            runner: DelayedProviderRunner()
+        )
+        let authority = RepoPromptHeadlessAuthority(store: store, providerAdapter: provider)
+        let owner = ExternalActor(userID: "gabblin:bob", username: "bob", displayName: "Bob")
+        let operatorActor = ExternalActor(userID: "operator:operator", username: "operator", displayName: "Operator portal")
+        let project = try await authority.createProject(
+            input: .init(name: "P", roots: []),
+            externalActor: owner,
+            idempotencyKey: "operator-child-project",
+            requestDigest: "operator-child-project"
+        )
+        let root = try await authority.createSession(
+            input: .init(projectID: project.projectID, provider: .codex, visibility: .privateSession),
+            externalActor: owner,
+            idempotencyKey: "operator-child-root",
+            requestDigest: "operator-child-root"
+        )
+        let child = try await authority.spawnChildSession(
+            parentSessionID: root.sessionID,
+            initialPrompt: "inspect"
+        )
+
+        let participantControl = try await authority.agentSessionActionSnapshot(
+            sessionID: child.sessionID,
+            actor: operatorActor,
+            composerAvailable: true
+        )
+        XCTAssertEqual(participantControl.submitTurn.reasonCode, "not_controller")
+
+        let operatorControl = try await authority.agentSessionActionSnapshot(
+            sessionID: child.sessionID,
+            actor: operatorActor,
+            composerAvailable: true,
+            controlScope: .operatorControl
+        )
+        XCTAssertTrue(operatorControl.submitTurn.allowed)
+        _ = try await authority.execute(
+            command: .sendFollowup(text: "continue", expectedSessionRevision: child.revision),
+            sessionID: child.sessionID,
+            externalActor: operatorActor,
+            idempotencyKey: "operator-child-followup",
+            requestDigest: "operator-child-followup",
+            controlScope: .operatorControl
+        )
+
+        let updated = try await authority.sessionSnapshot(sessionID: child.sessionID)
+        XCTAssertEqual(updated.transcript.last?.content, "continue")
+        XCTAssertEqual(updated.transcript.last?.actor?.userID, operatorActor.userID)
+        let collaboration = try await authority.collaborationMetadata(sessionID: child.sessionID)
+        XCTAssertEqual(collaboration.controllerUserID, owner.userID)
+        try await store.close()
+    }
+
     func testCollaborationRevisionsAndExecutionPermissionsAreOperational() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

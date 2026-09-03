@@ -287,8 +287,12 @@ final class ProviderSupervisorTests: XCTestCase {
         for path in [processHome, configHome, cacheHome, codexHome, sqliteHome] {
             try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
         }
-        try Data("keep".utf8).write(to: codexHome.appendingPathComponent("conversation-state"))
-        try Data(Self.fakeCodexAppServerScript(finalTextShell: "$CODEX_HOME", version: "provider 1.0").utf8).write(to: executable)
+        try Data("token".utf8).write(to: codexHome.appendingPathComponent("auth.json"))
+        let volatile = codexHome.appendingPathComponent("plugins", isDirectory: true)
+        try FileManager.default.createDirectory(at: volatile, withIntermediateDirectories: true)
+        try Data("changing".utf8).write(to: volatile.appendingPathComponent("install-staging"))
+        let isolationProbe = "$(if [ -f $CODEX_HOME/auth.json ] && [ ! -e $CODEX_HOME/plugins ]; then printf isolated; else printf leaked; fi)"
+        try Data(Self.fakeCodexAppServerScript(finalTextShell: isolationProbe, version: "provider 1.0").utf8).write(to: executable)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         defer { try? FileManager.default.removeItem(at: directory) }
 
@@ -317,8 +321,8 @@ final class ProviderSupervisorTests: XCTestCase {
         let result = try await adapter.complete(kind: .codex, model: nil, prompt: "prompt", workingDirectory: directory.path, runID: runID)
 
         let isolatedCodexHome = ephemeralHomes.appendingPathComponent(runID.uuidString).appendingPathComponent(".codex")
-        XCTAssertEqual(result.trimmingCharacters(in: .whitespacesAndNewlines), isolatedCodexHome.path)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: codexHome.appendingPathComponent("conversation-state").path))
+        XCTAssertEqual(result.trimmingCharacters(in: .whitespacesAndNewlines), "isolated")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: volatile.appendingPathComponent("install-staging").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: isolatedCodexHome.path))
         let resources = try await store.ownedResources(states: nil)
         XCTAssertTrue(resources.contains { $0.runID == runID && $0.kind == .providerHome })

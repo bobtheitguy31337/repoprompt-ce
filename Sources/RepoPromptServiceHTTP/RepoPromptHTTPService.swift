@@ -938,7 +938,6 @@ public struct RepoPromptHTTPService: Sendable {
             }
             let pageToken = request.uri.queryParameters["pageToken"].map(String.init)
             let session = try await authority.sessionSnapshot(sessionID: sessionID)
-            let metadata = try await authority.collaborationMetadata(sessionID: sessionID)
             let page = try await requireTranscriptPresentation().page(
                 sessionID: sessionID,
                 actorID: principal.actorID,
@@ -946,12 +945,13 @@ public struct RepoPromptHTTPService: Sendable {
                 interactions: session.interactions,
                 pageToken: pageToken,
                 limit: limit,
-                mutableInteractions: metadata.controllerUserID == principal.actorID
+                mutableInteractions: true
             )
             let control = try await authority.agentSessionActionSnapshot(
                 sessionID: sessionID,
                 actor: principal.externalActor,
-                composerAvailable: composerCatalog != nil
+                composerAvailable: composerCatalog != nil,
+                controlScope: .operatorControl
             )
             let sidebarSessions = try await portalSidebarSessions(
                 principal: principal,
@@ -1006,7 +1006,8 @@ public struct RepoPromptHTTPService: Sendable {
             let control = try? await authority.agentSessionActionSnapshot(
                 sessionID: snapshot.sessionID,
                 actor: principal.externalActor,
-                composerAvailable: composerCatalog != nil
+                composerAvailable: composerCatalog != nil,
+                controlScope: .operatorControl
             )
             return try portalJSON(
                 RepoPromptPortalSessionProjection.project(snapshot, agentControl: control),
@@ -1031,7 +1032,8 @@ public struct RepoPromptHTTPService: Sendable {
             let control = try await authority.agentSessionActionSnapshot(
                 sessionID: sessionID,
                 actor: principal.externalActor,
-                composerAvailable: composerCatalog != nil
+                composerAvailable: composerCatalog != nil,
+                controlScope: .operatorControl
             )
             return try portalJSON(RepoPromptPortalSessionProjection.project(
                 session,
@@ -1093,7 +1095,8 @@ public struct RepoPromptHTTPService: Sendable {
             let control = try? await authority.agentSessionActionSnapshot(
                 sessionID: session.sessionID,
                 actor: principal.externalActor,
-                composerAvailable: composerCatalog != nil
+                composerAvailable: composerCatalog != nil,
+                controlScope: .operatorControl
             )
             return try portalJSON(
                 PortalAgentSubmissionReceipt(
@@ -1115,7 +1118,8 @@ public struct RepoPromptHTTPService: Sendable {
                 sessionID: sessionID,
                 actor: principal.externalActor,
                 operation: "submitTurn",
-                requestDigest: digest
+                requestDigest: digest,
+                controlScope: .operatorControl
             )
             // The server, not a browser snapshot, decides whether this message
             // starts a turn or steers the currently bound run. This closes the
@@ -1124,7 +1128,8 @@ public struct RepoPromptHTTPService: Sendable {
                 let control = try await authority.agentSessionActionSnapshot(
                     sessionID: sessionID,
                     actor: principal.externalActor,
-                    composerAvailable: composerCatalog != nil
+                    composerAvailable: composerCatalog != nil,
+                    controlScope: .operatorControl
                 )
                 guard control.steer.allowed, let epoch = control.steer.targetTurnEpoch else {
                     throw ServiceAPIError(
@@ -1145,7 +1150,8 @@ public struct RepoPromptHTTPService: Sendable {
                     sessionID: sessionID,
                     externalActor: principal.externalActor,
                     idempotencyKey: portalIdempotencyKey(principal: principal, operationID: input.operationID),
-                    requestDigest: digest
+                    requestDigest: digest,
+                    controlScope: .operatorControl
                 )
                 return try portalJSON(receipt, status: .accepted)
             }
@@ -1177,7 +1183,8 @@ public struct RepoPromptHTTPService: Sendable {
             let control = try await authority.agentSessionActionSnapshot(
                 sessionID: sessionID,
                 actor: principal.externalActor,
-                composerAvailable: composerCatalog != nil
+                composerAvailable: composerCatalog != nil,
+                controlScope: .operatorControl
             )
             let command: SessionCommand
             if control.steer.allowed, let epoch = control.steer.targetTurnEpoch {
@@ -1199,7 +1206,8 @@ public struct RepoPromptHTTPService: Sendable {
                 sessionID: sessionID,
                 externalActor: principal.externalActor,
                 idempotencyKey: portalIdempotencyKey(principal: principal, operationID: input.operationID),
-                requestDigest: CanonicalSigning.bodyDigest(data)
+                requestDigest: CanonicalSigning.bodyDigest(data),
+                controlScope: .operatorControl
             )
             return try portalJSON(receipt, status: .accepted)
         } }
@@ -1239,7 +1247,8 @@ public struct RepoPromptHTTPService: Sendable {
                     principal: principal,
                     operationID: input.operationID
                 ),
-                requestDigest: CanonicalSigning.bodyDigest(data)
+                requestDigest: CanonicalSigning.bodyDigest(data),
+                controlScope: .operatorControl
             )
             return try portalJSON(resolved)
         } }
@@ -1256,7 +1265,8 @@ public struct RepoPromptHTTPService: Sendable {
             let control = try await authority.agentSessionActionSnapshot(
                 sessionID: sessionID,
                 actor: principal.externalActor,
-                composerAvailable: composerCatalog != nil
+                composerAvailable: composerCatalog != nil,
+                controlScope: .operatorControl
             )
             let command: SessionCommand
             switch action {
@@ -1315,7 +1325,8 @@ public struct RepoPromptHTTPService: Sendable {
                     principal: principal,
                     operationID: input.operationID
                 ),
-                requestDigest: CanonicalSigning.bodyDigest(data)
+                requestDigest: CanonicalSigning.bodyDigest(data),
+                controlScope: .operatorControl
             )
             return try portalJSON(receipt, status: .accepted)
         } }
@@ -2938,7 +2949,8 @@ public struct RepoPromptHTTPService: Sendable {
         let controls = try await authority.agentSessionActionSnapshots(
             sessionIDs: snapshots.map(\.sessionID),
             actor: principal.externalActor,
-            composerAvailable: composerCatalog != nil
+            composerAvailable: composerCatalog != nil,
+            controlScope: .operatorControl
         )
         let agents = try await authority.agentSnapshots()
         let agentsBySessionID = Dictionary(uniqueKeysWithValues: agents.map { ($0.sessionID, $0) })
@@ -2950,16 +2962,20 @@ public struct RepoPromptHTTPService: Sendable {
     }
 
     private func portalBootstrap(principal: PortalAuthenticatedPrincipal) async throws -> PortalBootstrapResponse {
-        try await bootstrap(actor: principal.externalActor)
+        try await bootstrap(actor: principal.externalActor, controlScope: .operatorControl)
     }
 
-    private func bootstrap(actor: ExternalActor) async throws -> PortalBootstrapResponse {
+    private func bootstrap(
+        actor: ExternalActor,
+        controlScope: AgentSessionControlScope = .participant
+    ) async throws -> PortalBootstrapResponse {
         let projects = await authority.projectSnapshots().map(RepoPromptPortalSessionProjection.project)
         let snapshots = try await authority.sessionSnapshots()
         let controls = try await authority.agentSessionActionSnapshots(
             sessionIDs: snapshots.map(\.sessionID),
             actor: actor,
-            composerAvailable: composerCatalog != nil
+            composerAvailable: composerCatalog != nil,
+            controlScope: controlScope
         )
         let agents = try await authority.agentSnapshots()
         let agentsBySessionID = Dictionary(uniqueKeysWithValues: agents.map { ($0.sessionID, $0) })
