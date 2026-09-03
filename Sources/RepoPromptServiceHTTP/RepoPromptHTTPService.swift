@@ -31,6 +31,7 @@ public struct RepoPromptHTTPService: Sendable {
     private let submissionDispatchQueue: AgentSubmissionDispatchQueue?
     private let transcriptPresentation: AgentTranscriptPresentationService?
     private let portalDesktopSettings: PortalDesktopSettingsService
+    private let projectFiles: ProjectFileService
     private let portalPeerCertificateDER: Data?
     private let portalPasswordLoginEnabled: Bool
 
@@ -71,6 +72,7 @@ public struct RepoPromptHTTPService: Sendable {
         }
         self.transcriptPresentation = transcriptPresentation
         self.portalDesktopSettings = portalDesktopSettings ?? PortalDesktopSettingsService(store: store)
+        projectFiles = ProjectFileService()
         self.portalPeerCertificateDER = portalPeerCertificateDER
         self.portalPasswordLoginEnabled = portalPasswordLoginEnabled
         self.readiness = readiness ?? RepoPromptReadinessService(
@@ -183,6 +185,54 @@ public struct RepoPromptHTTPService: Sendable {
                 ExternalProjectResponse(project: RepoPromptPortalSessionProjection.project(project)),
                 status: .created
             )
+        } }
+        router.get("/external/v1/projects/:id/files") { request, context in await portalRespond(request) {
+            _ = try await authenticateExternalClient(request: request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let project = try await authority.projectSnapshot(projectID: projectID)
+            let worktrees = try await authority.worktreeSnapshots(projectID: projectID)
+            let path = String(request.uri.queryParameters["path"] ?? "")
+            return try portalJSON(projectFiles.listing(project: project, worktrees: worktrees, path: path))
+        } }
+        router.get("/external/v1/projects/:id/files/content") { request, context in await portalRespond(request) {
+            _ = try await authenticateExternalClient(request: request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let project = try await authority.projectSnapshot(projectID: projectID)
+            let worktrees = try await authority.worktreeSnapshots(projectID: projectID)
+            let result = try projectFiles.read(project: project, worktrees: worktrees, path: String(request.uri.queryParameters["path"] ?? ""))
+            var response = portalBytes(result.data, contentType: result.mediaType)
+            response.headers[.init("X-Project-File-Revision")!] = result.entry.revision
+            response.headers[.init("X-Project-File-Writable")!] = result.entry.writable ? "true" : "false"
+            return response
+        } }
+        router.put("/external/v1/projects/:id/files/content") { request, context in await portalRespond(request) {
+            _ = try await authenticateExternalClient(request: request)
+            _ = try requireIdempotency(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let project = try await authority.projectSnapshot(projectID: projectID)
+            let worktrees = try await authority.worktreeSnapshots(projectID: projectID)
+            let data = try await bodyData(request, maximumBytes: ProjectFileService.maximumFileBytes)
+            let expectedRevision = request.headers[.init("X-Project-File-Revision")!]
+            let entry = try projectFiles.write(
+                project: project,
+                worktrees: worktrees,
+                path: String(request.uri.queryParameters["path"] ?? ""),
+                data: data,
+                expectedRevision: expectedRevision
+            )
+            return try portalJSON(entry)
+        } }
+        router.post("/external/v1/projects/:id/files/actions") { request, context in await portalRespond(request) {
+            _ = try await authenticateExternalClient(request: request)
+            _ = try requireIdempotency(request)
+            let projectID = try context.parameters.require("id", as: UUID.self)
+            let project = try await authority.projectSnapshot(projectID: projectID)
+            let worktrees = try await authority.worktreeSnapshots(projectID: projectID)
+            let input = try await JSONDecoder.serviceDecoder.decode(ProjectFileMutationRequest.self, from: bodyData(request))
+            if let entry = try projectFiles.mutate(project: project, worktrees: worktrees, request: input) {
+                return try portalJSON(entry)
+            }
+            return portalEmpty()
         } }
         router.get("/external/v1/projects/:id/composer-catalog") { request, context in await portalRespond(request) {
             let actor = try await authenticateExternalClient(request: request)
