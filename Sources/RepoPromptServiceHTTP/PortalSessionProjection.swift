@@ -42,6 +42,7 @@ enum RepoPromptPortalSessionProjection {
             sessionID: session.sessionID,
             projectID: session.projectID,
             parentSessionID: session.parentSessionID,
+            creator: session.creator,
             title: normalizedTitle(title) ?? self.title(for: session),
             provider: session.provider,
             providerSettingsID: session.providerSettingsID,
@@ -209,12 +210,21 @@ enum RepoPromptPortalSessionProjection {
             turnID: bounded(turn.turnID, bytes: 1_024),
             responseSpanID: turn.responseSpanID.map { bounded($0, bytes: 1_024) },
             requestAnchorID: turn.requestAnchorID,
+            requestActor: turn.requestActor.map(sanitize),
             terminalState: turn.terminalState.map { bounded($0, bytes: 1_024) },
             startedAt: turn.startedAt,
             completedAt: turn.completedAt,
             blocks: Array(turn.blocks.prefix(256)).map(sanitize),
             interactions: Array(turn.interactions.prefix(100)).map(sanitize),
             legacyStandalone: turn.legacyStandalone
+        )
+    }
+
+    private static func sanitize(_ actor: ExternalActor) -> ExternalActor {
+        ExternalActor(
+            userID: bounded(actor.userID, bytes: 128),
+            username: bounded(actor.username, bytes: 128),
+            displayName: bounded(actor.displayName, bytes: 256)
         )
     }
 

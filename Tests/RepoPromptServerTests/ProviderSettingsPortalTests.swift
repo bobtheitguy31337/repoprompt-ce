@@ -469,6 +469,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
             turns: [
                 AgentPresentationTurnWire(
                     turnID: "turn-1",
+                    requestActor: actor,
                     blocks: [
                         .request(
                             id: "request-1",
@@ -508,7 +509,9 @@ final class ProviderSettingsPortalTests: XCTestCase {
             sidebarSessions: [RepoPromptPortalSessionProjection.project(session, agentControl: control)]
         )
         XCTAssertEqual(page.session.title, "Build the provider portal faithfully")
+        XCTAssertEqual(page.session.creator, actor)
         XCTAssertEqual(page.sidebarSessions.map(\.sessionID), [sessionID])
+        XCTAssertEqual(page.presentation.turns[0].requestActor, actor)
         guard case let .standaloneAssistant(_, row) = page.presentation.turns[0].blocks[1],
               case let .assistant(_, content) = row
         else {
@@ -516,7 +519,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
         }
         XCTAssertEqual(content.utf8.count, RepoPromptPortalSessionProjection.maximumEntryBytes)
         let encoded = try String(decoding: JSONEncoder.serviceEncoder.encode(page), as: UTF8.self)
-        XCTAssertFalse(encoded.contains("portal-user"))
+        XCTAssertTrue(encoded.contains("portal-user"))
         XCTAssertFalse(encoded.contains("private-human-presentation"))
         XCTAssertFalse(encoded.contains("private-assistant-presentation"))
         XCTAssertTrue(encoded.contains("\"sessionId\""))
@@ -524,7 +527,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
         XCTAssertFalse(encoded.contains("\"sessionID\""))
         XCTAssertFalse(encoded.contains("\"turnID\""))
         XCTAssertFalse(encoded.contains("presentationPayload"))
-        XCTAssertFalse(encoded.contains("actor"))
+        XCTAssertTrue(encoded.contains("requestActor"))
 
         var legacyObject = try XCTUnwrap(
             JSONSerialization.jsonObject(with: JSONEncoder.serviceEncoder.encode(page)) as? [String: Any]

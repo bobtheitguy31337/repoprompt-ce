@@ -1358,6 +1358,24 @@ final class SessionAuthorityStreamingTests: XCTestCase {
 }
 
 final class AgentTranscriptPresentationTests: XCTestCase {
+    func testLegacyPresentationAttributesTheRequestActor() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let service = AgentTranscriptPresentationService(store: store)
+        let actor = ExternalActor(userID: "collaborator-1", username: "alice", displayName: "Alice")
+        let request = TranscriptEntry(
+            entryID: UUID(),
+            sessionSequence: 1,
+            kind: .human,
+            content: "Review this change",
+            actor: actor,
+            timestamp: Date()
+        )
+
+        let page = try await service.page(sessionID: UUID(), actorID: actor.userID, legacyTranscript: [request])
+
+        XCTAssertEqual(page.turns.first?.requestActor, actor)
+    }
+
     func testOnlyPendingInteractionStatesRemainActionableInPresentation() {
         let runID = UUID()
         func interaction(_ state: InteractionSnapshot.State) -> InteractionSnapshot {

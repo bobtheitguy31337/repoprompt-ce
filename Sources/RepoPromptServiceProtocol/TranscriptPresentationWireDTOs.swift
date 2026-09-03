@@ -468,6 +468,7 @@ public struct AgentPresentationTurnWire: Codable, Hashable, Sendable {
     public let turnID: String
     public let responseSpanID: String?
     public let requestAnchorID: UUID?
+    public let requestActor: ExternalActor?
     public let terminalState: String?
     public let startedAt: Date?
     public let completedAt: Date?
@@ -475,10 +476,11 @@ public struct AgentPresentationTurnWire: Codable, Hashable, Sendable {
     public let interactions: [AgentPresentationInteractionWire]
     public let legacyStandalone: Bool
 
-    public init(turnID: String, responseSpanID: String? = nil, requestAnchorID: UUID? = nil, terminalState: String? = nil, startedAt: Date? = nil, completedAt: Date? = nil, blocks: [AgentPresentationBlockWire], interactions: [AgentPresentationInteractionWire] = [], legacyStandalone: Bool = false) {
+    public init(turnID: String, responseSpanID: String? = nil, requestAnchorID: UUID? = nil, requestActor: ExternalActor? = nil, terminalState: String? = nil, startedAt: Date? = nil, completedAt: Date? = nil, blocks: [AgentPresentationBlockWire], interactions: [AgentPresentationInteractionWire] = [], legacyStandalone: Bool = false) {
         self.turnID = turnID
         self.responseSpanID = responseSpanID
         self.requestAnchorID = requestAnchorID
+        self.requestActor = requestActor
         self.terminalState = terminalState
         self.startedAt = startedAt
         self.completedAt = completedAt
@@ -487,7 +489,7 @@ public struct AgentPresentationTurnWire: Codable, Hashable, Sendable {
         self.legacyStandalone = legacyStandalone
     }
 
-    private enum CodingKeys: String, CodingKey { case turnID = "turnId", responseSpanID = "responseSpanId", requestAnchorID = "requestAnchorId", terminalState, startedAt, completedAt, blocks, interactions, legacyStandalone }
+    private enum CodingKeys: String, CodingKey { case turnID = "turnId", responseSpanID = "responseSpanId", requestAnchorID = "requestAnchorId", requestActor, terminalState, startedAt, completedAt, blocks, interactions, legacyStandalone }
 }
 
 public struct AgentTranscriptPresentationPageWire: Codable, Hashable, Sendable {

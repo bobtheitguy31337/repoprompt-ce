@@ -184,6 +184,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
     public let sessionID: UUID
     public let projectID: UUID
     public let parentSessionID: UUID?
+    public let creator: ExternalActor?
     public let title: String
     public let provider: ProviderKind
     public let providerSettingsID: ProviderSettingsID?
@@ -204,6 +205,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         sessionID: UUID,
         projectID: UUID,
         parentSessionID: UUID?,
+        creator: ExternalActor? = nil,
         title: String,
         provider: ProviderKind,
         providerSettingsID: ProviderSettingsID? = nil,
@@ -223,6 +225,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         self.sessionID = sessionID
         self.projectID = projectID
         self.parentSessionID = parentSessionID
+        self.creator = creator
         self.title = title
         self.provider = provider
         self.providerSettingsID = providerSettingsID
@@ -245,6 +248,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         sessionID = try container.decode(UUID.self, forKey: .sessionID)
         projectID = try container.decode(UUID.self, forKey: .projectID)
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
+        creator = try container.decodeIfPresent(ExternalActor.self, forKey: .creator)
         title = try container.decode(String.self, forKey: .title)
         provider = try container.decode(ProviderKind.self, forKey: .provider)
         providerSettingsID = try container.decodeIfPresent(ProviderSettingsID.self, forKey: .providerSettingsID)
@@ -266,7 +270,7 @@ public struct PortalSessionSummary: Codable, Hashable, Sendable {
         case sessionID = "sessionId"
         case projectID = "projectId"
         case parentSessionID = "parentSessionId"
-        case title, provider
+        case creator, title, provider
         case providerSettingsID = "providerSettingsId"
         case model, state, revision, agentRevision, runGeneration, turnEpoch, lastActivityAt, sidebarDepth, effectiveContextWindowTokens
         case runPresentation, agentControl, contextUsage

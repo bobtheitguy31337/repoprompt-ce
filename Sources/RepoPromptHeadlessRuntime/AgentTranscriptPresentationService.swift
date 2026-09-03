@@ -113,7 +113,15 @@ public actor AgentTranscriptPresentationService {
                 activities: presentationActivities,
                 interactions: attachedInteractions
             ))
-            units.append(.init(sequence: record.firstSequence, beforeSequence: record.firstSequence, turn: projected))
+            let requestActor = legacyTranscript.first {
+                ($0.entryID == record.identity.requestAnchorID || $0.entryID == record.identity.turnID)
+                    && $0.kind == .human
+            }?.actor
+            units.append(.init(
+                sequence: record.firstSequence,
+                beforeSequence: record.firstSequence,
+                turn: Self.attributing(projected, to: requestActor)
+            ))
         }
 
         units.append(contentsOf: legacyUnits)
@@ -244,12 +252,28 @@ public actor AgentTranscriptPresentationService {
             turnID: turnID,
             responseSpanID: projected.responseSpanID,
             requestAnchorID: projected.requestAnchorID,
+            requestActor: request?.actor,
             terminalState: projected.terminalState,
             blocks: blocks,
             interactions: projected.interactions,
             legacyStandalone: true
         )
         return .init(sequence: first.sessionSequence, beforeSequence: first.sessionSequence, turn: turn)
+    }
+
+    private static func attributing(_ turn: AgentPresentationTurnWire, to actor: ExternalActor?) -> AgentPresentationTurnWire {
+        AgentPresentationTurnWire(
+            turnID: turn.turnID,
+            responseSpanID: turn.responseSpanID,
+            requestAnchorID: turn.requestAnchorID,
+            requestActor: actor,
+            terminalState: turn.terminalState,
+            startedAt: turn.startedAt,
+            completedAt: turn.completedAt,
+            blocks: turn.blocks,
+            interactions: turn.interactions,
+            legacyStandalone: turn.legacyStandalone
+        )
     }
 
     private static func mergingLegacyFragment(_ current: String, _ incoming: String) -> String {
