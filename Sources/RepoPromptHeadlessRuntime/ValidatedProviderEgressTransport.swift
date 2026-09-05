@@ -488,7 +488,10 @@ public final class ValidatedProviderEgressTransport: ValidatedProviderEgressTran
         do {
             channel = try await bootstrap.connect(to: connectionPlan?.address ?? address).get()
         } catch {
-            throw useTLS ? ValidatedProviderEgressError.tlsValidationFailed : ValidatedProviderEgressError.transportUnavailable
+            // NIO debug builds trap unfinished promises; fail before rethrowing.
+            let mapped = useTLS ? ValidatedProviderEgressError.tlsValidationFailed : .transportUnavailable
+            responsePromise.fail(mapped)
+            throw mapped
         }
         defer { channel.close(promise: nil) }
 
@@ -508,13 +511,20 @@ public final class ValidatedProviderEgressTransport: ValidatedProviderEgressTran
             uri: request.pathAndQuery,
             headers: headers
         )
-        try await channel.write(HTTPClientRequestPart.head(head)).get()
-        if let body = request.body {
-            var buffer = channel.allocator.buffer(capacity: body.count)
-            buffer.writeBytes(body)
-            try await channel.write(HTTPClientRequestPart.body(.byteBuffer(buffer))).get()
+        do {
+            try await channel.write(HTTPClientRequestPart.head(head)).get()
+            if let body = request.body {
+                var buffer = channel.allocator.buffer(capacity: body.count)
+                buffer.writeBytes(body)
+                try await channel.write(HTTPClientRequestPart.body(.byteBuffer(buffer))).get()
+            }
+            try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
+        } catch {
+            // Go through the handler so `completed` is set; raw promise.fail + channel.close
+            // would double-fail via channelInactive in debug NIO.
+            handler.abort(.transportUnavailable, channel: channel)
+            throw ValidatedProviderEgressError.transportUnavailable
         }
-        try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
 
         let timeoutTask = channel.eventLoop.scheduleTask(in: .nanoseconds(request.totalTimeout.nanosecondsClamped)) {
             handler.abort(.timedOut, channel: channel)
