@@ -489,8 +489,9 @@ public final class ValidatedProviderEgressTransport: ValidatedProviderEgressTran
             channel = try await bootstrap.connect(to: connectionPlan?.address ?? address).get()
         } catch {
             // NIO debug builds trap unfinished promises; fail before rethrowing.
-            responsePromise.fail(ValidatedProviderEgressError.transportUnavailable)
-            throw useTLS ? ValidatedProviderEgressError.tlsValidationFailed : ValidatedProviderEgressError.transportUnavailable
+            let mapped = useTLS ? ValidatedProviderEgressError.tlsValidationFailed : .transportUnavailable
+            responsePromise.fail(mapped)
+            throw mapped
         }
         defer { channel.close(promise: nil) }
 
@@ -519,8 +520,10 @@ public final class ValidatedProviderEgressTransport: ValidatedProviderEgressTran
             }
             try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
         } catch {
-            responsePromise.fail(error)
-            throw error
+            // Go through the handler so `completed` is set; raw promise.fail + channel.close
+            // would double-fail via channelInactive in debug NIO.
+            handler.abort(.transportUnavailable, channel: channel)
+            throw ValidatedProviderEgressError.transportUnavailable
         }
 
         let timeoutTask = channel.eventLoop.scheduleTask(in: .nanoseconds(request.totalTimeout.nanosecondsClamped)) {
