@@ -488,6 +488,8 @@ public final class ValidatedProviderEgressTransport: ValidatedProviderEgressTran
         do {
             channel = try await bootstrap.connect(to: connectionPlan?.address ?? address).get()
         } catch {
+            // NIO debug builds trap unfinished promises; fail before rethrowing.
+            responsePromise.fail(ValidatedProviderEgressError.transportUnavailable)
             throw useTLS ? ValidatedProviderEgressError.tlsValidationFailed : ValidatedProviderEgressError.transportUnavailable
         }
         defer { channel.close(promise: nil) }
@@ -508,13 +510,18 @@ public final class ValidatedProviderEgressTransport: ValidatedProviderEgressTran
             uri: request.pathAndQuery,
             headers: headers
         )
-        try await channel.write(HTTPClientRequestPart.head(head)).get()
-        if let body = request.body {
-            var buffer = channel.allocator.buffer(capacity: body.count)
-            buffer.writeBytes(body)
-            try await channel.write(HTTPClientRequestPart.body(.byteBuffer(buffer))).get()
+        do {
+            try await channel.write(HTTPClientRequestPart.head(head)).get()
+            if let body = request.body {
+                var buffer = channel.allocator.buffer(capacity: body.count)
+                buffer.writeBytes(body)
+                try await channel.write(HTTPClientRequestPart.body(.byteBuffer(buffer))).get()
+            }
+            try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
+        } catch {
+            responsePromise.fail(error)
+            throw error
         }
-        try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
 
         let timeoutTask = channel.eventLoop.scheduleTask(in: .nanoseconds(request.totalTimeout.nanosecondsClamped)) {
             handler.abort(.timedOut, channel: channel)
