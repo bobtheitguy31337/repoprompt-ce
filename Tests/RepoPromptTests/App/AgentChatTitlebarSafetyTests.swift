@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
@@ -57,6 +58,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
                 rename: { invocations.append(("rename", $0)) },
                 stash: { invocations.append(("stash", $0)) },
                 copyHandoffPrompt: { invocations.append(("copy", $0)) },
+                copySessionID: { _ in },
                 delete: { invocations.append(("delete", $0)) }
             )
         )
@@ -77,6 +79,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
                 rename: { _ in },
                 stash: { _ in },
                 copyHandoffPrompt: { _ in },
+                copySessionID: { _ in },
                 delete: { _ in }
             )
         )
@@ -103,6 +106,126 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         XCTAssertEqual(invocations.map(\.1), Array(repeating: target, count: 5))
     }
 
+    func testCopySessionIDItemAppearsOnlyWithAGenerationBearingCaptureAndPassesItThrough() throws {
+        let target = AgentChatOptionsMenuTarget(
+            windowID: 7,
+            workspaceID: UUID(),
+            tabID: UUID(),
+            agentSessionID: UUID(),
+            tabName: "Captured"
+        )
+
+        // No eligible endpoint: the action is not offered at all, rather than offered and then denied.
+        let withoutCapture = AgentChatOptionsMenuPresenter.makeMenu(
+            snapshot: AgentChatOptionsMenuSnapshot(target: target, isPinned: false),
+            actions: Self.noopActions()
+        )
+        XCTAssertFalse(withoutCapture.items.map(\.title).contains("Copy Session ID"))
+
+        let capture = AgentSessionCopyIDTarget(
+            windowID: target.windowID,
+            workspaceID: target.workspaceID,
+            tabID: target.tabID,
+            sessionID: target.agentSessionID,
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 4
+        )
+        var copied: [AgentSessionCopyIDTarget] = []
+        let menu = AgentChatOptionsMenuPresenter.makeMenu(
+            snapshot: AgentChatOptionsMenuSnapshot(
+                target: target,
+                isPinned: false,
+                copySessionIDTarget: capture
+            ),
+            actions: Self.noopActions(copySessionID: { copied.append($0) })
+        )
+        XCTAssertEqual(menu.items.map(\.title), [
+            "Pin",
+            "Rename",
+            "Stash",
+            "Handoff",
+            "Copy Session ID",
+            "",
+            "Delete"
+        ])
+
+        let item = menu.items[4]
+        XCTAssertTrue(try NSApplication.shared.sendAction(
+            XCTUnwrap(item.action),
+            to: item.target,
+            from: item
+        ))
+        // The menu carries the exact incarnation, not just the session ID, so a same-ID rebind
+        // between menu open and click is still detectable at the clipboard write.
+        XCTAssertEqual(copied, [capture])
+    }
+
+    func testTitleClusterCopiedNoticeIsRevisionGuardedAndSurvivesUnrelatedTitleUpdates() async throws {
+        let model = AgentChatTitleClusterModel(title: "Alpha")
+        XCTAssertNil(model.state.copiedNotice)
+
+        model.showCopiedNotice("Session ID copied", duration: .milliseconds(60))
+        XCTAssertEqual(model.state.copiedNotice, "Session ID copied")
+
+        // A title/chat-options refresh must not clear an in-flight confirmation.
+        model.update(title: "Alpha renamed", showsChatOptions: true)
+        XCTAssertEqual(model.state.title, "Alpha renamed")
+        XCTAssertEqual(model.state.copiedNotice, "Session ID copied")
+
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertNil(model.state.copiedNotice)
+    }
+
+    func testLaterCopiedNoticeSupersedesAnInFlightReset() async throws {
+        let model = AgentChatTitleClusterModel(title: "Alpha")
+        model.showCopiedNotice("first", duration: .milliseconds(40))
+        // The second notice takes a newer generation, so the first one's pending reset must not clear
+        // it when it fires.
+        model.showCopiedNotice("second", duration: .milliseconds(400))
+
+        try await Task.sleep(for: .milliseconds(180))
+        XCTAssertEqual(model.state.copiedNotice, "second")
+
+        try await Task.sleep(for: .milliseconds(400))
+        XCTAssertNil(model.state.copiedNotice)
+    }
+
+    func testTitlebarCopyWritesNothingAndShowsNoFeedbackForAForeignWindow() {
+        // A capture from another window can never be satisfied here: zero clipboard writes and no
+        // false success confirmation.
+        let model = AgentChatTitleClusterModel(title: "Alpha")
+        let capture = AgentSessionCopyIDTarget(
+            windowID: 1234,
+            workspaceID: UUID(),
+            tabID: UUID(),
+            sessionID: UUID(),
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 1
+        )
+        var writes: [String] = []
+        let outcome = AgentSessionCopyIDPolicy.outcome(for: capture, liveCandidates: [])
+        if case let .copied(value) = outcome {
+            writes.append(value)
+            model.showCopiedNotice("Session ID copied")
+        }
+        XCTAssertEqual(outcome, .staleTarget)
+        XCTAssertTrue(writes.isEmpty)
+        XCTAssertNil(model.state.copiedNotice)
+    }
+
+    private static func noopActions(
+        copySessionID: @escaping (AgentSessionCopyIDTarget) -> Void = { _ in }
+    ) -> AgentChatOptionsMenuActions {
+        AgentChatOptionsMenuActions(
+            togglePin: { _ in },
+            rename: { _ in },
+            stash: { _ in },
+            copyHandoffPrompt: { _ in },
+            copySessionID: copySessionID,
+            delete: { _ in }
+        )
+    }
+
     func testHandoffPromptRendersExactBuildAwareMCPAndCLIRouting() throws {
         let target = try AgentChatOptionsMenuTarget(
             windowID: 7,
@@ -124,6 +247,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         let expectedDebug = """
         Use RepoPrompt CE to continue this exact Agent Mode session.
 
+        Session title: "Captured"
         Window ID: 7
         Workspace ID: 11111111-1111-1111-1111-111111111111
         Context ID (compose tab): 22222222-2222-2222-2222-222222222222
@@ -140,6 +264,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         let expectedRelease = """
         Use RepoPrompt CE to continue this exact Agent Mode session.
 
+        Session title: "Captured"
         Window ID: 7
         Workspace ID: 11111111-1111-1111-1111-111111111111
         Context ID (compose tab): 22222222-2222-2222-2222-222222222222
@@ -162,6 +287,26 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             AgentSessionHandoffPrompt.render(target: target, cliCommandName: "rpce-cli"),
             expectedRelease
         )
+    }
+
+    func testHandoffPromptEscapesSessionTitleAsOneHumanReadableLine() throws {
+        let target = try AgentChatOptionsMenuTarget(
+            windowID: 7,
+            workspaceID: XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111")),
+            tabID: XCTUnwrap(UUID(uuidString: "22222222-2222-2222-2222-222222222222")),
+            agentSessionID: XCTUnwrap(UUID(uuidString: "33333333-3333-3333-3333-333333333333")),
+            tabName: "Line 1\n\"quoted\" \\ path — 日本語 👨‍👩‍👧‍👦 \u{85}\u{2028}\u{2029}"
+        )
+
+        let prompt = AgentSessionHandoffPrompt.render(target: target, cliCommandName: "rpce-cli-debug")
+        let lines = prompt.split(separator: "\n", omittingEmptySubsequences: false)
+
+        XCTAssertEqual(
+            lines[2],
+            #"Session title: "Line 1\n\"quoted\" \\ path — 日本語 👨‍👩‍👧‍👦 \u{85}\u{2028}\u{2029}""#
+        )
+        XCTAssertEqual(prompt.components(separatedBy: "Agent session ID:").count, 2)
+        XCTAssertTrue(prompt.contains("Agent session ID: 33333333-3333-3333-3333-333333333333"))
     }
 
     func testHandoffPromptExplicitEmptyMatchesLegacyPromptByteForByte() throws {
@@ -417,6 +562,34 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             )
             XCTAssertNotNil(fixture.tab(fixture.tabAID))
             XCTAssertNotNil(fixture.tab(fixture.tabBID))
+            XCTAssertFalse(
+                fixture.window.workspaceManager.activeWorkspace?.stashedTabs
+                    .contains(where: { $0.tab.id == fixture.tabAID }) == true
+            )
+        }
+    }
+
+    func testPostPreflightStashRefusalPreservesSessionTranscriptAndTab() async throws {
+        try await withFixture { fixture in
+            fixture.sessionA.setItemsSilently([
+                .user("Keep this instruction", sequenceIndex: 0),
+                .assistant("Keep this answer", sequenceIndex: 1)
+            ], reason: .testOverride)
+            fixture.viewModel.refreshDerivedTranscriptState(for: fixture.sessionA)
+            let originalRows = fixture.sessionA.items.map(\.id)
+            let preflight = fixture.window.promptManager.setComposeTabsRemovalPreflight { _, _, _ in .proceed }
+            defer { fixture.window.promptManager.removeComposeTabsRemovalPreflight(preflight) }
+
+            let report = await fixture.window.promptManager.stashComposeTabs(
+                withIDs: [fixture.tabAID],
+                postPreflightValidation: { false },
+                expandCascade: false
+            )
+
+            XCTAssertFalse(report.rejections.isEmpty)
+            XCTAssertNotNil(fixture.tab(fixture.tabAID))
+            XCTAssertEqual(fixture.sessionA.items.map(\.id), originalRows)
+            XCTAssertEqual(fixture.sessionA.items.count, 2)
             XCTAssertFalse(
                 fixture.window.workspaceManager.activeWorkspace?.stashedTabs
                     .contains(where: { $0.tab.id == fixture.tabAID }) == true

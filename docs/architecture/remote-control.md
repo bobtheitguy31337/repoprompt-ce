@@ -238,3 +238,32 @@ The desktop gateway remains responsible for its own threat model, residual risks
 and release gates. Companion applications maintain their security documentation
 and release process independently; they are wire-compatible peers, not build-time
 dependencies.
+
+## Upstream compatibility maintenance
+
+The October 7, 2026 integration incorporates upstream
+`2ee1a27a58c64cf9a7fcd10c513333e001148d26` while preserving the standalone
+Remote Gateway and Iroh transport. Remote session metadata belongs to the current
+`AgentTabSession` authority. Model configuration retains upstream's workspace and
+inactive-run admission checks, and successful starts settle provisional session
+claims through `mcpAcceptSessionTarget`.
+
+Remote pending interactions are projected from Agent Mode's canonical
+`mcpPendingInteraction` surface, including permission and worktree approvals.
+The optional `responseUnavailableReason` wire field directs hook trust,
+unsupported approval choices, and multipart requests to the Mac. The gateway
+also rejects responses to these requests, including from older mobile clients.
+The protocol remains version 1; legacy payloads omit this optional field.
+
+Validation for this integration: the desktop product build, MCP product build,
+93 focused Remote/persistence tests, and repository Swift lint passed. The mobile
+peer passed 62 iOS Simulator tests, 34 protocol tests, and 3 relay tests. The
+mobile repository's `Scripts/check-desktop-compatibility.py` checks vendored Swift
+sources and JSON fixtures against the tested desktop revision. Real paired-device
+acceptance and release packaging are separate, unperformed checks.
+
+The window catalog owns one lazy Remote Gateway, which owns its pairing and
+availability services. Settings observes those same instances. The Remote targets
+and direct imports are registered in the upstream module catalog; architecture
+ratchet limits remain unchanged. Gateway/security/mutation and producer/projection
+test classes retain their suite names in two app-test files.

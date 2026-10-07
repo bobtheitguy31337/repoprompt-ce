@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import OSLog
+import RepoPromptInstrumentation
 
 enum AgentConversationReplayMode: String, Equatable {
     case equivalent
@@ -191,33 +192,78 @@ struct AgentConversationReplaySerialization: Equatable {
     }
 
     enum AgentTranscriptDebugInstrumentation {
-        nonisolated(unsafe) static var isEnabled = false
-        nonisolated(unsafe) static var protectedTailScanHandler: ((AgentTranscriptProtectedTailScanMetrics) -> Void)?
-        nonisolated(unsafe) static var compactionHandler: ((AgentTranscriptCompactionMetrics) -> Void)?
-        nonisolated(unsafe) static var workingSourceItemsHandler: ((AgentTranscriptWorkingSourceItemsMetrics) -> Void)?
-        nonisolated(unsafe) static var rebuildHandler: ((AgentTranscriptRebuildMetrics) -> Void)?
-        nonisolated(unsafe) static var projectionBuildHandler: ((AgentTranscriptProjectionBuildMetrics) -> Void)?
-        nonisolated(unsafe) static var refreshAttemptHandler: ((AgentTranscriptRefreshAttemptMetrics) -> Void)?
-        nonisolated(unsafe) static var presentationPublishHandler: ((AgentTranscriptPresentationPublishMetrics) -> Void)?
-        nonisolated(unsafe) static var sessionItemsReplacementHandler: ((AgentTranscriptSessionItemsReplacementMetrics) -> Void)?
-        nonisolated(unsafe) static var projectionIdentityHandler: ((AgentTranscriptProjectionIdentityMetrics) -> Void)?
-        private static let refreshSignatureLock = NSLock()
-        private nonisolated(unsafe) static var lastRefreshInputSignatureByTabID: [UUID: String] = [:]
+        struct Handlers {
+            let protectedTailScanHandler: ((AgentTranscriptProtectedTailScanMetrics) -> Void)?
+            let compactionHandler: ((AgentTranscriptCompactionMetrics) -> Void)?
+            let workingSourceItemsHandler: ((AgentTranscriptWorkingSourceItemsMetrics) -> Void)?
+            let rebuildHandler: ((AgentTranscriptRebuildMetrics) -> Void)?
+            let projectionBuildHandler: ((AgentTranscriptProjectionBuildMetrics) -> Void)?
+            let refreshAttemptHandler: ((AgentTranscriptRefreshAttemptMetrics) -> Void)?
+            let presentationPublishHandler: ((AgentTranscriptPresentationPublishMetrics) -> Void)?
+            let sessionItemsReplacementHandler: ((AgentTranscriptSessionItemsReplacementMetrics) -> Void)?
+            let projectionIdentityHandler: ((AgentTranscriptProjectionIdentityMetrics) -> Void)?
+
+            init(
+                protectedTailScanHandler: ((AgentTranscriptProtectedTailScanMetrics) -> Void)? = nil,
+                compactionHandler: ((AgentTranscriptCompactionMetrics) -> Void)? = nil,
+                workingSourceItemsHandler: ((AgentTranscriptWorkingSourceItemsMetrics) -> Void)? = nil,
+                rebuildHandler: ((AgentTranscriptRebuildMetrics) -> Void)? = nil,
+                projectionBuildHandler: ((AgentTranscriptProjectionBuildMetrics) -> Void)? = nil,
+                refreshAttemptHandler: ((AgentTranscriptRefreshAttemptMetrics) -> Void)? = nil,
+                presentationPublishHandler: ((AgentTranscriptPresentationPublishMetrics) -> Void)? = nil,
+                sessionItemsReplacementHandler: ((AgentTranscriptSessionItemsReplacementMetrics) -> Void)? = nil,
+                projectionIdentityHandler: ((AgentTranscriptProjectionIdentityMetrics) -> Void)? = nil
+            ) {
+                self.protectedTailScanHandler = protectedTailScanHandler
+                self.compactionHandler = compactionHandler
+                self.workingSourceItemsHandler = workingSourceItemsHandler
+                self.rebuildHandler = rebuildHandler
+                self.projectionBuildHandler = projectionBuildHandler
+                self.refreshAttemptHandler = refreshAttemptHandler
+                self.presentationPublishHandler = presentationPublishHandler
+                self.sessionItemsReplacementHandler = sessionItemsReplacementHandler
+                self.projectionIdentityHandler = projectionIdentityHandler
+            }
+        }
+
+        private struct State {
+            var isEnabled = false
+            var handlers = Handlers()
+            var lastRefreshInputSignatureByTabID: [UUID: String] = [:]
+        }
+
+        private final class LockedState: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value = State()
+
+            func withLock<T>(_ body: (inout State) -> T) -> T {
+                lock.lock()
+                defer { lock.unlock() }
+                return body(&value)
+            }
+        }
+
+        private static let state = LockedState()
+
+        static var isEnabled: Bool {
+            state.withLock { $0.isEnabled }
+        }
+
+        static func configure(_ handlers: Handlers) {
+            state.withLock { $0 = State(isEnabled: true, handlers: handlers) }
+        }
 
         static func reset() {
-            isEnabled = false
-            protectedTailScanHandler = nil
-            compactionHandler = nil
-            workingSourceItemsHandler = nil
-            rebuildHandler = nil
-            projectionBuildHandler = nil
-            refreshAttemptHandler = nil
-            presentationPublishHandler = nil
-            sessionItemsReplacementHandler = nil
-            projectionIdentityHandler = nil
-            refreshSignatureLock.lock()
-            lastRefreshInputSignatureByTabID = [:]
-            refreshSignatureLock.unlock()
+            state.withLock { $0 = State() }
+        }
+
+        static func removeRefreshInputSignatures(for tabIDs: Set<UUID>) {
+            guard !tabIDs.isEmpty else { return }
+            state.withLock { state in
+                for tabID in tabIDs {
+                    state.lastRefreshInputSignatureByTabID.removeValue(forKey: tabID)
+                }
+            }
         }
 
         static func durationMS(since start: TimeInterval) -> Double {
@@ -237,12 +283,14 @@ struct AgentConversationReplaySerialization: Equatable {
             incrementalPath: String,
             inputSignature: String
         ) {
-            guard isEnabled else { return }
-            refreshSignatureLock.lock()
-            let previous = lastRefreshInputSignatureByTabID[tabID]
-            lastRefreshInputSignatureByTabID[tabID] = inputSignature
-            refreshSignatureLock.unlock()
-            refreshAttemptHandler?(.init(
+            let emission: (((AgentTranscriptRefreshAttemptMetrics) -> Void)?, String?)? = state.withLock {
+                guard $0.isEnabled else { return nil }
+                let previous = $0.lastRefreshInputSignatureByTabID[tabID]
+                $0.lastRefreshInputSignatureByTabID[tabID] = inputSignature
+                return ($0.handlers.refreshAttemptHandler, previous)
+            }
+            guard let emission else { return }
+            emission.0?(.init(
                 reason: reason,
                 sourceItemsRevision: sourceItemsRevision,
                 itemCount: itemCount,
@@ -253,9 +301,55 @@ struct AgentConversationReplaySerialization: Equatable {
                 pendingMutationSummary: pendingMutationSummary,
                 incrementalPath: incrementalPath,
                 inputSignature: inputSignature,
-                previousInputSignature: previous,
-                isConsecutiveDuplicateInput: previous == inputSignature
+                previousInputSignature: emission.1,
+                isConsecutiveDuplicateInput: emission.1 == inputSignature
             ))
+        }
+
+        static func emitProtectedTailScan(_ metrics: @autoclosure () -> AgentTranscriptProtectedTailScanMetrics) {
+            emit(\.protectedTailScanHandler, metrics)
+        }
+
+        static func emitCompaction(_ metrics: @autoclosure () -> AgentTranscriptCompactionMetrics) {
+            emit(\.compactionHandler, metrics)
+        }
+
+        static func emitWorkingSourceItems(_ metrics: @autoclosure () -> AgentTranscriptWorkingSourceItemsMetrics) {
+            emit(\.workingSourceItemsHandler, metrics)
+        }
+
+        static func emitRebuild(_ metrics: @autoclosure () -> AgentTranscriptRebuildMetrics) {
+            emit(\.rebuildHandler, metrics)
+        }
+
+        static func emitProjectionBuild(_ metrics: @autoclosure () -> AgentTranscriptProjectionBuildMetrics) {
+            emit(\.projectionBuildHandler, metrics)
+        }
+
+        static func emitPresentationPublish(_ metrics: @autoclosure () -> AgentTranscriptPresentationPublishMetrics) {
+            emit(\.presentationPublishHandler, metrics)
+        }
+
+        static func emitSessionItemsReplacement(
+            _ metrics: @autoclosure () -> AgentTranscriptSessionItemsReplacementMetrics
+        ) {
+            emit(\.sessionItemsReplacementHandler, metrics)
+        }
+
+        static func emitProjectionIdentity(_ metrics: @autoclosure () -> AgentTranscriptProjectionIdentityMetrics) {
+            emit(\.projectionIdentityHandler, metrics)
+        }
+
+        private static func emit<Metrics>(
+            _ handlerKeyPath: KeyPath<Handlers, ((Metrics) -> Void)?>,
+            _ metrics: () -> Metrics
+        ) {
+            let handler: ((Metrics) -> Void)? = state.withLock {
+                guard $0.isEnabled else { return nil }
+                return $0.handlers[keyPath: handlerKeyPath]
+            }
+            guard let handler else { return }
+            handler(metrics())
         }
 
         static func stableDigest(_ values: [String]) -> String {
@@ -1209,9 +1303,18 @@ final class AgentToolResultProcessingContext: @unchecked Sendable {
     private var toolExecutionByItemID: [UUID: AgentTranscriptToolExecution] = [:]
     private var missingToolExecutionItemIDs: Set<UUID> = []
     private var bashMetadataByRaw: [String: BashToolResultParser.Metadata] = [:]
+    /// When false, item-ID-keyed execution lookups always miss and stores are dropped.
+    /// Content-addressed caches (JSON parses, bash metadata) are unaffected. Used by
+    /// passes that must not let one activity's execution be reused for another activity
+    /// that happens to share its item ID.
+    private let cachesToolExecutions: Bool
     #if DEBUG || EDIT_FLOW_PERF
         private var metrics: AgentToolResultProcessingMetrics = .zero
     #endif
+
+    init(cachesToolExecutions: Bool = true) {
+        self.cachesToolExecutions = cachesToolExecutions
+    }
 
     func jsonObject(from raw: String?) -> [String: Any]? {
         guard let normalizedRaw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1270,6 +1373,7 @@ final class AgentToolResultProcessingContext: @unchecked Sendable {
     }
 
     func lookupToolExecution(for itemID: UUID) -> ToolExecutionLookup {
+        guard cachesToolExecutions else { return .miss }
         lock.lock()
         if let cached = toolExecutionByItemID[itemID] {
             #if DEBUG || EDIT_FLOW_PERF
@@ -1293,6 +1397,7 @@ final class AgentToolResultProcessingContext: @unchecked Sendable {
     }
 
     func storeToolExecution(_ execution: AgentTranscriptToolExecution, for itemID: UUID) {
+        guard cachesToolExecutions else { return }
         lock.lock()
         toolExecutionByItemID[itemID] = execution
         missingToolExecutionItemIDs.remove(itemID)
@@ -1300,6 +1405,7 @@ final class AgentToolResultProcessingContext: @unchecked Sendable {
     }
 
     func markMissingToolExecution(for itemID: UUID) {
+        guard cachesToolExecutions else { return }
         lock.lock()
         missingToolExecutionItemIDs.insert(itemID)
         toolExecutionByItemID.removeValue(forKey: itemID)
@@ -2271,7 +2377,7 @@ enum AgentTranscriptIO {
         let repairedRows = repairedSourceItems(rows, diagnosticContext: "working_source_items")
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
-                AgentTranscriptDebugInstrumentation.workingSourceItemsHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emitWorkingSourceItems(.init(
                     transcriptTurnCount: transcript.turns.count,
                     fullTurnCount: transcript.turns.count(where: { $0.retentionTier == .full }),
                     itemCount: repairedRows.count,
@@ -2448,7 +2554,7 @@ enum AgentTranscriptIO {
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
                 let worsening = retentionTierWorseningCounts(from: existingTranscript, to: compacted)
-                AgentTranscriptDebugInstrumentation.rebuildHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emitRebuild(.init(
                     existingTurnCount: existingTranscript.turns.count,
                     workingItemsCount: workingItems.count,
                     existingWorkingItemCount: existingWorkingItemCount,
@@ -3035,10 +3141,11 @@ enum AgentTranscriptIO {
 
     static func buildConversationHistory(
         from transcript: AgentTranscript,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder(),
         renderUserMessage: ((AgentTranscriptRequestAnchor) -> String)? = nil
     ) -> String {
         #if DEBUG
-            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let serialization = serializeConversationHistory(
             from: transcript,
@@ -3046,10 +3153,38 @@ enum AgentTranscriptIO {
             policy: .equivalent
         )
         #if DEBUG
-            AgentModePerfDiagnostics.recordConversationReplay(
-                serialization.metrics,
-                startMS: startMS
-            )
+            if perfRecorder.isEnabled {
+                let metrics = serialization.metrics
+                var fields: [String: String] = [
+                    "mode": metrics.mode.rawValue,
+                    "turnCount": String(metrics.turnCount),
+                    "examinedRowCount": String(metrics.examinedRowCount),
+                    "unboundedOutputUTF8Bytes": String(metrics.unboundedOutputUTF8Bytes),
+                    "outputUTF8Bytes": String(metrics.outputUTF8Bytes),
+                    "userAuthoredUTF8Bytes": String(metrics.userAuthoredUTF8Bytes),
+                    "originalToolArgumentCharacters": String(metrics.originalToolArgumentCharacters),
+                    "emittedToolArgumentCharacters": String(metrics.emittedToolArgumentCharacters),
+                    "truncatedToolCallCount": String(metrics.truncatedToolCallCount),
+                    "omittedRowCount": String(metrics.omittedRowCount),
+                    "essentialOverflowUTF8Bytes": String(metrics.essentialOverflowUTF8Bytes),
+                    "finalOverBudgetUTF8Bytes": String(metrics.finalOverBudgetUTF8Bytes)
+                ]
+                for category in AgentConversationReplayCategory.allCases {
+                    let categoryMetrics = metrics.categories[category] ?? .init()
+                    fields["\(category.rawValue).examined"] = String(categoryMetrics.examinedCount)
+                    fields["\(category.rawValue).emitted"] = String(categoryMetrics.emittedCount)
+                    fields["\(category.rawValue).omitted"] = String(categoryMetrics.omittedCount)
+                    fields["\(category.rawValue).unboundedUTF8Bytes"] = String(categoryMetrics.unboundedUTF8Bytes)
+                    fields["\(category.rawValue).emittedUTF8Bytes"] = String(categoryMetrics.emittedUTF8Bytes)
+                }
+                perfRecorder.recordConversationReplay(.init(
+                    mode: metrics.mode.rawValue,
+                    fields: fields,
+                    truncatedToolCallCount: metrics.truncatedToolCallCount,
+                    omittedRowCount: metrics.omittedRowCount,
+                    essentialOverflowUTF8Bytes: metrics.essentialOverflowUTF8Bytes
+                ), startMS: startMS)
+            }
         #endif
         return serialization.text
     }
@@ -4546,8 +4681,10 @@ enum AgentTranscriptIO {
         let keyPaths = Array(NSOrderedSet(array: toolExecutions.flatMap(\.keyPaths))) as? [String] ?? []
         let allToolNames = toolNameCounts.isEmpty ? toolNames : Array(toolNameCounts.keys.sorted())
         let narration = latestCollapsedNarrationText(from: activities)
-        let shortNarration = narration.map {
-            $0.count > 120 ? String($0.prefix(120)) + "…" : $0
+        let shortNarration: String? = narration.flatMap {
+            let sanitized = $0.sanitizedForDisplay
+            guard !sanitized.isEmpty else { return nil }
+            return sanitized.count > 120 ? String(sanitized.prefix(120)) + "…" : sanitized
         }
         let toolGroups = ClusterToolCategory.buildGroups(toolNames: allToolNames, counts: toolNameCounts)
         let summary = AgentTranscriptClusterSummary(
@@ -4832,7 +4969,7 @@ enum AgentTranscriptCompactor {
             let trimmed = structurallyTrimmedTranscript(copy)
             #if DEBUG
                 if AgentTranscriptDebugInstrumentation.isEnabled {
-                    AgentTranscriptDebugInstrumentation.compactionHandler?(.init(
+                    AgentTranscriptDebugInstrumentation.emitCompaction(.init(
                         mode: mode,
                         initialWorkingUnitCount: initialWorkingUnitCount,
                         finalWorkingUnitCount: CompactionPressure(transcript: trimmed).workingUnitCount,
@@ -4880,7 +5017,7 @@ enum AgentTranscriptCompactor {
         let trimmed = structurallyTrimmedTranscript(copy)
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
-                AgentTranscriptDebugInstrumentation.compactionHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emitCompaction(.init(
                     mode: mode,
                     initialWorkingUnitCount: initialWorkingUnitCount,
                     finalWorkingUnitCount: CompactionPressure(transcript: trimmed).workingUnitCount,
@@ -5075,7 +5212,7 @@ enum AgentTranscriptCompactor {
 
             func emit(countedToolExecutionCount: Int, protectedTurnCount: Int) {
                 guard AgentTranscriptDebugInstrumentation.isEnabled else { return }
-                AgentTranscriptDebugInstrumentation.protectedTailScanHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emitProtectedTailScan(.init(
                     transcriptTurnCount: transcript.turns.count,
                     limit: limit,
                     turnsVisited: turnsVisited,
@@ -5643,7 +5780,7 @@ enum AgentTranscriptProjectionBuilder {
                 "[AgentTranscriptProjection] build turns=\(transcript.turns.count) workingRows=\(workingRows.count) workingBlocks=\(workingBlocks.count) reusedPrefixTurns=\(reusablePrefix?.turnCount ?? 0) cacheHits=\(cacheHitCount) workingRowTail=[\(workingRowTail)] workingBlockTail=[\(workingBlockTail)]"
             )
             if AgentTranscriptDebugInstrumentation.isEnabled {
-                AgentTranscriptDebugInstrumentation.projectionBuildHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emitProjectionBuild(.init(
                     turnCount: transcript.turns.count,
                     reusedPrefixTurnCount: reusablePrefix?.turnCount ?? 0,
                     cacheHitCount: cacheHitCount,
@@ -5671,16 +5808,34 @@ enum AgentTranscriptProjectionBuilder {
         let transcriptTurnIDs = Set(transcript.turns.map(\.id))
         let protectedTurnID = protection.protectedTurnID
         var updatedTurnCaches = existingTurnCaches.filter { transcriptTurnIDs.contains($0.key) }
+        // Group the whole-projection collections once; per-turn filters would make this O(turns × blocks).
+        let workingBlocksByTurn = Dictionary(grouping: projection.workingBlocks, by: \.turnID)
+        let archivedBlocksByTurn = Dictionary(grouping: projection.archivedBlocks, by: \.turnID)
+        var rowAnchorsByTurn: [UUID: [UUID: AgentTranscriptAnchor]] = [:]
+        for (rowID, anchor) in projection.rowAnchorIndex {
+            rowAnchorsByTurn[turnID(for: anchor), default: [:]][rowID] = anchor
+        }
+        var anchorBlocksByTurn: [UUID: [AgentTranscriptAnchor: String]] = [:]
+        for (anchor, blockID) in projection.anchorBlockIndex {
+            anchorBlocksByTurn[turnID(for: anchor), default: [:]][anchor] = blockID
+        }
         for turn in transcript.turns {
             guard turn.isCompleted else {
                 updatedTurnCaches.removeValue(forKey: turn.id)
                 continue
             }
             guard turn.id != protectedTurnID else { continue }
+            let turnWorkingBlocks = workingBlocksByTurn[turn.id] ?? []
+            let turnArchivedBlocks = archivedBlocksByTurn[turn.id] ?? []
             updatedTurnCaches[turn.id] = projectionCache(
                 for: turn,
                 token: validationToken(for: turn),
-                projection: projection
+                workingBlocks: turnWorkingBlocks,
+                archivedBlocks: turnArchivedBlocks,
+                workingRows: projectionRows(for: turnWorkingBlocks),
+                archivedRows: projectionRows(for: turnArchivedBlocks),
+                rowAnchorIndex: rowAnchorsByTurn[turn.id] ?? [:],
+                anchorBlockIndex: anchorBlocksByTurn[turn.id] ?? [:]
             )
         }
         return updatedTurnCaches
@@ -6046,25 +6201,6 @@ enum AgentTranscriptProjectionBuilder {
             archivedRows: archivedRows,
             rowAnchorIndex: rowAnchorIndex.filter { turnID(for: $0.value) == turn.id },
             anchorBlockIndex: anchorBlockIndex.filter { turnID(for: $0.key) == turn.id }
-        )
-    }
-
-    private static func projectionCache(
-        for turn: AgentTranscriptTurn,
-        token: AgentTranscriptTurnProjectionCache.ValidationToken,
-        projection: AgentTranscriptProjection
-    ) -> AgentTranscriptTurnProjectionCache {
-        let workingBlocks = projection.workingBlocks.filter { $0.turnID == turn.id }
-        let archivedBlocks = projection.archivedBlocks.filter { $0.turnID == turn.id }
-        return projectionCache(
-            for: turn,
-            token: token,
-            workingBlocks: workingBlocks,
-            archivedBlocks: archivedBlocks,
-            workingRows: projectionRows(for: workingBlocks),
-            archivedRows: projectionRows(for: archivedBlocks),
-            rowAnchorIndex: projection.rowAnchorIndex,
-            anchorBlockIndex: projection.anchorBlockIndex
         )
     }
 
@@ -7658,10 +7794,10 @@ enum AgentTranscriptProjectionBuilder {
         let containsFailure = toolExecutions.contains { $0.status == .failed || $0.status == .cancelled }
         let containsWarning = toolExecutions.contains { $0.status == .warning }
         let narration = latestNarrationText(from: rows)
-        let shortNarration: String? = if let narration, !narration.isEmpty {
-            narration.count > 120 ? String(narration.prefix(120)) + "…" : narration
-        } else {
-            nil
+        let shortNarration: String? = narration.flatMap {
+            let sanitized = $0.sanitizedForDisplay
+            guard !sanitized.isEmpty else { return nil }
+            return sanitized.count > 120 ? String(sanitized.prefix(120)) + "…" : sanitized
         }
         let allToolNames = toolNameCounts.isEmpty ? Array(toolNames) : Array(toolNameCounts.keys.sorted())
         let toolGroups = ClusterToolCategory.buildGroups(toolNames: allToolNames, counts: toolNameCounts)

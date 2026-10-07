@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 // MARK: - Agent Session Error
 
@@ -33,6 +34,8 @@ enum AgentSessionError: Error, LocalizedError {
 }
 
 struct AgentTokenUsagePersist: Codable, Equatable {
+    let runID: UUID?
+    let turnID: UUID?
     let promptTokens: Int
     let completionTokens: Int
     let contextUsedTokens: Int?
@@ -42,6 +45,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
     let timestamp: Date
 
     init(
+        runID: UUID? = nil,
+        turnID: UUID? = nil,
         promptTokens: Int,
         completionTokens: Int,
         contextUsedTokens: Int? = nil,
@@ -50,6 +55,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
         estimatedToolOutputTokens: Int = 0,
         timestamp: Date = Date()
     ) {
+        self.runID = runID
+        self.turnID = turnID
         self.promptTokens = max(0, promptTokens)
         self.completionTokens = max(0, completionTokens)
         if let contextUsedTokens {
@@ -84,6 +91,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
     }
 
     enum CodingKeys: String, CodingKey {
+        case runID
+        case turnID
         case promptTokens
         case completionTokens
         case contextUsedTokens
@@ -95,6 +104,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        runID = try container.decodeIfPresent(UUID.self, forKey: .runID)
+        turnID = try container.decodeIfPresent(UUID.self, forKey: .turnID)
         promptTokens = try max(0, container.decode(Int.self, forKey: .promptTokens))
         completionTokens = try max(0, container.decode(Int.self, forKey: .completionTokens))
         if let decodedContext = try container.decodeIfPresent(Int.self, forKey: .contextUsedTokens) {
@@ -111,6 +122,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(runID, forKey: .runID)
+        try container.encodeIfPresent(turnID, forKey: .turnID)
         try container.encode(promptTokens, forKey: .promptTokens)
         try container.encode(completionTokens, forKey: .completionTokens)
         try container.encodeIfPresent(contextUsedTokens, forKey: .contextUsedTokens)
@@ -125,7 +138,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 
 /// Persisted agent mode session containing the chat transcript and configuration
 struct AgentSession: Codable, Identifiable {
-    static let currentSerializationVersion = 7
+    // 9 adds the granular observer-session Auto-wake target UUID set.
+    static let currentSerializationVersion = 9
     static let legacyUnversionedSerializationVersion = 0
 
     let id: UUID
@@ -158,8 +172,11 @@ struct AgentSession: Codable, Identifiable {
     /// Model used for this session (e.g., "sonnet", "opus", "codexMedium")
     var agentModel: String?
 
-    /// User-selected reasoning effort (Codex-only)
+    /// User-selected effort for this conversation (Codex or Claude-compatible providers).
     var agentReasoningEffort: String?
+
+    /// Explicit provider-advertised ACP model parameters, stored independently from the base model.
+    var acpModelParameterSelections: [ACPModelParameterSelection]
 
     /// State of the last run
     var lastRunState: String?
@@ -180,10 +197,27 @@ struct AgentSession: Codable, Identifiable {
     /// a session ID may route cleanup, but does not imply remote deletion support.
     var providerCleanupHandle: ProviderConversationCleanupHandle?
     var autoEditEnabled: Bool
+    /// Whether this observer session may reserve one system-origin follow-up turn when sessions it
+    /// oversees change status.
+    ///
+    /// Session configuration rather than link or global state: it is scoped to this observer, saved
+    /// with it, and inert while the session oversees nothing. Nothing else about oversight is
+    /// gated on it — status collection and natural-turn delivery are always on for a live, eligible
+    /// direct link.
+    var autoWakeOnOversightUpdates: Bool
+    /// Granular target selections preserved even while the master setting is on.
+    var agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID>
+    var routineWakeIntervalEnabled: Bool
+    var routineWakeIntervalSeconds: Int
+    var periodicIdleWakeEnabled: Bool
+    var periodicIdleWakeIntervalSeconds: Int
 
     /// Persisted per-turn token usage for non-Codex providers.
     /// Used to rebuild context usage after reopen/resume when tool payloads are pruned.
     var providerTokenUsageByTurn: [AgentTokenUsagePersist]
+
+    /// Bounded, local-only Jev decision and provider-application evidence keyed by transcript turn ID.
+    var automationTurnAudit: [AgentAutomationTurnAudit]
 
     /// Codex native session identifiers (v2 thread and rollout path)
     var codexConversationID: String?
@@ -199,6 +233,9 @@ struct AgentSession: Codable, Identifiable {
 
     /// Parent session ID for thread nesting (child sessions spawned from another session)
     var parentSessionID: UUID?
+
+    /// Immutable creation provenance for an overseer-created top-level lane.
+    var createdByOverseerSessionID: UUID?
 
     /// Whether this session was originally created by an MCP client (vs the user in the UI).
     /// Used to scope cleanup operations to MCP-originated sessions only.
@@ -219,6 +256,13 @@ struct AgentSession: Codable, Identifiable {
     var pendingHandoffSourceItemID: UUID?
     var pendingHandoffDefersProviderLockUntilSend: Bool
 
+    /// Optional recovery data. A decoded attempt is never authority to resume provider work.
+    var selfCompactState: AgentSelfCompactState?
+    /// Runtime-only: the decoded record was invalid and its original file needs preservation.
+    var selfCompactPersistenceWarning = false
+    /// Runtime-only: decode-time reconciliation should be persisted after the source is safe to rewrite.
+    var selfCompactNeedsRecoveryRewrite = false
+
     init(
         id: UUID = UUID(),
         serializationVersion: Int = AgentSession.currentSerializationVersion,
@@ -235,6 +279,7 @@ struct AgentSession: Codable, Identifiable {
         agentKind: String? = nil,
         agentModel: String? = nil,
         agentReasoningEffort: String? = nil,
+        acpModelParameterSelections: [ACPModelParameterSelection] = [],
         lastRunState: String? = nil,
         originWorkflowID: String? = nil,
         originWorkflowDisplayName: String? = nil,
@@ -242,7 +287,14 @@ struct AgentSession: Codable, Identifiable {
         providerSessionID: String? = nil,
         providerCleanupHandle: ProviderConversationCleanupHandle? = nil,
         autoEditEnabled: Bool = true,
+        autoWakeOnOversightUpdates: Bool = false,
+        agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID> = [],
+        routineWakeIntervalEnabled: Bool = false,
+        routineWakeIntervalSeconds: Int = AgentSessionLinkRoutineWakeInterval.defaultSeconds,
+        periodicIdleWakeEnabled: Bool = false,
+        periodicIdleWakeIntervalSeconds: Int = AgentSessionLinkPeriodicWakeInterval.defaultSeconds,
         providerTokenUsageByTurn: [AgentTokenUsagePersist] = [],
+        automationTurnAudit: [AgentAutomationTurnAudit] = [],
         codexConversationID: String? = nil,
         codexRolloutPath: String? = nil,
         codexModel: String? = nil,
@@ -252,10 +304,12 @@ struct AgentSession: Codable, Identifiable {
         codexTotalTotalTokens: Int? = nil,
         codexMcpSessionKey: String? = nil,
         parentSessionID: UUID? = nil,
+        createdByOverseerSessionID: UUID? = nil,
         pendingHandoffPayload: String? = nil,
         pendingHandoffCreatedAt: Date? = nil,
         pendingHandoffSourceItemID: UUID? = nil,
         pendingHandoffDefersProviderLockUntilSend: Bool = false,
+        selfCompactState: AgentSelfCompactState? = nil,
         isMCPOriginated: Bool = false,
         worktreeBindings: [AgentSessionWorktreeBinding] = [],
         worktreeMergeOperations: [AgentSessionWorktreeMergeOperation] = []
@@ -275,6 +329,7 @@ struct AgentSession: Codable, Identifiable {
         self.agentKind = agentKind
         self.agentModel = agentModel
         self.agentReasoningEffort = agentReasoningEffort
+        self.acpModelParameterSelections = ACPModelParameterSelection.normalized(acpModelParameterSelections)
         self.lastRunState = lastRunState
         self.originWorkflowID = originWorkflowID
         self.originWorkflowDisplayName = originWorkflowDisplayName
@@ -282,7 +337,14 @@ struct AgentSession: Codable, Identifiable {
         self.providerSessionID = providerSessionID
         self.providerCleanupHandle = providerCleanupHandle
         self.autoEditEnabled = autoEditEnabled
+        self.autoWakeOnOversightUpdates = autoWakeOnOversightUpdates
+        self.agentSessionLinkAutoWakeTargetSessionIDs = agentSessionLinkAutoWakeTargetSessionIDs
+        self.routineWakeIntervalEnabled = routineWakeIntervalEnabled
+        self.routineWakeIntervalSeconds = AgentSessionLinkRoutineWakeInterval.normalized(routineWakeIntervalSeconds)
+        self.periodicIdleWakeEnabled = periodicIdleWakeEnabled
+        self.periodicIdleWakeIntervalSeconds = AgentSessionLinkPeriodicWakeInterval.normalized(periodicIdleWakeIntervalSeconds)
         self.providerTokenUsageByTurn = providerTokenUsageByTurn
+        self.automationTurnAudit = AgentAutomationTurnAudit.retain(automationTurnAudit)
         self.codexConversationID = codexConversationID
         self.codexRolloutPath = codexRolloutPath
         self.codexModel = codexModel
@@ -292,10 +354,12 @@ struct AgentSession: Codable, Identifiable {
         self.codexTotalTotalTokens = codexTotalTotalTokens
         self.codexMcpSessionKey = codexMcpSessionKey
         self.parentSessionID = parentSessionID
+        self.createdByOverseerSessionID = createdByOverseerSessionID
         self.pendingHandoffPayload = pendingHandoffPayload
         self.pendingHandoffCreatedAt = pendingHandoffCreatedAt
         self.pendingHandoffSourceItemID = pendingHandoffSourceItemID
         self.pendingHandoffDefersProviderLockUntilSend = pendingHandoffDefersProviderLockUntilSend
+        self.selfCompactState = selfCompactState
         self.isMCPOriginated = isMCPOriginated
         self.worktreeBindings = worktreeBindings
         self.worktreeMergeOperations = worktreeMergeOperations
@@ -317,6 +381,7 @@ struct AgentSession: Codable, Identifiable {
         case agentKind
         case agentModel
         case agentReasoningEffort
+        case acpModelParameterSelections
         case lastRunState
         case originWorkflowID
         case originWorkflowDisplayName
@@ -324,7 +389,14 @@ struct AgentSession: Codable, Identifiable {
         case providerSessionID
         case providerCleanupHandle
         case autoEditEnabled
+        case autoWakeOnOversightUpdates
+        case agentSessionLinkAutoWakeTargetSessionIDs
+        case routineWakeIntervalEnabled
+        case routineWakeIntervalSeconds
+        case periodicIdleWakeEnabled
+        case periodicIdleWakeIntervalSeconds
         case providerTokenUsageByTurn
+        case automationTurnAudit
         case codexConversationID
         case codexRolloutPath
         case codexModel
@@ -334,10 +406,12 @@ struct AgentSession: Codable, Identifiable {
         case codexTotalTotalTokens
         case codexMcpSessionKey
         case parentSessionID
+        case createdByOverseerSessionID
         case pendingHandoffPayload
         case pendingHandoffCreatedAt
         case pendingHandoffSourceItemID
         case pendingHandoffDefersProviderLockUntilSend
+        case selfCompactState
         case isMCPOriginated
         case worktreeBindings
         case worktreeMergeOperations
@@ -362,6 +436,9 @@ struct AgentSession: Codable, Identifiable {
         agentKind = try container.decodeIfPresent(String.self, forKey: .agentKind)
         agentModel = try container.decodeIfPresent(String.self, forKey: .agentModel)
         agentReasoningEffort = try container.decodeIfPresent(String.self, forKey: .agentReasoningEffort)
+        acpModelParameterSelections = try ACPModelParameterSelection.normalized(
+            container.decodeIfPresent([ACPModelParameterSelection].self, forKey: .acpModelParameterSelections) ?? []
+        )
         lastRunState = try container.decodeIfPresent(String.self, forKey: .lastRunState)
         originWorkflowID = try container.decodeIfPresent(String.self, forKey: .originWorkflowID)
         originWorkflowDisplayName = try container.decodeIfPresent(String.self, forKey: .originWorkflowDisplayName)
@@ -369,7 +446,30 @@ struct AgentSession: Codable, Identifiable {
         providerSessionID = try container.decodeIfPresent(String.self, forKey: .providerSessionID)
         providerCleanupHandle = try container.decodeIfPresent(ProviderConversationCleanupHandle.self, forKey: .providerCleanupHandle)
         autoEditEnabled = try container.decode(Bool.self, forKey: .autoEditEnabled)
+        // Additive and `decodeIfPresent`: every session written before version 8 decodes as off.
+        // Fresh live sessions now start on, but restore deliberately preserves this legacy value.
+        autoWakeOnOversightUpdates = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .autoWakeOnOversightUpdates
+        ) ?? false
+        agentSessionLinkAutoWakeTargetSessionIDs = try container.decodeIfPresent(
+            Set<UUID>.self,
+            forKey: .agentSessionLinkAutoWakeTargetSessionIDs
+        ) ?? []
+        routineWakeIntervalEnabled = try container.decodeIfPresent(Bool.self, forKey: .routineWakeIntervalEnabled) ?? false
+        routineWakeIntervalSeconds = try AgentSessionLinkRoutineWakeInterval.normalized(
+            container.decodeIfPresent(Int.self, forKey: .routineWakeIntervalSeconds)
+                ?? AgentSessionLinkRoutineWakeInterval.defaultSeconds
+        )
+        periodicIdleWakeEnabled = try container.decodeIfPresent(Bool.self, forKey: .periodicIdleWakeEnabled) ?? false
+        periodicIdleWakeIntervalSeconds = try AgentSessionLinkPeriodicWakeInterval.normalized(
+            container.decodeIfPresent(Int.self, forKey: .periodicIdleWakeIntervalSeconds)
+                ?? AgentSessionLinkPeriodicWakeInterval.defaultSeconds
+        )
         providerTokenUsageByTurn = try container.decodeIfPresent([AgentTokenUsagePersist].self, forKey: .providerTokenUsageByTurn) ?? []
+        automationTurnAudit = try AgentAutomationTurnAudit.retain(
+            container.decodeIfPresent([AgentAutomationTurnAudit].self, forKey: .automationTurnAudit) ?? []
+        )
         codexConversationID = try container.decodeIfPresent(String.self, forKey: .codexConversationID)
         codexRolloutPath = try container.decodeIfPresent(String.self, forKey: .codexRolloutPath)
         codexModel = try container.decodeIfPresent(String.self, forKey: .codexModel)
@@ -379,10 +479,27 @@ struct AgentSession: Codable, Identifiable {
         codexTotalTotalTokens = try container.decodeIfPresent(Int.self, forKey: .codexTotalTotalTokens)
         codexMcpSessionKey = try container.decodeIfPresent(String.self, forKey: .codexMcpSessionKey)
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
+        createdByOverseerSessionID = try container.decodeIfPresent(UUID.self, forKey: .createdByOverseerSessionID)
         pendingHandoffPayload = try container.decodeIfPresent(String.self, forKey: .pendingHandoffPayload)
         pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)
         pendingHandoffSourceItemID = try container.decodeIfPresent(UUID.self, forKey: .pendingHandoffSourceItemID)
         pendingHandoffDefersProviderLockUntilSend = try container.decodeIfPresent(Bool.self, forKey: .pendingHandoffDefersProviderLockUntilSend) ?? false
+        if container.contains(.selfCompactState), try !(container.decodeNil(forKey: .selfCompactState)) {
+            do {
+                var restored = try container.decode(AgentSelfCompactState.self, forKey: .selfCompactState)
+                // Every decode, including an in-process reload, reconciles: a decoded attempt has no
+                // live worker, so it becomes explicit recovery rather than resumable work.
+                selfCompactNeedsRecoveryRewrite = restored.reconcileDecodedRecord()
+                selfCompactState = restored
+            } catch {
+                // An optional maintenance record must not make the whole session unreadable.
+                selfCompactPersistenceWarning = true
+                selfCompactNeedsRecoveryRewrite = true
+                selfCompactState = AgentSelfCompactState(latest: .malformedRecovery())
+            }
+        } else {
+            selfCompactState = nil
+        }
         isMCPOriginated = try container.decodeIfPresent(Bool.self, forKey: .isMCPOriginated) ?? false
         worktreeBindings = try container.decodeIfPresent([AgentSessionWorktreeBinding].self, forKey: .worktreeBindings) ?? []
         worktreeMergeOperations = try container.decodeIfPresent([AgentSessionWorktreeMergeOperation].self, forKey: .worktreeMergeOperations) ?? []

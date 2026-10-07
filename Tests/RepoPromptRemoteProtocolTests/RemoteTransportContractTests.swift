@@ -224,18 +224,15 @@ final class RemoteTransportContractTests: XCTestCase {
 
     func testTranscriptRPCPagingModeIsAdditiveAndLegacyPayloadStillDecodes() throws {
         let sessionID = UUID()
-        let recent = RemoteTranscriptRPCRequest(
-            sessionID: sessionID,
-            pagingMode: .recentBackward,
-            limit: 25
-        )
-        XCTAssertEqual(
-            try JSONDecoder().decode(
-                RemoteTranscriptRPCRequest.self,
-                from: JSONEncoder().encode(recent)
-            ),
-            recent
-        )
+        for mode in [RemoteTranscriptRPCPagingMode.recentBackward, .legacyForward] {
+            let request = RemoteTranscriptRPCRequest(
+                sessionID: sessionID, pagingMode: mode, limit: 25
+            )
+            XCTAssertEqual(
+                try JSONDecoder().decode(RemoteTranscriptRPCRequest.self, from: JSONEncoder().encode(request)),
+                request
+            )
+        }
 
         let legacyPayload: [String: Any] = [
             "sessionID": sessionID.uuidString,

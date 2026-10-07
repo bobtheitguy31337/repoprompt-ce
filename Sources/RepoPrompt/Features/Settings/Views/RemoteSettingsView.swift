@@ -4,8 +4,14 @@ import RepoPromptRemoteProtocol
 import SwiftUI
 
 struct RemoteSettingsView: View {
-    @ObservedObject private var gateway = RemoteGatewayController.shared
-    @ObservedObject private var availability = RemoteAvailabilityController.shared
+    @ObservedObject private var gateway: RemoteGatewayController
+    @ObservedObject private var availability: RemoteAvailabilityController
+
+    init(gateway: RemoteGatewayController) {
+        _gateway = ObservedObject(wrappedValue: gateway)
+        _availability = ObservedObject(wrappedValue: gateway.availabilityController)
+    }
+
     @State private var showsLegacyPairingCode = true
 
     private static let authorityLevels: [RemoteAuthorityLevel] = [
@@ -26,7 +32,7 @@ struct RemoteSettingsView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onAppear {
-            RemoteGatewayController.shared.configure(windowStatesManager: WindowStatesManager.shared)
+            gateway.configure(windowStatesManager: WindowStatesManager.shared)
         }
     }
 

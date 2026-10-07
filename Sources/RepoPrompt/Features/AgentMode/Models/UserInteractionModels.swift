@@ -1,7 +1,8 @@
 import CryptoKit
 import Foundation
+import RepoPromptFileSystem
 
-private enum StableUserInteractionIdentity {
+enum StableUserInteractionIdentity {
     static func uuid(from seed: String) -> UUID {
         let digest = Array(SHA256.hash(data: Data(seed.utf8)))
         let bytes: uuid_t = (
@@ -538,14 +539,32 @@ struct AgentAskUserPendingState: Identifiable, Hashable {
 
 /// Response from user instruction input in Agent mode
 public struct UserInstructionResponse: Sendable {
+    /// Who supplied the text a waiting run is being resumed with.
+    ///
+    /// A typed origin rather than an inference from the text: an auto-wake continuation resumes with
+    /// a RepoPrompt-authored envelope that is indistinguishable, byte-wise, from a user instruction
+    /// that happened to contain one. Defaulting to `.user` keeps every existing construction
+    /// source-compatible and keeps the unusual case the one that has to name itself.
+    public enum Origin: Sendable, Equatable {
+        case user
+        case laneUpdateAutoWake(wakeID: UUID)
+    }
+
     public let text: String?
     public let timedOut: Bool
     public let elapsedSeconds: Int
+    public let origin: Origin
 
-    public init(text: String?, timedOut: Bool, elapsedSeconds: Int) {
+    public init(
+        text: String?,
+        timedOut: Bool,
+        elapsedSeconds: Int,
+        origin: Origin = .user
+    ) {
         self.text = text
         self.timedOut = timedOut
         self.elapsedSeconds = elapsedSeconds
+        self.origin = origin
     }
 }
 
@@ -924,6 +943,12 @@ struct AgentPermissionsRequest: Identifiable, Hashable {
     }
 }
 
+/// Provider-projected scope of the session decision; nil preserves legacy presentation.
+enum AgentApprovalSessionScope: Hashable {
+    case oneTime
+    case editsSession
+}
+
 struct AgentApprovalRequest: Identifiable, Hashable {
     let id: UUID
     let requestID: AgentApprovalRequestID
@@ -937,6 +962,12 @@ struct AgentApprovalRequest: Identifiable, Hashable {
     let cwd: String?
     let grantRoot: String?
     let proposedExecpolicyAmendmentJSON: String?
+    /// ACP-only snapshot of genuine one-time allow availability; submission rechecks the live request.
+    let overseerOneTimeAllowAvailable: Bool?
+    /// ACP-only availability of the ordinary one-time decision, derived from live provider options.
+    let plainApproveAvailable: Bool?
+    /// Live request scope only; this does not store or grant consent.
+    let sessionApprovalScope: AgentApprovalSessionScope?
     let details: [AgentApprovalDetail]
 
     init(
@@ -952,6 +983,9 @@ struct AgentApprovalRequest: Identifiable, Hashable {
         cwd: String? = nil,
         grantRoot: String? = nil,
         proposedExecpolicyAmendmentJSON: String? = nil,
+        overseerOneTimeAllowAvailable: Bool? = nil,
+        plainApproveAvailable: Bool? = nil,
+        sessionApprovalScope: AgentApprovalSessionScope? = nil,
         details: [AgentApprovalDetail] = []
     ) {
         self.id = id ?? Self.stableID(
@@ -973,6 +1007,9 @@ struct AgentApprovalRequest: Identifiable, Hashable {
         self.cwd = cwd
         self.grantRoot = grantRoot
         self.proposedExecpolicyAmendmentJSON = proposedExecpolicyAmendmentJSON
+        self.overseerOneTimeAllowAvailable = overseerOneTimeAllowAvailable
+        self.plainApproveAvailable = plainApproveAvailable
+        self.sessionApprovalScope = sessionApprovalScope
         self.details = details
     }
 
@@ -998,7 +1035,16 @@ struct AgentApprovalRequest: Identifiable, Hashable {
         }
     }
 
+    var supportsPlainApprove: Bool {
+        guard case .acp = requestID else { return true }
+        return plainApproveAvailable == true
+    }
+
     var supportsAlwaysAllow: Bool {
-        true
+        sessionApprovalScope != .oneTime
+    }
+
+    var sessionApprovalLabel: String {
+        sessionApprovalScope == .editsSession ? "Allow edits this session" : "Always Allow"
     }
 }

@@ -351,7 +351,6 @@ struct RemoteIssuedPairingAdvertisements {
 /// Keychain-backed.
 @MainActor
 final class RemotePairingManager {
-    static let shared = RemotePairingManager()
     static let pairingLifetime: TimeInterval = 5 * 60
     static let credentialLifetime: TimeInterval = 60 * 60 * 24 * 30
     static let maximumDeviceNameCharacters = 128
@@ -367,7 +366,7 @@ final class RemotePairingManager {
     private let persistStoredDevice: (RemoteStoredDeviceCredential?) throws -> Void
     private let encoder = JSONEncoder()
 
-    private convenience init() {
+    convenience init() {
         let decoder = JSONDecoder()
         let key = "RepoPrompt.remote.desktopInstanceID"
         let desktopInstanceID: String

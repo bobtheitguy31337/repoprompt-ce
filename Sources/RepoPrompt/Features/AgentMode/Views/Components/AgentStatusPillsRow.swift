@@ -1,8 +1,11 @@
+import RepoPromptInstrumentation
 import SwiftUI
 
 struct AgentStatusPillsRow: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let agentModeVM: AgentModeViewModel
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
+    let openContextDrawerFiles: () -> Void
     @ObservedObject var oracleViewModel: OracleViewModel
     @ObservedObject var promptManager: PromptViewModel
     let selectionCoordinator: WorkspaceSelectionCoordinator
@@ -15,7 +18,7 @@ struct AgentStatusPillsRow: View {
 
     var body: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.statusPillsRow")
+            let _ = perfRecorder.increment("ui.body.statusPillsRow")
         #endif
         HStack(spacing: 12) {
             HStack(spacing: 6) {
@@ -39,9 +42,21 @@ struct AgentStatusPillsRow: View {
                     selectWorkflow: { agentModeVM.selectWorkflow($0) }
                 )
 
+                AgentMonitorPill(statusPillsUI: statusPillsUI)
+
                 AgentInterviewPill(
                     isOn: snapshot.interviewFirst,
                     onToggle: { agentModeVM.toggleInterviewFirst() }
+                )
+
+                AgentModelRouterPill(
+                    props: snapshot.modelRouter,
+                    onToggle: { agentModeVM.toggleGlobalModelRouter() }
+                )
+
+                AgentAutoEffortPill(
+                    props: snapshot.autoEffort,
+                    onToggle: { agentModeVM.toggleAutoEffort() }
                 )
 
                 if let stagedSlashCommand = snapshot.stagedSlashCommand {
@@ -74,6 +89,7 @@ struct AgentStatusPillsRow: View {
 
                 AgentContextPill(
                     promptManager: promptManager,
+                    openContextDrawerFiles: openContextDrawerFiles,
                     selectionCoordinator: selectionCoordinator,
                     runtimeVM: runtimeVM,
                     currentTabID: snapshot.currentTabID,

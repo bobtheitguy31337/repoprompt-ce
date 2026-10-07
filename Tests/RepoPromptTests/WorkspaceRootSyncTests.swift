@@ -1,5 +1,7 @@
 import Combine
 @testable import RepoPromptApp
+import RepoPromptFileSystem
+import RepoPromptWorkspaceCore
 import XCTest
 
 @MainActor

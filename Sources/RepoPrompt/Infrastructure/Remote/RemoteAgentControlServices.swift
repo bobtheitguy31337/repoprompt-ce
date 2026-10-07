@@ -176,7 +176,8 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             tabID: nil,
             sessionID: nil,
             createIfNeeded: true,
-            sessionName: "Remote run"
+            sessionName: "Remote run",
+            expectedWorkspaceID: workspaceID
         )
 
         do {
@@ -184,18 +185,28 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 tabID: target.tabID,
                 agentRaw: request.agentID,
                 modelRaw: request.modelID,
-                reasoningEffortRaw: request.reasoningEffort
+                reasoningEffortRaw: request.reasoningEffort,
+                workspaceAuthority: .init(
+                    target: target,
+                    expectedWorkspaceID: workspaceID,
+                    allowMatchingControlledSession: false
+                )
             )
             guard let sessionID = target.sessionID else {
                 throw RemoteAgentControlServiceError.sessionNotFound
             }
+            try context.agentMode.requireCurrentMCPWorkspaceTarget(target, expectedWorkspaceID: workspaceID)
             try await context.agentMode.mcpActivateControlContext(
                 forTabID: target.tabID,
                 sessionID: sessionID,
                 originatingConnectionID: nil,
                 taskLabelKind: .pair,
                 startPending: true,
-                markSessionAsMCPOriginated: true
+                markSessionAsMCPOriginated: true,
+                requireInactiveRunState: true
+            )
+            try context.agentMode.requireCurrentMCPWorkspaceTarget(
+                target, expectedWorkspaceID: workspaceID
             )
             _ = try await context.agentMode.mcpDispatchInstruction(
                 sessionID: sessionID,
@@ -203,6 +214,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 allowStartingRun: true,
                 workflow: workflow
             )
+            context.agentMode.mcpAcceptSessionTarget(target)
             let response = await response(
                 request: request,
                 workspaceID: workspaceID,
@@ -227,7 +239,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             switch RemoteMutationFailurePolicy.disposition(for: request.operation) {
             case .rollbackProvisionalSession:
                 let discarded = await context.agentMode.mcpDiscardSessionTarget(target)
-                guard discarded else {
+                guard discarded == .complete else {
                     throw RemoteAgentControlServiceError.partialSuccess(
                         "The remote run could not start and provisional session cleanup was incomplete."
                     )
@@ -253,6 +265,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 createIfNeeded: true,
                 sessionName: nil
             )
+            defer { context.agentMode.mcpAcceptSessionTarget(target) }
             guard let session = context.agentMode.sessions[target.tabID],
                   session.activeAgentSessionID == sessionID
             else { throw RemoteAgentControlServiceError.sessionNotFound }
@@ -300,18 +313,26 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             )
         }
         let context = try await contextForSession(sessionID, requestedWorkspaceID: request.workspaceID)
+        let expectedWorkspaceID = try workspaceID(for: context, fallback: request.workspaceID)
         let target = try await context.agentMode.mcpResolveOrCreateSessionTarget(
             tabID: nil,
             sessionID: sessionID,
             createIfNeeded: true,
-            sessionName: nil
+            sessionName: nil,
+            expectedWorkspaceID: expectedWorkspaceID
         )
+        defer { context.agentMode.mcpAcceptSessionTarget(target) }
         let resolved = try await context.agentMode.mcpConfigureRemoteSession(
             tabID: target.tabID,
             sessionID: sessionID,
             agentRaw: request.agentID,
             modelRaw: request.modelID,
-            reasoningEffortRaw: request.reasoningEffort
+            reasoningEffortRaw: request.reasoningEffort,
+            workspaceAuthority: .init(
+                target: target,
+                expectedWorkspaceID: expectedWorkspaceID,
+                allowMatchingControlledSession: false
+            )
         )
         let workspaceID = try workspaceID(for: context, fallback: request.workspaceID)
         let response = await response(
@@ -339,14 +360,18 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
     private func continueRun(_ request: RemoteCommandRequest) async throws -> RemoteCommandResponse {
         let sessionID = try requiredSessionID(request.sessionID)
         let context = try await contextForSession(sessionID, requestedWorkspaceID: request.workspaceID)
+        let expectedWorkspaceID = try workspaceID(for: context, fallback: request.workspaceID)
         let target = try await context.agentMode.mcpResolveOrCreateSessionTarget(
             tabID: nil,
             sessionID: sessionID,
             createIfNeeded: true,
-            sessionName: nil
+            sessionName: nil,
+            expectedWorkspaceID: expectedWorkspaceID
         )
+        defer { context.agentMode.mcpAcceptSessionTarget(target) }
         let session = await context.agentMode.ensureSessionReady(tabID: target.tabID)
         let message = try requiredMessage(request.message)
+        try context.agentMode.requireCurrentMCPWorkspaceTarget(target, expectedWorkspaceID: expectedWorkspaceID)
         var activatedForRequest = false
         if session.mcpControlContext?.sessionID != sessionID {
             try await context.agentMode.mcpActivateControlContext(
@@ -360,6 +385,9 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             activatedForRequest = true
         }
         do {
+            try context.agentMode.requireCurrentMCPWorkspaceTarget(
+                target, expectedWorkspaceID: expectedWorkspaceID
+            )
             _ = try await context.agentMode.mcpDispatchInstruction(
                 sessionID: sessionID,
                 text: message,
@@ -386,15 +414,29 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         let sessionID = try requiredSessionID(request.sessionID)
         let interactionID = try requiredInteractionID(request.interactionID)
         let context = try await contextForSession(sessionID, requestedWorkspaceID: request.workspaceID)
+        let expectedWorkspaceID = try workspaceID(for: context, fallback: request.workspaceID)
         let target = try await context.agentMode.mcpResolveOrCreateSessionTarget(
             tabID: nil,
             sessionID: sessionID,
             createIfNeeded: false,
-            sessionName: nil
+            sessionName: nil,
+            expectedWorkspaceID: expectedWorkspaceID
         )
+        defer { context.agentMode.mcpAcceptSessionTarget(target) }
         let session = await context.agentMode.ensureSessionReady(tabID: target.tabID)
-        guard Self.pendingInteractionID(in: session) == interactionID else {
+        try context.agentMode.requireCurrentMCPWorkspaceTarget(
+            target, expectedWorkspaceID: expectedWorkspaceID
+        )
+        let interaction = context.agentMode.mcpPendingInteraction(for: session)
+        guard interaction?.id == interactionID else {
             throw RemoteAgentControlServiceError.invalidInteractionID
+        }
+        if let reason = AgentModeRemoteSessionQueryService.projectInteraction(
+            interaction,
+            createdAt: session.lastActivityAt,
+            supportsPlainApproval: session.pendingApproval?.supportsPlainApprove ?? true
+        )?.responseUnavailableReason {
+            throw RemoteAgentControlServiceError.commandRejected(reason)
         }
         var answers = request.answers
         if let secret = request.secret {
@@ -427,9 +469,6 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             skip: request.decision?.lowercased() == "skip",
             explicitSkip: request.decision?.lowercased() == "skip",
             responseArgument: responseArgument,
-            // `decision` is part of the Remote wire request, but is normalized
-            // into CE's canonical response field before entering Agent Mode.
-            containsDecisionArgument: false,
             amendment: nil,
             answersByQuestionID: answers
         )
@@ -459,13 +498,19 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
     private func cancel(_ request: RemoteCommandRequest) async throws -> RemoteCommandResponse {
         let sessionID = try requiredSessionID(request.sessionID)
         let context = try await contextForSession(sessionID, requestedWorkspaceID: request.workspaceID)
+        let expectedWorkspaceID = try workspaceID(for: context, fallback: request.workspaceID)
         let target = try await context.agentMode.mcpResolveOrCreateSessionTarget(
             tabID: nil,
             sessionID: sessionID,
             createIfNeeded: false,
-            sessionName: nil
+            sessionName: nil,
+            expectedWorkspaceID: expectedWorkspaceID
         )
+        defer { context.agentMode.mcpAcceptSessionTarget(target) }
         let session = await context.agentMode.ensureSessionReady(tabID: target.tabID)
+        try context.agentMode.requireCurrentMCPWorkspaceTarget(
+            target, expectedWorkspaceID: expectedWorkspaceID
+        )
         guard session.runState.isActive else {
             throw RemoteAgentControlServiceError.commandRejected(
                 "The requested session has no active run to cancel."
@@ -680,13 +725,6 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
     private func requiredInteractionID(_ interactionID: UUID?) throws -> UUID {
         guard let interactionID else { throw RemoteAgentControlServiceError.interactionIDRequired }
         return interactionID
-    }
-
-    private static func pendingInteractionID(in session: AgentModeViewModel.TabSession) -> UUID? {
-        if let pending = session.pendingAskUser { return pending.id }
-        if let pending = session.pendingUserInputRequest { return pending.id }
-        if let pending = session.pendingMCPElicitationRequest { return pending.id }
-        return session.pendingApproval?.id
     }
 
     private func requiredMessage(_ message: String?) throws -> String {

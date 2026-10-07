@@ -192,6 +192,7 @@ public struct RemoteInteractionSummary: Codable, Sendable, Equatable {
     public let title: String?
     public let prompt: String?
     public let requiresSecureEntry: Bool
+    public let responseUnavailableReason: String?
     public let createdAt: Date
 
     public init(
@@ -200,6 +201,7 @@ public struct RemoteInteractionSummary: Codable, Sendable, Equatable {
         title: String? = nil,
         prompt: String? = nil,
         requiresSecureEntry: Bool = false,
+        responseUnavailableReason: String? = nil,
         createdAt: Date = Date()
     ) {
         self.id = id
@@ -207,6 +209,7 @@ public struct RemoteInteractionSummary: Codable, Sendable, Equatable {
         self.title = title
         self.prompt = prompt
         self.requiresSecureEntry = requiresSecureEntry
+        self.responseUnavailableReason = responseUnavailableReason
         self.createdAt = createdAt
     }
 }

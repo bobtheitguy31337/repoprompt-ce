@@ -1,4 +1,6 @@
 import AppKit
+import RepoPromptFileSystem
+import RepoPromptVCS
 import SwiftUI
 
 /// Always-visible workspace roots section for Agent Mode sidebar.
@@ -370,6 +372,9 @@ struct AgentWorkspaceRootsSectionView: View {
             case .paused:
                 Image(systemName: "pause.circle.fill")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .medium))
+            case .recoveryExhausted:
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .medium))
             case .mixed:
                 Image(systemName: "circle.lefthalf.filled")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .medium))
@@ -386,7 +391,7 @@ struct AgentWorkspaceRootsSectionView: View {
         case .indexing: .blue
         case .reconciling: .orange
         case .ready: .secondary
-        case .mixed: .orange
+        case .recoveryExhausted, .mixed: .orange
         case .paused, .unavailable: .secondary
         }
     }
@@ -444,7 +449,7 @@ struct AgentWorkspaceRootsSectionView: View {
 
     private func codemapRootPopoverRow(_ row: AgentWorkspaceRootRow) -> some View {
         let pending = rootsStore.isCodemapActionPending(rowID: row.id)
-        let actionTitle = row.codemap.isPaused ? "Resume" : "Pause"
+        let actionTitle = row.codemap.canRetry ? "Retry" : (row.codemap.isPaused ? "Resume" : "Pause")
         return VStack(alignment: .leading, spacing: fontPreset.scaledClamped(5, max: 7)) {
             HStack(spacing: fontPreset.scaledClamped(7, max: 9)) {
                 Image(systemName: "folder.fill")
@@ -459,10 +464,14 @@ struct AgentWorkspaceRootsSectionView: View {
                         .foregroundStyle(codemapTint(row.codemap.tone))
                 }
                 Spacer(minLength: 4)
-                if row.codemap.canToggle {
+                if row.codemap.canRetry || row.codemap.canToggle {
                     Button {
                         Task {
-                            await rootsStore.toggleCodemapGeneration(rowID: row.id)
+                            if row.codemap.canRetry {
+                                await rootsStore.retryCodemapGeneration(rowID: row.id)
+                            } else {
+                                await rootsStore.toggleCodemapGeneration(rowID: row.id)
+                            }
                         }
                     } label: {
                         HStack(spacing: 4) {
@@ -470,7 +479,11 @@ struct AgentWorkspaceRootsSectionView: View {
                                 ProgressView()
                                     .controlSize(.mini)
                             } else {
-                                Image(systemName: row.codemap.isPaused ? "play.fill" : "pause.fill")
+                                Image(
+                                    systemName: row.codemap.canRetry
+                                        ? "arrow.clockwise"
+                                        : (row.codemap.isPaused ? "play.fill" : "pause.fill")
+                                )
                             }
                             Text(actionTitle)
                         }
@@ -765,12 +778,21 @@ struct AgentWorkspaceRootsSectionView: View {
 
         Divider()
 
-        Button(row.codemap.isPaused ? "Resume Code Map Generation" : "Pause Code Map Generation") {
-            Task {
-                await rootsStore.toggleCodemapGeneration(rowID: row.id)
+        if row.codemap.canRetry {
+            Button("Retry Code Map Indexing") {
+                Task {
+                    await rootsStore.retryCodemapGeneration(rowID: row.id)
+                }
             }
+            .disabled(rootsStore.isCodemapActionPending(rowID: row.id))
+        } else {
+            Button(row.codemap.isPaused ? "Resume Code Map Generation" : "Pause Code Map Generation") {
+                Task {
+                    await rootsStore.toggleCodemapGeneration(rowID: row.id)
+                }
+            }
+            .disabled(rootsStore.isCodemapActionPending(rowID: row.id) || !row.codemap.canToggle)
         }
-        .disabled(rootsStore.isCodemapActionPending(rowID: row.id) || !row.codemap.canToggle)
 
         if let worktree = row.worktree {
             Divider()

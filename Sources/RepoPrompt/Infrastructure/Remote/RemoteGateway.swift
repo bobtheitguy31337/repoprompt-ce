@@ -8,7 +8,6 @@ import RepoPromptRemoteProtocol
 /// typed application services through the snapshot and command boundaries.
 @MainActor
 final class RemoteGatewayController: NSObject, ObservableObject {
-    static let shared = RemoteGatewayController()
     private static let unpairLogger = Logger(subsystem: "com.pvncher.repoprompt.ce", category: "RemoteUnpair")
 
     @Published private(set) var isRunning = false
@@ -37,11 +36,11 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
     private weak var windowStatesManager: WindowStatesManager?
     private var controlService: (any RemoteAgentControlService)?
-    private let pairingManager = RemotePairingManager.shared
+    private let pairingManager = RemotePairingManager()
     private lazy var notificationRelay = RemoteNotificationRelay(pairingManager: pairingManager)
     private let tlsIdentityStore = RemoteTLSIdentityStore()
     private let irohIdentityStore = RemoteIrohIdentityStore()
-    private let availabilityController = RemoteAvailabilityController.shared
+    let availabilityController = RemoteAvailabilityController()
     private let replayBuffer = RemoteEventReplayBuffer(capacity: 512)
     private let transcriptRevisionTracker = RemoteTranscriptRevisionTracker()
     /// Changes only when the CE process restarts. Gateway stop/start preserves it.
@@ -84,7 +83,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         pairingManager.registeredNotification != nil
     }
 
-    override private init() {
+    override init() {
         isEnabled = UserDefaults.standard.bool(forKey: Self.enabledKey)
         isIrohEnabled = UserDefaults.standard.object(forKey: Self.irohEnabledKey) as? Bool ?? false
         isPaired = pairingManager.isPaired

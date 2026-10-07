@@ -1,5 +1,8 @@
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptFileSystem
+import RepoPromptPersistence
+import RepoPromptVCS
 
 #if !DEBUG
     struct WorkspaceCodemapManifestMeasurementAggregate: Equatable {}
@@ -240,7 +243,7 @@ struct WorkspaceCodemapManifestWriterRetryWaiter {
 }
 
 struct WorkspaceCodemapBindingRootRegistration: Equatable {
-    let capabilityRequest: WorkspaceCodemapGitCapabilityRequest
+    let capabilityRequest: WorkspaceCodemapRootCapabilityRequest
     let catalogGeneration: UInt64
     let ingressGeneration: UInt64
 
@@ -251,7 +254,7 @@ struct WorkspaceCodemapBindingRootRegistration: Equatable {
         catalogGeneration: UInt64,
         ingressGeneration: UInt64
     ) {
-        capabilityRequest = WorkspaceCodemapGitCapabilityRequest(
+        capabilityRequest = WorkspaceCodemapRootCapabilityRequest(
             rootID: rootID,
             rootLifetimeID: rootLifetimeID,
             loadedRootURL: loadedRootURL
@@ -283,6 +286,18 @@ struct WorkspaceCodemapBindingCatalogClient: @unchecked Sendable {
     let publishMarkerReadiness: @Sendable (
         WorkspaceCodemapMarkerReadinessUpdate
     ) async -> Bool
+    /// Reports that the root authority behind one registration is no longer current, so the owner
+    /// can fence mutations and schedule cleanup and re-resolution. Routed like
+    /// `publishMarkerReadiness`, so a detached route drops the notification instead of needing a
+    /// second session callback channel.
+    ///
+    /// The payload is the originating registration rather than the root epoch alone. Same-epoch
+    /// authority replacement reuses the epoch, so an epoch-keyed route lookup can hand a delayed
+    /// report to the registration that already replaced the reporting one; carrying the
+    /// registration lets the recipient reject exactly that case.
+    let reportRootAuthorityInvalidated: @Sendable (
+        WorkspaceCodemapBindingRootRegistration
+    ) async -> Void
 
     init(
         _ resolveManifestBinding: @escaping @Sendable (
@@ -312,12 +327,16 @@ struct WorkspaceCodemapBindingCatalogClient: @unchecked Sendable {
         ) async -> WorkspaceCodemapGraphIndexCatalogTokenDisposition,
         publishMarkerReadiness: @escaping @Sendable (
             WorkspaceCodemapMarkerReadinessUpdate
-        ) async -> Bool = { _ in false }
+        ) async -> Bool = { _ in false },
+        reportRootAuthorityInvalidated: @escaping @Sendable (
+            WorkspaceCodemapBindingRootRegistration
+        ) async -> Void = { _ in }
     ) {
         self.resolveManifestBinding = resolveManifestBinding
         self.readGraphIndexCatalogPage = readGraphIndexCatalogPage
         self.revalidateGraphIndexCatalogToken = revalidateGraphIndexCatalogToken
         self.publishMarkerReadiness = publishMarkerReadiness
+        self.reportRootAuthorityInvalidated = reportRootAuthorityInvalidated
     }
 
     static let unavailable = WorkspaceCodemapBindingCatalogClient { _, _ in nil }
@@ -346,7 +365,7 @@ struct WorkspaceCodemapBindingDemand: Equatable {
 enum WorkspaceCodemapBindingRegistrationResult {
     case registered(adoptedReadyCount: Int)
     case exactDuplicate
-    case unavailable(WorkspaceCodemapGitCapabilityState)
+    case unavailable(WorkspaceCodemapRootCapabilityState)
     case busy
     case failed
 }
@@ -546,6 +565,8 @@ struct WorkspaceCodemapBindingEngineHooks {
     ) async -> Void
     let afterManifestStoreWriteBeforeCompletion: @Sendable (WorkspaceCodemapRootEpoch) async -> Void
     #if DEBUG
+        /// Deterministic async race seam immediately before manifest persistence.
+        let beforeManifestStoreWrite: @Sendable (WorkspaceCodemapRootEpoch) async -> Void
         /// Deterministic race seam, structurally absent from non-DEBUG products.
         let afterPublishedArtifactLookupBeforeCurrentnessValidation: @Sendable (
             WorkspaceCodemapRootEpoch
@@ -565,6 +586,7 @@ struct WorkspaceCodemapBindingEngineHooks {
             afterManifestRevisionQueuedBeforeWaiterInstall
         self.afterManifestStoreWriteBeforeCompletion = afterManifestStoreWriteBeforeCompletion
         #if DEBUG
+            beforeManifestStoreWrite = { _ in }
             afterPublishedArtifactLookupBeforeCurrentnessValidation = { _ in }
         #endif
     }
@@ -587,6 +609,32 @@ struct WorkspaceCodemapBindingEngineHooks {
             self.afterManifestRevisionQueuedBeforeWaiterInstall =
                 afterManifestRevisionQueuedBeforeWaiterInstall
             self.afterManifestStoreWriteBeforeCompletion = afterManifestStoreWriteBeforeCompletion
+            beforeManifestStoreWrite = { _ in }
+            self.afterPublishedArtifactLookupBeforeCurrentnessValidation =
+                afterPublishedArtifactLookupBeforeCurrentnessValidation
+        }
+
+        init(
+            debugBeforeManifestStoreWrite: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch
+            ) async -> Void,
+            event: @escaping @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void = { _ in },
+            afterManifestRevisionQueuedBeforeWaiterInstall: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch,
+                UInt64
+            ) async -> Void = { _, _ in },
+            afterManifestStoreWriteBeforeCompletion: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch
+            ) async -> Void = { _ in },
+            afterPublishedArtifactLookupBeforeCurrentnessValidation: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch
+            ) async -> Void = { _ in }
+        ) {
+            self.event = event
+            self.afterManifestRevisionQueuedBeforeWaiterInstall =
+                afterManifestRevisionQueuedBeforeWaiterInstall
+            self.afterManifestStoreWriteBeforeCompletion = afterManifestStoreWriteBeforeCompletion
+            beforeManifestStoreWrite = debugBeforeManifestStoreWrite
             self.afterPublishedArtifactLookupBeforeCurrentnessValidation =
                 afterPublishedArtifactLookupBeforeCurrentnessValidation
         }
@@ -677,6 +725,12 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
     var graphIndexExplicitOvertakes: UInt64 = 0
     var graphIndexBudgetRejections: UInt64 = 0
     var graphIndexCancelledBatches: UInt64 = 0
+    /// Wall-clock nanoseconds spent processing graph-index batches, summed across roots.
+    var graphIndexBatchNanoseconds: UInt64 = 0
+    /// Graph slots published to the overlay by graph-index batches (pending and classified).
+    var graphIndexPublishedSlots: UInt64 = 0
+    /// Nanoseconds spent inside overlay graph-slot publications.
+    var graphIndexPublishNanoseconds: UInt64 = 0
 
     init(initialValue: UInt64 = 0) {
         capabilityResolutions = initialValue
@@ -760,6 +814,9 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
         graphIndexExplicitOvertakes = initialValue
         graphIndexBudgetRejections = initialValue
         graphIndexCancelledBatches = initialValue
+        graphIndexBatchNanoseconds = initialValue
+        graphIndexPublishedSlots = initialValue
+        graphIndexPublishNanoseconds = initialValue
     }
 }
 
@@ -778,6 +835,11 @@ enum WorkspaceCodemapGraphIndexWorkerCompletionReason: String, Hashable {
     case prioritizeRestart
 }
 
+enum WorkspaceCodemapGraphIndexWorkerRecoveryState: Hashable {
+    case available
+    case exhausted
+}
+
 enum WorkspaceCodemapGraphIndexWatchdogDisposition: Hashable {
     case current
     case restarted
@@ -793,6 +855,21 @@ enum WorkspaceCodemapGraphIndexPrioritizeDisposition: Hashable {
     case promoted
     case alreadyComplete
     case unavailable
+}
+
+/// Per-root graph-index batch timing and slot counts. Per-batch cost should stay flat as a root
+/// grows; a rising `lastBatchDurationNanoseconds` at constant batch size signals superlinear work.
+struct WorkspaceCodemapGraphIndexBatchTiming: Hashable {
+    static let zero = Self()
+
+    var batchCount: UInt64 = 0
+    var lastBatchDurationNanoseconds: UInt64 = 0
+    var maximumBatchDurationNanoseconds: UInt64 = 0
+    var totalBatchDurationNanoseconds: UInt64 = 0
+    var lastBatchPublishedSlotCount: UInt64 = 0
+    var publishedSlotCount: UInt64 = 0
+    var lastBatchPublishDurationNanoseconds: UInt64 = 0
+    var totalPublishDurationNanoseconds: UInt64 = 0
 }
 
 struct WorkspaceCodemapBindingEngineGraphIndexRootAccounting: Equatable {
@@ -828,6 +905,7 @@ struct WorkspaceCodemapBindingEngineGraphIndexRootAccounting: Equatable {
     let inBatchResolvedCandidateCount: UInt64?
     let checkpointPresent: Bool
     let manifestMeasurements: WorkspaceCodemapManifestMeasurementAggregate
+    let batchTiming: WorkspaceCodemapGraphIndexBatchTiming
 }
 
 struct WorkspaceCodemapBindingEngineAccounting: Equatable {
@@ -894,5 +972,24 @@ struct WorkspaceCodemapBindingEngineAccounting: Equatable {
         self.drainingGraphIndexTaskCount = drainingGraphIndexTaskCount
         self.graphIndexResources = graphIndexResources
         self.graphIndexRoots = graphIndexRoots
+    }
+}
+
+/// How the engine's graph pull loop pauses after a committed diff while indexing is in progress.
+///
+/// The pause only coalesces pending publications into fewer commits; the engine interrupts it
+/// whenever a caller needs the graph caught up (for example before reporting graph-index
+/// completion) and when the pull task is cancelled. Tests inject a gated pause to force the path.
+struct WorkspaceCodemapGraphPullPause {
+    /// Receives the wall-clock nanoseconds the preceding apply took.
+    let pause: @Sendable (_ applyNanoseconds: UInt64) async -> Void
+
+    /// Pauses for twice the apply time, capped at 250 ms; sub-millisecond commits do not pause.
+    static let production = WorkspaceCodemapGraphPullPause { applyNanoseconds in
+        let (scaled, overflow) = applyNanoseconds.multipliedReportingOverflow(by: 2)
+        let maximum: UInt64 = 250_000_000
+        let pause = overflow ? maximum : min(scaled, maximum)
+        guard pause >= 1_000_000 else { return }
+        try? await Task.sleep(nanoseconds: pause)
     }
 }
