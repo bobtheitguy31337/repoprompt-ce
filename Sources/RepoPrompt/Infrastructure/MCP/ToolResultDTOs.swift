@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptFoundation
 
 /// Namespace for MCP Tool result DTOs.
 /// Using a namespace avoids name collisions with existing private structs
@@ -255,6 +257,10 @@ enum ToolResultDTOs {
         let note: String?
         let wasTruncated: Bool?
         let worktreeScope: WorktreeScopeDTO?
+        let errorMessage: String?
+        let errorCode: String?
+        let retryable: Bool?
+        let retryAfterMilliseconds: Int?
 
         init(
             rootsCount: Int,
@@ -262,7 +268,11 @@ enum ToolResultDTOs {
             tree: String,
             note: String? = nil,
             wasTruncated: Bool? = nil,
-            worktreeScope: WorktreeScopeDTO? = nil
+            worktreeScope: WorktreeScopeDTO? = nil,
+            errorMessage: String? = nil,
+            errorCode: String? = nil,
+            retryable: Bool? = nil,
+            retryAfterMilliseconds: Int? = nil
         ) {
             self.rootsCount = rootsCount
             self.usesLegend = usesLegend
@@ -270,6 +280,10 @@ enum ToolResultDTOs {
             self.note = note
             self.wasTruncated = wasTruncated
             self.worktreeScope = worktreeScope
+            self.errorMessage = errorMessage
+            self.errorCode = errorCode
+            self.retryable = retryable
+            self.retryAfterMilliseconds = retryAfterMilliseconds
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -279,6 +293,10 @@ enum ToolResultDTOs {
             case note
             case wasTruncated = "was_truncated"
             case worktreeScope = "worktree_scope"
+            case errorMessage = "error"
+            case errorCode = "error_code"
+            case retryable
+            case retryAfterMilliseconds = "retry_after_ms"
         }
     }
 
@@ -1087,11 +1105,69 @@ enum ToolResultDTOs {
             let patch: String
         }
 
+        struct OracleLaneErrorDTO: Codable, Equatable {
+            let code: String
+            let message: String
+            let partialResponse: String?
+
+            private enum CodingKeys: String, CodingKey {
+                case code
+                case message
+                case partialResponse = "partial_response"
+            }
+        }
+
+        struct OracleLaneDTO: Codable, Equatable {
+            struct ExecutionProfileDTO: Codable, Equatable {
+                let providerID: String
+                let modelID: String
+                let effectiveReasoningEffort: String?
+
+                private enum CodingKeys: String, CodingKey {
+                    case providerID = "provider_id"
+                    case modelID = "model_id"
+                    case effectiveReasoningEffort = "effective_reasoning_effort"
+                }
+            }
+
+            let laneIndex: Int
+            let role: String
+            let chatID: String
+            let providerID: String?
+            let modelID: String
+            let status: String
+            let executionProfile: ExecutionProfileDTO?
+            let response: String?
+            let error: OracleLaneErrorDTO?
+
+            private enum CodingKeys: String, CodingKey {
+                case laneIndex = "lane_index"
+                case role
+                case chatID = "chat_id"
+                case providerID = "provider_id"
+                case modelID = "model_id"
+                case status
+                case executionProfile = "execution_profile"
+                case response
+                case error
+            }
+        }
+
+        struct OracleWarningDTO: Codable, Equatable {
+            let code: String
+            let message: String
+        }
+
         let chatID: String?
         let mode: String?
         let response: String?
         let diffs: [Diff]?
         let errors: [String]?
+        let oracleGroupID: String?
+        let status: String?
+        let oracleCount: Int?
+        let oracleResults: [OracleLaneDTO]?
+        let warnings: [OracleWarningDTO]?
 
         private enum CodingKeys: String, CodingKey {
             case chatID = "chat_id"
@@ -1100,14 +1176,35 @@ enum ToolResultDTOs {
             case diffs
             case patches
             case errors
+            case oracleGroupID = "oracle_group_id"
+            case status
+            case oracleCount = "oracle_count"
+            case oracleResults = "oracle_results"
+            case warnings
         }
 
-        init(chatID: String?, mode: String?, response: String?, diffs: [Diff]?, errors: [String]?) {
+        init(
+            chatID: String?,
+            mode: String?,
+            response: String?,
+            diffs: [Diff]?,
+            errors: [String]?,
+            oracleGroupID: String? = nil,
+            status: String? = nil,
+            oracleCount: Int? = nil,
+            oracleResults: [OracleLaneDTO]? = nil,
+            warnings: [OracleWarningDTO]? = nil
+        ) {
             self.chatID = chatID
             self.mode = mode
             self.response = response
             self.diffs = diffs
             self.errors = errors
+            self.oracleGroupID = oracleGroupID
+            self.status = status
+            self.oracleCount = oracleCount
+            self.oracleResults = oracleResults
+            self.warnings = warnings
         }
 
         init(from decoder: Decoder) throws {
@@ -1121,6 +1218,11 @@ enum ToolResultDTOs {
                 diffs = try container.decodeIfPresent([Diff].self, forKey: .patches)
             }
             errors = try container.decodeIfPresent([String].self, forKey: .errors)
+            oracleGroupID = try container.decodeIfPresent(String.self, forKey: .oracleGroupID)
+            status = try container.decodeIfPresent(String.self, forKey: .status)
+            oracleCount = try container.decodeIfPresent(Int.self, forKey: .oracleCount)
+            oracleResults = try container.decodeIfPresent([OracleLaneDTO].self, forKey: .oracleResults)
+            warnings = try container.decodeIfPresent([OracleWarningDTO].self, forKey: .warnings)
         }
 
         func encode(to encoder: Encoder) throws {
@@ -1130,6 +1232,11 @@ enum ToolResultDTOs {
             try container.encodeIfPresent(response, forKey: .response)
             try container.encodeIfPresent(diffs, forKey: .diffs)
             try container.encodeIfPresent(errors, forKey: .errors)
+            try container.encodeIfPresent(oracleGroupID, forKey: .oracleGroupID)
+            try container.encodeIfPresent(status, forKey: .status)
+            try container.encodeIfPresent(oracleCount, forKey: .oracleCount)
+            try container.encodeIfPresent(oracleResults, forKey: .oracleResults)
+            try container.encodeIfPresent(warnings, forKey: .warnings)
         }
     }
 

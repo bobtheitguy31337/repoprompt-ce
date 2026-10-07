@@ -11,10 +11,12 @@ enum WorkspaceCodemapRootAvailability: String, Hashable {
 }
 
 enum WorkspaceCodemapRootStatusUnavailableReason: String, Hashable {
-    case notGitRepository
+    /// No usable source authority for this root. A healthy filesystem root never reports this.
+    case sourceRootUnavailable
     case setupFailed
     case graphUnavailable
     case retryExhausted
+    case workerRecoveryExhausted
 }
 
 struct WorkspaceCodemapGraphCommitCadence: Hashable {

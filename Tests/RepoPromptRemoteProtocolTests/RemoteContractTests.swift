@@ -1,10 +1,33 @@
 import XCTest
 @testable import RepoPromptRemoteProtocol
 
-/// Wire-compatibility coverage for protocol v1 as shipped from RepoPrompt Remote
-/// commit 0bfa18f2a480791cddde24bb79fa79b40d0dd934. The two applications own
-/// independent source implementations; these tests protect their shared wire behavior.
 final class RemoteContractTests: XCTestCase {
+    func testMacOnlyInteractionReasonIsOptionalForOlderClientsAndGateways() throws {
+        struct LegacyInteraction: Codable, Equatable {
+            let id: String
+            let kind: RemoteInteractionKind
+            let title: String?
+            let prompt: String?
+            let requiresSecureEntry: Bool
+            let createdAt: Date
+        }
+        let legacy = LegacyInteraction(
+            id: UUID().uuidString, kind: .approval, title: "Approval", prompt: "Review request",
+            requiresSecureEntry: false, createdAt: Date(timeIntervalSince1970: 100)
+        )
+        let decoded = try JSONDecoder().decode(
+            RemoteInteractionSummary.self, from: JSONEncoder().encode(legacy)
+        )
+        XCTAssertNil(decoded.responseUnavailableReason)
+        let current = RemoteInteractionSummary(
+            id: legacy.id, kind: legacy.kind, title: legacy.title, prompt: legacy.prompt,
+            responseUnavailableReason: "Review hook trust on your Mac.", createdAt: legacy.createdAt
+        )
+        let data = try JSONEncoder().encode(current)
+        XCTAssertEqual(try JSONDecoder().decode(RemoteInteractionSummary.self, from: data), current)
+        XCTAssertEqual(try JSONDecoder().decode(LegacyInteraction.self, from: data), legacy)
+    }
+
     func testProtocolCompatibilityAcceptsCurrentVersionOnly() {
         XCTAssertEqual(RemoteProtocol.minimumSupportedVersion, 1)
         XCTAssertEqual(RemoteProtocol.currentVersion, 1)

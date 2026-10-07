@@ -48,6 +48,10 @@ enum AgentToolResultSanitizationPurpose {
     case persistentStorage
 }
 
+/// Durable tool-result persistence for every ACP provider. The `cursorACP*` symbols are
+/// named for the first provider that used them; recognition is content-based on the
+/// canonical `acp_status` payload produced by `ACPToolUpdateResultAdapter`, so Cursor,
+/// Grok Build, and future ACP providers share this policy.
 enum AgentToolResultPersistencePolicy {
     static let maxPersistedToolSummaryBytes = 2048
     private static let cursorACPPersistedDiffBytesLimit = 1200
@@ -552,6 +556,9 @@ enum AgentToolResultPersistencePolicy {
         sanitizeTranscriptForPersistenceWithMetrics(transcript).transcript
     }
 
+    /// - Parameter context: Leave `nil` or supply a context created with
+    ///   `cachesToolExecutions: false`. A context with execution caching enabled can
+    ///   hand a repeated activity ID a cached execution derived from another activity.
     static func sanitizeTranscriptForPersistenceWithMetrics(
         _ transcript: AgentTranscript,
         context: AgentToolResultProcessingContext? = nil
@@ -561,7 +568,10 @@ enum AgentToolResultPersistencePolicy {
             previousSanitizedTranscript: nil,
             reusablePrefixTurnCount: nil,
             preservedVisibleToolResultRowIDs: [],
-            context: context,
+            // A fresh per-pass context memoizes repeated JSON parses within this single
+            // snapshot walk. Item-ID execution caching stays disabled so a repeated ID
+            // cannot hand one activity a cached execution derived from another.
+            context: context ?? AgentToolResultProcessingContext(cachesToolExecutions: false),
             purpose: .persistentStorage
         )
     }

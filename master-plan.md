@@ -562,14 +562,14 @@ Use the CE debug app and `rpce-cli-debug` for desktop behavior. Validate the
 real app/gateway path after focused unit tests; do not treat a mock transport or
 an unrelated product build as evidence for the CE desktop implementation.
 
-## 9. Immediate next coding task
+## 9. Implementation record
 
-Implement Phase 0 and the beginning of Phase 1:
+The original Phase 0/Phase 1 coding task is complete in the working trees:
 
 1. ~~Create/configure the desktop fork `bobtheitguy31337/repoprompt-ce` as `origin`.~~ Done.
 2. ~~Configure the mobile GitHub remote and CI.~~ Done.
-3. Extract the shared Remote contract into a versioned Foundation package.
-   In progress as a local package; tagging/release dependency remains.
+3. Extract the shared Remote contract into a Foundation package. Done locally;
+   tagging remains a publishing/release step.
 4. Inventory and document the existing Agent Mode/session/workspace owners. Done.
 5. Define `WorkspaceCatalogService`, `WorkspaceActivationService`, and
    `RemoteStateProjectionService` protocols. Done.
@@ -578,8 +578,9 @@ Implement Phase 0 and the beginning of Phase 1:
 7. Add a test fixture that produces a complete Fleet snapshot with live,
    waiting, failed, completed, and child sessions. Done.
 
-Do not begin push notifications, WAN transport, mobile editing, or broad UI
-polish until the paired snapshot and reconnect path is real.
+Provider credentials, relay deployment, package tagging, and Android FCM
+registration remain deliberate release/deferred work; they are not required to
+change the LAN authority boundary or the iOS client contract.
 
 ## 10. Definition of first usable release
 

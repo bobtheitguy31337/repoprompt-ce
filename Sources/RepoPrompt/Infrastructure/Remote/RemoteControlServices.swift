@@ -421,7 +421,7 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
                     runState: runState,
                     lifecycleStage: live?.runState.rawValue,
                     latestMeaningfulActivity: live?.runningStatusText ?? live?.waitingPrompt,
-                    pendingInteraction: Self.pendingInteraction(for: live),
+                    pendingInteraction: Self.pendingInteraction(for: live, agentMode: context.agentMode),
                     worktreeSummary: entry.worktreeBindingSummaries.isEmpty ? nil : "Worktree configured",
                     mergeAttention: entry.activeWorktreeMergeSummaries.isEmpty ? nil : "Merge review available",
                     failureSummary: runState == .failed ? "Agent run failed" : nil,
@@ -507,48 +507,47 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
         )
     }
 
-    private static func pendingInteraction(for session: AgentModeViewModel.TabSession?) -> RemoteInteractionSummary? {
+    private static func pendingInteraction(
+        for session: AgentModeViewModel.TabSession?,
+        agentMode: AgentModeViewModel
+    ) -> RemoteInteractionSummary? {
         guard let session else { return nil }
-        if let pending = session.pendingAskUser {
-            return RemoteInteractionSummary(
-                id: pending.id.uuidString,
-                kind: .question,
-                title: pending.interaction.title,
-                prompt: pending.currentQuestion?.question,
-                createdAt: pending.interaction.askedAt
-            )
+        return projectInteraction(
+            agentMode.mcpPendingInteraction(for: session),
+            createdAt: session.lastActivityAt,
+            supportsPlainApproval: session.pendingApproval?.supportsPlainApprove ?? true
+        )
+    }
+
+    static func projectInteraction(
+        _ interaction: AgentRunMCPSnapshot.Interaction?,
+        createdAt: Date,
+        supportsPlainApproval: Bool = true
+    ) -> RemoteInteractionSummary? {
+        guard let interaction, interaction.kind != .instruction else { return nil }
+        let isApproval = interaction.kind == .approval || interaction.kind == .hookApproval
+        let isSecret = interaction.fields.contains { $0.isSecret == true }
+        let unavailableReason: String? = if interaction.kind == .hookApproval {
+            "Review hook trust and discovery on your Mac."
+        } else if isApproval, !supportsPlainApproval {
+            "This request needs a specific approval option. Review it on your Mac."
+        } else if interaction.fields.count > 1 {
+            "Answer this multi-part request on your Mac."
+        } else {
+            nil
         }
-        if let pending = session.pendingUserInputRequest,
-           let question = pending.questions.first
-        {
-            return RemoteInteractionSummary(
-                id: pending.id.uuidString,
-                kind: question.isSecret ? .secretInput : .question,
-                title: question.header,
-                prompt: question.question,
-                requiresSecureEntry: question.isSecret,
-                createdAt: pending.askedAt
-            )
-        }
-        if let pending = session.pendingMCPElicitationRequest {
-            return RemoteInteractionSummary(
-                id: pending.id.uuidString,
-                kind: .question,
-                title: pending.title,
-                prompt: pending.prompt ?? pending.message,
-                createdAt: Date()
-            )
-        }
-        if session.pendingApproval != nil {
-            return RemoteInteractionSummary(
-                id: session.pendingApproval?.id.uuidString ?? "",
-                kind: .approval,
-                title: "Approval required",
-                prompt: "Review this request in RepoPrompt.",
-                createdAt: session.activeAgentRunStartedAt ?? Date()
-            )
-        }
-        return nil
+        let details = interaction.details.map { "\($0.label): \($0.value)" }
+        let prompt = ([interaction.prompt ?? interaction.fields.first?.prompt].compactMap(\.self) + details)
+            .joined(separator: "\n\n")
+        return RemoteInteractionSummary(
+            id: interaction.id.uuidString,
+            kind: isApproval ? .approval : (isSecret ? .secretInput : .question),
+            title: interaction.title,
+            prompt: prompt.isEmpty ? nil : prompt,
+            requiresSecureEntry: isSecret,
+            responseUnavailableReason: unavailableReason,
+            createdAt: createdAt
+        )
     }
 }
 

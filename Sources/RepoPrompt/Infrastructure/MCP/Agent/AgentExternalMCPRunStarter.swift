@@ -8,8 +8,8 @@ enum AgentExternalMCPRunStarter {
         let delivery: AgentModeViewModel.MCPInstructionDispatch
     }
 
-    typealias RequestMetadata = MCPServerViewModel.RequestMetadata
-    typealias BindCurrentRequestToTab = (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
+    typealias RequestMetadata = MCPRequestMetadata
+    typealias BindCurrentRequestToTab = (_ tabID: UUID, _ metadata: MCPRequestMetadata) async throws -> Void
     typealias DispatchInstruction = @MainActor (
         _ sessionID: UUID,
         _ tabID: UUID,
@@ -24,7 +24,8 @@ enum AgentExternalMCPRunStarter {
     }
 
     /// Extracts a reasoning effort suffix from a model string if present.
-    /// Supports formats like "gpt-5.4-high", "o3_low", "gpt-5.4-fast-high".
+    /// Supports Codex variants such as "gpt-5.4-high" and Claude variants such as
+    /// "claude-opus-5-5:low" without changing the model selection.
     /// The model string is passed through unchanged (preserving service tier and other modifiers);
     /// only the effort is extracted separately.
     static func extractReasoningEffort(from modelRaw: String?) -> (model: String?, effort: String?) {
@@ -33,13 +34,16 @@ enum AgentExternalMCPRunStarter {
         if let effort = specifier.reasoningEffort {
             return (modelRaw, effort.rawValue)
         }
+        if let effort = ClaudeModelSpecifier(raw: modelRaw).explicitEffortLevel {
+            return (modelRaw, effort.rawValue)
+        }
         return (modelRaw, nil)
     }
 
     static func startPreservingCallerBinding(
         target: AgentModeViewModel.MCPSessionTarget,
         message: String,
-        metadata: RequestMetadata,
+        metadata: MCPRequestMetadata,
         agentModeVM: AgentModeViewModel,
         agentRaw: String?,
         modelRaw: String?,
@@ -48,6 +52,7 @@ enum AgentExternalMCPRunStarter {
         workflow: AgentWorkflowDefinition? = nil,
         expectedParentSessionID: UUID? = nil,
         oracleReviewSource: AgentRunOracleReviewSource? = nil,
+        preserveRoutedInitialEffort: Bool = false,
         dispatchInstruction: DispatchInstruction? = nil
     ) async throws -> StartOutcome {
         try await startWithBindingDisposition(
@@ -63,6 +68,7 @@ enum AgentExternalMCPRunStarter {
             workflow: workflow,
             expectedParentSessionID: expectedParentSessionID,
             oracleReviewSource: oracleReviewSource,
+            preserveRoutedInitialEffort: preserveRoutedInitialEffort,
             dispatchInstruction: dispatchInstruction
         )
     }
@@ -70,7 +76,7 @@ enum AgentExternalMCPRunStarter {
     static func startApplyingRequestBindingPolicy(
         target: AgentModeViewModel.MCPSessionTarget,
         message: String,
-        metadata: RequestMetadata,
+        metadata: MCPRequestMetadata,
         bindCurrentRequestToTab: @escaping BindCurrentRequestToTab,
         agentModeVM: AgentModeViewModel,
         agentRaw: String?,
@@ -80,6 +86,7 @@ enum AgentExternalMCPRunStarter {
         workflow: AgentWorkflowDefinition? = nil,
         expectedParentSessionID: UUID? = nil,
         oracleReviewSource: AgentRunOracleReviewSource? = nil,
+        preserveRoutedInitialEffort: Bool = false,
         dispatchInstruction: DispatchInstruction? = nil
     ) async throws -> StartOutcome {
         try await startWithBindingDisposition(
@@ -95,6 +102,7 @@ enum AgentExternalMCPRunStarter {
             workflow: workflow,
             expectedParentSessionID: expectedParentSessionID,
             oracleReviewSource: oracleReviewSource,
+            preserveRoutedInitialEffort: preserveRoutedInitialEffort,
             dispatchInstruction: dispatchInstruction
         )
     }
@@ -102,7 +110,7 @@ enum AgentExternalMCPRunStarter {
     private static func startWithBindingDisposition(
         target: AgentModeViewModel.MCPSessionTarget,
         message: String,
-        metadata: RequestMetadata,
+        metadata: MCPRequestMetadata,
         bindingDisposition: RequestBindingDisposition,
         agentModeVM: AgentModeViewModel,
         agentRaw: String?,
@@ -112,6 +120,7 @@ enum AgentExternalMCPRunStarter {
         workflow: AgentWorkflowDefinition?,
         expectedParentSessionID: UUID?,
         oracleReviewSource: AgentRunOracleReviewSource?,
+        preserveRoutedInitialEffort: Bool,
         dispatchInstruction: DispatchInstruction?
     ) async throws -> StartOutcome {
         let resolvedModel: String?
@@ -128,7 +137,7 @@ enum AgentExternalMCPRunStarter {
             throw MCPError.internalError("Failed to resolve target agent session ID.")
         }
         #if DEBUG
-            AgentModePerfDiagnostics.event("mcp.routing.externalRunStarterActivate", tabID: target.tabID, fields: [
+            agentModeVM.perfRecorder.event("mcp.routing.externalRunStarterActivate", tabID: target.tabID, fields: [
                 "sessionID": sessionID.uuidString,
                 "connectionID": metadata.connectionID?.uuidString ?? "nil",
                 "clientName": metadata.clientName ?? "nil",
@@ -167,7 +176,7 @@ enum AgentExternalMCPRunStarter {
             switch bindingDisposition {
             case .preserveCallerBinding:
                 #if DEBUG
-                    AgentModePerfDiagnostics.event("mcp.routing.externalRunStarterPreservedCallerBinding", tabID: target.tabID, fields: [
+                    agentModeVM.perfRecorder.event("mcp.routing.externalRunStarterPreservedCallerBinding", tabID: target.tabID, fields: [
                         "sessionID": sessionID.uuidString,
                         "connectionID": metadata.connectionID?.uuidString ?? "nil",
                         "windowID": metadata.windowID.map(String.init) ?? "nil"
@@ -176,7 +185,7 @@ enum AgentExternalMCPRunStarter {
             case let .applyRequestBindingPolicy(bindCurrentRequestToTab):
                 try await bindCurrentRequestToTab(target.tabID, metadata)
                 #if DEBUG
-                    AgentModePerfDiagnostics.event("mcp.routing.externalRunStarterBoundRequest", tabID: target.tabID, fields: [
+                    agentModeVM.perfRecorder.event("mcp.routing.externalRunStarterBoundRequest", tabID: target.tabID, fields: [
                         "sessionID": sessionID.uuidString,
                         "connectionID": metadata.connectionID?.uuidString ?? "nil",
                         "windowID": metadata.windowID.map(String.init) ?? "nil"
@@ -195,13 +204,14 @@ enum AgentExternalMCPRunStarter {
                     sessionID: sessionID,
                     text: message,
                     allowStartingRun: true,
-                    workflow: workflow
+                    workflow: workflow,
+                    preserveRoutedInitialEffort: preserveRoutedInitialEffort
                 )
             }
 
             let snapshot = await resolveInitialSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
             #if DEBUG
-                AgentModePerfDiagnostics.event("mcp.routing.externalRunStarterDispatched", tabID: target.tabID, fields: [
+                agentModeVM.perfRecorder.event("mcp.routing.externalRunStarterDispatched", tabID: target.tabID, fields: [
                     "sessionID": sessionID.uuidString,
                     "connectionID": metadata.connectionID?.uuidString ?? "nil",
                     "snapshotStatus": snapshot.status.rawValue

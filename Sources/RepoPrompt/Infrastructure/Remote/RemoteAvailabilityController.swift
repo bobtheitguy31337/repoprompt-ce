@@ -8,8 +8,6 @@ import ServiceManagement
 /// for input; an idle gateway does not keep the Mac awake.
 @MainActor
 final class RemoteAvailabilityController: ObservableObject {
-    static let shared = RemoteAvailabilityController()
-
     private static let launchAtLoginKey = "RepoPrompt.remote.launchAtLogin"
 
     @Published private(set) var launchAtLoginEnabled: Bool
@@ -18,7 +16,7 @@ final class RemoteAvailabilityController: ObservableObject {
 
     private var assertionID = IOPMAssertionID(kIOPMNullAssertionID)
 
-    private init() {
+    init() {
         launchAtLoginEnabled = UserDefaults.standard.bool(forKey: Self.launchAtLoginKey)
         refreshLaunchAtLoginStatus()
     }

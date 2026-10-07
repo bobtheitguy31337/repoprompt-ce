@@ -1,47 +1,12 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Per-stream identifier for cancellation.
 public typealias ChatStreamID = UUID
 
-/// Groups all token-usage info so we can extend it later.
-public struct ChatTokenInfo: Codable, Equatable {
-    public let promptTokens: Int?
-    public let completionTokens: Int?
-    public let cost: Double?
-
-    public init(
-        promptTokens: Int? = nil,
-        completionTokens: Int? = nil,
-        cost: Double? = nil
-    ) {
-        self.promptTokens = promptTokens
-        self.completionTokens = completionTokens
-        self.cost = cost
-    }
-}
-
-/// The output of our Chat stream, now carrying a TokenInfo block.
-public struct ChatStreamOutput {
-    public let text: String
-    public let reasoning: String?
-    public let tokens: ChatTokenInfo
-    public let isFinal: Bool
-    public let cleanupHandle: ProviderConversationCleanupHandle?
-
-    public init(
-        text: String,
-        reasoning: String?,
-        tokens: ChatTokenInfo,
-        isFinal: Bool,
-        cleanupHandle: ProviderConversationCleanupHandle? = nil
-    ) {
-        self.text = text
-        self.reasoning = reasoning
-        self.tokens = tokens
-        self.isFinal = isFinal
-        self.cleanupHandle = cleanupHandle
-    }
-}
+public typealias ChatTokenInfo = RepoPromptDomainRuntime.ChatTokenInfo
+public typealias ChatStreamTerminalOutcome = RepoPromptDomainRuntime.ChatStreamTerminalOutcome
+public typealias ChatStreamOutput = RepoPromptDomainRuntime.ChatStreamOutput
 
 struct PartialBuffer {
     var chunks: [String] = []
@@ -256,6 +221,23 @@ public class AIQueriesService {
     ) async -> ProviderConversationCleanupOutcome
 
     private let taskManager = TaskManager()
+
+    #if DEBUG
+        /// Cancellation-connected replacement transport. Registration is acknowledged before
+        /// returning to sendMessage, including cancellation that raced registration.
+        func registerControlledStreamForTesting(
+            id: ChatStreamID,
+            continuation: AsyncThrowingStream<ChatStreamOutput, Error>.Continuation,
+            producer: Task<Void, Never>
+        ) async {
+            await taskManager.storeContinuation(continuation, for: id)
+            await taskManager.addTask(producer, for: id)
+        }
+
+        func removeControlledStreamForTesting(id: ChatStreamID) async {
+            await taskManager.removeTask(for: id)
+        }
+    #endif
     private let chunkSizeThreshold = 8000 // e.g. 8KB
     private let timeThreshold: TimeInterval = 0.7 // 0.4 seconds
     private let providerPool: DisposableProviderPool
@@ -316,6 +298,34 @@ public class AIQueriesService {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         return trimmed.hasPrefix("**") || trimmed.contains("****")
+    }
+
+    static func transportActivityOutput(for result: AIStreamResult) -> ChatStreamOutput? {
+        guard result.type == AIStreamResult.transportActivityType else { return nil }
+        return ChatStreamOutput(
+            text: "",
+            reasoning: nil,
+            tokens: ChatTokenInfo(),
+            isTransportActivity: true
+        )
+    }
+
+    static func terminalOutcome(for result: AIStreamResult) throws -> ChatStreamTerminalOutcome? {
+        switch result.type {
+        case "message_stop":
+            return .completed
+        case AIStreamResult.incompleteType:
+            guard let reason = result.stopReason?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !reason.isEmpty
+            else {
+                throw AIProviderError.invalidResponse(
+                    detail: "The provider reported incomplete termination without a reason."
+                )
+            }
+            return .incomplete(reason: reason)
+        default:
+            return nil
+        }
     }
 
     static func cleanupHandle(for result: AIStreamResult, model: AIModel) -> ProviderConversationCleanupHandle? {
@@ -407,6 +417,11 @@ public class AIQueriesService {
                                 break streamLoop
                             }
 
+                            if let activityOutput = Self.transportActivityOutput(for: result) {
+                                continuation.yield(activityOutput)
+                                continue streamLoop
+                            }
+
                             var shouldYield = false
 
                             if let text = result.text, !text.isEmpty {
@@ -454,11 +469,12 @@ public class AIQueriesService {
                                 lastTokenInfo = chunkTokenInfo
                             }
 
-                            // If the provider signals end of message or buffers are ready to be flushed.
-                            if result.type == "message_stop" || shouldYield {
+                            let terminalOutcome = try Self.terminalOutcome(for: result)
+
+                            // Flush when the provider reports a terminal outcome or buffers are ready.
+                            if terminalOutcome != nil || shouldYield {
                                 let (combinedText, combinedReasoning, bufferedTokenInfo, _) = await self.taskManager.flushBuffer(for: taskId)
-                                let isFinal = (result.type == "message_stop")
-                                if isFinal { sawMessageStop = true }
+                                if terminalOutcome == .completed { sawMessageStop = true }
 
                                 // Prefer buffered counts; fall back to this chunk's counts
                                 let tokenInfo = bufferedTokenInfo ?? chunkTokenInfo
@@ -468,11 +484,11 @@ public class AIQueriesService {
                                         text: combinedText,
                                         reasoning: combinedReasoning.map(ReasoningTextFormatter.normalize),
                                         tokens: tokenInfo,
-                                        isFinal: isFinal,
+                                        terminalOutcome: terminalOutcome,
                                         cleanupHandle: cleanupHandle
                                     )
                                 )
-                                if isFinal {
+                                if terminalOutcome != nil {
                                     break streamLoop
                                 }
                             }
@@ -484,7 +500,7 @@ public class AIQueriesService {
                             _ = await self.taskManager.flushBuffer(for: taskId)
                             continuation.finish(throwing: CancellationError())
                         } else if !sawMessageStop {
-                            // Stream ended without message_stop - flush any remaining buffer as final
+                            // Stream ended without message_stop - flush remaining content as non-final
                             let (combinedText, combinedReasoning, bufferedTokenInfo, didHaveContent) = await self.taskManager.flushBuffer(for: taskId)
                             if didHaveContent {
                                 let tokenInfo = bufferedTokenInfo ?? lastTokenInfo ?? ChatTokenInfo()
@@ -493,7 +509,6 @@ public class AIQueriesService {
                                         text: combinedText,
                                         reasoning: combinedReasoning.map(ReasoningTextFormatter.normalize),
                                         tokens: tokenInfo,
-                                        isFinal: true,
                                         cleanupHandle: cleanupHandle
                                     )
                                 )

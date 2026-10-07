@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptInstrumentation
 
 /// Reasons the session-index state changed, used by the store to notify the
 /// delegate (the view model) so it can trigger sidebar UI sync.
@@ -36,8 +37,7 @@ protocol AgentWorkspaceSessionIndexStoreDelegate: AnyObject {
 
     /// Called when `sessionIndex`, `sessionListSortDates`, or
     /// `sessionListCacheReady` changes. The delegate dispatches to
-    /// `syncSidebarUIState` and `scheduleSidebarAutoArchiveIfReady` as
-    /// appropriate for the reason.
+    /// `syncSidebarUIState` as appropriate for the reason.
     func sessionIndexStore(
         _ store: AgentWorkspaceSessionIndexStore,
         didChangeStateWithReason reason: SessionIndexStateChangeReason
@@ -56,6 +56,12 @@ protocol AgentWorkspaceSessionIndexStoreDelegate: AnyObject {
 /// the view model owns the REFRESH FLOW that populates the data.
 @MainActor
 final class AgentWorkspaceSessionIndexStore: ObservableObject {
+    private let perfRecorder: any AgentModePerfRecording
+
+    init(perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()) {
+        self.perfRecorder = perfRecorder
+    }
+
     /// Owner epoch tracking which workspace activation produced the current
     /// session index. Moved out of `AgentModeViewModel` to reduce
     /// workspace-specific state on the view model. The VM retains a typealias
@@ -272,10 +278,28 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
     /// rebuilds sort dates. Used by the view model's
     /// `publishSessionIndexReplacement` after checking the refresh token.
     func setSessionIndexAndRebuildSortDates(_ replacement: [UUID: AgentSessionIndexEntry]) {
-        if sessionIndex != replacement {
-            sessionIndex = replacement
+        let indexChanged = sessionIndex != replacement
+        let previousSortDates = sessionListSortDates
+
+        // The index and its derived sort dates are one logical sidebar state.
+        // Publishing their didSet notifications separately exposed an
+        // intermediate index/new + dates/old fingerprint and rebuilt every row
+        // twice per restore batch. Settle both values first, then notify once.
+        do {
+            suppressDelegateNotifications = true
+            defer { suppressDelegateNotifications = false }
+            if indexChanged {
+                sessionIndex = replacement
+            }
+            rebuildSessionSortDatesFromIndex()
         }
-        rebuildSessionSortDatesFromIndex()
+
+        let sortDatesChanged = previousSortDates != sessionListSortDates
+        guard indexChanged || sortDatesChanged else { return }
+        delegate?.sessionIndexStore(
+            self,
+            didChangeStateWithReason: indexChanged ? .sessionIndex : .sortDates
+        )
     }
 
     func applyLocalUpsert(_ entry: AgentSessionIndexEntry) {
@@ -309,7 +333,7 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
 
     func rebuildSessionSortDatesFromIndex() {
         #if DEBUG
-            let rebuildStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let rebuildStartMS = perfRecorder.timestampMSIfEnabled()
             let debugSessionIndexCount = sessionIndex.count
         #endif
         var sortDates = AgentSessionRestoreSupport.sidebarSortDates(from: sessionIndex)
@@ -318,7 +342,7 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
             sessionListSortDates = sortDates
         }
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "cleanup.vm.rebuildSessionSortDates",
                 startMS: rebuildStartMS,
                 fields: [

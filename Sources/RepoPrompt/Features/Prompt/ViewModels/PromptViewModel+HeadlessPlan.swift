@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
 
 // MARK: - Headless Mode
 
@@ -71,10 +73,11 @@ extension PromptViewModel {
         from snapshot: HeadlessContextSnapshot,
         model: AIModel,
         mode: HeadlessMode = .plan,
-        gitScopeOverride: GitInclusion? = nil
+        gitScopeOverride: GitInclusion? = nil,
+        oraclePromptConfiguration: OraclePromptConfiguration? = nil
     ) async throws -> AIMessage {
         let effectiveGitScope = mode == .review ? (gitScopeOverride ?? .selected) : .none
-        let headlessConfig = PromptContextResolved(
+        var headlessConfig = oraclePromptConfiguration?.promptContext ?? PromptContextResolved(
             includeFiles: true,
             includeUserPrompt: true,
             includeMetaPrompts: false,
@@ -84,8 +87,9 @@ extension PromptViewModel {
             gitInclusion: effectiveGitScope,
             storedPromptIds: []
         )
+        headlessConfig.gitInclusion = effectiveGitScope
         // 4. System prompt based on mode
-        let systemPrompt: String = {
+        let systemPrompt: String = oraclePromptConfiguration?.systemPrompt ?? {
             switch mode {
             case .plan:
                 let custom = customPlanningPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -137,7 +141,7 @@ extension PromptViewModel {
             ) ?? ""
             return PromptPackagingService.buildAIMessage(
                 systemPrompt: systemPrompt,
-                metaInstructions: [],
+                metaInstructions: oraclePromptConfiguration?.metaInstructions ?? [],
                 fileTree: fileTree,
                 fileContents: partitionedBlocks.contentBlocks,
                 gitDiff: preAssembly.gitDiff,
