@@ -154,6 +154,13 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
         }
     }
 
+    public func discoverModelCatalog(kind: ProviderKind, policy: ProviderExecutionPolicy) async throws -> [ProviderModelCatalogEntry] {
+        guard let runtime = runtimes[kind] as? any ProviderModelCatalogDiscovering else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Provider runtime does not support model discovery")
+        }
+        return try await runtime.discoverModelCatalog(policy: policy)
+    }
+
     public func applyRuntimeDefaults(kind: ProviderKind, defaults: ProviderRuntimeDefaults) throws {
         guard runtimes[kind] != nil, cataloguedConfigurations.isEmpty || cataloguedConfigurations[kind] != nil else {
             throw ServiceAPIError(code: .providerUnavailable, message: "Provider is not configured")
@@ -331,6 +338,14 @@ public actor ProviderCLIAdapter: AgentProviderDispatcher, InteractionDeliveryPor
 
     public func capabilities() async -> [ProviderCapability] {
         await dispatcher.capabilities()
+    }
+
+    public func discoverModelCatalog(providerID: ProviderSettingsID) async throws -> [ProviderModelCatalogEntry] {
+        guard let kind = providerID.runtimeKind, !providerID.isDirectAPI else {
+            throw ServiceAPIError(code: .capabilityMissing, message: "Provider is not a CLI runtime")
+        }
+        let settings = ["claude.backendID": providerID.rawValue]
+        return try await dispatcher.discoverModelCatalog(kind: kind, policy: .init(mode: .readOnly, providerSettings: settings))
     }
 
     public func preflight() async -> [ProviderCapability] {

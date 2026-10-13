@@ -110,7 +110,10 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
             suggestions: !suggestions.isEmpty,
             steering: groups.contains { $0.models.contains { $0.capabilities.steering } }
         )
-        let locks = ComposerLockSnapshotWire(model: controllerLock, effort: controllerLock, workflow: controllerLock, tools: controllerLock, permissions: permissionLock, attachments: activeLock, send: .init())
+        let sendLock: ComposerLockWire = selected == nil
+            ? .init(locked: true, reasonCode: "models_unavailable", reasonText: "Provider models are synchronizing. Try again shortly.")
+            : .init()
+        let locks = ComposerLockSnapshotWire(model: controllerLock, effort: controllerLock, workflow: controllerLock, tools: controllerLock, permissions: permissionLock, attachments: activeLock, send: sendLock)
         let empty = AgentEmptyStateWire(
             heading: emptyState.heading,
             featuredWorkflowIDs: try await liveFeaturedWorkflowIDs(),
@@ -289,28 +292,12 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
                 ProviderComposerStableControls.permissionDescriptor(providerID: matrix.providerID, selectedID: selectedPermission, mutable: true, lockReasonCode: nil)
             }
             var sources: [AgentCatalogModelSource] = []
-            let cached = matrix.discoveryPolicy.allowsPersistedFallback
-                ? try await store.composerProviderCatalog(providerID: matrix.providerID)
-                : nil
             if !settings.models.isEmpty {
-                let persistedDiscovery = matrix.discoveryPolicy.allowsPersistedFallback
-                    ? try await store.providerModelCatalog(providerID: matrix.providerID)
-                    : nil
-                if let persistedDiscovery, persistedDiscovery.models == settings.models {
-                    sources.append(.init(kind: .persisted, observedAt: persistedDiscovery.refreshedAt, models: settings.models.map(Self.candidate)))
+                if let persisted = try await store.providerModelCatalog(providerID: matrix.providerID) {
+                    sources.append(.init(kind: .persisted, observedAt: persisted.refreshedAt, models: settings.models.map(Self.candidate)))
                 } else {
                     sources.append(.init(kind: .live, observedAt: catalog.generatedAt, models: settings.models.map(Self.candidate)))
-                    if matrix.discoveryPolicy.allowsPersistedFallback, cached?.models != settings.models {
-                        try await store.persistComposerProviderCatalog(.init(providerID: matrix.providerID, models: settings.models, observedAt: instant))
-                    }
                 }
-            }
-            if let cached {
-                sources.append(.init(kind: .persisted, observedAt: cached.observedAt, models: cached.models.map(Self.candidate)))
-            }
-            let desktopFallback = DesktopProviderModelFallbackCatalog.candidates(for: matrix.providerID)
-            if matrix.discoveryPolicy.allowsStaticFallbackAfterSuccessfulPreflight, !desktopFallback.isEmpty {
-                sources.append(.init(kind: .providerFallback, models: desktopFallback))
             }
             // The composer is a projection of durable provider choices, not a live
             // health check. A transient CLI/auth probe must not make already-known
@@ -327,7 +314,7 @@ public actor AgentComposerCatalogService: AgentComposerCatalogProviding {
                 configured: settings.preflight.ready || settings.authentication.state != .notConfigured,
                 preflightReady: catalogReady,
                 adapterAvailable: adapters[matrix.providerID] != nil,
-                discoveryPolicy: matrix.discoveryPolicy,
+                discoveryPolicy: .init(allowsPersistedFallback: true, allowsStaticFallbackAfterSuccessfulPreflight: false, discoveryReplacesStaticChoices: true),
                 modelSources: sources,
                 preferredModelID: settings.preference.defaultModel,
                 preferredEffortID: settings.preference.reasoningEffort,

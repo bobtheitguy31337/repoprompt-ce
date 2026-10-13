@@ -364,7 +364,7 @@ final class AgentInteractionPresentationAdapterTests: XCTestCase {
 }
 
 final class AgentComposerCatalogTests: XCTestCase {
-    func testDesktopFallbackPopulatesCodexComposerWithoutDiscoveredCatalog() async throws {
+    func testComposerDoesNotInventModelsWithoutADiscoveredCatalog() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
         _ = try await store.upsertProviderSettings(
@@ -403,16 +403,9 @@ final class AgentComposerCatalogTests: XCTestCase {
             context: .init(kind: .project, projectID: UUID(), actorID: "catalog-reader")
         )
 
-        let group = try XCTUnwrap(snapshot.providerGroups.first { $0.providerID == .codex })
-        let sol = try XCTUnwrap(group.models.first { $0.id == "gpt-5.6-sol" })
-        XCTAssertEqual(sol.supportedEffortIDs, ["low", "medium", "high", "xhigh", "max", "ultra"])
-        XCTAssertEqual(sol.defaultEffortID, "medium")
-        XCTAssertTrue(group.models.contains { $0.id == "gpt-5.6-sol-fast" })
-        XCTAssertEqual(snapshot.selected?.providerID, .codex)
-        XCTAssertEqual(snapshot.selected?.modelID, "gpt-5.6-sol")
-        XCTAssertEqual(snapshot.selected?.effortID, "medium")
-        XCTAssertNotNil(group.permissionControl)
-        XCTAssertFalse(group.toolControls.isEmpty)
+        XCTAssertTrue(snapshot.providerGroups.isEmpty)
+        XCTAssertNil(snapshot.selected)
+        XCTAssertTrue(snapshot.locks.send.locked)
     }
 
     func testComposerSelectionLiveReadsPreferredComposeModelFromAgentModelsStore() async throws {
@@ -447,6 +440,11 @@ final class AgentComposerCatalogTests: XCTestCase {
             configurations: [configuration],
             initiallyEnabled: [.codex],
             runner: runner
+        )
+        _ = try await store.replaceProviderModelCatalog(
+            providerID: .codex,
+            models: [.init(id: "gpt-5.6-sol-fast", displayName: "Discovered Sol Fast", isProviderDefault: true)],
+            expectedRevision: 0
         )
         try await settings.bootstrap()
 
@@ -672,7 +670,7 @@ final class AgentComposerCatalogTests: XCTestCase {
             runner: runner
         )
         try await settings.bootstrap()
-        let beforeRefresh = try await settings.catalog()
+        let beforeRefresh = try await settings.catalog(refreshRuntime: true)
         let codex = try XCTUnwrap(beforeRefresh.providers.first { $0.providerID == .codex })
         XCTAssertTrue(codex.runtimePreflightVerified)
         XCTAssertFalse(codex.preflight.ready)
@@ -684,7 +682,7 @@ final class AgentComposerCatalogTests: XCTestCase {
 
         let group = try XCTUnwrap(snapshot.providerGroups.first { $0.providerID == .codex })
         XCTAssertEqual(group.models.first?.id, modelID)
-        XCTAssertTrue(group.models.contains { $0.id == "gpt-5.6-sol-fast" })
+        XCTAssertEqual(group.models.map(\.id), [modelID])
         XCTAssertNotNil(group.permissionControl)
         XCTAssertFalse(group.toolControls.isEmpty)
     }

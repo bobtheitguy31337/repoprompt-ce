@@ -143,11 +143,17 @@ public enum ClaudeCompatibleLaunchResolver {
         let specifier = EffortEncodedModel(raw: requestedModel)
         switch settings.modelBehavior {
         case .noModel:
-            guard !specifier.hasEffort, isAllowedNoModelSelection(requestedModel, providerID: settings.providerID) else {
+            guard !specifier.hasEffort else {
                 throw ServiceAPIError(
                     code: .providerUnavailable,
                     message: "Unsupported \(settings.displayName) model selection."
                 )
+            }
+            if !isAllowedNoModelSelection(requestedModel, providerID: settings.providerID) {
+                guard let model = specifier.baseModel, isSafeDiscoveredModelID(model) else {
+                    throw ServiceAPIError(code: .providerUnavailable, message: "Invalid provider model identifier")
+                }
+                return ResolvedModel(effectiveModel: model, selectedBackendModelID: model, environmentSettings: settings)
             }
             return ResolvedModel(effectiveModel: nil, selectedBackendModelID: nil, environmentSettings: settings)
         case .claudeSlotMapping:
@@ -299,11 +305,18 @@ public enum ClaudeCompatibleLaunchResolver {
 
     private static func directSelectableGLMSlot(for rawModel: String) -> String? {
         switch rawModel.lowercased() {
-        case "glm-4.7": haikuRequestedModel
-        case "glm-5-turbo": defaultRequestedModel
-        case "glm-5.1": opusRequestedModel
-        default: nil
+        case "glm-4.7": return haikuRequestedModel
+        case "glm-5-turbo": return defaultRequestedModel
+        case "glm-5.1": return opusRequestedModel
+        default:
+            guard !["haiku", "sonnet", "opus", "default"].contains(rawModel.lowercased()), isSafeDiscoveredModelID(rawModel) else { return nil }
+            return defaultRequestedModel
         }
+    }
+
+    private static func isSafeDiscoveredModelID(_ model: String) -> Bool {
+        !model.isEmpty && model.utf8.count <= 256 && !ProviderSecretRedaction.containsLikelySecret(model)
+            && model.unicodeScalars.allSatisfy { CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._/[]:+").contains($0) }
     }
 
     private static func withSlotOverride(

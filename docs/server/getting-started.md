@@ -48,3 +48,16 @@ Production deployments can still require client certificates for chat and other 
 A chat host can present a signed `AuthorizationDecision`, selected-message context (`explicit-selection` only), and HMAC-signed internal routes. Wire roles encode as `app` / `sync` / `repoprompt-operator`. Integration HMAC files and app/sync certificate identities use `REPOPROMPT_APP_*` and `REPOPROMPT_SYNC_*`.
 
 See [`docs/architecture/linux-server.md`](../architecture/linux-server.md) for authority, persistence, and the portal map.
+
+### Model discovery
+
+The server discovers models from each connected provider every 30 minutes,
+independently of browser traffic. CLI providers use their native model catalog
+handshakes; API providers use their authenticated model-list endpoints with
+bounded pagination. Connections, explicit tests, and configuration changes also
+refresh their catalog. Failed discovery retries after five minutes and retains
+the last successful catalog for up to 24 hours. Successful observations renew
+freshness even when the list is unchanged. Chat menus use only discovered models;
+there is no bundled model-name fallback. Web/desktop and mobile periodically read
+the server cache every five minutes while visible and refresh after returning to
+the foreground. Opening a model menu does not contact the provider.

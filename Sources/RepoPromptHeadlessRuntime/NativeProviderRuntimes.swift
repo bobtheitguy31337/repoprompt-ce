@@ -167,6 +167,12 @@ private struct NativeProviderProcessSupport {
         }
     }
 
+    func discoverClaudeBackend(policy: ProviderExecutionPolicy) async throws -> [ProviderModelCatalogEntry]? {
+        let environment = try await credentialEnvironment.environment(for: .claudeCompatible, model: nil, policy: policy)
+        let providerID = policy.providerSettings["claude.backendID"].flatMap(ProviderSettingsID.init(rawValue:)) ?? .claudeCompatible
+        return try await ProviderModelDiscovery.claudeBackend(environment: environment, providerID: providerID)
+    }
+
     func recover() async throws {
         try await ProviderProcessSupervisor(processPort: processPort, store: processStore).recoverPersistedFamilies()
     }
@@ -593,7 +599,7 @@ private actor NativeJSONLineProcess {
     }
 }
 
-actor CodexAppServerProviderRuntime: AgentProviderRuntime {
+actor CodexAppServerProviderRuntime: AgentProviderRuntime, ProviderModelCatalogDiscovering {
     let kind = ProviderKind.codex
     nonisolated static let appServerArguments = [
         "--disable", "plugins",
@@ -628,6 +634,37 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
         } catch {
             await preflightProcess?.interrupt { _ in }
             return .init(kind: kind, enabled: false, executable: base.executable, supportsResume: true, supportsSteering: true, version: base.version, protocolVersion: base.protocolVersion, reasonUnavailable: "Codex app-server initialize handshake failed: \(error)")
+        }
+    }
+
+    func discoverModelCatalog(policy: ProviderExecutionPolicy) async throws -> [ProviderModelCatalogEntry] {
+        let process = try await support.makeSession(runID: UUID(), arguments: ["app-server"], workingDirectory: FileManager.default.temporaryDirectory.path, policy: policy)
+        do {
+            _ = try await process.request(method: "initialize", params: ["clientInfo": ["name": "repoprompt-model-discovery", "version": "1"]], timeout: .seconds(30), onFrame: { _ in })
+            try await process.notify(method: "initialized")
+            var models: [ProviderModelCatalogEntry] = []
+            var cursor: String?
+            var seen = Set<String>()
+            repeat {
+                var params: [String: Any] = ["limit": 100, "includeHidden": false]
+                if let cursor { params["cursor"] = cursor }
+                let response = try await process.request(method: "model/list", encodedParams: JSONSerialization.data(withJSONObject: params), timeout: .seconds(30), onFrame: { _ in })
+                let page = try ProviderModelDiscovery.codexPage(response)
+                models.append(contentsOf: page.models)
+                cursor = page.cursor
+                if let cursor, !seen.insert(cursor).inserted {
+                    throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider model pagination repeated a cursor")
+                }
+                guard models.count <= 500, seen.count <= 10 else {
+                    throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider model catalog exceeded its limit")
+                }
+            } while cursor != nil
+            let catalog = try ProviderModelDiscovery.validated(models)
+            await process.finish()
+            return catalog
+        } catch {
+            await process.finish()
+            throw error
         }
     }
 
@@ -1303,7 +1340,7 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
     }
 }
 
-private actor ACPProviderRuntime: AgentProviderRuntime {
+private actor ACPProviderRuntime: AgentProviderRuntime, ProviderModelCatalogDiscovering {
     let kind: ProviderKind
     private let arguments: [String]
     private let support: NativeProviderProcessSupport
@@ -1338,6 +1375,21 @@ private actor ACPProviderRuntime: AgentProviderRuntime {
         } catch {
             await preflightProcess?.interrupt { _ in }
             return .init(kind: kind, enabled: false, executable: base.executable, supportsResume: true, supportsSteering: true, version: base.version, protocolVersion: base.protocolVersion, reasonUnavailable: "ACP initialize handshake failed: \(error)")
+        }
+    }
+
+    func discoverModelCatalog(policy: ProviderExecutionPolicy) async throws -> [ProviderModelCatalogEntry] {
+        let directory = FileManager.default.temporaryDirectory.path
+        let process = try await support.makeSession(runID: UUID(), arguments: arguments, workingDirectory: directory, policy: policy)
+        do {
+            _ = try await process.request(method: "initialize", params: ["protocolVersion": 1, "clientInfo": ["name": "RepoPrompt Model Discovery", "version": "1"], "clientCapabilities": ["fs": ["readTextFile": false, "writeTextFile": false], "terminal": false]], timeout: .seconds(30), onFrame: { _ in })
+            let response = try await process.request(method: "session/new", params: ["cwd": directory, "mcpServers": []], timeout: .seconds(30), onFrame: { _ in })
+            let models = try ProviderModelDiscovery.acp(response)
+            await process.finish()
+            return models
+        } catch {
+            await process.finish()
+            throw error
         }
     }
 
@@ -1510,7 +1562,14 @@ private actor ACPProviderRuntime: AgentProviderRuntime {
         let options = sessionOpenResult["configOptions"] as? [[String: Any]] ?? []
         guard let model = options.first(where: { ($0["category"] as? String)?.caseInsensitiveCompare("model") == .orderedSame }),
               let configID = model["id"] as? String
-        else { throw ServiceAPIError(code: .capabilityMissing, message: "ACP provider does not advertise model selection") }
+        else {
+            let available = try ProviderModelDiscovery.acp(JSONSerialization.data(withJSONObject: sessionOpenResult))
+            guard let selected = available.first(where: { $0.id.caseInsensitiveCompare(requestedModel) == .orderedSame }) else {
+                throw ServiceAPIError(code: .providerUnavailable, message: "Requested ACP model is not advertised by the provider")
+            }
+            _ = try await process.request(method: "session/set_model", params: ["sessionId": sessionID, "modelId": selected.id], onFrame: { line in try await forward(line, output: output) })
+            return
+        }
         let choices = model["options"] as? [[String: Any]] ?? []
         let canonical = choices.compactMap { ($0["value"] ?? $0["id"]) as? String }
             .first { $0.caseInsensitiveCompare(requestedModel) == .orderedSame }
@@ -1601,7 +1660,7 @@ private actor ACPProviderRuntime: AgentProviderRuntime {
     }
 }
 
-actor ClaudeNativeProviderRuntime: AgentProviderRuntime {
+actor ClaudeNativeProviderRuntime: AgentProviderRuntime, ProviderModelCatalogDiscovering {
     let kind = ProviderKind.claudeCompatible
     private let support: NativeProviderProcessSupport
     private var sessions: [UUID: NativeJSONLineProcess] = [:]
@@ -1616,6 +1675,33 @@ actor ClaudeNativeProviderRuntime: AgentProviderRuntime {
 
     func preflight() async -> ProviderCapability {
         await support.preflight(supportsResume: true, supportsSteering: true, protocolName: "bidirectional-stream-json")
+    }
+
+    func discoverModelCatalog(policy: ProviderExecutionPolicy) async throws -> [ProviderModelCatalogEntry] {
+        if let models = try await support.discoverClaudeBackend(policy: policy) { return models }
+        let process = try await support.makeSession(runID: UUID(), arguments: ["--print", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json", "--no-session-persistence", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--tools", ""], workingDirectory: FileManager.default.temporaryDirectory.path, policy: policy)
+        do {
+            let requestID = UUID().uuidString
+            try await process.sendRaw(JSONSerialization.data(withJSONObject: ["type": "control_request", "request_id": requestID, "request": ["subtype": "initialize", "hooks": [:]]]))
+            let deadline = ContinuousClock().now.advanced(by: .seconds(30))
+            while true {
+                let line = try await process.nextLine(deadline: deadline)
+                guard let frame = try JSONSerialization.jsonObject(with: line) as? [String: Any],
+                      frame["type"] as? String == "control_response",
+                      let response = frame["response"] as? [String: Any],
+                      response["request_id"] as? String == requestID
+                else { continue }
+                guard response["subtype"] as? String == "success" else {
+                    throw ServiceAPIError(code: .dependencyUnavailable, message: "Claude model discovery initialization failed")
+                }
+                let models = try ProviderModelDiscovery.claude(JSONSerialization.data(withJSONObject: response["response"] ?? [:]))
+                await process.finish()
+                return models
+            }
+        } catch {
+            await process.finish()
+            throw error
+        }
     }
 
     func recoverProcessFamilies() async throws {

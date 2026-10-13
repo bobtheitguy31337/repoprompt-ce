@@ -113,4 +113,18 @@ public extension SQLiteServiceStore {
             return next
         }
     }
+
+    /// A successful observation renews freshness even when the provider returns
+    /// the same models. Content revisions change only when the catalog changes.
+    func refreshProviderModelCatalog(providerID: ProviderSettingsID, expectedRevision: Int64) async throws {
+        try await transaction {
+            let rows = try await connection.query(
+                "UPDATE provider_model_catalogs SET refreshed_at=? WHERE provider_id=? AND revision=? RETURNING revision",
+                [.float(Date().timeIntervalSince1970), .text(providerID.rawValue), .integer(Int(expectedRevision))]
+            )
+            guard !rows.isEmpty else {
+                throw ServiceAPIError(code: .staleRevision, message: "Provider model catalog revision is stale")
+            }
+        }
+    }
 }

@@ -107,6 +107,11 @@ public actor ProviderSettingsService {
     private var statusRefreshedAt: [ProviderSettingsID: Date] = [:]
     private var connectedRecoveryStarted = false
     private let statusRefreshTTL: TimeInterval = 15
+    public static let modelCatalogRefreshInterval: TimeInterval = 30 * 60
+    private var modelRefreshTasks: [ProviderSettingsID: Task<Void, Never>] = [:]
+    private var modelRefreshStopped = false
+    private var modelRefreshAttemptedAt: [ProviderSettingsID: Date] = [:]
+    private var modelRefreshedAt: [ProviderSettingsID: Date] = [:]
 
     public init(
         store: SQLiteServiceStore,
@@ -156,6 +161,7 @@ public actor ProviderSettingsService {
                   persistedCatalog.models.allSatisfy({ validCatalogEntry($0, providerID: persistedCatalog.providerID) })
             else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Persisted provider model catalog is invalid", retryable: false) }
             modelCatalogs[persistedCatalog.providerID] = persistedCatalog.models
+            modelRefreshedAt[persistedCatalog.providerID] = persistedCatalog.refreshedAt
         }
         let persisted = try await store.providerSettings()
         preferences = Dictionary(uniqueKeysWithValues: persisted.map { ($0.providerID, $0) })
@@ -272,15 +278,99 @@ public actor ProviderSettingsService {
         return ProviderSettingsCatalogResponse(providers: snapshots)
     }
 
-    /// Composer reads are served from the durable settings/model projection. Runtime
-    /// and authentication health are refreshed opportunistically so opening a chat
-    /// never waits for CLI process startup or an external authentication probe.
-    public func composerCatalog() async throws -> ProviderSettingsCatalogResponse {
-        for providerID in ProviderSettingsID.allCases where providerID.ownsRuntimeAdmission && !providerID.isDirectAPI {
-            guard preferences[providerID]?.enabled == true else { continue }
-            requestProviderStatusRefresh(providerID: providerID)
+    /// Menu reads never launch provider processes or make provider API requests.
+    public func composerCatalog() throws -> ProviderSettingsCatalogResponse {
+        try ProviderSettingsCatalogResponse(providers: ProviderSettingsID.allCases.map { try snapshot(for: $0) })
+    }
+
+    /// Runs independently of browser traffic. Successful catalogs refresh every
+    /// 30 minutes; failures retry after five minutes while retaining known models.
+    public func runModelCatalogRefreshLoop() async {
+        while !Task.isCancelled, !modelRefreshStopped {
+            await refreshModelCatalogs()
+            do { try await Task.sleep(for: .seconds(60)) } catch { return }
         }
-        return try ProviderSettingsCatalogResponse(providers: ProviderSettingsID.allCases.map { try snapshot(for: $0) })
+    }
+
+    public func stopModelCatalogRefreshes() async {
+        modelRefreshStopped = true
+        let tasks = Array(modelRefreshTasks.values)
+        tasks.forEach { $0.cancel() }
+        for task in tasks { await task.value }
+        modelRefreshTasks.removeAll()
+    }
+
+    public func refreshModelCatalogs(now: Date = Date()) async {
+        await withTaskGroup(of: Void.self) { group in
+            for providerID in ProviderSettingsID.allCases {
+                group.addTask { await self.refreshModelCatalog(providerID: providerID, now: now) }
+            }
+        }
+    }
+
+    public func refreshModelCatalog(providerID: ProviderSettingsID, force: Bool = false, now: Date = Date()) async {
+        guard !modelRefreshStopped, deploymentAllows(providerID),
+              providerID == .ollama || connections[providerID] != nil || externallyProvisioned(providerID)
+        else { return }
+        if let task = modelRefreshTasks[providerID] {
+            await task.value
+            return
+        }
+        if !force {
+            if let refreshed = modelRefreshedAt[providerID], now.timeIntervalSince(refreshed) < Self.modelCatalogRefreshInterval { return }
+            if let attempted = modelRefreshAttemptedAt[providerID], now.timeIntervalSince(attempted) < 5 * 60 { return }
+        }
+        modelRefreshAttemptedAt[providerID] = now
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.performModelCatalogRefresh(providerID: providerID, observedAt: now)
+        }
+        modelRefreshTasks[providerID] = task
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        modelRefreshTasks[providerID] = nil
+    }
+
+    private func performModelCatalogRefresh(providerID: ProviderSettingsID, observedAt: Date) async {
+        do {
+            var connectionRevision = connections[providerID]?.record.revision
+            let models: [ProviderModelCatalogEntry]
+            if providerID.isDirectAPI {
+                let connection = connections[providerID]
+                guard providerID == .ollama || connection?.record.testState == .valid else { return }
+                let secret: Data?
+                if let reference = connection?.credentialReference {
+                    guard let vault else { return }
+                    secret = try await vault.load(providerID: providerID, connectionID: reference)
+                } else { secret = nil }
+                let result = await credentialTester.test(providerID: providerID, method: connection?.record.authenticationMethod ?? .providerSpecific, secret: secret)
+                guard result.state == .valid, let discovered = result.models else { return }
+                models = discovered
+            } else {
+                await refreshProviderStatus(providerID: providerID, force: true)
+                guard try snapshot(for: providerID).preflight.ready else { return }
+                connectionRevision = connections[providerID]?.record.revision
+                if providerID == .codex, connections[providerID]?.record.authenticationMethod == .deviceCodeBeta {
+                    guard let discovered = try await managedAuthentication.discoverModelCatalog(providerID: providerID, forceRefresh: true) else { return }
+                    models = discovered
+                } else {
+                    models = try await adapter.discoverModelCatalog(providerID: providerID)
+                }
+            }
+            // A disconnect/reconnect while discovery is in flight must not publish
+            // a previous account's catalog into the new connection.
+            guard connections[providerID]?.record.revision == connectionRevision,
+                  deploymentAllows(providerID), !Task.isCancelled
+            else { return }
+            try await persistDiscoveredCatalog(models, providerID: providerID)
+            modelRefreshedAt[providerID] = observedAt
+        } catch {
+            // Discovery failures retain only the bounded last successful catalog.
+            // Credentials and provider error bodies never enter the public catalog.
+        }
     }
 
     public func update(
@@ -316,6 +406,7 @@ public actor ProviderSettingsService {
         }
         preferences[providerID] = try await store.upsertProviderSettings(next, expectedRevision: current.revision, audit: audit)
         try await applyRuntimePreference(providerID)
+        Task { await self.refreshModelCatalog(providerID: providerID, force: true) }
         return try snapshot(for: providerID)
     }
 
@@ -339,6 +430,7 @@ public actor ProviderSettingsService {
         }
         let updated = try await directProviderRegistry.update(providerID: providerID, request: request, attribution: attribution)
         directConfigurations[providerID] = updated
+        Task { await self.refreshModelCatalog(providerID: providerID, force: true) }
         return updated
     }
 
@@ -640,6 +732,7 @@ public actor ProviderSettingsService {
         if stored.record.authenticationMethod == .deviceCodeBeta {
             try await reconcileManagedAuthentication(attribution: attribution)
             await refreshProviderStatus(providerID: providerID, force: true)
+            await refreshModelCatalog(providerID: providerID, force: true)
             return try snapshot(for: providerID)
         }
         if stored.credentialReference == nil,
@@ -675,6 +768,7 @@ public actor ProviderSettingsService {
                 )
             )
             await refreshProviderStatus(providerID: providerID, force: true)
+            await refreshModelCatalog(providerID: providerID, force: true)
             return try snapshot(for: providerID)
         }
         let secret: Data?
@@ -714,6 +808,7 @@ public actor ProviderSettingsService {
             audit: .init(operation: "test", attribution: attribution, authenticationMethod: stored.record.authenticationMethod, result: testState.rawValue)
         )
         await refreshProviderStatus(providerID: providerID, force: true)
+        await refreshModelCatalog(providerID: providerID, force: true)
         return try snapshot(for: providerID)
     }
 
@@ -904,14 +999,16 @@ public actor ProviderSettingsService {
     }
 
     private func persistDiscoveredCatalog(_ models: [ProviderModelCatalogEntry], providerID: ProviderSettingsID) async throws {
-        guard providerID.isDirectAPI || providerID == .codex,
-              !models.isEmpty,
+        guard !models.isEmpty,
               models.count <= 500,
               Set(models.map(\.id)).count == models.count,
               models.allSatisfy({ validCatalogEntry($0, providerID: providerID) })
         else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider validation returned an unsafe model catalog") }
-        guard modelCatalogs[providerID] != models else { return }
         let currentRevision = try await store.providerModelCatalog(providerID: providerID)?.revision ?? 0
+        if modelCatalogs[providerID] == models, currentRevision > 0 {
+            try await store.refreshProviderModelCatalog(providerID: providerID, expectedRevision: currentRevision)
+            return
+        }
         let persisted = try await store.replaceProviderModelCatalog(
             providerID: providerID,
             models: models,
@@ -1065,6 +1162,7 @@ public actor ProviderSettingsService {
         Task { [weak self] in
             guard let self else { return }
             await self.refreshProviderStatus(providerID: providerID, force: force)
+            if force { await self.refreshModelCatalog(providerID: providerID, force: true) }
         }
     }
 
@@ -1101,12 +1199,6 @@ public actor ProviderSettingsService {
             try? await reconcileManagedAuthentication(attribution: Self.lifecycleAttribution)
         }
         await refreshRuntimePreflight(providerID: providerID, kind: kind)
-        if providerID == .codex,
-           (try? snapshot(for: providerID).preflight.ready) == true,
-           let models = try? await managedAuthentication.discoverModelCatalog(providerID: providerID, forceRefresh: false)
-        {
-            try? await persistDiscoveredCatalog(models, providerID: providerID)
-        }
     }
 
     private func refreshCLIHealth(providerID: ProviderSettingsID, kind: ProviderKind, configuration: ProviderCLIConfiguration) async {
@@ -1140,7 +1232,9 @@ public actor ProviderSettingsService {
 
     private func resolvedModels(for providerID: ProviderSettingsID) -> [ProviderModelCatalogEntry] {
         let discovered = modelCatalogs[providerID] ?? []
-        return directConfigurations[providerID]?.resolvedCatalog(discovered: discovered) ?? discovered
+        guard let configuration = directConfigurations[providerID] else { return discovered }
+        let available = Set(discovered.map(\.id))
+        return configuration.resolvedCatalog(discovered: discovered).filter { available.contains($0.id) }
     }
 
     private func deploymentAllows(_ providerID: ProviderSettingsID) -> Bool {
@@ -1245,7 +1339,7 @@ public actor ProviderSettingsService {
         {
             return .init(ready: false, reason: .missingCredential, detail: "External provider credential source is unavailable")
         }
-        if connection == nil {
+        if connection == nil, providerID != .ollama {
             guard externallyProvisioned(providerID) else { return .init(ready: false, reason: .missingCredential, detail: "Provider credential is not configured") }
         }
         if connection?.expiresAt.map({ $0 <= Date() }) == true { return .init(ready: false, reason: .invalidCredential, detail: "Provider credential has expired") }

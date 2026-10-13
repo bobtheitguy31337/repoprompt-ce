@@ -12,7 +12,7 @@ import RepoPromptWorkspaceRuntimeCore
 import XCTest
 
 final class ProviderManagementBackendTests: XCTestCase {
-    func testComposerCatalogReturnsBeforeProviderStatusProbeCompletes() async throws {
+    func testComposerCatalogDoesNotLaunchProviderStatusProbes() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
         _ = try await store.upsertProviderSettings(
@@ -33,7 +33,10 @@ final class ProviderManagementBackendTests: XCTestCase {
         let startedAt = Date()
         _ = try await service.composerCatalog()
         XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.2)
-        await runner.waitForVersionProbe()
+        let before = await runner.probeCount
+        for _ in 0 ..< 10 { _ = try await service.composerCatalog() }
+        let after = await runner.probeCount
+        XCTAssertEqual(before, after)
     }
 
     func testBootstrapReconcilesRetiredModelToConcreteCatalogDefaultsAndPersistsRestartSafeSelection() async throws {
@@ -925,6 +928,7 @@ private actor StaticVersionRunner: WorkspaceCommandRunning {
 }
 
 private actor SlowVersionRunner: WorkspaceCommandRunning {
+    private(set) var probeCount = 0
     private var versionProbeFinished = false
     private var completionWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -945,6 +949,7 @@ private actor SlowVersionRunner: WorkspaceCommandRunning {
 
     private func response(for arguments: [String]) async throws -> String {
         guard arguments == ["--version"] else { return "" }
+        probeCount += 1
         try await Task.sleep(for: .milliseconds(500))
         versionProbeFinished = true
         let waiters = completionWaiters

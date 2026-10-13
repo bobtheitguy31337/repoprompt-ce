@@ -750,6 +750,7 @@ public enum RepoPromptServerRunner {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask { try await internalApplication.runService() }
                 group.addTask { try await healthApplication.runService() }
+                group.addTask { await providerSettings.runModelCatalogRefreshLoop() }
                 if let portalPort = configuration.portalPort {
                     let portalApplication = Application(
                         router: service.internalRouter(),
@@ -763,6 +764,7 @@ public enum RepoPromptServerRunner {
                 _ = try await group.next()
                 let drain = await drainController.drain(timeout: 15)
                 await mcpSocketServer.stop()
+                await providerSettings.stopModelCatalogRefreshes()
                 try await authority.quiesce()
                 await durabilityOperations.stop()
                 _ = await durabilityOperations.runOnce()
@@ -775,6 +777,7 @@ public enum RepoPromptServerRunner {
             serviceError = error
             _ = await drainController.drain(timeout: 15)
             await mcpSocketServer.stop()
+            await providerSettings.stopModelCatalogRefreshes()
             try? await authority.quiesce()
             await durabilityOperations.stop()
             _ = await durabilityOperations.runOnce()

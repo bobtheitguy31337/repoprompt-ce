@@ -298,37 +298,46 @@ public actor DirectProviderCredentialTester: ProviderCredentialTesting {
     }
 
     public func test(providerID: ProviderSettingsID, method: ProviderAuthenticationMethod, secret: Data?) async -> ProviderCredentialTestResult {
-        guard method == .apiKey,
-              await supportedAuthenticationMethods(for: providerID).contains(method),
-              let secret,
-              let credential = String(data: secret, encoding: .utf8),
-              !credential.isEmpty,
-              credential.utf8.count <= 65_536,
+        let credential = secret.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        let credentialValid: Bool
+        if providerID == .ollama {
+            credentialValid = await registry.isDeploymentAllowed(providerID)
+        } else {
+            let supported = await supportedAuthenticationMethods(for: providerID)
+            credentialValid = method == .apiKey && supported.contains(method) && !credential.isEmpty
+        }
+        guard credentialValid, credential.utf8.count <= 65_536,
               !credential.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
         else { return .init(state: .invalid, detail: "Provider credential is invalid") }
         do {
             let configuration = try await registry.configuration(for: providerID)
             let endpoint = try await registry.endpoint(for: providerID)
-            let response = try await transport.execute(.init(
-                endpoint: endpoint,
-                method: "GET",
-                pathAndQuery: Self.catalogPath(providerID: providerID, endpoint: endpoint, configuration: configuration),
-                headers: Self.authenticationHeaders(providerID: providerID, credential: credential),
-                maximumResponseBodyBytes: 2 * 1024 * 1024,
-                totalTimeout: .seconds(15)
-            ))
-            switch response.statusCode {
-            case 200 ..< 300:
-                let models = Self.mergingPreferredModel(
-                    try Self.parseCatalog(response: response, providerID: providerID),
-                    preferredModel: configuration.preferredModel
-                )
-                return .init(state: .valid, detail: "Provider credential and model catalog validated", models: models)
-            case 401, 403:
-                return .init(state: .invalid, detail: "Provider rejected the configured credential")
-            default:
-                return .init(state: .unavailable, detail: "Provider validation is temporarily unavailable")
+            let initialPath = Self.catalogPath(providerID: providerID, endpoint: endpoint, configuration: configuration)
+            var path: String? = initialPath
+            var visited = Set<String>()
+            var models: [ProviderModelCatalogEntry] = []
+            while let requestPath = path {
+                guard visited.insert(requestPath).inserted, visited.count <= 10 else {
+                    throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider model pagination is invalid")
+                }
+                let response = try await transport.execute(.init(
+                    endpoint: endpoint,
+                    method: "GET",
+                    pathAndQuery: requestPath,
+                    headers: Self.authenticationHeaders(providerID: providerID, credential: credential),
+                    maximumResponseBodyBytes: 2 * 1024 * 1024,
+                    totalTimeout: .seconds(15)
+                ))
+                guard (200 ..< 300).contains(response.statusCode) else {
+                    return .init(state: [401, 403].contains(response.statusCode) ? .invalid : .unavailable, detail: "Provider model discovery is unavailable")
+                }
+                models.append(contentsOf: try Self.parseCatalog(response: response, providerID: providerID))
+                guard models.count <= 500, Set(models.map(\.id)).count == models.count else {
+                    throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider model catalog exceeded its limit")
+                }
+                path = try Self.nextCatalogPage(response: response, initialPath: initialPath, endpoint: endpoint)
             }
+            return .init(state: .valid, detail: "Provider credential and model catalog validated", models: models)
         } catch is CancellationError {
             return .init(state: .unavailable, detail: "Provider validation was cancelled")
         } catch {
@@ -344,6 +353,8 @@ public actor DirectProviderCredentialTester: ProviderCredentialTesting {
             ["x-api-key": credential, "anthropic-version": "2023-06-01"]
         case .azure:
             ["api-key": credential]
+        case .gemini:
+            ["x-goog-api-key": credential]
         case .ollama:
             [:]
         default:
@@ -410,9 +421,9 @@ public actor DirectProviderCredentialTester: ProviderCredentialTesting {
             } else {
                 description = nil
             }
-            let reasoningEfforts: [String] = providerID == .anthropicAPI
-                ? []
-                : ["low", "medium", "high", "xhigh", "max"]
+            let reasoningEfforts: [String] = [.openAIAPI, .openRouter, .customOpenAICompatible, .xAI].contains(providerID)
+                ? ["low", "medium", "high", "xhigh", "max"]
+                : []
             let serviceTiers: [String] = providerID == .openAIAPI
                 ? ["auto", "default", "flex", "priority", "scale"]
                 : []
@@ -429,6 +440,31 @@ public actor DirectProviderCredentialTester: ProviderCredentialTesting {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider model catalog is empty")
         }
         return models.sorted { $0.id < $1.id }
+    }
+
+    static func nextCatalogPage(response: ValidatedProviderHTTPResponse, initialPath: String, endpoint: DirectProviderEndpoint) throws -> String? {
+        guard let payload = try JSONSerialization.jsonObject(with: response.body) as? [String: Any] else { return nil }
+        var components = URLComponents(string: initialPath)
+        var query = components?.queryItems ?? []
+        if let token = (payload["nextPageToken"] ?? payload["next_page_token"]) as? String, !token.isEmpty {
+            query.append(.init(name: payload["nextPageToken"] != nil ? "pageToken" : "page_token", value: token))
+        } else if payload["has_more"] as? Bool == true {
+            guard let lastID = payload["last_id"] as? String else {
+                throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider model pagination omitted its cursor")
+            }
+            query.append(.init(name: "after_id", value: lastID))
+        } else if let nextLink = payload["nextLink"] as? String {
+            guard let next = URLComponents(string: nextLink), next.scheme == "https", next.host == endpoint.host,
+                  next.user == nil, next.password == nil, next.port == nil || next.port == 443,
+                  next.path == components?.path
+            else { throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider model pagination changed its endpoint") }
+            return next.path + (next.percentEncodedQuery.map { "?" + $0 } ?? "")
+        } else { return nil }
+        components?.queryItems = query
+        guard let next = components?.string, next.utf8.count <= 8192 else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Provider model pagination is invalid")
+        }
+        return next
     }
 
     static func mergingPreferredModel(

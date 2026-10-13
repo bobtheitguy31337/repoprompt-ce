@@ -88,7 +88,7 @@ public struct DirectProviderConfiguration: Codable, Hashable, Sendable {
         let extras = allowlistedModelIDs
         switch providerID {
         case .customOpenAICompatible:
-            return catalog(from: discovered, allowed: extras, includeDiscovered: false)
+            return catalog(from: discovered, allowed: extras, includeDiscovered: includeDefaultModels)
         case .openRouter:
             return catalog(from: discovered, allowed: extras, includeDiscovered: includeDefaultModels)
         case .openAIAPI:
@@ -120,7 +120,7 @@ public struct DirectProviderConfiguration: Codable, Hashable, Sendable {
     public func allowsLaunchModel(_ model: String) -> Bool {
         switch providerID {
         case .customOpenAICompatible:
-            return allowlistedModelIDs.contains(model)
+            return includeDefaultModels || allowlistedModelIDs.contains(model)
         case .openRouter:
             return includeDefaultModels || allowlistedModelIDs.contains(model)
         default:
