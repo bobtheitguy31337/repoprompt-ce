@@ -500,7 +500,7 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                 {
                     sanitizeText(summary, characterLimit: 512)
                 } else if let summary = activity.toolExecution?.summaryText,
-                                              !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                          !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 {
                     sanitizeVisibleText(summary)
                 } else if activity.toolExecution != nil {
@@ -566,8 +566,20 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
 
     static func compactToolSummary(_ execution: AgentTranscriptToolExecution) -> String? {
         let name = normalizedToolCardName(execution.toolName)?.lowercased()
-        guard let name, ["read", "read_file", "file_search", "grep", "glob", "list_files",
-                         "bash", "apply_edits", "apply_patch", "edit", "edit_file", "write_file"].contains(name)
+        guard let name, [
+            "read",
+            "read_file",
+            "file_search",
+            "grep",
+            "glob",
+            "list_files",
+            "bash",
+            "apply_edits",
+            "apply_patch",
+            "edit",
+            "edit_file",
+            "write_file"
+        ].contains(name)
         else { return nil }
 
         // Large payloads still have their original summary and expandable, size-limited detail.
@@ -620,8 +632,8 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
     }
 
     private static func boundedToolPayload(_ raw: String?) -> String? {
-        guard let raw, raw.utf8.prefix(65_537).count <= 65_536 else { return nil }
-        return sanitizeText(raw, characterLimit: 65_536)
+        guard let raw, raw.utf8.prefix(65537).count <= 65536 else { return nil }
+        return sanitizeText(raw, characterLimit: 65536)
     }
 
     private static func diffLineSummary(_ diffs: [String]) -> String? {
