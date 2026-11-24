@@ -1352,6 +1352,7 @@ public struct RemoteCommandRequest: Codable, Sendable, Equatable {
     public let modelID: String?
     public let reasoningEffort: String?
     public let workflowID: String?
+    public let interviewFirst: Bool?
     public let contextBuilderResponseType: String?
     public let contextBuilderExportResponse: Bool?
     public let notificationRegistration: RemoteNotificationRegistration?
@@ -1375,6 +1376,7 @@ public struct RemoteCommandRequest: Codable, Sendable, Equatable {
         modelID: String? = nil,
         reasoningEffort: String? = nil,
         workflowID: String? = nil,
+        interviewFirst: Bool? = nil,
         contextBuilderResponseType: String? = nil,
         contextBuilderExportResponse: Bool? = nil,
         notificationRegistration: RemoteNotificationRegistration? = nil,
@@ -1397,6 +1399,7 @@ public struct RemoteCommandRequest: Codable, Sendable, Equatable {
         self.modelID = modelID
         self.reasoningEffort = reasoningEffort
         self.workflowID = workflowID
+        self.interviewFirst = interviewFirst
         self.contextBuilderResponseType = contextBuilderResponseType
         self.contextBuilderExportResponse = contextBuilderExportResponse
         self.notificationRegistration = notificationRegistration

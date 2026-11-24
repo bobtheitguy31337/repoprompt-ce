@@ -248,6 +248,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 taskLabelKind: .pair,
                 workflow: workflow,
                 remoteAttachments: attachments,
+                remoteInterviewFirst: request.interviewFirst == true,
                 validateDispatch: authorizeDispatch,
                 workspaceAuthority: .init(
                     target: target, expectedWorkspaceID: workspaceID, allowMatchingControlledSession: false
