@@ -547,8 +547,8 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
             ? ([interaction.prompt ?? interaction.fields.first?.prompt].compactMap(\.self) + details).joined(separator: "\n\n")
             : nil
         let questionnaire: RemoteQuestionnaire? = if unavailableReason == nil,
-                                                       isAskUser || isUserInput,
-                                                       !interaction.fields.isEmpty
+                                                     isAskUser || isUserInput,
+                                                     !interaction.fields.isEmpty
         {
             RemoteQuestionnaire(context: interaction.context, questions: interaction.fields.map { field in
                 var options = field.options.map {

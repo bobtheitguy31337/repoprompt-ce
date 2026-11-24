@@ -2109,8 +2109,14 @@ final class RemoteSnapshotProjectionTests: XCTestCase {
         let request = AgentRequestUserInputRequest(
             receipt: .fixture(.int(9)), method: "item/tool/requestUserInput", threadID: "t", turnID: "t", itemID: "i",
             questions: [
-                .init(id: "mode", header: "Mode", question: "Which mode?", isOther: true, isSecret: false,
-                      options: [.init(label: "Read", description: "Read files")]),
+                .init(
+                    id: "mode",
+                    header: "Mode",
+                    question: "Which mode?",
+                    isOther: true,
+                    isSecret: false,
+                    options: [.init(label: "Read", description: "Read files")]
+                ),
                 .init(id: "code", header: "Code", question: "Enter a code", isOther: false, isSecret: true, options: [])
             ]
         )
