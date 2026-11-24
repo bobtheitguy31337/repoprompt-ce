@@ -1089,6 +1089,30 @@ final class RemoteMutationBehaviorTests: XCTestCase {
 
 @MainActor
 final class RemoteProducerParityTests: XCTestCase {
+    func testCompactToolSummariesIncludeResultMetadataWithoutFullOutput() {
+        let read = toolExecution(
+            name: "read_file", status: .success, argsJSON: #"{"path":"Sources/A.swift"}"#,
+            resultJSON: #"{"content":"omitted body","total_lines":100,"first_line":3,"last_line":6,"display_path":"Sources/A.swift"}"#
+        )
+        XCTAssertEqual(WindowRemoteReadService.compactToolSummary(read), "Sources/A.swift • Lines 3–6")
+        let search = toolExecution(
+            name: "file_search", status: .success, argsJSON: #"{"pattern":"needle"}"#,
+            resultJSON: #"{"total_matches":12,"content_match_groups":[]}"#
+        )
+        XCTAssertEqual(WindowRemoteReadService.compactToolSummary(search), "\"needle\" • 12 matches")
+        let command = toolExecution(
+            name: "functions.exec_command", status: .failed,
+            resultJSON: #"{"type":"commandExecution","command":"swift build","exitCode":1,"aggregatedOutput":"omitted output","status":"failed"}"#
+        )
+        XCTAssertEqual(WindowRemoteReadService.compactToolSummary(command), "swift build • Exit 1")
+        let patch = toolExecution(
+            name: "apply_patch", status: .success,
+            resultJSON: #"{"status":"success","change_count":1,"changes":[{"path":"Sources/A.swift","kind":"update","diff":"@@ -1 +1 @@\n-old\n+new"}]}"#
+        )
+        XCTAssertEqual(WindowRemoteReadService.compactToolSummary(patch), "Sources/A.swift • +1 −1 lines")
+        XCTAssertNil(WindowRemoteReadService.compactToolSummary(toolExecution(name: "unrecognized", status: .success)))
+    }
+
     func testWorkflowDescriptorsUseAuthoritativeVisualsAndFeaturedRanks() throws {
         let customID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000901"))
         let custom = AgentWorkflowDefinition(
